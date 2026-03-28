@@ -1,0 +1,40 @@
+[
+    {
+        "market": {
+            "symbol": "NVDA",
+            "price": 167.52,
+            "day_high": 170.97,
+            "volume": 194056113,
+            "timestamp": "2026-03-27T19:31:37.475446"
+        },
+        "social": [
+            {
+                "title": "Sample post while waiting for API approval",
+                "score": 10
+            },
+            {
+                "title": "Discussion about NVDA on r/stocks",
+                "score": 25
+            }
+        ]
+    },
+    {
+        "market": {
+            "symbol": "TSLA",
+            "price": 361.83,
+            "day_high": 369.86,
+            "volume": 60620359,
+            "timestamp": "2026-03-27T19:31:37.699636"
+        },
+        "social": [
+            {
+                "title": "Sample post while waiting for API approval",
+                "score": 10
+            },
+            {
+                "title": "Discussion about TSLA on r/stocks",
+                "score": 25
+            }
+        ]
+    }
+]
