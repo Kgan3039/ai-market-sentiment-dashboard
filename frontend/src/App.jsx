@@ -182,7 +182,7 @@ const DUMMY_DATA = {
 };
 
 export default function App() {
-  // useState: ticker could be swapped out when you add a search bar via setActiveTicker
+  // useState: ticker could be swapped out when you add a search bar
   const [activeTicker, setActiveTicker] = useState("AAPL");
   const data = DUMMY_DATA; // later: fetch from backend based on activeTicker
 
