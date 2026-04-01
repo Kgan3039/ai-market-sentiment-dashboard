@@ -1,0 +1,28 @@
+# FastAPI framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# Data validation & serialization
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# HTTP requests
+requests==2.31.0
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Database (future use)
+sqlalchemy==2.0.23
+
+# Async support
+aiohttp==3.9.1
+
+# Development
+pytest==7.4.3
+black==23.12.1
+flake8==6.1.0
+
+# Shared dependencies with other modules
+pandas==2.2.1
+numpy==1.24.3
