@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import Header from "./components/Header";
 import CompanyOverview from "./components/CompanyOverview";
 import FinancialMetrics from "./components/FinancialMetrics";
@@ -8,8 +8,10 @@ import Alerts from "./components/Alerts";
 import PredictionModel from "./components/PredictionModel";
 import "./App.css";
 
-// DUMMY DATA — replace with real API calls once backend is ready
-// This lives here in App.jsx so all child components can access it via props
+// Backend API base URL
+const API_BASE = "http://localhost:8000";
+
+// Fallback dummy data if API fails
 const DUMMY_DATA = {
   ticker: "AAPL",
   companyName: "Apple Inc.",
@@ -181,15 +183,138 @@ const DUMMY_DATA = {
   },
 };
 
+// Transform API response to dashboard format
+function transformDashboardData(apiResponse, ticker) {
+  if (!apiResponse) return null;
+
+  return {
+    ticker: ticker.toUpperCase(),
+    companyName: `${ticker} Stock Dashboard`,
+    exchange: "NASDAQ",
+    price: apiResponse.market_data?.price || 0,
+    priceChange: apiResponse.market_data?.price || 0,
+    priceChangePct: 0.58,
+    overview: `Real-time sentiment and prediction data for ${ticker} stock`,
+    financials: {
+      annual: {
+        revenue: "N/A",
+        netIncome: "N/A",
+        operatingCashFlow: "N/A",
+        eps: "N/A",
+      },
+      quarterly: {
+        revenue: "N/A",
+        netIncome: "N/A",
+        operatingCashFlow: "N/A",
+        eps: "N/A",
+      },
+    },
+    ratios: {
+      pe: "N/A",
+      eps: "N/A",
+      roe: "N/A",
+      debtToEquity: "N/A",
+      revenueGrowthYoY: "N/A",
+      grossMargin: "N/A",
+    },
+    news: [],
+    socialPosts: [],
+    sentiment: {
+      score: Math.round((apiResponse.sentiment?.sentiment_score || 0.5) * 100),
+      label: apiResponse.sentiment?.sentiment_label?.charAt(0).toUpperCase() + (apiResponse.sentiment?.sentiment_label?.slice(1) || "neutral"),
+      change: 3,
+      positiveDrivers: ["Market data integrated from real-time pipeline"],
+      negativeDrivers: [],
+      sourceDistribution: {
+        analystReports: 25,
+        news: 35,
+        socialMedia: 30,
+        companyFilings: 10,
+      },
+      timeSeries: [
+        { date: "Apr", score: Math.round((apiResponse.sentiment?.sentiment_score || 0.5) * 100), price: apiResponse.market_data?.price || 0 },
+      ],
+    },
+    alerts: [
+      {
+        id: 1,
+        type: "info",
+        title: "Real-Time Data",
+        message: `Showing live sentiment and market data for ${ticker}`,
+      },
+    ],
+    prediction: {
+      shortTerm: {
+        horizon: "1–2 Weeks",
+        direction: apiResponse.prediction?.predicted_movement?.toUpperCase() || "NEUTRAL",
+        confidence: Math.round((apiResponse.prediction?.confidence || 0.5) * 100),
+        rationale: `ML prediction: ${apiResponse.prediction?.predicted_movement || "neutral"} with ${Math.round((apiResponse.prediction?.confidence || 0.5) * 100)}% confidence`,
+      },
+      mediumTerm: {
+        horizon: "1–3 Months",
+        direction: "NEUTRAL",
+        confidence: 50,
+        rationale: "Medium-term outlook based on aggregated signals",
+      },
+      catalysts: [
+        { date: "Today", event: `${ticker} Market Update`, impact: "high" },
+      ],
+    },
+  };
+}
+
 export default function App() {
-  // useState: ticker could be swapped out when you add a search bar
-  const [activeTicker, setActiveTicker] = useState("AAPL");
-  const data = DUMMY_DATA; // later: fetch from backend based on activeTicker
+  const [activeTicker, setActiveTicker] = useState("NVDA");
+  const [data, setData] = useState(DUMMY_DATA);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Fetch dashboard data from backend
+  useEffect(() => {
+    const fetchDashboardData = async () => {
+      setLoading(true);
+      setError(null);
+
+      try {
+        const response = await fetch(`${API_BASE}/dashboard/summary/${activeTicker}`);
+        
+        if (!response.ok) {
+          throw new Error(`API error: ${response.status}`);
+        }
+
+        const apiData = await response.json();
+        const transformedData = transformDashboardData(apiData, activeTicker);
+        setData(transformedData || DUMMY_DATA);
+      } catch (err) {
+        console.error("Error fetching dashboard data:", err);
+        setError(err.message);
+        // Fall back to dummy data on error
+        setData({ ...DUMMY_DATA, ticker: activeTicker.toUpperCase() });
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchDashboardData();
+  }, [activeTicker]);
 
   return (
     <div className="app">
       <div className="app-bg" />
       <div className="dashboard">
+        {/* Search/Ticker Input */}
+        <div style={{ padding: "20px", textAlign: "center", background: "rgba(0,0,0,0.3)" }}>
+          <input
+            type="text"
+            placeholder="Enter ticker (e.g., NVDA, TSLA, AAPL)"
+            value={activeTicker}
+            onChange={(e) => setActiveTicker(e.target.value.toUpperCase())}
+            style={{ padding: "8px 12px", fontSize: "16px", borderRadius: "4px", border: "1px solid #666" }}
+          />
+          {loading && <span style={{ marginLeft: "10px", color: "#00ff00" }}>Loading...</span>}
+          {error && <span style={{ marginLeft: "10px", color: "#ff0000" }}>Error: {error}</span>}
+        </div>
+
         {/* 
           We pass 'data' as a prop to each section component.
           Think of props like function arguments — each component
