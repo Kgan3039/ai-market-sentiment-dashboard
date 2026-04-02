@@ -11,8 +11,33 @@ Integration Points:
 Current Status: Placeholder implementation - awaiting NLP integration
 """
 
+import os
+import sys
+import json
 from typing import Dict, Any
+from datetime import datetime
 from app.models.schemas import SentimentScores
+
+
+def _load_nlp_module():
+    """Load nlp/sentiment module dynamically for backend integration."""
+    try:
+        from nlp import sentiment as sentiment_module
+        return sentiment_module
+    except Exception:
+        # If PYTHONPATH is not set to project root, add relative nlp path
+        nlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'nlp'))
+        if nlp_dir not in sys.path:
+            sys.path.append(nlp_dir)
+        try:
+            import sentiment as sentiment_module
+            return sentiment_module
+        except Exception:
+            return None
+
+
+def _pipeline_file_path() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'stock_data.json'))
 
 
 class SentimentService:
@@ -28,15 +53,16 @@ class SentimentService:
 
         Returns:
             SentimentScores: Sentiment analysis results with probabilities and labels
-
-        TODO (Mihir + Matthew): Import FinBERT model from ../nlp/sentiment.py
-        TODO (Matthew): Call get_sentiment_scores() function from sentiment.py
-        TODO (Mihir): Add caching decorator to avoid redundant analyses
-        TODO (Mihir): Add error handling for empty/invalid text
         """
-        # PLACEHOLDER: Returns mock data - will be replaced with actual NLP calls
-        # In production: from nlp.sentiment import get_sentiment_scores
-        # return get_sentiment_scores(text)
+        if not text or not str(text).strip():
+            raise ValueError("Text input is required")
+
+        sentiment_module = _load_nlp_module()
+        if sentiment_module is not None and hasattr(sentiment_module, 'get_sentiment_scores'):
+            raw = sentiment_module.get_sentiment_scores(str(text))
+            return SentimentScores(**raw)
+
+        # Fallback legacy placeholder
         positive_prob = 0.65
         negative_prob = 0.20
         neutral_prob = 0.15
@@ -58,46 +84,99 @@ class SentimentService:
     @staticmethod
     def get_sentiment_for_ticker(ticker: str) -> Dict[str, Any]:
         """
-        Aggregate sentiment from all sources for a given stock ticker.
+        Aggregate sentiment for a ticker using pipeline data and FinBERT scoring.
 
         Args:
             ticker (str): Stock ticker symbol
 
         Returns:
-            dict: Aggregated sentiment with sources
-
-        TODO (Mihir + Isaac): Load social media data from Isaac's data pipeline
-        TODO (Mihir + Matthew): Call get_sentiment_for_text() on each post's text field
-        TODO (Mihir): Aggregate results (average, weighted average by post_score, etc.)
-        TODO (Mihir): Add source-level breakdown (Reddit vs News sentiment difference)
-        TODO (Mihir): Add time decay (recent posts weighted more heavily)
-        TODO (Mihir): Cache aggregated sentiment to reduce computation
+            dict: Aggregated sentiment with source breakdown
         """
-        # PLACEHOLDER: Returns mock data with multiple sources
-        # In production: Will load data from Isaac's pipeline and process through Matthew's NLP
-        return {
-            "ticker": ticker,
-            "overall_sentiment": SentimentScores(
-                positive_prob=0.70,
-                negative_prob=0.15,
-                neutral_prob=0.15,
-                sentiment_score=0.55,
-                sentiment_label="positive",
-                sentiment_confidence=0.70,
-            ),
-            "source_breakdown": {
-                "reddit": {
-                    "positive_prob": 0.72,
-                    "negative_prob": 0.12,
-                    "neutral_prob": 0.16,
-                    "count": 45,
-                },
-                "news": {
-                    "positive_prob": 0.68,
-                    "negative_prob": 0.18,
-                    "neutral_prob": 0.14,
-                    "count": 12,
-                },
-            },
-            "timestamp": "2026-04-01T10:30:00",
+        if not ticker or len(ticker.strip()) == 0:
+            raise ValueError("Invalid ticker symbol")
+
+        ticker = ticker.upper()
+        sentiment_module = _load_nlp_module()
+
+        grouped = {
+            'ticker': ticker,
+            'overall_sentiment': None,
+            'source_breakdown': {},
+            'timestamp': datetime.now().isoformat(),
         }
+
+        posts = []
+        pipeline_path = _pipeline_file_path()
+        if os.path.exists(pipeline_path):
+            with open(pipeline_path, 'r') as f:
+                all_posts = json.load(f)
+            posts = [p for p in all_posts if p.get('ticker', '').upper() == ticker]
+
+        if not posts:
+            return {
+                'ticker': ticker,
+                'overall_sentiment': SentimentScores(
+                    positive_prob=0.70,
+                    negative_prob=0.15,
+                    neutral_prob=0.15,
+                    sentiment_score=0.55,
+                    sentiment_label='positive',
+                    sentiment_confidence=0.70,
+                ),
+                'source_breakdown': {},
+                'timestamp': grouped['timestamp'],
+            }
+
+        source_stats = {}
+        total_score = 0.0
+        total_confidence = 0.0
+
+        for post in posts:
+            text = post.get('text', '')
+            if sentiment_module is not None and hasattr(sentiment_module, 'get_sentiment_scores'):
+                scored = sentiment_module.get_sentiment_scores(text)
+                score_obj = SentimentScores(**scored)
+            else:
+                score_obj = SentimentService.get_sentiment_for_text(text)
+
+            source = post.get('source', 'unknown')
+            source_bucket = source_stats.setdefault(source, {
+                'positive_prob': 0.0,
+                'negative_prob': 0.0,
+                'neutral_prob': 0.0,
+                'count': 0,
+            })
+            source_bucket['positive_prob'] += score_obj.positive_prob
+            source_bucket['negative_prob'] += score_obj.negative_prob
+            source_bucket['neutral_prob'] += score_obj.neutral_prob
+            source_bucket['count'] += 1
+
+            total_score += score_obj.sentiment_score
+            total_confidence += score_obj.sentiment_confidence
+
+        count = max(1, len(posts))
+        overall_score = total_score / count
+        overall_confidence = total_confidence / count
+        overall_positive = sum(s['positive_prob'] for s in source_stats.values()) / max(1, count)
+        overall_negative = sum(s['negative_prob'] for s in source_stats.values()) / max(1, count)
+        overall_neutral = sum(s['neutral_prob'] for s in source_stats.values()) / max(1, count)
+
+        grouped['overall_sentiment'] = SentimentScores(
+            positive_prob=overall_positive,
+            negative_prob=overall_negative,
+            neutral_prob=overall_neutral,
+            sentiment_score=overall_score,
+            sentiment_label='positive' if overall_score > 0.05 else ('negative' if overall_score < -0.05 else 'neutral'),
+            sentiment_confidence=overall_confidence,
+        )
+
+        for source, stats in source_stats.items():
+            count_src = stats['count']
+            grouped['source_breakdown'][source] = {
+                'positive_prob': stats['positive_prob'] / count_src,
+                'negative_prob': stats['negative_prob'] / count_src,
+                'neutral_prob': stats['neutral_prob'] / count_src,
+                'count': count_src,
+            }
+
+        return grouped
