@@ -1,304 +1,305 @@
-# AI Market Sentiment Dashboard - TODO Items & Integration Points
+# AI Market Sentiment Dashboard - Honest Status Update
 
-## Overview
-This document lists all TODO items and integration points grouped by team member. Each team member should refer to their section to understand what needs to be implemented and where placeholders exist in the code.
+## 🎯 Current Reality Check
 
-**Status**: ✅ All code is **pull request ready** with clear integration points marked.
+**What's Actually WORKING:**
+- ✅ Backend API (Mihir) - All 14 endpoints running, returning valid JSON
+- ✅ Frontend Dashboard (Srish) - Loads successfully, fetches from backend
+- ✅ Real Market Data - Using yfinance (NVDA: 175.75, TSLA real prices)
+- ✅ Market Features - Real price_delta_24h and volume_delta calculations
+
+**What's NOT Implemented Yet:**
+- ❌ Isaac Data Pipeline - MOCK social posts ("Sample post while waiting for API approval")
+- ❌ Matthew NLP - NOT integrated into backend
+- ❌ Abhi ML - NOT integrated into backend
+- ❌ Sentiment Scores - Returns MOCK hardcoded values (0.7, 0.15, 0.55)
+- ❌ Stock Predictions - Returns MOCK hardcoded values (0.75 prob, 0.82 confidence)
+
+**Status**: ⚠️ PARTIALLY IMPLEMENTED - Backend + Frontend working, but pipelines not yet wired
 
 ---
 
-## 📊 Isaac (Data Pipeline)
+## 📊 Isaac - Data Pipeline
 
-### Core Responsibilities
-- Collect social media data from approved APIs
-- Calculate market features (price_delta_24h, volume_delta)
-- Produce properly formatted output matching dataset_format.md
+**Current Status**: ⚠️ PARTIALLY WORKING
 
-### Current Implementation
-- ✅ Fetches market data from yfinance
-- ✅ Calculates 24h price and volume changes
-- ✅ Outputs JSON in dataset_format.md structure
-- 🔄 **PLACEHOLDER**: Using mock social media posts
-- ✅ **VERIFIED**: Data structure matches schema exactly for frontend integration
+**What's Working:**
+- ✅ Fetches REAL market data from yfinance
+- ✅ Calculates REAL price_delta_24h and volume_delta
+- ✅ Outputs proper JSON schema
+
+**What's NOT Working:**
+- ❌ Social posts are MOCK ("Sample post while waiting for API approval")
+- ❌ Not: Real Reddit API integration
+
+**Actual Output (stock_data.json):**
+```json
+{
+  "ticker": "NVDA",
+  "date": "2026-04-01",
+  "text": "Sample post while waiting for API approval",  // ← MOCK
+  "source": "reddit",
+  "post_score": 10,
+  "price_delta_24h": 0.00774,  // ← REAL
+  "volume_delta": -0.182       // ← REAL
+}
+```
 
 ### TODO Items
 
-#### File: `data/app.py`
-```python
-# TODO (Isaac): Replace with real Reddit API data when approved
-#   - Once Reddit API access is granted, fetch real posts from r/stocks, r/investing, etc.
-#   - Parse post content and assign post_score based on engagement (upvotes, comments)
-#   - Ensure date is in ISO format and post_score is numeric
-```
+**Priority 1: Replace mock social posts with real Reddit API**
+- [ ] File: `data/app.py` lines 35-60
+- [ ] Get Reddit API credentials
+- [ ] Replace mock posts with real API calls from r/stocks, r/investing
+- [ ] Parse post_score from upvotes/comments
+- [ ] Test: `cd data && python app.py && head -10 stock_data.json`
+- **Blocking**: Matthew NLP integration (data for NLP to process)
 
-#### File: `data/app.py` (End of file)
-```python
-# TODO (Isaac): Add error handling for missing market data
-# TODO (Isaac): Add retry logic for yfinance rate limiting
-# TODO (Isaac): Implement data validation to ensure all required fields are present
-# TODO (Isaac): Add logging to track data pipeline execution
-```
+**Priority 2: Add error handling & validation**
+- [ ] File: `data/app.py` (end of file)
+- [ ] Add try/catch for yfinance failures
+- [ ] Validate all required fields present
+- [ ] Add logging for pipeline execution
 
-#### File: `backend/app/services/data_service.py`
-```python
-# TODO (Mihir + Isaac): Load market data from Isaac data pipeline
-# TODO (Isaac): Expose market data through API or file output
-# TODO (Mihir): Parse JSON and extract price, volume, day_high fields
-# TODO (Isaac): Add timestamp to track when data was last updated
-
-# TODO (Mihir + Isaac): Load social media posts from Isaac data pipeline output
-# TODO (Isaac): Parse stock_data.json for all posts matching the ticker
-# TODO (Isaac): Expose market data through API or file interface
-# TODO (Isaac): Add pagination support for high-volume tickers
-```
-
-#### Backend Integration
-- **File**: `backend/app/routes/market.py`
-- **Endpoint**: `GET /market/{ticker}` 
-- **Expected Input**: Real market data (ticker, price, volume, high)
-- **Expected Output**: MarketData model with current prices
+**Note**: Market data integration already working ✅
+- Backend successfully loads from stock_data.json
+- Fallback to yfinance working
+- /market/{ticker} returns REAL prices
 
 ---
 
-## 🧠 Matthew (NLP Sentiment Analysis)
+## 🧠 Matthew - NLP Sentiment Analysis
 
-### Core Responsibilities
-- Process raw social media posts through FinBERT
-- Generate sentiment scores with probabilities
-- Aggregate sentiment features by ticker/date
-- Produce clean aggregated output for prediction model
+**Current Status**: ❌ NOT INTEGRATED
 
-### Current Implementation
-- ✅ Uses FinBERT model (ProsusAI/finbert)
-- ✅ Calculates positive_prob, negative_prob, neutral_prob
-- ✅ Generates sentiment_score and sentiment_confidence
-- ✅ Aggregates by ticker/date with mean values
-- ✅ Outputs aggregated JSON for prediction model
-- ✅ **VERIFIED**: Sentiment scores flowing to frontend via `/sentiment/{ticker}` endpoint
-- ✅ **INTEGRATION LIVE**: Frontend dashboard displays real sentiment data
+**What Exists:**
+- ✅ Code written: `nlp/sentiment.py` with FinBERT
+- ✅ Model loads: ProsusAI/finbert transformer
+- ✅ Function works: `get_sentiment_scores(text)` implemented
+
+**What's NOT Working:**
+- ❌ Backend NOT calling Matthew's module
+- ❌ Returns MOCK hardcoded sentiment values:
+```json
+{
+  "sentiment_score": 0.55,           // ← HARDCODED (not from NLP)
+  "positive_prob": 0.7,              // ← HARDCODED
+  "negative_prob": 0.15,             // ← HARDCODED
+  "neutral_prob": 0.15,              // ← HARDCODED
+  "sentiment_label": "positive",     // ← HARDCODED
+  "sentiment_confidence": 0.7        // ← HARDCODED
+}
+```
+
+**Status in Backend**: `backend/app/services/sentiment_service.py` line 8 says "Placeholder implementation - awaiting NLP integration"
 
 ### TODO Items
 
-#### File: `nlp/sentiment.py`
-```python
-# TODO (Matthew): Add confidence thresholds - skip low-confidence predictions
-# TODO (Matthew): Implement caching for repeated text analysis
-# TODO (Matthew): Add batch processing optimization for large datasets
-```
+**Priority 1: Integrate Matthew's NLP into backend**
+- [ ] File: `backend/app/services/sentiment_service.py`
+- [ ] Load posts from Isaac pipeline (stock_data.json)
+- [ ] Call Matthew's `get_sentiment_scores(text)` for each post
+- [ ] Aggregate by ticker
+- [ ] Replace hardcoded values with real NLP results
+- [ ] Test: `curl http://localhost:8000/sentiment/NVDA`
+- **Blocked by**: Isaac needing real posts (currently mock)
+- **Can start**: Once Isaac delivers stock_data.json
 
-#### Backend Integration
-- **File**: `backend/app/services/sentiment_service.py`
-- **Endpoint**: `GET /sentiment/{ticker}`
-- **Expected Input**: Raw posts from Isaac
-- **Expected Output**: SentimentScores with probabilities
+**Priority 2: Optimize NLP**
+- [ ] Add result caching (in_memory or Redis)
+- [ ] Implement batch processing for efficiency
+- [ ] Add confidence threshold filtering
 
-```python
-# TODO (Mihir + Matthew): Import FinBERT model from ../nlp/sentiment.py
-# TODO (Matthew): Call get_sentiment_scores() function from sentiment.py
-# TODO (Mihir + Matthew): Replace placeholder mock data with real NLP calls
-
-# TODO (Mihir + Isaac): Load social media data from Isaac data pipeline
-# TODO (Mihir + Matthew): Call get_sentiment_for_text() on each post
-# TODO (Mihir): Aggregate results (average, weighted by post_score)
-# TODO (Mihir): Add source-level breakdown (Reddit vs News sentiment)
-# TODO (Mihir): Add time decay weighting
-```
+**Note**: Your NLP code already works! File `nlp/sentiment.py` is ready to use.
 
 ---
 
-## 🤖 Abhi (ML Prediction Model)
+## 🤖 Abhi - ML Predictions
 
-### Core Responsibilities
-- Train ML models on sentiment + market data
-- Predict stock movement direction (up/down)
-- Export trained models for backend use
-- Provide model metadata and performance metrics
+**Current Status**: ❌ NOT INTEGRATED
 
-### Current Implementation
-- ✅ Trains Logistic Regression (97% accuracy)
-- ✅ Trains Random Forest (97% accuracy, 99.8% AUC)
-- ✅ Loads pipeline data from NLP and data modul
-- ✅ **VERIFIED**: Predictions flowing to frontend via `/prediction/{ticker}` endpoint
-- ✅ **INTEGRATION LIVE**: Frontend dashboard shows real ML predictions with confidence scoreses
-- ✅ Makes predictions on aggregated sentiment features
-- 🔄 **PLACEHOLDER**: Models retrained each run
+**What Exists:**
+- ✅ Code written: `prediction/prediction.py` with ML models
+- ✅ Models train: Logistic Regression (97% acc), Random Forest (99.8% AUC)
+- ✅ Models work: Trains and predicts successfully
+
+**What's NOT Working:**
+- ❌ Models not saved to disk (retrain every run)
+- ❌ Backend NOT calling Abhi's module
+- ❌ Returns MOCK hardcoded predictions:
+```json
+{
+  "predicted_movement": "up",  // ← HARDCODED (not from ML)
+  "probability": 0.75,         // ← HARDCODED
+  "confidence": 0.82           // ← HARDCODED
+}
+```
+
+**Status in Backend**: `backend/app/services/prediction_service.py` line 6 says "Placeholder implementation - awaiting ML model integration"
 
 ### TODO Items
 
-#### File: `prediction/prediction.py`
-```python
-# TODO (Abhi): In production, load pre-trained models from disk instead of retraining
-# TODO (Abhi): Implement model persistence (save trained models as pickle/joblib)
-# TODO (Abhi): Add model versioning to track which model version is in use
-# TODO (Abhi): Implement cross-validation for more robust performance estimates
+**Priority 1: Save trained models to disk**
+- [ ] File: `prediction/prediction.py` lines 21-23
+- [ ] After training, save models:
+  ```python
+  import joblib
+  joblib.dump(log_reg, 'models/logistic_regression.joblib')
+  joblib.dump(rf, 'models/random_forest.joblib')
+  ```
+- [ ] Load from disk in startup instead of retraining
 
-# TODO (Abhi): Implement model export endpoint for use in backend API
-# TODO (Abhi): Add prediction uncertainty quantification
-# TODO (Abhi): Implement model monitoring to detect performance degradation
-# TODO (Abhi): Add feature importance explanation for predictions
-```
+**Priority 2: Integrate Abhi's models into backend**
+- [ ] File: `backend/app/services/prediction_service.py`
+- [ ] Load persisted models from disk
+- [ ] Call models with real sentiment + market features
+- [ ] Replace hardcoded values with real predictions
+- [ ] Test: `curl http://localhost:8000/prediction/NVDA`
+- **Blocked by**: Needing real sentiment first (Matthew integration)
+- **Can start**: Once Matthew's sentiment is real
 
-#### Backend Integration
-- **File**: `backend/app/services/prediction_service.py`
-- **Endpoint**: `GET /prediction/{ticker}`
-- **Expected Input**: Sentiment + market features
-- **Expected Output**: PredictionResponse with direction & confidence
+**Priority 3: Add model features**
+- [ ] Add model versioning system
+- [ ] Add model metadata (version, features, accuracy)
+- [ ] Implement cross-validation
 
-```python
-# TODO (Mihir + Abhi): Load pre-trained ML model from ../prediction/prediction.py
-# TODO (Abhi): Export trained model (pickle/joblib) for backend to load
-# TODO (Mihir): Prepare feature vector with correct field names and order
-# TODO (Mihir): Call model.predict() and model.predict_proba()
-
-# TODO (Mihir): Call sentiment_service.get_sentiment_for_ticker()
-# TODO (Mihir): Call data_service.get_market_data()
-# TODO (Mihir): Extract required fields and call predict_movement()
-# TODO (Abhi): Add model metadata (name, version, features_used) to response
-```
+**Note**: Your ML code already works! File `prediction/prediction.py` trains successfully.
 
 ---
 
-## 🔌 Mihir (Backend API Integration)
+## 🔌 Mihir - Backend API (COMPLETE ✅)
 
-### Core Responsibilities
-- Integrate all pipeline components via REST API
-- Provide data aggregation endpoints
-- Implement caching and performance optimization
-- Serve dashboard data to frontend
+**Current Status**: ✅ FULLY WORKING
 
-### Current Implementation
-- ✅ FastAPI application with full endpoint structure
-- ✅ Pydantic models for all data validation
-- ✅ Placeholder implementations with mock data
-- ✅ All 14 API tests passing (100%)
-- ✅ Interactive API docs at /docs
+**What's Working:**
+- ✅ All 14 endpoints running and responding
+- ✅ Real market data from yfinance endpoint working
+- ✅ Error handling with fallbacks
 - ✅ CORS enabled for frontend
+- ✅ Health check /test endpoint working
+- ✅ All endpoints returning valid JSON
 
-### TODO Items
-
-#### File: `backend/main.py`
-```python
-# TODO (Mihir): Restrict CORS to frontend domain in production (e.g., ["http://localhost:3000"])
-# TODO (Mihir): Initialize database connections (if using database)
-# TODO (Mihir + Abhi): Load pre-trained ML models into memory for fast inference
-# TODO (Mihir): Verify connections to Isaac data pipeline
-# TODO (Mihir): Verify connections to Matthew NLP module
-# TODO (Mihir): Run health checks on dependent services
-# TODO (Mihir): Load configuration from environment variables
+**Endpoint Status:**
+```
+/test                           → ✅ Returns health check
+/market/{ticker}                → ✅ Returns REAL yfinance data
+/market/batch                   → ✅ Returns REAL yfinance data
+/sentiment/{ticker}             → ⚠️ Returns MOCK (awaiting Matthew)
+/sentiment/analyze-text         → ⚠️ Returns MOCK (awaiting Matthew)
+/prediction/{ticker}            → ⚠️ Returns MOCK (awaiting Abhi)
+/dashboard/summary/{ticker}     → ⚠️ Returns aggregated MOCK data
+/dashboard/summary-batch        → ⚠️ Returns aggregated MOCK data
 ```
 
-#### File: `backend/app/routes/sentiment.py`
-```python
-# TODO (Mihir): Add @cache decorator to cache sentiment for 1 hour
-# TODO (Mihir): Integrate with real NLP once Matthew module is ready
-# TODO (Srish): Add optional date parameter to get historical sentiment
-# TODO (Srish): Add option to filter by source (reddit, news, twitter)
-```
+### TODO Items (OPTIONAL - After Phase 1-3 Complete)
 
-#### File: `backend/app/routes/prediction.py`
-```python
-# TODO (Mihir): Add @cache decorator to cache predictions for 1 hour
-# TODO (Mihir): Integrate with models once Abhi exports them
-# TODO (Srish): Add optional date parameter for different timeframes
-# TODO (Abhi): Add confidence intervals to response
-# TODO (Abhi): Add feature attribution to explain predictions
-```
+**When Isaac delivers real posts:**
+- [ ] Verify sentiment service loads from stock_data.json
+- [ ] Test aggregation by ticker
 
-#### File: `backend/app/routes/market.py`
-```python
-# TODO (Mihir + Isaac): Load market data from Isaac pipeline
-# TODO (Isaac): Expose price_delta_24h and volume_delta from pipeline
-# TODO (Isaac): Add historical OHLC data endpoint
-# TODO (Isaac): Add technical indicators (moving averages, RSI, Bollinger Bands)
-# TODO (Mihir): Add @cache decorator (refresh every 5 min)
+**When Matthew NLP is integrated:**
+- [ ] Uncomment real NLP calls in sentiment_service.py
+- [ ] Test /sentiment/{ticker} returns real NLP scores
 
-# TODO (Mihir): Add connection pooling to reduce API calls
-# TODO (Mihir): Add @cache decorator with key based on tickers and timestamp
-# TODO (Isaac): Optimize batch queries in data pipeline
-# TODO (Srish): Handle case where not all tickers return data
-```
+**When Abhi ML is integrated:**
+- [ ] Load models from disk in startup
+- [ ] Test /prediction/{ticker} returns real ML predictions
 
-#### File: `backend/app/routes/dashboard.py`
-```python
-# TODO (Mihir): Add @lru_cache to cache dashboard data (1 hour TTL)
-# TODO (Srish): Add optional date parameter to get historical dashboard
-# TODO (Srish): Add sentiment_source_breakdown (Reddit vs News)
-# TODO (Srish): Add technical indicators (RSI, MACD, Bollinger Bands)
-# TODO (Srish): Add analyst ratings (if available)
+**Performance Optimization (After Integration):**
+- [ ] Add caching layer (Redis) if needed
+- [ ] Set up scheduled data refresh (APScheduler)
+- [ ] Add connection pooling
 
-# TODO (Mihir): Add @lru_cache with composite cache key of all tickers
-# TODO (Srish): Implement Server-Sent Events (SSE) for live dashboard updates
-# TODO (Srish): Add portfolio-level aggregation (average sentiment)
-# TODO (Mihir): Implement streaming response for large ticker lists
-# TODO (Srish): Add sorting/filtering options (by sentiment, prediction, risk)
-# TODO (Srish): Add portfolio performance tracking (aggregate P&L)
-```
-
-#### Backend Scheduling
-```python
-# TODO (Mihir): Once data pipeline is finalized, set up scheduled execution (e.g., hourly)
-#   - Use APScheduler or Celery to run data/app.py periodically
-#   - Run NLP pipeline on new data
-#   - Update predictions with fresh results
-```
+**Your backend is done! ✅ Just waiting for Matthew and Abhi to be ready.**
 
 ---
 
-## 🖥️ Srish (Frontend Integration)
+## 🖥️ Srish - Frontend Dashboard (COMPLETE ✅)
 
-### Current Implementation
-- 🔄 **Frontend not yet implemented**
-- React dashboard will consume API endpoints
+**Current Status**: ✅ FULLY WORKING
 
-### Integration Points
+**What's Working:**
+- ✅ Dashboard loads without errors
+- ✅ Ticker input component working
+- ✅ useEffect hook fetches from backend
+- ✅ API calls to `/dashboard/summary/{ticker}` successful
+- ✅ Error handling with fallbacks
+- ✅ Loading state while fetching
+- ✅ Components render API responses
 
-#### Expected API Endpoints (Already Available)
-- `GET /sentiment/{ticker}` - Sentiment scores
-- `GET /prediction/{ticker}` - Movement predictions
-- `GET /market/{ticker}` - Market data
-- `GET /dashboard/summary/{ticker}` - Aggregated data for one stock
-- `GET /dashboard/summary-batch` - Aggregated data for multiple stocks
-
-### TODO Items
-
-#### Frontend Features
-```python
-# TODO (Srish): Update frontend to display sentiment with visual indicators
-# TODO (Srish): Update frontend to display predictions with confidence indicators
-# TODO (Srish): Update frontend to display real-time market data
-# TODO (Srish): Add sentiment_source_breakdown (Reddit vs News sentiment)
-# TODO (Srish): Add technical analysis indicators (RSI, MACD)
-# TODO (Srish): Add charting library to visualize historical prices
-# TODO (Srish): Add optional date parameter to get historical summaries
-# TODO (Srish): Add filter parameter to include/exclude sentiment, prediction, or market data
-# TODO (Srish): Handle case where not all tickers return data
-# TODO (Srish): Implement Server-Sent Events (SSE) for live dashboard updates
-# TODO (Srish): Add portfolio-level aggregation (average sentiment, combined signals)
-# TODO (Srish): Add sorting/filtering options (by sentiment, prediction, risk)
-# TODO (Srish): Add pagination support for large portfolios
-# TODO (Srish): Add portfolio performance tracking (aggregate P&L)
+**Current Data Flow:**
 ```
+User enters ticker → useEffect fires → fetch() to backend
+→ Backend returns aggregated data → Components render response
+```
+
+**Sample Response Frontend Receives:**
+```json
+{
+  "sentiment": {
+    "positive_prob": 0.7,       // ← MOCK now (awaiting Matthew)
+    "sentiment_score": 0.55,    // ← MOCK now
+  },
+  "market": {
+    "symbol": "NVDA",
+    "price": 175.75,            // ← REAL from yfinance ✅
+    "volume": 156552273         // ← REAL ✅
+  },
+  "prediction": {
+    "predicted_movement": "up", // ← MOCK now (awaiting Abhi)
+    "probability": 0.75         // ← MOCK now
+  }
+}
+```
+
+**TODO (Optional - After Pipelines Ready):**
+- [ ] Add historical price charts (once data increases)
+- [ ] Add stock comparison feature
+- [ ] Add watchlist/favorites
+- [ ] Add data export (CSV/PDF)
+- [ ] Consider real-time WebSocket updates
 
 ---
 
-## 🔄 Integration Workflow
+## 🔄 Implementation Phases
 
-### Data Flow
-```
-Isaac (Data) → JSON
-             ↓
-         (stock_data.json)
-             ↓
-        Matthew (NLP) → JSON
-                     ↓
-                 (sentiment_data.json)
-                     ↓
-           Abhi (ML) + Isaac (Market) → Model
-                     ↓
-                 Mihir (API)
-                     ↓
-                 Srish (Frontend)
-```
+### PHASE 1: Isaac - Get Real Social Posts
+**Status**: 🔴 NEEDS START
+**Timeline**: 2-3 days
+**Steps**:
+1. Get Reddit API credentials
+2. Replace mock posts in `data/app.py` with real API calls
+3. Verify stock_data.json contains real posts (not "Sample post...")
+4. Test: `cd data && python app.py && head -20 stock_data.json`
+
+### PHASE 2: Matthew - Wire NLP into Backend
+**Status**: 🟡 BLOCKED ON PHASE 1
+**Timeline**: 1-2 days (can start prep now)
+**Prerequisites**: Isaac delivers real posts
+**Steps**:
+1. Backend loads posts from stock_data.json
+2. Calls Matthew's `get_sentiment_scores()` for each post
+3. Aggregates results by ticker
+4. Replace hardcoded sentiment values
+5. Test: `curl http://localhost:8000/sentiment/NVDA`
+
+### PHASE 3: Abhi - Persist Models & Wire into Backend
+**Status**: 🟡 BLOCKED ON PHASE 2 (optional, can do in parallel)
+**Timeline**: 1-2 days
+**Steps**:
+1. `prediction/prediction.py`: Save models to disk after training
+2. Backend loads models from disk
+3. Backend calls models with real sentiment + market data
+4. Replace hardcoded predictions
+5. Test: `curl http://localhost:8000/prediction/NVDA`
+
+### PHASE 4: End-to-End Verification
+**Status**: 🟡 BLOCKED ON PHASE 1-3
+**Timeline**: 1 day
+**Test**:
+1. All services running
+2. Enter ticker in frontend
+3. Verify REAL posts → REAL sentiment → REAL predictions → UI
 
 ### Setup Instructions
 
@@ -340,22 +341,38 @@ Isaac (Data) → JSON
 
 ---
 
-## 📋 Code Organization
+## � Current Mock vs Real Data
 
-### Placeholder Implementations
-Placeholders exist in:
-- `backend/app/services/sentiment_service.py` - Mock sentiment data
-- `backend/app/services/prediction_service.py` - Mock predictions
-- `backend/app/services/data_service.py` - Mock market data
+### REAL Data Right Now ✅
+- Market prices from yfinance (NVDA 175.75, TSLA real prices)
+- Volume data (156M+ shares for NVDA)
+- Price deltas (0.77% for NVDA 24h)
+- Volume deltas (-18.2% for NVDA)
 
-Search for "PLACEHOLDER" or "PLACEHOLDER:" to find all mock implementations that need real data.
+### MOCK Data Right Now ❌
+- Social posts: "Sample post while waiting for API approval"
+- Sentiment scores: Hardcoded 0.7, 0.15, 0.55
+- Predictions: Hardcoded "up", 0.75 probability, 0.82 confidence
 
-### Comments Style
-- **TODO (Name)**: Work assigned to specific team member
-- **PLACEHOLDER**: Mock data that needs real implementation
-- **Integration Points**: Connections between modules
+## 📋 Exact Action Items by Person
 
----
+### For Isaac:
+1. Open `data/app.py`, lines 35-60
+2. Replace mock `social_posts` with Reddit API calls
+3. Keep the market data calculations (they're already REAL)
+4. Test: `cd data && python app.py && cat stock_data.json | head -20`
 
-## Questions?
-Refer to individual TODO comments in source code for specific implementation details.
+### For Matthew:
+- Wait for Isaac to deliver real posts
+- Your NLP code is ready - just needs to be called by Mihir's backend
+
+### For Abhi:
+- Add model persistence at `prediction/prediction.py` lines 21-23
+- Save models to disk after training
+- Wait for Matthew to integrate NLP first (you use sentiment as input)
+
+### For Mihir:
+- Backend is ready ✅ Just waiting for other modules
+
+### For Srish:
+- Frontend is ready ✅ Just waiting for real backend data
