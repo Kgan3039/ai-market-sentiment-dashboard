@@ -37,7 +37,9 @@ def _load_nlp_module():
 
 
 def _pipeline_file_path() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'stock_data.json'))
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'stock_data.json')
+    )
 
 
 class SentimentService:
@@ -102,7 +104,7 @@ class SentimentService:
             'ticker': ticker,
             'overall_sentiment': None,
             'source_breakdown': {},
-            'timestamp': datetime.now().isoformat(),
+            'date': datetime.now().date().isoformat(),
         }
 
         posts = []
@@ -124,7 +126,7 @@ class SentimentService:
                     sentiment_confidence=0.70,
                 ),
                 'source_breakdown': {},
-                'timestamp': grouped['timestamp'],
+                'date': grouped['date'],
             }
 
         source_stats = {}

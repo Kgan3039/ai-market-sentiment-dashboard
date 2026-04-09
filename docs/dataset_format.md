@@ -91,6 +91,39 @@ Fields:
 
 ---
 
+## 5. Canonical API Naming
+
+Backend responses and frontend integrations should reuse the same shared field names
+from this contract whenever they refer to the same concept.
+
+Canonical names:
+- ticker, never symbol
+- date, never timestamp or updated_at
+- label for model targets or predicted movement
+- sentiment_* fields stay unchanged
+
+API-specific fields such as price, day_high, volume, or confidence can be added,
+but shared identifiers should keep these canonical names.
+
+Market example:
+{
+  "ticker": "NVDA",
+  "price": 875.50,
+  "day_high": 885.00,
+  "volume": 45000000,
+  "date": "2026-03-27"
+}
+
+Prediction example:
+{
+  "ticker": "NVDA",
+  "date": "2026-03-27",
+  "label": "up",
+  "confidence": 0.78
+}
+
+---
+
 ## Notes
 
 - Isaac (Data) → produces raw + market features

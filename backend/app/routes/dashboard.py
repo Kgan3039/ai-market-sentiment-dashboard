@@ -20,12 +20,10 @@ TODO (Srish): Add portfolio aggregation (summed sentiment, average prediction)
 
 from fastapi import APIRouter, HTTPException, Query
 from typing import List
-from datetime import datetime
 from app.models.schemas import DashboardSummary
 from app.services.sentiment_service import SentimentService
 from app.services.prediction_service import PredictionService
 from app.services.data_service import DataService
-from datetime import datetime
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
@@ -51,10 +49,10 @@ async def get_dashboard_summary(ticker: str):
         GET /dashboard/summary/NVDA
         Response: {
             "ticker": "NVDA",
+            "date": "2026-04-01",
             "sentiment": {...},
             "market_data": {...},
-            "prediction": {...},
-            "updated_at": "2026-04-01T10:30:00"
+            "prediction": {...}
         }
 
     TODO (Mihir): Add @lru_cache to cache dashboard data (1 hour TTL)
@@ -77,10 +75,10 @@ async def get_dashboard_summary(ticker: str):
         # Combine into dashboard summary
         return DashboardSummary(
             ticker=ticker,
+            date=market_data.date,
             sentiment=sentiment_data["overall_sentiment"],
             market_data=market_data,
             prediction=prediction_data["prediction"],
-            updated_at=datetime.now(),
         )
     except Exception as e:
         raise HTTPException(

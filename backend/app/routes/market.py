@@ -32,7 +32,7 @@ async def get_market_data(ticker: str):
         ticker (str): Stock ticker symbol (e.g., 'NVDA', 'TSLA')
 
     Returns:
-        MarketData: Current price, volume, and timestamp
+        MarketData: Current price, volume, and date
 
     Raises:
         HTTPException: 404 if ticker not found
@@ -40,11 +40,11 @@ async def get_market_data(ticker: str):
     Example:
         GET /market/NVDA
         Response: {
-            "symbol": "NVDA",
+            "ticker": "NVDA",
             "price": 875.50,
             "day_high": 885.00,
             "volume": 45000000,
-            "timestamp": "2026-04-01T10:30:00"
+            "date": "2026-04-01"
         }
 
     TODO (Mihir + Isaac): Load market data from Isaac's data pipeline
@@ -79,12 +79,12 @@ async def get_market_data_batch(tickers: List[str]):
     Example:
         GET /market/batch?tickers=NVDA&tickers=TSLA
         Response: [
-            {"symbol": "NVDA", "price": 875.50, ...},
-            {"symbol": "TSLA", "price": 245.30, ...}
+            {"ticker": "NVDA", "price": 875.50, ...},
+            {"ticker": "TSLA", "price": 245.30, ...}
         ]
 
     TODO (Mihir): Add connection pooling to reduce API calls
-    TODO (Mihir): Add @cache decorator with key based on tickers and timestamp
+    TODO (Mihir): Add @cache decorator with key based on tickers and date
     TODO (Isaac): Optimize batch queries in data pipeline
     TODO (Srish): Handle case where not all tickers return data
     """

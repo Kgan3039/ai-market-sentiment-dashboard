@@ -80,11 +80,12 @@ async def analyze_text(request: TextAnalysisRequest):
         Body: {"text": "NVDA earnings beat expectations!"}
 
         Response: {
-            "positive": 0.85,
-            "negative": 0.08,
-            "neutral": 0.07,
+            "positive_prob": 0.85,
+            "negative_prob": 0.08,
+            "neutral_prob": 0.07,
             "sentiment_score": 0.77,
-            "sentiment_label": "positive"
+            "sentiment_label": "positive",
+            "sentiment_confidence": 0.85
         }
     """
     try:

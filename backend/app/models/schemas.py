@@ -7,7 +7,6 @@ All endpoints return data matching these schemas.
 
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List
-from datetime import datetime
 
 
 class HealthCheckResponse(BaseModel):
@@ -53,41 +52,37 @@ class SentimentScores(BaseModel):
 class MarketData(BaseModel):
     """Market data for a stock."""
 
-    symbol: str = Field(..., description="Stock ticker symbol")
+    ticker: str = Field(..., description="Stock ticker symbol")
     price: float = Field(..., description="Current stock price")
     day_high: float = Field(..., description="Day high price")
     volume: int = Field(..., description="Trading volume")
-    timestamp: datetime = Field(..., description="Data timestamp")
+    date: str = Field(..., description="ISO date string for the market data snapshot")
 
     class Config:
         example = {
-            "symbol": "NVDA",
+            "ticker": "NVDA",
             "price": 875.50,
             "day_high": 885.00,
             "volume": 45000000,
-            "timestamp": "2026-04-01T10:30:00",
+            "date": "2026-04-01",
         }
 
 
 class PredictionResponse(BaseModel):
     """Stock movement prediction response."""
 
-    symbol: str = Field(..., description="Stock ticker symbol")
-    predicted_movement: str = Field(
-        ..., description="Predicted movement: 'up', 'down', or 'neutral'"
-    )
-    probability: float = Field(
-        ..., ge=0, le=1, description="Confidence score for prediction"
-    )
+    ticker: str = Field(..., description="Stock ticker symbol")
+    date: str = Field(..., description="ISO date string for the prediction")
+    label: str = Field(..., description="Predicted movement label: 'up', 'down', or 'neutral'")
     confidence: float = Field(
         ..., ge=0, le=1, description="Model confidence score"
     )
 
     class Config:
         example = {
-            "symbol": "NVDA",
-            "predicted_movement": "up",
-            "probability": 0.78,
+            "ticker": "NVDA",
+            "date": "2026-04-01",
+            "label": "up",
             "confidence": 0.85,
         }
 
@@ -106,14 +101,15 @@ class DashboardSummary(BaseModel):
     """Summary data for dashboard display."""
 
     ticker: str = Field(..., description="Stock ticker symbol")
+    date: str = Field(..., description="ISO date string for the dashboard snapshot")
     sentiment: SentimentScores = Field(..., description="Current sentiment scores")
     market_data: MarketData = Field(..., description="Current market data")
     prediction: PredictionResponse = Field(..., description="Stock movement prediction")
-    updated_at: datetime = Field(..., description="Last update timestamp")
 
     class Config:
         example = {
             "ticker": "NVDA",
+            "date": "2026-04-01",
             "sentiment": {
                 "positive_prob": 0.75,
                 "negative_prob": 0.15,
@@ -123,17 +119,16 @@ class DashboardSummary(BaseModel):
                 "sentiment_confidence": 0.75,
             },
             "market_data": {
-                "symbol": "NVDA",
+                "ticker": "NVDA",
                 "price": 875.50,
                 "day_high": 885.00,
                 "volume": 45000000,
-                "timestamp": "2026-04-01T10:30:00",
+                "date": "2026-04-01",
             },
             "prediction": {
-                "symbol": "NVDA",
-                "predicted_movement": "up",
-                "probability": 0.78,
+                "ticker": "NVDA",
+                "date": "2026-04-01",
+                "label": "up",
                 "confidence": 0.85,
             },
-            "updated_at": "2026-04-01T10:30:00",
         }

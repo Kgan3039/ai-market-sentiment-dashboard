@@ -23,7 +23,9 @@ class DataService:
 
     @staticmethod
     def _pipeline_file_path() -> str:
-        return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'stock_data.json'))
+        return os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'stock_data.json')
+        )
 
     @staticmethod
     def get_market_data(ticker: str) -> MarketData:
@@ -54,11 +56,11 @@ class DataService:
                 if ticker_records:
                     latest = sorted(ticker_records, key=lambda r: r.get('date', ''), reverse=True)[0]
                     market_data = {
-                        'symbol': ticker,
+                        'ticker': ticker,
                         'price': float(latest.get('price', 0.0)) if latest.get('price') is not None else 0.0,
                         'day_high': float(latest.get('day_high', 0.0)) if latest.get('day_high') is not None else 0.0,
                         'volume': int(latest.get('volume', 0)) if latest.get('volume') is not None else 0,
-                        'timestamp': datetime.now(),
+                        'date': latest.get('date', datetime.now().date().isoformat()),
                     }
             except Exception:
                 market_data = None
@@ -77,11 +79,11 @@ class DataService:
             volume = int(hist['Volume'].iloc[-1])
 
             market_data = {
-                'symbol': ticker,
+                'ticker': ticker,
                 'price': price,
                 'day_high': day_high,
                 'volume': volume,
-                'timestamp': datetime.now(),
+                'date': datetime.now().date().isoformat(),
             }
 
         return MarketData(**market_data)

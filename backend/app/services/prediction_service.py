@@ -66,9 +66,9 @@ class PredictionService:
                 )
 
                 return PredictionResponse(
-                    symbol=ticker,
-                    predicted_movement=result.get('direction', 'neutral'),
-                    probability=float(result.get('confidence', 0.0)),
+                    ticker=ticker,
+                    date=datetime.now().date().isoformat(),
+                    label=result.get('direction', 'neutral'),
                     confidence=float(result.get('confidence', 0.0)),
                 )
             except Exception:
@@ -76,13 +76,12 @@ class PredictionService:
 
         # Fallback: simple rule-based prediction
         movement = "up" if sentiment_score > 0.2 else ("down" if sentiment_score < -0.2 else "neutral")
-        probability = 0.75 if movement == "up" else 0.65 if movement == "down" else 0.5
-        confidence = 0.82
+        confidence = 0.75 if movement == "up" else 0.65 if movement == "down" else 0.5
 
         return PredictionResponse(
-            symbol=ticker,
-            predicted_movement=movement,
-            probability=probability,
+            ticker=ticker,
+            date=datetime.now().date().isoformat(),
+            label=movement,
             confidence=confidence,
         )
 
@@ -120,7 +119,9 @@ class PredictionService:
         # Try to infer delta fields from pipeline by reading stock_data
         try:
             import json
-            pipeline_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'stock_data.json'))
+            pipeline_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'stock_data.json')
+            )
             if os.path.exists(pipeline_path):
                 with open(pipeline_path, 'r') as f:
                     data = json.load(f)
@@ -140,9 +141,10 @@ class PredictionService:
 
         return {
             'ticker': ticker,
+            'date': prediction.date,
             'prediction': prediction,
             'model_info': {
-                'name': 'RandomForestClassifier' if prediction.predicted_movement in ['up', 'down'] else 'FallbackRule',
+                'name': 'RandomForestClassifier' if prediction.label in ['up', 'down'] else 'FallbackRule',
                 'version': '0.1.0',
                 'features_used': [
                     'sentiment_score',
@@ -151,5 +153,4 @@ class PredictionService:
                     'volume_delta',
                 ],
             },
-            'timestamp': datetime.now().isoformat(),
         }

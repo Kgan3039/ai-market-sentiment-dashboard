@@ -30,7 +30,7 @@ async def get_prediction(ticker: str):
         ticker (str): Stock ticker symbol (e.g., 'NVDA', 'TSLA')
 
     Returns:
-        PredictionResponse: Predicted movement direction and confidence
+        PredictionResponse: Predicted movement label and confidence
 
     Raises:
         HTTPException: 404 if ticker data not found
@@ -38,9 +38,9 @@ async def get_prediction(ticker: str):
     Example:
         GET /prediction/NVDA
         Response: {
-            "symbol": "NVDA",
-            "predicted_movement": "up",
-            "probability": 0.78,
+            "ticker": "NVDA",
+            "date": "2026-04-01",
+            "label": "up",
             "confidence": 0.85
         }
 

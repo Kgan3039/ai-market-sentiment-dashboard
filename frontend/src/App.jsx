@@ -187,14 +187,21 @@ const DUMMY_DATA = {
 function transformDashboardData(apiResponse, ticker) {
   if (!apiResponse) return null;
 
+  const responseTicker = apiResponse.ticker?.toUpperCase() ?? ticker.toUpperCase();
+  const sentimentScore = apiResponse.sentiment?.sentiment_score ?? 0.5;
+  const sentimentLabel = apiResponse.sentiment?.sentiment_label ?? "neutral";
+  const predictionLabel = apiResponse.prediction?.label ?? "neutral";
+  const predictionConfidence = apiResponse.prediction?.confidence ?? 0.5;
+  const marketPrice = apiResponse.market_data?.price ?? 0;
+
   return {
-    ticker: ticker.toUpperCase(),
-    companyName: `${ticker} Stock Dashboard`,
+    ticker: responseTicker,
+    companyName: `${responseTicker} Stock Dashboard`,
     exchange: "NASDAQ",
-    price: apiResponse.market_data?.price || 0,
-    priceChange: apiResponse.market_data?.price || 0,
+    price: marketPrice,
+    priceChange: marketPrice,
     priceChangePct: 0.58,
-    overview: `Real-time sentiment and prediction data for ${ticker} stock`,
+    overview: `Real-time sentiment and prediction data for ${responseTicker} stock`,
     financials: {
       annual: {
         revenue: "N/A",
@@ -220,8 +227,8 @@ function transformDashboardData(apiResponse, ticker) {
     news: [],
     socialPosts: [],
     sentiment: {
-      score: Math.round((apiResponse.sentiment?.sentiment_score || 0.5) * 100),
-      label: apiResponse.sentiment?.sentiment_label?.charAt(0).toUpperCase() + (apiResponse.sentiment?.sentiment_label?.slice(1) || "neutral"),
+      score: Math.round(sentimentScore * 100),
+      label: sentimentLabel.charAt(0).toUpperCase() + sentimentLabel.slice(1),
       change: 3,
       positiveDrivers: ["Market data integrated from real-time pipeline"],
       negativeDrivers: [],
@@ -232,7 +239,7 @@ function transformDashboardData(apiResponse, ticker) {
         companyFilings: 10,
       },
       timeSeries: [
-        { date: "Apr", score: Math.round((apiResponse.sentiment?.sentiment_score || 0.5) * 100), price: apiResponse.market_data?.price || 0 },
+        { date: "Apr", score: Math.round(sentimentScore * 100), price: marketPrice },
       ],
     },
     alerts: [
@@ -240,15 +247,15 @@ function transformDashboardData(apiResponse, ticker) {
         id: 1,
         type: "info",
         title: "Real-Time Data",
-        message: `Showing live sentiment and market data for ${ticker}`,
+        message: `Showing live sentiment and market data for ${responseTicker}`,
       },
     ],
     prediction: {
       shortTerm: {
         horizon: "1–2 Weeks",
-        direction: apiResponse.prediction?.predicted_movement?.toUpperCase() || "NEUTRAL",
-        confidence: Math.round((apiResponse.prediction?.confidence || 0.5) * 100),
-        rationale: `ML prediction: ${apiResponse.prediction?.predicted_movement || "neutral"} with ${Math.round((apiResponse.prediction?.confidence || 0.5) * 100)}% confidence`,
+        direction: predictionLabel.toUpperCase(),
+        confidence: Math.round(predictionConfidence * 100),
+        rationale: `ML prediction: ${predictionLabel} with ${Math.round(predictionConfidence * 100)}% confidence`,
       },
       mediumTerm: {
         horizon: "1–3 Months",
@@ -257,7 +264,7 @@ function transformDashboardData(apiResponse, ticker) {
         rationale: "Medium-term outlook based on aggregated signals",
       },
       catalysts: [
-        { date: "Today", event: `${ticker} Market Update`, impact: "high" },
+        { date: apiResponse.date ?? "Today", event: `${responseTicker} Market Update`, impact: "high" },
       ],
     },
   };
