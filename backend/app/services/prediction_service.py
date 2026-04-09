@@ -19,13 +19,21 @@ from datetime import datetime
 from app.models.schemas import PredictionResponse
 
 
+def _repo_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+
+
 def _load_prediction_module():
     """Load prediction/prediction module dynamically and return predict function."""
+    repo_root = _repo_root()
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
+
     try:
         from prediction import prediction as prediction_module
         return prediction_module
     except Exception:
-        prediction_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'prediction'))
+        prediction_dir = os.path.join(repo_root, 'prediction')
         if prediction_dir not in sys.path:
             sys.path.append(prediction_dir)
         try:
@@ -119,9 +127,7 @@ class PredictionService:
         # Try to infer delta fields from pipeline by reading stock_data
         try:
             import json
-            pipeline_path = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'stock_data.json')
-            )
+            pipeline_path = os.path.join(_repo_root(), 'data', 'stock_data.json')
             if os.path.exists(pipeline_path):
                 with open(pipeline_path, 'r') as f:
                     data = json.load(f)

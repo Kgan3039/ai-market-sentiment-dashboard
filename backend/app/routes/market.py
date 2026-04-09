@@ -15,12 +15,49 @@ TODO (Isaac): Expose market data through API or file interface
 TODO (Srish): Update frontend to display real-time market data
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from typing import List
 from app.models.schemas import MarketData
 from app.services.data_service import DataService
 
 router = APIRouter(prefix="/market", tags=["Market Data"])
+
+
+@router.get("/batch", response_model=List[MarketData])
+async def get_market_data_batch(tickers: List[str] = Query(...)):
+    """
+    Get market data for multiple stocks at once.
+
+    Args:
+        tickers (List[str]): List of stock ticker symbols
+
+    Returns:
+        List[MarketData]: Market data for each ticker
+
+    Example:
+        GET /market/batch?tickers=NVDA&tickers=TSLA
+        Response: [
+            {"ticker": "NVDA", "price": 875.50, ...},
+            {"ticker": "TSLA", "price": 245.30, ...}
+        ]
+
+    TODO (Mihir): Add connection pooling to reduce API calls
+    TODO (Mihir): Add @cache decorator with key based on tickers and date
+    TODO (Isaac): Optimize batch queries in data pipeline
+    TODO (Srish): Handle case where not all tickers return data
+    """
+    if not tickers or len(tickers) == 0:
+        raise HTTPException(status_code=400, detail="At least one ticker required")
+
+    try:
+        data = DataService.get_market_data_multiple(
+            [t.upper() for t in tickers]
+        )
+        return list(data.values())
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error retrieving market data: {str(e)}"
+        )
 
 
 @router.get("/{ticker}", response_model=MarketData)
@@ -59,43 +96,6 @@ async def get_market_data(ticker: str):
 
     try:
         return DataService.get_market_data(ticker.upper())
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error retrieving market data: {str(e)}"
-        )
-
-
-@router.get("/batch", response_model=List[MarketData])
-async def get_market_data_batch(tickers: List[str]):
-    """
-    Get market data for multiple stocks at once.
-
-    Args:
-        tickers (List[str]): List of stock ticker symbols
-
-    Returns:
-        List[MarketData]: Market data for each ticker
-
-    Example:
-        GET /market/batch?tickers=NVDA&tickers=TSLA
-        Response: [
-            {"ticker": "NVDA", "price": 875.50, ...},
-            {"ticker": "TSLA", "price": 245.30, ...}
-        ]
-
-    TODO (Mihir): Add connection pooling to reduce API calls
-    TODO (Mihir): Add @cache decorator with key based on tickers and date
-    TODO (Isaac): Optimize batch queries in data pipeline
-    TODO (Srish): Handle case where not all tickers return data
-    """
-    if not tickers or len(tickers) == 0:
-        raise HTTPException(status_code=400, detail="At least one ticker required")
-
-    try:
-        data = DataService.get_market_data_multiple(
-            [t.upper() for t in tickers]
-        )
-        return list(data.values())
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error retrieving market data: {str(e)}"

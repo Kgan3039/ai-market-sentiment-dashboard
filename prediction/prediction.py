@@ -29,6 +29,7 @@ FEATURES = [
 ]
 
 TARGET = "label"
+_MODEL_CACHE = None
 
 
 def prepare_data(df):
@@ -228,4 +229,109 @@ def predict_batch(df, lr, rf, scaler, model="lr"):
 
     return df
 
+
+def _synthetic_training_frame():
+    """Create a lightweight training set so backend inference can run locally."""
+    rows = []
+    for sentiment_score in (-0.8, -0.5, -0.2, 0.0, 0.2, 0.5, 0.8):
+        for sentiment_confidence in (0.55, 0.7, 0.85, 0.95):
+            for price_delta in (-0.04, -0.015, 0.015, 0.04):
+                for volume_delta in (-0.2, 0.0, 0.2):
+                    if sentiment_score > 0.05:
+                        avg_positive_prob = sentiment_confidence
+                        avg_negative_prob = max(0.02, 0.25 - sentiment_score / 4)
+                        avg_neutral_prob = max(0.02, 1 - avg_positive_prob)
+                    elif sentiment_score < -0.05:
+                        avg_negative_prob = sentiment_confidence
+                        avg_positive_prob = max(0.02, 0.25 + sentiment_score / 4)
+                        avg_neutral_prob = max(0.02, 1 - avg_negative_prob)
+                    else:
+                        avg_neutral_prob = sentiment_confidence
+                        avg_positive_prob = max(0.02, (1 - avg_neutral_prob) / 2)
+                        avg_negative_prob = max(0.02, (1 - avg_neutral_prob) / 2)
+
+                    rows.append({
+                        "avg_sentiment_score": sentiment_score,
+                        "avg_positive_prob": min(avg_positive_prob, 0.98),
+                        "avg_negative_prob": min(avg_negative_prob, 0.98),
+                        "avg_neutral_prob": min(avg_neutral_prob, 0.98),
+                        "price_delta_24h": price_delta,
+                        "volume_delta": volume_delta,
+                        "label": int(price_delta + (0.35 * sentiment_score) > 0),
+                    })
+
+    return pd.DataFrame(rows)
+
+
+def _ensure_models():
+    global _MODEL_CACHE
+
+    if _MODEL_CACHE is None:
+        lr, rf, scaler, _ = train_models(_synthetic_training_frame())
+        _MODEL_CACHE = {
+            "lr": lr,
+            "rf": rf,
+            "scaler": scaler,
+        }
+
+    return _MODEL_CACHE
+
+
+def _row_from_features(sentiment_score, sentiment_confidence, price_delta_24h, volume_delta):
+    if sentiment_score > 0.05:
+        return {
+            "avg_sentiment_score": sentiment_score,
+            "avg_positive_prob": sentiment_confidence,
+            "avg_negative_prob": max(0.02, 0.2 - (sentiment_score / 4)),
+            "avg_neutral_prob": max(0.02, 1 - sentiment_confidence),
+            "price_delta_24h": price_delta_24h,
+            "volume_delta": volume_delta,
+            "label": int(price_delta_24h + (0.35 * sentiment_score) > 0),
+        }
+
+    if sentiment_score < -0.05:
+        return {
+            "avg_sentiment_score": sentiment_score,
+            "avg_positive_prob": max(0.02, 0.2 + (sentiment_score / 4)),
+            "avg_negative_prob": sentiment_confidence,
+            "avg_neutral_prob": max(0.02, 1 - sentiment_confidence),
+            "price_delta_24h": price_delta_24h,
+            "volume_delta": volume_delta,
+            "label": int(price_delta_24h + (0.35 * sentiment_score) > 0),
+        }
+
+    neutral_prob = max(sentiment_confidence, 0.34)
+    side_prob = max(0.02, (1 - neutral_prob) / 2)
+    return {
+        "avg_sentiment_score": sentiment_score,
+        "avg_positive_prob": side_prob,
+        "avg_negative_prob": side_prob,
+        "avg_neutral_prob": neutral_prob,
+        "price_delta_24h": price_delta_24h,
+        "volume_delta": volume_delta,
+        "label": int(price_delta_24h + (0.35 * sentiment_score) > 0),
+    }
+
+
+def predict(sentiment_score, sentiment_confidence, price_delta_24h, volume_delta, model="lr"):
+    """
+    Backend-compatible prediction entrypoint.
+
+    Returns:
+        { "direction": "up"/"down", "confidence": float, "model": str }
+    """
+    models = _ensure_models()
+    row = _row_from_features(
+        sentiment_score=sentiment_score,
+        sentiment_confidence=sentiment_confidence,
+        price_delta_24h=price_delta_24h,
+        volume_delta=volume_delta,
+    )
+    return predict_single(
+        row=row,
+        lr=models["lr"],
+        rf=models["rf"],
+        scaler=models["scaler"],
+        model=model,
+    )
 

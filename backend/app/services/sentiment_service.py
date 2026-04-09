@@ -19,14 +19,22 @@ from datetime import datetime
 from app.models.schemas import SentimentScores
 
 
+def _repo_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+
+
 def _load_nlp_module():
     """Load nlp/sentiment module dynamically for backend integration."""
+    repo_root = _repo_root()
+    if repo_root not in sys.path:
+        sys.path.append(repo_root)
+
     try:
         from nlp import sentiment as sentiment_module
         return sentiment_module
     except Exception:
-        # If PYTHONPATH is not set to project root, add relative nlp path
-        nlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'nlp'))
+        # Fall back to importing the module directly from the nlp directory
+        nlp_dir = os.path.join(repo_root, 'nlp')
         if nlp_dir not in sys.path:
             sys.path.append(nlp_dir)
         try:
@@ -37,9 +45,11 @@ def _load_nlp_module():
 
 
 def _pipeline_file_path() -> str:
-    return os.path.abspath(
-        os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'stock_data.json')
-    )
+    return os.path.join(_repo_root(), 'data', 'stock_data.json')
+
+
+def _aggregated_sentiment_file_path() -> str:
+    return os.path.join(_repo_root(), 'nlp', 'sentiment_data.json')
 
 
 class SentimentService:
@@ -106,6 +116,38 @@ class SentimentService:
             'source_breakdown': {},
             'date': datetime.now().date().isoformat(),
         }
+
+        aggregated_path = _aggregated_sentiment_file_path()
+        if os.path.exists(aggregated_path):
+            try:
+                with open(aggregated_path, 'r') as f:
+                    aggregated_rows = json.load(f)
+
+                for row in aggregated_rows:
+                    if row.get('ticker', '').upper() == ticker:
+                        confidence = float(
+                            row.get(
+                                'avg_sentiment_confidence',
+                                max(
+                                    row.get('avg_positive_prob', 0.0),
+                                    row.get('avg_negative_prob', 0.0),
+                                    row.get('avg_neutral_prob', 0.0),
+                                ),
+                            )
+                        )
+                        score = float(row.get('avg_sentiment_score', 0.0))
+                        grouped['overall_sentiment'] = SentimentScores(
+                            positive_prob=float(row.get('avg_positive_prob', 0.0)),
+                            negative_prob=float(row.get('avg_negative_prob', 0.0)),
+                            neutral_prob=float(row.get('avg_neutral_prob', 0.0)),
+                            sentiment_score=score,
+                            sentiment_label='positive' if score > 0.05 else ('negative' if score < -0.05 else 'neutral'),
+                            sentiment_confidence=confidence,
+                        )
+                        grouped['date'] = row.get('date', grouped['date'])
+                        return grouped
+            except Exception:
+                pass
 
         posts = []
         pipeline_path = _pipeline_file_path()

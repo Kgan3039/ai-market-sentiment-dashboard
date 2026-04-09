@@ -87,6 +87,26 @@ def test_market_response_uses_ticker_and_date(monkeypatch):
     assert "timestamp" not in payload
 
 
+def test_market_batch_route_uses_batch_handler(monkeypatch):
+    monkeypatch.setattr(
+        DataService,
+        "get_market_data_multiple",
+        staticmethod(
+            lambda tickers: {
+                ticker: _market_payload(ticker)
+                for ticker in tickers
+            }
+        ),
+    )
+
+    response = client.get("/market/batch?tickers=NVDA&tickers=TSLA")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert isinstance(payload, list)
+    assert [item["ticker"] for item in payload] == ["NVDA", "TSLA"]
+
+
 def test_prediction_response_uses_label_contract(monkeypatch):
     monkeypatch.setattr(
         PredictionService,
