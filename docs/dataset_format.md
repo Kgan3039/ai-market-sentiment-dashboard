@@ -80,14 +80,53 @@ Example:
 
 ---
 
-## 4. Final Model Input (Data + NLP → Prediction)
+## 4. Final Model Input (Aggregated Data → Prediction)
 
-Fields:
-- sentiment_score
-- sentiment_confidence
-- price_delta_24h
-- volume_delta
-- label (target)
+The prediction model consumes aggregated features from the NLP pipeline along with market data.
+
+Each row represents a grouped time window (by ticker and date).
+
+### Required Fields
+
+- avg_sentiment_score (float)
+- avg_positive_prob (float)
+- avg_negative_prob (float)
+- avg_neutral_prob (float)
+- price_delta_24h (float)
+- volume_delta (float)
+- label (int, required for training, optional for inference)
+
+---
+
+### Derived Features (Computed Inside Model)
+
+The model internally converts aggregated sentiment into final features:
+
+- sentiment_score = avg_sentiment_score
+
+- sentiment_confidence = max(
+    avg_positive_prob,
+    avg_negative_prob,
+    avg_neutral_prob
+  )
+
+These derived features are NOT required from upstream pipelines.
+
+---
+
+### Example Final Input Row
+
+{
+  "ticker": "NVDA",
+  "date": "2026-03-27",
+  "avg_sentiment_score": 0.41,
+  "avg_positive_prob": 0.58,
+  "avg_negative_prob": 0.19,
+  "avg_neutral_prob": 0.23,
+  "price_delta_24h": 0.012,
+  "volume_delta": 0.10,
+  "label": 1
+}
 
 ---
 
