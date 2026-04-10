@@ -27,7 +27,7 @@ def get_sentiment_scores(text):
         text (str): Input text
 
     Returns:
-        dict: sentiment probabilities, score, and label
+        dict: sentiment probabilities, confidence, score, and label
     """
     text = str(text)
 
@@ -48,6 +48,9 @@ def get_sentiment_scores(text):
     negative = scores.get("negative", 0.0)
     neutral = scores.get("neutral", 0.0)
 
+    probabilities = [positive, negative, neutral]
+    sentiment_confidence = max(probabilities)
+
     # Create sentiment score
     sentiment_score = positive - negative
 
@@ -58,6 +61,7 @@ def get_sentiment_scores(text):
         "positive_prob": positive,
         "negative_prob": negative,
         "neutral_prob": neutral,
+        "sentiment_confidence": sentiment_confidence,
         "sentiment_score": sentiment_score,
         "sentiment_label": sentiment_label
     }
