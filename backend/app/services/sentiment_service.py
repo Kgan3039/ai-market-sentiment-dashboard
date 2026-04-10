@@ -52,6 +52,11 @@ def _pipeline_file_path() -> str:
     )
 
 
+def _aggregated_sentiment_file_path() -> str:
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "aggregated_sentiment.json")
+    )
+
 class SentimentService:
     """Service for managing sentiment analysis operations."""
 
@@ -143,7 +148,7 @@ class SentimentService:
                             sentiment_score=score,
                             sentiment_label='positive' if score > 0.05 else ('negative' if score < -0.05 else 'neutral'),
                             sentiment_confidence=confidence,
-                        )
+                        ).model_dump()
                         grouped['date'] = row.get('date', grouped['date'])
                         return grouped
             except Exception:
@@ -166,7 +171,7 @@ class SentimentService:
                     sentiment_score=0.55,
                     sentiment_label='positive',
                     sentiment_confidence=0.70,
-                ),
+                ).model_dump(),
                 'source_breakdown': {},
                 'date': grouped['date'],
             }
@@ -212,7 +217,7 @@ class SentimentService:
             sentiment_score=overall_score,
             sentiment_label='positive' if overall_score > 0.05 else ('negative' if overall_score < -0.05 else 'neutral'),
             sentiment_confidence=overall_confidence,
-        )
+        ).model_dump()
 
         for source, stats in source_stats.items():
             count_src = stats['count']

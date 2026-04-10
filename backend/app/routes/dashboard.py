@@ -72,6 +72,23 @@ async def get_dashboard_summary(ticker: str):
         market_data = DataService.get_market_data(ticker)
         prediction_data = PredictionService.predict_for_ticker(ticker)
 
+        # Handle async returns if services are async
+        import asyncio
+        if asyncio.iscoroutine(sentiment_data):
+            sentiment_data = await sentiment_data
+        if asyncio.iscoroutine(market_data):
+            market_data = await market_data
+        if asyncio.iscoroutine(prediction_data):
+            prediction_data = await prediction_data
+
+        # Validate responses
+        if not sentiment_data or "overall_sentiment" not in sentiment_data:
+            raise ValueError("Invalid sentiment data")
+        if not market_data or not hasattr(market_data, "date"):
+            raise ValueError("Invalid market data")
+        if not prediction_data or "prediction" not in prediction_data:
+            raise ValueError("Invalid prediction data")
+
         # Combine into dashboard summary
         return DashboardSummary(
             ticker=ticker,

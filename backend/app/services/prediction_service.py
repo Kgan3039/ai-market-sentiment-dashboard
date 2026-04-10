@@ -117,8 +117,17 @@ class PredictionService:
         market_info = DataService.get_market_data(ticker)
 
         overall_sentiment = sentiment_info.get('overall_sentiment')
-        sentiment_score = overall_sentiment.sentiment_score if overall_sentiment is not None else 0.0
-        sentiment_confidence = overall_sentiment.sentiment_confidence if overall_sentiment is not None else 0.0
+
+        # Handle both object and dict formats
+        if isinstance(overall_sentiment, dict):
+            sentiment_score = overall_sentiment.get('sentiment_score', 0.0)
+            sentiment_confidence = overall_sentiment.get('sentiment_confidence', 0.0)
+        elif overall_sentiment is not None:
+            sentiment_score = getattr(overall_sentiment, 'sentiment_score', 0.0)
+            sentiment_confidence = getattr(overall_sentiment, 'sentiment_confidence', 0.0)
+        else:
+            sentiment_score = 0.0
+            sentiment_confidence = 0.0
 
         market_features = {
             'price_delta_24h': 0.0,
@@ -152,7 +161,8 @@ class PredictionService:
         return {
             'ticker': ticker,
             'date': prediction.date,
-            'prediction': prediction,
+            'prediction': prediction.label,
+            'confidence': prediction.confidence,
             'model_info': {
                 'name': 'RandomForestClassifier' if prediction.label in ['up', 'down'] else 'FallbackRule',
                 'version': '0.1.0',

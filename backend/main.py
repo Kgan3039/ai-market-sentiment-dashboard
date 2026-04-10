@@ -15,7 +15,6 @@ To run locally:
     # Interactive docs at http://localhost:8000/docs
     # ReDoc documentation at http://localhost:8000/redoc
 """
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings

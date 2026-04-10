@@ -78,22 +78,22 @@ class DataService:
                     volume = int(hist['Volume'].iloc[-1])
 
                     market_data = {
-                        'symbol': ticker,
+                        'ticker': ticker,
                         'price': price,
                         'day_high': day_high,
                         'volume': volume,
-                        'timestamp': datetime.now(),
+                        'date': datetime.now().date().isoformat(),
                     }
             except Exception:
                 market_data = None
 
         if market_data is None:
             market_data = {
-                'symbol': ticker,
+                'ticker': ticker,
                 'price': 0.0,
                 'day_high': 0.0,
                 'volume': 0,
-                'timestamp': datetime.now(),
+                'date': datetime.now().date().isoformat(),
             }
 
         return MarketData(**market_data)
