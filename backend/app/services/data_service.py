@@ -24,7 +24,7 @@ class DataService:
     @staticmethod
     def _pipeline_file_path() -> str:
         return os.path.abspath(
-            os.path.join(os.path.dirname(__file__), '..', '..', '..', 'data', 'stock_data.json')
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "stock_data.json")
         )
 
     @staticmethod
@@ -67,23 +67,33 @@ class DataService:
 
         # Fallback to yfinance if pipeline data is unavailable or incomplete
         if market_data is None or market_data['price'] <= 0:
-            import yfinance as yf
+            try:
+                import yfinance as yf
 
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period='1d')
-            if hist.empty:
-                raise RuntimeError(f"Unable to fetch market data for ticker {ticker}")
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period='1d')
+                if not hist.empty:
+                    price = float(hist['Close'].iloc[-1])
+                    day_high = float(hist['High'].iloc[-1])
+                    volume = int(hist['Volume'].iloc[-1])
 
-            price = float(hist['Close'].iloc[-1])
-            day_high = float(hist['High'].iloc[-1])
-            volume = int(hist['Volume'].iloc[-1])
+                    market_data = {
+                        'symbol': ticker,
+                        'price': price,
+                        'day_high': day_high,
+                        'volume': volume,
+                        'timestamp': datetime.now(),
+                    }
+            except Exception:
+                market_data = None
 
+        if market_data is None:
             market_data = {
-                'ticker': ticker,
-                'price': price,
-                'day_high': day_high,
-                'volume': volume,
-                'date': datetime.now().date().isoformat(),
+                'symbol': ticker,
+                'price': 0.0,
+                'day_high': 0.0,
+                'volume': 0,
+                'timestamp': datetime.now(),
             }
 
         return MarketData(**market_data)

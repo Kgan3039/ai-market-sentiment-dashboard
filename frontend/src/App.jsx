@@ -9,7 +9,7 @@ import PredictionModel from "./components/PredictionModel";
 import "./App.css";
 
 // Backend API base URL
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 // Fallback dummy data if API fails
 const DUMMY_DATA = {
@@ -187,12 +187,12 @@ const DUMMY_DATA = {
 function transformDashboardData(apiResponse, ticker) {
   if (!apiResponse) return null;
 
-  const responseTicker = apiResponse.ticker?.toUpperCase() ?? ticker.toUpperCase();
-  const sentimentScore = apiResponse.sentiment?.sentiment_score ?? 0.5;
-  const sentimentLabel = apiResponse.sentiment?.sentiment_label ?? "neutral";
-  const predictionLabel = apiResponse.prediction?.label ?? "neutral";
-  const predictionConfidence = apiResponse.prediction?.confidence ?? 0.5;
-  const marketPrice = apiResponse.market_data?.price ?? 0;
+  const sentimentScore = apiResponse.sentiment?.sentiment_score || 0;
+  const normalizedSentimentScore = Math.max(
+    0,
+    Math.min(100, Math.round(((sentimentScore + 1) / 2) * 100))
+  );
+  const predictionDirection = apiResponse.prediction?.predicted_movement || "neutral";
 
   return {
     ticker: responseTicker,
@@ -227,8 +227,10 @@ function transformDashboardData(apiResponse, ticker) {
     news: [],
     socialPosts: [],
     sentiment: {
-      score: Math.round(sentimentScore * 100),
-      label: sentimentLabel.charAt(0).toUpperCase() + sentimentLabel.slice(1),
+      score: normalizedSentimentScore,
+      label:
+        apiResponse.sentiment?.sentiment_label?.charAt(0).toUpperCase() +
+          (apiResponse.sentiment?.sentiment_label?.slice(1) || "neutral"),
       change: 3,
       positiveDrivers: ["Market data integrated from real-time pipeline"],
       negativeDrivers: [],
@@ -239,7 +241,11 @@ function transformDashboardData(apiResponse, ticker) {
         companyFilings: 10,
       },
       timeSeries: [
-        { date: "Apr", score: Math.round(sentimentScore * 100), price: marketPrice },
+        {
+          date: "Now",
+          score: normalizedSentimentScore,
+          price: apiResponse.market_data?.price || 0,
+        },
       ],
     },
     alerts: [
@@ -253,9 +259,9 @@ function transformDashboardData(apiResponse, ticker) {
     prediction: {
       shortTerm: {
         horizon: "1–2 Weeks",
-        direction: predictionLabel.toUpperCase(),
-        confidence: Math.round(predictionConfidence * 100),
-        rationale: `ML prediction: ${predictionLabel} with ${Math.round(predictionConfidence * 100)}% confidence`,
+        direction: predictionDirection.toUpperCase(),
+        confidence: Math.round((apiResponse.prediction?.confidence || 0.5) * 100),
+        rationale: `ML prediction: ${predictionDirection} with ${Math.round((apiResponse.prediction?.confidence || 0.5) * 100)}% confidence`,
       },
       mediumTerm: {
         horizon: "1–3 Months",

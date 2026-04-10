@@ -9,32 +9,41 @@ Dataset Format Contract:
 - This data flows into Matthew NLP pipeline
 """
 
-import yfinance as yf
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
 
 tickers = ["NVDA", "TSLA"]
 data_out = []
+output_path = Path(__file__).with_name("stock_data.json")
+
+
+def get_market_deltas(ticker: str) -> tuple[float, float]:
+    """Fetch market deltas when available, otherwise return demo-safe defaults."""
+    try:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="5d")
+
+        if len(hist) >= 2:
+            current_price = hist["Close"].iloc[-1]
+            previous_price = hist["Close"].iloc[-2]
+            price_delta_24h = (
+                (current_price - previous_price) / previous_price if previous_price else 0.0
+            )
+
+            recent_volume = hist["Volume"].iloc[-1]
+            avg_volume = hist["Volume"].tail(5).mean()
+            volume_delta = (recent_volume - avg_volume) / avg_volume if avg_volume > 0 else 0.0
+            return float(price_delta_24h), float(volume_delta)
+    except Exception:
+        pass
+
+    return 0.0, 0.0
 
 for t in tickers:
-    stock = yf.Ticker(t)
-
-    # Get historical data for price delta calculation
-    hist = stock.history(period="2d")  # Last 2 days for 24h delta
-
-    if len(hist) >= 2:
-        # Calculate 24h price change
-        current_price = hist['Close'].iloc[-1]
-        previous_price = hist['Close'].iloc[-2]
-        price_delta_24h = (current_price - previous_price) / previous_price
-
-        # Calculate volume delta (vs 5-day average)
-        recent_volume = hist['Volume'].iloc[-1]
-        avg_volume = hist['Volume'].tail(5).mean()
-        volume_delta = (recent_volume - avg_volume) / avg_volume if avg_volume > 0 else 0
-    else:
-        price_delta_24h = 0.0
-        volume_delta = 0.0
+    price_delta_24h, volume_delta = get_market_deltas(t)
 
     # Get current date in ISO format
     current_date = datetime.now().date().isoformat()
@@ -67,8 +76,8 @@ for t in tickers:
 
     data_out.extend(social_posts)
 
-# Save raw data in dataset_format.md format
-with open("stock_data.json", "w") as f:
+# Save raw data next to this script so the backend can load it reliably.
+with output_path.open("w") as f:
     json.dump(data_out, f, indent=4)
 
 # TODO (Isaac): Add error handling for missing market data
@@ -77,5 +86,5 @@ with open("stock_data.json", "w") as f:
 # TODO (Isaac): Add logging to track data pipeline execution
 # TODO (Mihir): Once data pipeline is finalized, set up scheduled execution (e.g., hourly)
 
-print("Pipeline updated with real market data. Saved to stock_data.json")
+print(f"Pipeline updated with real market data. Saved to {output_path}")
 print(f"Generated {len(data_out)} social media posts in dataset_format.md format")

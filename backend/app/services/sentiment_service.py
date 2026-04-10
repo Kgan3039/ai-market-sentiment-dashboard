@@ -33,8 +33,10 @@ def _load_nlp_module():
         from nlp import sentiment as sentiment_module
         return sentiment_module
     except Exception:
-        # Fall back to importing the module directly from the nlp directory
-        nlp_dir = os.path.join(repo_root, 'nlp')
+        # If PYTHONPATH is not set to project root, add relative nlp path
+        nlp_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "nlp")
+        )
         if nlp_dir not in sys.path:
             sys.path.append(nlp_dir)
         try:
@@ -45,11 +47,9 @@ def _load_nlp_module():
 
 
 def _pipeline_file_path() -> str:
-    return os.path.join(_repo_root(), 'data', 'stock_data.json')
-
-
-def _aggregated_sentiment_file_path() -> str:
-    return os.path.join(_repo_root(), 'nlp', 'sentiment_data.json')
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "stock_data.json")
+    )
 
 
 class SentimentService:
