@@ -24,7 +24,7 @@ router = APIRouter(prefix="/market", tags=["Market Data"])
 
 
 @router.get("/batch", response_model=List[MarketData])
-async def get_market_data_batch(tickers: List[str]):
+async def get_market_data_batch(tickers: List[str] = Query(...)):
     """
     Get market data for multiple stocks at once.
 
@@ -37,12 +37,12 @@ async def get_market_data_batch(tickers: List[str]):
     Example:
         GET /market/batch?tickers=NVDA&tickers=TSLA
         Response: [
-            {"symbol": "NVDA", "price": 875.50, ...},
-            {"symbol": "TSLA", "price": 245.30, ...}
+            {"ticker": "NVDA", "price": 875.50, ...},
+            {"ticker": "TSLA", "price": 245.30, ...}
         ]
 
     TODO (Mihir): Add connection pooling to reduce API calls
-    TODO (Mihir): Add @cache decorator with key based on tickers and timestamp
+    TODO (Mihir): Add @cache decorator with key based on tickers and date
     TODO (Isaac): Optimize batch queries in data pipeline
     TODO (Srish): Handle case where not all tickers return data
     """

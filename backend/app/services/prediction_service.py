@@ -49,6 +49,25 @@ class PredictionService:
     """Service for managing stock movement predictions."""
 
     @staticmethod
+    def _normalize_prediction_payload(prediction: PredictionResponse | Dict[str, Any], ticker: str) -> PredictionResponse:
+        """Return a canonical prediction object that matches the API schema."""
+        if isinstance(prediction, PredictionResponse):
+            return prediction
+
+        if isinstance(prediction, dict):
+            if {"ticker", "date", "label", "confidence"}.issubset(prediction):
+                return PredictionResponse(**prediction)
+
+            return PredictionResponse(
+                ticker=ticker,
+                date=prediction.get("date", datetime.now().date().isoformat()),
+                label=prediction.get("label", prediction.get("direction", "neutral")),
+                confidence=float(prediction.get("confidence", 0.0)),
+            )
+
+        raise ValueError("Prediction payload must be a PredictionResponse or dict")
+
+    @staticmethod
     def predict_movement(
         ticker: str, sentiment_score: float, market_features: Dict[str, float]
     ) -> PredictionResponse:
@@ -157,14 +176,14 @@ class PredictionService:
             sentiment_score=sentiment_score,
             market_features=market_features,
         )
+        prediction_payload = PredictionService._normalize_prediction_payload(prediction, ticker)
 
         return {
             'ticker': ticker,
-            'date': prediction.date,
-            'prediction': prediction.label,
-            'confidence': prediction.confidence,
+            'date': prediction_payload.date,
+            'prediction': prediction_payload,
             'model_info': {
-                'name': 'RandomForestClassifier' if prediction.label in ['up', 'down'] else 'FallbackRule',
+                'name': 'RandomForestClassifier' if prediction_payload.label in ['up', 'down'] else 'FallbackRule',
                 'version': '0.1.0',
                 'features_used': [
                     'sentiment_score',

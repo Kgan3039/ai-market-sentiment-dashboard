@@ -187,12 +187,14 @@ const DUMMY_DATA = {
 function transformDashboardData(apiResponse, ticker) {
   if (!apiResponse) return null;
 
+  const responseTicker = apiResponse.ticker?.toUpperCase() ?? ticker.toUpperCase();
+  const marketPrice = apiResponse.market_data?.price ?? 0;
   const sentimentScore = apiResponse.sentiment?.sentiment_score || 0;
   const normalizedSentimentScore = Math.max(
     0,
     Math.min(100, Math.round(((sentimentScore + 1) / 2) * 100))
   );
-  const predictionDirection = apiResponse.prediction?.predicted_movement || "neutral";
+  const predictionDirection = apiResponse.prediction?.label || "neutral";
 
   return {
     ticker: responseTicker,
