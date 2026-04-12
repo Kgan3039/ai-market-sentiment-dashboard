@@ -47,7 +47,7 @@ def get_sentiment_scores(text):
         text (str): Input text
 
     Returns:
-        dict: sentiment probabilities, score, and label
+        dict: sentiment probabilities, confidence, score, and label
     """
     text = str(text)
 
@@ -99,6 +99,9 @@ def get_sentiment_scores(text):
     negative = scores.get("negative", 0.0)
     neutral = scores.get("neutral", 0.0)
 
+    probabilities = [positive, negative, neutral]
+    sentiment_confidence = max(probabilities)
+
     # Create sentiment score
     sentiment_score = positive - negative
 
@@ -131,6 +134,27 @@ def score_dataframe(df, text_column="text"):
     """
     scored = df[text_column].apply(lambda x: pd.Series(get_sentiment_scores(x)))
     return pd.concat([df, scored], axis=1)
+
+
+def flatten_grouped_pipeline_records(records):
+    """Expand grouped ticker/date records into post-level rows for NLP scoring."""
+    rows = []
+
+    for record in records:
+        ticker = record.get("ticker")
+        date = record.get("date")
+        for post in record.get("posts", []) or []:
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "date": date,
+                    "text": post.get("text", ""),
+                    "source": post.get("source", "unknown"),
+                    "post_score": post.get("post_score", 0),
+                }
+            )
+
+    return rows
 
 
 def aggregate_sentiment(df, date_col="date", ticker_col="ticker"):
@@ -183,9 +207,10 @@ if __name__ == "__main__":
 
     try:
         with open(data_path, 'r') as f:
-            posts = json.load(f)
+            grouped_records = json.load(f)
 
-        print(f"Loaded {len(posts)} posts from data pipeline")
+        posts = flatten_grouped_pipeline_records(grouped_records)
+        print(f"Loaded {len(posts)} posts from grouped data pipeline")
 
         # Convert to DataFrame for processing
         df = pd.DataFrame(posts)

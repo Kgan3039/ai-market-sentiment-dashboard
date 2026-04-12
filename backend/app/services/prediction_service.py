@@ -130,8 +130,9 @@ class PredictionService:
                     data = json.load(f)
                 for row in data:
                     if row.get('ticker', '').upper() == ticker:
-                        market_features['price_delta_24h'] = float(row.get('price_delta_24h', 0.0))
-                        market_features['volume_delta'] = float(row.get('volume_delta', 0.0))
+                        market_snapshot = row.get("market_data", {}) or {}
+                        market_features['price_delta_24h'] = float(market_snapshot.get('price_delta_24h', 0.0) or 0.0)
+                        market_features['volume_delta'] = 0.0
                         break
         except Exception:
             pass

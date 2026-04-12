@@ -28,6 +28,26 @@ class DataService:
         )
 
     @staticmethod
+    def _load_pipeline_records() -> List[Dict[str, Any]]:
+        pipeline_path = DataService._pipeline_file_path()
+        if not os.path.exists(pipeline_path):
+            return []
+
+        try:
+            with open(pipeline_path, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _get_ticker_records(ticker: str) -> List[Dict[str, Any]]:
+        return [
+            record
+            for record in DataService._load_pipeline_records()
+            if record.get("ticker", "").upper() == ticker
+        ]
+
+    @staticmethod
     def get_market_data(ticker: str) -> MarketData:
         """
         Get current market data for a stock.
@@ -44,26 +64,19 @@ class DataService:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
-        pipeline_path = DataService._pipeline_file_path()
-
-        # Try reading pipeline JSON first
         market_data = None
-        if os.path.exists(pipeline_path):
-            try:
-                with open(pipeline_path, 'r') as f:
-                    records = json.load(f)
-                ticker_records = [r for r in records if r.get('ticker', '').upper() == ticker]
-                if ticker_records:
-                    latest = sorted(ticker_records, key=lambda r: r.get('date', ''), reverse=True)[0]
-                    market_data = {
-                        'symbol': ticker,
-                        'price': float(latest.get('price', 0.0)) if latest.get('price') is not None else 0.0,
-                        'day_high': float(latest.get('day_high', 0.0)) if latest.get('day_high') is not None else 0.0,
-                        'volume': int(latest.get('volume', 0)) if latest.get('volume') is not None else 0,
-                        'timestamp': datetime.now(),
-                    }
-            except Exception:
-                market_data = None
+        ticker_records = DataService._get_ticker_records(ticker)
+        if ticker_records:
+            latest = sorted(ticker_records, key=lambda r: r.get("date", ""), reverse=True)[0]
+            market_snapshot = latest.get("market_data", {}) or {}
+            price = float(market_snapshot.get("price", 0.0) or 0.0)
+            market_data = {
+                "symbol": ticker,
+                "price": price,
+                "day_high": price,
+                "volume": int(market_snapshot.get("volume", 0) or 0),
+                "timestamp": datetime.now(),
+            }
 
         # Fallback to yfinance if pipeline data is unavailable or incomplete
         if market_data is None or market_data['price'] <= 0:
@@ -126,34 +139,35 @@ class DataService:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
-        pipeline_path = DataService._pipeline_file_path()
-
         posts = []
-        if os.path.exists(pipeline_path):
-            try:
-                with open(pipeline_path, 'r') as f:
-                    records = json.load(f)
-                posts = [r for r in records if r.get('ticker', '').upper() == ticker]
-            except Exception:
-                posts = []
+        for record in DataService._get_ticker_records(ticker):
+            record_posts = record.get("posts", []) or []
+            for post in record_posts:
+                posts.append(
+                    {
+                        "ticker": ticker,
+                        "date": record.get("date", datetime.now().date().isoformat()),
+                        "text": post.get("text", ""),
+                        "source": post.get("source", "unknown"),
+                        "post_score": post.get("post_score", 0),
+                    }
+                )
 
         if not posts:
             # Provide fallback stub posts and guidelines for development
             posts = [
                 {
-                    'ticker': ticker,
-                    'date': datetime.now().date().isoformat(),
-                    'text': f"Sample fallback post for {ticker}",
-                    'source': 'reddit',
-                    'post_score': 10,
-                    'price_delta_24h': 0.0,
-                    'volume_delta': 0.0,
+                    "ticker": ticker,
+                    "date": datetime.now().date().isoformat(),
+                    "text": f"Sample fallback post for {ticker}",
+                    "source": "mock_social",
+                    "post_score": 1,
                 }
             ]
 
         return {
-            'ticker': ticker,
-            'post_count': len(posts),
-            'posts': posts,
-            'avg_post_score': sum([p.get('post_score', 0) for p in posts]) / max(1, len(posts)),
+            "ticker": ticker,
+            "post_count": len(posts),
+            "posts": posts,
+            "avg_post_score": sum([p.get("post_score", 0) for p in posts]) / max(1, len(posts)),
         }
