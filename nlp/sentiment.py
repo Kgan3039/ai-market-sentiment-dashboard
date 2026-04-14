@@ -190,6 +190,72 @@ def aggregate_sentiment(df, date_col="date", ticker_col="ticker"):
         "text": "mention_count"
     })
 
+def aggregate_posts_for_day(row):
+    """
+    Aggregates sentiment across all posts for a given ticker/date.
+
+    Input row format:
+    {
+        "ticker": str,
+        "date": str,
+        "posts": [ { "text": str, "source": str, "post_score": int } ],
+        "market_data": { ... }
+    }
+
+    Returns:
+        Aggregated sentiment metrics per (ticker, date)
+    """
+
+    posts = row.get("posts", []) or []
+
+    # Handle empty case
+    if not posts:
+        return {
+            "ticker": row.get("ticker"),
+            "date": row.get("date"),
+            "avg_sentiment_score": 0.0,
+            "avg_positive_prob": 0.0,
+            "avg_negative_prob": 0.0,
+            "avg_neutral_prob": 0.0,
+            "mention_count": 0,
+            "sentiment_label": "neutral",
+            "sentiment_confidence": 0.0,
+        }
+
+    scored_posts = []
+
+    for post in posts:
+        text = post.get("text", "")
+        scored_posts.append(get_sentiment_scores(text))
+
+    mention_count = len(scored_posts)
+
+    avg_positive_prob = sum(p["positive_prob"] for p in scored_posts) / mention_count
+    avg_negative_prob = sum(p["negative_prob"] for p in scored_posts) / mention_count
+    avg_neutral_prob = sum(p["neutral_prob"] for p in scored_posts) / mention_count
+    avg_sentiment_score = sum(p["sentiment_score"] for p in scored_posts) / mention_count
+
+    avg_probs = {
+        "positive": avg_positive_prob,
+        "negative": avg_negative_prob,
+        "neutral": avg_neutral_prob,
+    }
+
+    sentiment_label = max(avg_probs, key=avg_probs.get)
+    sentiment_confidence = max(avg_probs.values())
+
+    return {
+        "ticker": row.get("ticker"),
+        "date": row.get("date"),
+        "avg_sentiment_score": avg_sentiment_score,
+        "avg_positive_prob": avg_positive_prob,
+        "avg_negative_prob": avg_negative_prob,
+        "avg_neutral_prob": avg_neutral_prob,
+        "mention_count": mention_count,
+        "sentiment_label": sentiment_label,
+        "sentiment_confidence": sentiment_confidence,
+    }
+
 
 # TODO (Matthew): Add confidence thresholds - skip low-confidence predictions
 # TODO (Matthew): Implement caching for repeated text analysis
