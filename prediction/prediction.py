@@ -172,9 +172,9 @@ def predict_single(
     confidence = probs[pred]
 
     return {
-        "direction": "up" if pred == 1 else "down",
+        "predicted_movement": "up" if pred == 1 else "down",
+        "probability": round(float(probs[1]), 4),  # raw prob of going up
         "confidence": round(float(confidence), 4),
-        "model": model,
     }
 
 
