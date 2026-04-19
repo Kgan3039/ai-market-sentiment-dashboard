@@ -16,6 +16,7 @@ Model Used: FinBERT (ProsusAI/finbert) - Pre-trained on financial text
 import pandas as pd
 
 classifier = None
+_sentiment_cache = {}
 
 
 def _get_classifier():
@@ -51,6 +52,10 @@ def get_sentiment_scores(text):
     """
     text = str(text)
 
+    # Cache repeated text analysis
+    if text in _sentiment_cache:
+        return _sentiment_cache[text]
+
     loaded_classifier = _get_classifier()
 
     if not loaded_classifier:
@@ -73,7 +78,7 @@ def get_sentiment_scores(text):
         sentiment_score = positive - negative
         sentiment_confidence = max(positive, negative, neutral)
 
-        return {
+        result = {
             "positive_prob": positive,
             "negative_prob": negative,
             "neutral_prob": neutral,
@@ -81,6 +86,9 @@ def get_sentiment_scores(text):
             "sentiment_label": sentiment_label,
             "sentiment_confidence": sentiment_confidence,
         }
+
+        _sentiment_cache[text] = result
+        return result
 
     # Get all class scores
     results = loaded_classifier(text, top_k=None)
@@ -99,9 +107,6 @@ def get_sentiment_scores(text):
     negative = scores.get("negative", 0.0)
     neutral = scores.get("neutral", 0.0)
 
-    probabilities = [positive, negative, neutral]
-    sentiment_confidence = max(probabilities)
-
     # Create sentiment score
     sentiment_score = positive - negative
 
@@ -111,50 +116,89 @@ def get_sentiment_scores(text):
     # Add sentiment confidence (highest probability)
     sentiment_confidence = max(positive, negative, neutral)
 
-    return {
+    result = {
         "positive_prob": positive,
         "negative_prob": negative,
         "neutral_prob": neutral,
+        "sentiment_confidence": sentiment_confidence,
         "sentiment_score": sentiment_score,
         "sentiment_label": sentiment_label,
-        "sentiment_confidence": sentiment_confidence
     }
 
+    _sentiment_cache[text] = result
+    return result
 
-def score_dataframe(df, text_column="text"):
+
+def batch_get_sentiment_scores(texts):
+    """
+    Analyze sentiment for a batch of texts for faster processing on large datasets.
+
+    Args:
+        texts (list): List of input texts
+
+    Returns:
+        list[dict]: List of sentiment result dictionaries
+    """
+    texts = [str(text) for text in texts]
+    loaded_classifier = _get_classifier()
+
+    # Use cache where possible
+    uncached_texts = [text for text in texts if text not in _sentiment_cache]
+
+    if uncached_texts:
+        if not loaded_classifier:
+            # Fallback: compute one-by-one using keyword rules
+            for text in uncached_texts:
+                get_sentiment_scores(text)
+        else:
+            batch_results = loaded_classifier(uncached_texts, top_k=None)
+
+            for text, results in zip(uncached_texts, batch_results):
+                scores = {item["label"].lower(): item["score"] for item in results}
+
+                positive = scores.get("positive", 0.0)
+                negative = scores.get("negative", 0.0)
+                neutral = scores.get("neutral", 0.0)
+
+                sentiment_score = positive - negative
+                sentiment_label = max(scores, key=scores.get)
+                sentiment_confidence = max(positive, negative, neutral)
+
+                _sentiment_cache[text] = {
+                    "positive_prob": positive,
+                    "negative_prob": negative,
+                    "neutral_prob": neutral,
+                    "sentiment_score": sentiment_score,
+                    "sentiment_label": sentiment_label,
+                    "sentiment_confidence": sentiment_confidence,
+                }
+
+    return [_sentiment_cache[text] for text in texts]
+
+
+def score_dataframe(df, text_column="text", min_confidence=0.0):
     """
     Apply sentiment scoring to a pandas DataFrame.
 
     Args:
         df (pd.DataFrame): Input dataframe
         text_column (str): Column containing text
+        min_confidence (float): Minimum confidence threshold (0.0 to 1.0)
 
     Returns:
         pd.DataFrame: Original dataframe + sentiment columns
     """
-    scored = df[text_column].apply(lambda x: pd.Series(get_sentiment_scores(x)))
-    return pd.concat([df, scored], axis=1)
+    texts = df[text_column].astype(str).tolist()
+    scored_list = batch_get_sentiment_scores(texts)
+    scored = pd.DataFrame(scored_list)
 
+    result = pd.concat([df.reset_index(drop=True), scored], axis=1)
 
-def flatten_grouped_pipeline_records(records):
-    """Expand grouped ticker/date records into post-level rows for NLP scoring."""
-    rows = []
+    # Skip low-confidence predictions if threshold is provided
+    if min_confidence > 0:
+        result = result[result["sentiment_confidence"] >= min_confidence].reset_index(drop=True)
 
-    for record in records:
-        ticker = record.get("ticker")
-        date = record.get("date")
-        for post in record.get("posts", []) or []:
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "date": date,
-                    "text": post.get("text", ""),
-                    "source": post.get("source", "unknown"),
-                    "post_score": post.get("post_score", 0),
-                }
-            )
-
-    return rows
+    return result
 
 
 def aggregate_sentiment(df, date_col="date", ticker_col="ticker"):
@@ -177,9 +221,9 @@ def aggregate_sentiment(df, date_col="date", ticker_col="ticker"):
         "positive_prob": "mean",
         "negative_prob": "mean",
         "neutral_prob": "mean",
-        "sentiment_confidence": "mean",  # Add sentiment_confidence aggregation
-        "post_score": "mean",  # For avg_post_score
-        "text": "count"  # For mention_count
+        "sentiment_confidence": "mean",
+        "post_score": "mean",
+        "text": "count"
     }).rename(columns={
         "sentiment_score": "avg_sentiment_score",
         "positive_prob": "avg_positive_prob",
@@ -190,76 +234,7 @@ def aggregate_sentiment(df, date_col="date", ticker_col="ticker"):
         "text": "mention_count"
     })
 
-def aggregate_posts_for_day(row):
-    """
-    Aggregates sentiment across all posts for a given ticker/date.
 
-    Input row format:
-    {
-        "ticker": str,
-        "date": str,
-        "posts": [ { "text": str, "source": str, "post_score": int } ],
-        "market_data": { ... }
-    }
-
-    Returns:
-        Aggregated sentiment metrics per (ticker, date)
-    """
-
-    posts = row.get("posts", []) or []
-
-    # Handle empty case
-    if not posts:
-        return {
-            "ticker": row.get("ticker"),
-            "date": row.get("date"),
-            "avg_sentiment_score": 0.0,
-            "avg_positive_prob": 0.0,
-            "avg_negative_prob": 0.0,
-            "avg_neutral_prob": 0.0,
-            "mention_count": 0,
-            "sentiment_label": "neutral",
-            "sentiment_confidence": 0.0,
-        }
-
-    scored_posts = []
-
-    for post in posts:
-        text = post.get("text", "")
-        scored_posts.append(get_sentiment_scores(text))
-
-    mention_count = len(scored_posts)
-
-    avg_positive_prob = sum(p["positive_prob"] for p in scored_posts) / mention_count
-    avg_negative_prob = sum(p["negative_prob"] for p in scored_posts) / mention_count
-    avg_neutral_prob = sum(p["neutral_prob"] for p in scored_posts) / mention_count
-    avg_sentiment_score = sum(p["sentiment_score"] for p in scored_posts) / mention_count
-
-    avg_probs = {
-        "positive": avg_positive_prob,
-        "negative": avg_negative_prob,
-        "neutral": avg_neutral_prob,
-    }
-
-    sentiment_label = max(avg_probs, key=avg_probs.get)
-    sentiment_confidence = max(avg_probs.values())
-
-    return {
-        "ticker": row.get("ticker"),
-        "date": row.get("date"),
-        "avg_sentiment_score": avg_sentiment_score,
-        "avg_positive_prob": avg_positive_prob,
-        "avg_negative_prob": avg_negative_prob,
-        "avg_neutral_prob": avg_neutral_prob,
-        "mention_count": mention_count,
-        "sentiment_label": sentiment_label,
-        "sentiment_confidence": sentiment_confidence,
-    }
-
-
-# TODO (Matthew): Add confidence thresholds - skip low-confidence predictions
-# TODO (Matthew): Implement caching for repeated text analysis
-# TODO (Matthew): Add batch processing optimization for large datasets
 # TODO (Mihir): Once NLP pipeline is finalized, integrate with backend API
 
 # Quick test when running file directly - loads data from Isaac's pipeline and runs sentiment analysis
@@ -273,10 +248,9 @@ if __name__ == "__main__":
 
     try:
         with open(data_path, 'r') as f:
-            grouped_records = json.load(f)
+            posts = json.load(f)
 
-        posts = flatten_grouped_pipeline_records(grouped_records)
-        print(f"Loaded {len(posts)} posts from grouped data pipeline")
+        print(f"Loaded {len(posts)} posts from data pipeline")
 
         # Convert to DataFrame for processing
         df = pd.DataFrame(posts)
