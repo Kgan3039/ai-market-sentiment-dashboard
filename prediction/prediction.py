@@ -224,8 +224,13 @@ def predict_batch(
     X_scaled = scaler.transform(X)
 
     chosen_model = lr if model == "lr" else rf
-    df["prediction"] = chosen_model.predict(X_scaled)
-    df["confidence"] = chosen_model.predict_proba(X_scaled).max(axis=1)
+    preds = chosen_model.predict(X_scaled)
+    probs = chosen_model.predict_proba(X_scaled)
+
+    df["predicted_movement"] = ["up" if p == 1 else "down" for p in preds]
+    df["probability"] = probs[:, 1].round(4)
+    df["confidence"] = probs[np.arange(len(preds)), preds].round(4)
+    df["model"] = model
     return df
 
 
@@ -250,3 +255,17 @@ if __name__ == "__main__":
             model="rf",
         )
     )
+
+    result = predict(
+        sentiment_score=0.41,
+        sentiment_confidence=0.58,
+        price_delta_24h=0.012,
+        volume_delta=0.10,
+        model="lr",
+    )
+    assert set(result.keys()) == {"predicted_movement", "probability", "confidence"}, \
+        f"Contract mismatch: {result.keys()}"
+    assert result["predicted_movement"] in ("up", "down")
+    assert 0.0 <= result["probability"] <= 1.0
+    assert 0.0 <= result["confidence"] <= 1.0
+    print("predict() contract verification passed:", result)
