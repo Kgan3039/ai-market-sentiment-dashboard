@@ -1,0 +1,24 @@
+[
+  {
+    "date":"2026-04-01",
+    "ticker":"NVDA",
+    "avg_sentiment_score":0.0138564967,
+    "avg_positive_prob":0.0389196938,
+    "avg_negative_prob":0.0250631971,
+    "avg_neutral_prob":0.9360171258,
+    "avg_sentiment_confidence":0.9360171258,
+    "avg_post_score":17.5,
+    "mention_count":2
+  },
+  {
+    "date":"2026-04-01",
+    "ticker":"TSLA",
+    "avg_sentiment_score":0.0088145584,
+    "avg_positive_prob":0.0377430283,
+    "avg_negative_prob":0.0289284699,
+    "avg_neutral_prob":0.9333285391,
+    "avg_sentiment_confidence":0.9333285391,
+    "avg_post_score":17.5,
+    "mention_count":2
+  }
+]

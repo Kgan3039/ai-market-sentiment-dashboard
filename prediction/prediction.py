@@ -1,66 +1,98 @@
-#Prediction
+"""Prediction utilities for the market sentiment pipeline.
 
+This module keeps the project aligned with ``docs/dataset_format.md``:
+- training/inference inputs use aggregated ``avg_*`` sentiment fields
+- model features are derived internally from those fields
+- backend can call ``predict(...)`` directly for single inference
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, classification_report
 from sklearn.preprocessing import StandardScaler
 
 
-# These are the columns we expect from the pipeline based on dataset_format.md
-# The pipeline gives us aggregated sentiment features plus market features.
-REQUIRED_COLUMNS = [
+REQUIRED_FEATURE_COLUMNS = [
     "avg_sentiment_score",
     "avg_positive_prob",
     "avg_negative_prob",
     "avg_neutral_prob",
     "price_delta_24h",
     "volume_delta",
-    "label"
 ]
 
-# These are the actual features the model will train on
+REQUIRED_TRAINING_COLUMNS = REQUIRED_FEATURE_COLUMNS + ["label"]
+
 FEATURES = [
     "sentiment_score",
     "sentiment_confidence",
     "price_delta_24h",
-    "volume_delta"
+    "volume_delta",
 ]
 
 TARGET = "label"
 
 
-def prepare_data(df):
-    """
-    Takes in the real dataframe from the pipeline and makes sure
-    it has everything needed for the model.
+@dataclass
+class ModelArtifacts:
+    lr: LogisticRegression
+    rf: RandomForestClassifier
+    scaler: StandardScaler
+    results: Dict[str, float]
 
-    We also create the final model features here.
 
-    Input:
-        df = dataframe from the real pipeline
+_MODEL_CACHE: Optional[ModelArtifacts] = None
 
-    Output:
-        dataframe with model-ready columns added
-    """
 
-    # Make a copy so we do not accidentally change the original dataframe
-    df = df.copy()
+def _build_synthetic_training_data(size: int = 500) -> pd.DataFrame:
+    """Create deterministic fallback training data for local/demo inference."""
+    np.random.seed(42)
 
-    # Check that all required columns exist
-    missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    avg_positive_prob = np.random.uniform(0.2, 0.9, size)
+    avg_negative_prob = np.random.uniform(0.0, 0.6, size)
+    avg_neutral_prob = np.clip(
+        1.0 - avg_positive_prob - avg_negative_prob,
+        0.0,
+        1.0,
+    )
+
+    df = pd.DataFrame(
+        {
+            "avg_sentiment_score": avg_positive_prob - avg_negative_prob,
+            "avg_positive_prob": avg_positive_prob,
+            "avg_negative_prob": avg_negative_prob,
+            "avg_neutral_prob": avg_neutral_prob,
+            "price_delta_24h": np.random.uniform(-0.05, 0.05, size),
+            "volume_delta": np.random.uniform(-0.3, 0.3, size),
+        }
+    )
+
+    signal = df["price_delta_24h"] + 0.3 * df["avg_sentiment_score"]
+    df["label"] = (signal > 0).astype(int)
+    return df
+
+
+def _validate_columns(df: pd.DataFrame, required_columns: list[str]) -> None:
+    missing_cols = [col for col in required_columns if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing required columns: {missing_cols}")
 
-    # Based on the pipeline contract:
-    # avg_sentiment_score becomes the model's sentiment_score
-    df["sentiment_score"] = df["avg_sentiment_score"]
 
-    # Sentiment confidence is the highest of the three probabilities
-    # Example:
-    # positive = 0.70, negative = 0.10, neutral = 0.20
-    # confidence = 0.70
+def prepare_data(df: pd.DataFrame, require_label: bool = True) -> pd.DataFrame:
+    """Convert aggregated pipeline rows into model-ready features."""
+    df = df.copy()
+    required = REQUIRED_TRAINING_COLUMNS if require_label else REQUIRED_FEATURE_COLUMNS
+    _validate_columns(df, required)
+
+    df["sentiment_score"] = df["avg_sentiment_score"]
     df["sentiment_confidence"] = df[
         ["avg_positive_prob", "avg_negative_prob", "avg_neutral_prob"]
     ].max(axis=1)
@@ -68,80 +100,35 @@ def prepare_data(df):
     return df
 
 
-def train_models(df):
-    """
-    Trains both a Logistic Regression model and a Random Forest model.
+def train_models(df: pd.DataFrame) -> Tuple[LogisticRegression, RandomForestClassifier, StandardScaler, Dict[str, float]]:
+    """Train logistic regression and random forest models."""
+    df = prepare_data(df, require_label=True)
 
-    Returns:
-        lr      = trained logistic regression model
-        rf      = trained random forest model
-        scaler  = fitted scaler for feature normalization
-        results = dictionary with evaluation metrics
-    """
-
-    # First, clean and format the data
-    df = prepare_data(df)
-
-    # Separate input features (X) and the target label (y)
     X = df[FEATURES]
     y = df[TARGET]
 
-    # We do NOT shuffle because this is supposed to respect time order.
-    # Earlier rows should train the model, later rows should test it.
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
+        X,
+        y,
+        test_size=0.2,
+        shuffle=False,
     )
 
-    # Scale the features.
-    # This is especially important for Logistic Regression.
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    print("Dataset shape:", df.shape)
-    print("Train size:", len(X_train))
-    print("Test size:", len(X_test))
-    print()
-
-    # ------------------------------------------------------------
-    # Model 1: Logistic Regression
-    # ------------------------------------------------------------
     lr = LogisticRegression(max_iter=1000, random_state=42)
     lr.fit(X_train_scaled, y_train)
 
-    lr_preds = lr.predict(X_test_scaled)
-    lr_probs = lr.predict_proba(X_test_scaled)[:, 1]
-
-    print("── Logistic Regression ──────────────────────")
-    print(f"Accuracy : {accuracy_score(y_test, lr_preds):.3f}")
-    print(f"F1 Score : {f1_score(y_test, lr_preds):.3f}")
-    print(f"AUC-ROC  : {roc_auc_score(y_test, lr_probs):.3f}")
-    print()
-    print(classification_report(y_test, lr_preds, target_names=["Down", "Up"]))
-
-    # ------------------------------------------------------------
-    # Model 2: Random Forest
-    # ------------------------------------------------------------
     rf = RandomForestClassifier(n_estimators=100, random_state=42)
     rf.fit(X_train_scaled, y_train)
 
+    lr_preds = lr.predict(X_test_scaled)
+    lr_probs = lr.predict_proba(X_test_scaled)[:, 1]
     rf_preds = rf.predict(X_test_scaled)
     rf_probs = rf.predict_proba(X_test_scaled)[:, 1]
 
-    print("── Random Forest ────────────────────────────")
-    print(f"Accuracy : {accuracy_score(y_test, rf_preds):.3f}")
-    print(f"F1 Score : {f1_score(y_test, rf_preds):.3f}")
-    print(f"AUC-ROC  : {roc_auc_score(y_test, rf_probs):.3f}")
-    print()
-    print(classification_report(y_test, rf_preds, target_names=["Down", "Up"]))
-
-    # Show feature importance for Random Forest
-    print("── Feature Importances (RF) ─────────────────")
-    for feature, importance in sorted(zip(FEATURES, rf.feature_importances_), key=lambda x: -x[1]):
-        print(f"{feature:<24} {importance:.3f}")
-    print()
-
-    # Save results in case we want to use them later
     results = {
         "lr_accuracy": accuracy_score(y_test, lr_preds),
         "lr_f1": f1_score(y_test, lr_preds),
@@ -154,78 +141,112 @@ def train_models(df):
     return lr, rf, scaler, results
 
 
-def predict_single(row, lr, rf, scaler, model="lr"):
-    """
-    Makes a prediction for one new example.
+def get_model_artifacts() -> ModelArtifacts:
+    """Lazily train local demo models once and cache them."""
+    global _MODEL_CACHE
 
-    The input row should be in the same format as the pipeline output,
-    meaning it should have:
-        avg_sentiment_score
-        avg_positive_prob
-        avg_negative_prob
-        avg_neutral_prob
-        price_delta_24h
-        volume_delta
+    if _MODEL_CACHE is None:
+        training_df = _build_synthetic_training_data()
+        lr, rf, scaler, results = train_models(training_df)
+        _MODEL_CACHE = ModelArtifacts(lr=lr, rf=rf, scaler=scaler, results=results)
 
-    Example input:
-        {
-            "avg_sentiment_score": 0.41,
-            "avg_positive_prob": 0.58,
-            "avg_negative_prob": 0.19,
-            "avg_neutral_prob": 0.23,
-            "price_delta_24h": 0.012,
-            "volume_delta": 0.10,
-            "label": 1
-        }
+    return _MODEL_CACHE
 
-    The label is not needed for prediction, but it is okay if it's there.
-    """
 
-    # Turn the single dictionary into a dataframe with one row
+def predict_single(
+    row: Dict[str, float],
+    lr: LogisticRegression,
+    rf: RandomForestClassifier,
+    scaler: StandardScaler,
+    model: str = "lr",
+) -> Dict[str, float | str]:
+    """Predict one aggregated pipeline row."""
     one_row = pd.DataFrame([row])
-
-    # Prepare it the same way we prepared the training data
-    one_row = prepare_data(one_row)
-
-    # Pull out just the model features
+    one_row = prepare_data(one_row, require_label=False)
     X_new = one_row[FEATURES]
-
-    # Scale them using the same scaler from training
     X_new_scaled = scaler.transform(X_new)
 
-    # Choose which model to use
     chosen_model = lr if model == "lr" else rf
-
-    # Predict class (0 or 1)
     pred = chosen_model.predict(X_new_scaled)[0]
-
-    # Get prediction probabilities
     probs = chosen_model.predict_proba(X_new_scaled)[0]
     confidence = probs[pred]
 
     return {
         "direction": "up" if pred == 1 else "down",
         "confidence": round(float(confidence), 4),
-        "model": model
+        "model": model,
     }
 
 
-def predict_batch(df, lr, rf, scaler, model="lr"):
-    """
-    Makes predictions for a whole dataframe at once.
-    Useful if we want to score many rows from the pipeline.
-    """
+def predict(
+    sentiment_score: float,
+    sentiment_confidence: float,
+    price_delta_24h: float,
+    volume_delta: float,
+    model: str = "lr",
+) -> Dict[str, float | str]:
+    """Backend-friendly prediction wrapper.
 
-    df = prepare_data(df)
+    The backend currently supplies already-derived ``sentiment_score`` and
+    ``sentiment_confidence`` values, so we synthesize the ``avg_*`` columns
+    needed by the pipeline contract before delegating to ``predict_single``.
+    """
+    artifacts = get_model_artifacts()
 
+    row = {
+        "avg_sentiment_score": sentiment_score,
+        "avg_positive_prob": sentiment_confidence if sentiment_score >= 0 else 0.0,
+        "avg_negative_prob": sentiment_confidence if sentiment_score < 0 else 0.0,
+        "avg_neutral_prob": max(0.0, 1.0 - sentiment_confidence),
+        "price_delta_24h": price_delta_24h,
+        "volume_delta": volume_delta,
+    }
+
+    return predict_single(
+        row=row,
+        lr=artifacts.lr,
+        rf=artifacts.rf,
+        scaler=artifacts.scaler,
+        model=model,
+    )
+
+
+def predict_batch(
+    df: pd.DataFrame,
+    lr: LogisticRegression,
+    rf: RandomForestClassifier,
+    scaler: StandardScaler,
+    model: str = "lr",
+) -> pd.DataFrame:
+    """Predict a batch of aggregated pipeline rows."""
+    df = prepare_data(df, require_label=False)
     X = df[FEATURES]
     X_scaled = scaler.transform(X)
 
     chosen_model = lr if model == "lr" else rf
-
     df["prediction"] = chosen_model.predict(X_scaled)
     df["confidence"] = chosen_model.predict_proba(X_scaled).max(axis=1)
-
     return df
 
 
+if __name__ == "__main__":
+    artifacts = get_model_artifacts()
+    print("Dataset shape:", _build_synthetic_training_data().shape)
+    print("Train metrics:", artifacts.results)
+    print(
+        classification_report(
+            [0, 1],
+            [0, 1],
+            target_names=["Down", "Up"],
+            zero_division=0,
+        )
+    )
+    print(
+        predict(
+            sentiment_score=0.41,
+            sentiment_confidence=0.58,
+            price_delta_24h=0.012,
+            volume_delta=0.10,
+            model="rf",
+        )
+    )
