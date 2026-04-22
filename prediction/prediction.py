@@ -230,7 +230,6 @@ def predict_batch(
     df["predicted_movement"] = ["up" if p == 1 else "down" for p in preds]
     df["probability"] = probs[:, 1].round(4)
     df["confidence"] = probs[np.arange(len(preds)), preds].round(4)
-    df["model"] = model
     return df
 
 
