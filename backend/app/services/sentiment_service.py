@@ -44,6 +44,36 @@ def _pipeline_file_path() -> str:
     )
 
 
+def _load_grouped_posts(ticker: str) -> list[dict[str, Any]]:
+    pipeline_path = _pipeline_file_path()
+    if not os.path.exists(pipeline_path):
+        return []
+
+    try:
+        with open(pipeline_path, "r") as file:
+            records = json.load(file)
+    except Exception:
+        return []
+
+    flattened_posts = []
+    for record in records:
+        if record.get("ticker", "").upper() != ticker:
+            continue
+
+        for post in record.get("posts", []) or []:
+            flattened_posts.append(
+                {
+                    "ticker": ticker,
+                    "date": record.get("date"),
+                    "text": post.get("text", ""),
+                    "source": post.get("source", "unknown"),
+                    "post_score": post.get("post_score", 0),
+                }
+            )
+
+    return flattened_posts
+
+
 class SentimentService:
     """Service for managing sentiment analysis operations."""
 
@@ -109,12 +139,7 @@ class SentimentService:
             'timestamp': datetime.now().isoformat(),
         }
 
-        posts = []
-        pipeline_path = _pipeline_file_path()
-        if os.path.exists(pipeline_path):
-            with open(pipeline_path, 'r') as f:
-                all_posts = json.load(f)
-            posts = [p for p in all_posts if p.get('ticker', '').upper() == ticker]
+        posts = _load_grouped_posts(ticker)
 
         if not posts:
             return {
