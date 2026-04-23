@@ -7,22 +7,42 @@ Data → NLP → Prediction
 
 ## 1. Raw Data (Data → NLP)
 
-Each row = one social media post
+Each row = one grouped ticker/date record
 
 Fields:
 - ticker (string) — e.g. "NVDA"
 - date (string) — ISO format
+- posts (array)
+- market_data (object)
+
+Each post contains:
 - text (string)
-- source (string) — e.g. "reddit"
+- source (string)
 - post_score (int)
+
+market_data contains:
+- price (float)
+- price_delta_24h (float)
+- percent_change_24h (float)
+- volume (int)
 
 Example:
 {
   "ticker": "NVDA",
   "date": "2026-03-27",
-  "text": "NVDA is going crazy after earnings",
-  "source": "reddit",
-  "post_score": 42
+  "posts": [
+    {
+      "text": "NVDA is going crazy after earnings",
+      "source": "reddit",
+      "post_score": 42
+    }
+  ],
+  "market_data": {
+    "price": 910.5,
+    "price_delta_24h": 12.4,
+    "percent_change_24h": 1.38,
+    "volume": 1250000
+  }
 }
 
 ---

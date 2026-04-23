@@ -1,90 +1,151 @@
-"""Data Pipeline - Generates raw social media posts with market features.
+"""Data pipeline output generator.
 
 Author: Isaac
-Responsibility: Collect social media data from approved APIs and combine with market data
-
-Dataset Format Contract:
-- Output format must match dataset_format.md specification
-- Fields: ticker, date, text, source, post_score, price_delta_24h, volume_delta
-- This data flows into Matthew NLP pipeline
+Responsibility: Collect market/news data when available and write grouped
+records that downstream services can consume consistently.
 """
 
+from __future__ import annotations
+
 import json
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
-tickers = ["NVDA", "TSLA"]
-data_out = []
-output_path = Path(__file__).with_name("stock_data.json")
+import requests
+from dotenv import load_dotenv
 
 
-def get_market_deltas(ticker: str) -> tuple[float, float]:
-    """Fetch market deltas when available, otherwise return demo-safe defaults."""
+load_dotenv()
+
+TICKERS = ["NVDA", "TSLA"]
+OUTPUT_PATH = Path(__file__).with_name("stock_data.json")
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        import yfinance as yf
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="5d")
 
-        if len(hist) >= 2:
-            current_price = hist["Close"].iloc[-1]
-            previous_price = hist["Close"].iloc[-2]
-            price_delta_24h = (
-                (current_price - previous_price) / previous_price if previous_price else 0.0
-            )
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-            recent_volume = hist["Volume"].iloc[-1]
-            avg_volume = hist["Volume"].tail(5).mean()
-            volume_delta = (recent_volume - avg_volume) / avg_volume if avg_volume > 0 else 0.0
-            return float(price_delta_24h), float(volume_delta)
-    except Exception:
-        pass
 
-    return 0.0, 0.0
-
-for t in tickers:
-    price_delta_24h, volume_delta = get_market_deltas(t)
-
-    # Get current date in ISO format
-    current_date = datetime.now().date().isoformat()
-
-    # Social media data in dataset_format.md format
-    # TODO (Isaac): Replace with real Reddit API data when approved
-    #   - Once Reddit API access is granted, fetch real posts from r/stocks, r/investing, etc.
-    #   - Parse post content and assign post_score based on engagement (upvotes, comments)
-    #   - Ensure date is in ISO format and post_score is numeric
-    social_posts = [
+def build_mock_posts(ticker: str) -> list[dict[str, Any]]:
+    """Return demo-safe placeholder posts when live ingestion is unavailable."""
+    return [
         {
-            "ticker": t,
-            "date": current_date,
-            "text": "Sample post while waiting for API approval",
-            "source": "reddit",
-            "post_score": 10,
-            "price_delta_24h": price_delta_24h,
-            "volume_delta": volume_delta
+            "text": f"{ticker} beat expectations with strong growth and bullish demand signals.",
+            "source": "mock_news",
+            "post_score": 1,
         },
         {
-            "ticker": t,
-            "date": current_date,
-            "text": f"Discussion about {t} on r/stocks",
-            "source": "reddit",
-            "post_score": 25,
-            "price_delta_24h": price_delta_24h,
-            "volume_delta": volume_delta
-        }
+            "text": f"Investors expect further gains as {ticker} shows strong momentum.",
+            "source": "mock_social",
+            "post_score": 1,
+        },
     ]
 
-    data_out.extend(social_posts)
 
-# Save raw data next to this script so the backend can load it reliably.
-with output_path.open("w") as f:
-    json.dump(data_out, f, indent=4)
+def build_mock_market_data(ticker: str) -> dict[str, Any]:
+    """Return stable placeholder market data for local development."""
+    base_prices = {"NVDA": 910.5, "TSLA": 174.2}
+    base_price = base_prices.get(ticker, 100.0)
+    price_delta = 2.5 if ticker == "NVDA" else -1.2
+    percent_change = (price_delta / base_price) * 100 if base_price else 0.0
 
-# TODO (Isaac): Add error handling for missing market data
-# TODO (Isaac): Add retry logic for yfinance rate limiting
-# TODO (Isaac): Implement data validation to ensure all required fields are present
-# TODO (Isaac): Add logging to track data pipeline execution
-# TODO (Mihir): Once data pipeline is finalized, set up scheduled execution (e.g., hourly)
+    return {
+        "price": round(base_price, 2),
+        "price_delta_24h": round(price_delta, 2),
+        "percent_change_24h": round(percent_change, 2),
+        "volume": 1_250_000 if ticker == "NVDA" else 980_000,
+    }
 
-print(f"Pipeline updated with real market data. Saved to {output_path}")
-print(f"Generated {len(data_out)} social media posts in dataset_format.md format")
+
+def get_market_snapshot(ticker: str, api_key: str | None) -> dict[str, Any]:
+    """Fetch market snapshot when a Finnhub key is configured, else use mock data."""
+    if not api_key:
+        return build_mock_market_data(ticker)
+
+    quote_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
+    try:
+        response = requests.get(quote_url, timeout=10)
+        response.raise_for_status()
+        quote = response.json()
+        return {
+            "price": _safe_float(quote.get("c")),
+            "price_delta_24h": _safe_float(quote.get("d")),
+            "percent_change_24h": _safe_float(quote.get("dp")),
+            "volume": _safe_int(quote.get("v"), default=0),
+        }
+    except Exception:
+        return build_mock_market_data(ticker)
+
+
+def get_posts(ticker: str, api_key: str | None) -> list[dict[str, Any]]:
+    """Fetch company news when available, else use mock posts."""
+    if not api_key:
+        return build_mock_posts(ticker)
+
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+    news_url = (
+        "https://finnhub.io/api/v1/company-news"
+        f"?symbol={ticker}&from={start_date}&to={end_date}&token={api_key}"
+    )
+
+    try:
+        response = requests.get(news_url, timeout=10)
+        response.raise_for_status()
+        articles = response.json()
+        posts = []
+        for article in articles[:15]:
+            posts.append(
+                {
+                    "text": article.get("headline", ""),
+                    "source": article.get("source", "finnhub"),
+                    "post_score": 1,
+                }
+            )
+        return posts or build_mock_posts(ticker)
+    except Exception:
+        return build_mock_posts(ticker)
+
+
+def build_grouped_record(ticker: str, date: str, api_key: str | None) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "date": date,
+        "posts": get_posts(ticker, api_key),
+        "market_data": get_market_snapshot(ticker, api_key),
+    }
+
+
+def main() -> None:
+    current_date = datetime.now().date().isoformat()
+    finnhub_api_key = os.getenv("FINNHUB_API_KEY")
+
+    data_out = [
+        build_grouped_record(ticker=ticker, date=current_date, api_key=finnhub_api_key)
+        for ticker in TICKERS
+    ]
+
+    with OUTPUT_PATH.open("w") as file:
+        json.dump(data_out, file, indent=2)
+
+    print(f"Saved grouped pipeline data to {OUTPUT_PATH}")
+    print(f"Generated {len(data_out)} ticker records")
+
+
+if __name__ == "__main__":
+    main()

@@ -52,10 +52,35 @@ def _pipeline_file_path() -> str:
     )
 
 
-def _aggregated_sentiment_file_path() -> str:
-    return os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "aggregated_sentiment.json")
-    )
+def _load_grouped_posts(ticker: str) -> list[dict[str, Any]]:
+    pipeline_path = _pipeline_file_path()
+    if not os.path.exists(pipeline_path):
+        return []
+
+    try:
+        with open(pipeline_path, "r") as file:
+            records = json.load(file)
+    except Exception:
+        return []
+
+    flattened_posts = []
+    for record in records:
+        if record.get("ticker", "").upper() != ticker:
+            continue
+
+        for post in record.get("posts", []) or []:
+            flattened_posts.append(
+                {
+                    "ticker": ticker,
+                    "date": record.get("date"),
+                    "text": post.get("text", ""),
+                    "source": post.get("source", "unknown"),
+                    "post_score": post.get("post_score", 0),
+                }
+            )
+
+    return flattened_posts
+
 
 class SentimentService:
     """Service for managing sentiment analysis operations."""
@@ -119,47 +144,10 @@ class SentimentService:
             'ticker': ticker,
             'overall_sentiment': None,
             'source_breakdown': {},
-            'date': datetime.now().date().isoformat(),
+            'timestamp': datetime.now().isoformat(),
         }
 
-        aggregated_path = _aggregated_sentiment_file_path()
-        if os.path.exists(aggregated_path):
-            try:
-                with open(aggregated_path, 'r') as f:
-                    aggregated_rows = json.load(f)
-
-                for row in aggregated_rows:
-                    if row.get('ticker', '').upper() == ticker:
-                        confidence = float(
-                            row.get(
-                                'avg_sentiment_confidence',
-                                max(
-                                    row.get('avg_positive_prob', 0.0),
-                                    row.get('avg_negative_prob', 0.0),
-                                    row.get('avg_neutral_prob', 0.0),
-                                ),
-                            )
-                        )
-                        score = float(row.get('avg_sentiment_score', 0.0))
-                        grouped['overall_sentiment'] = SentimentScores(
-                            positive_prob=float(row.get('avg_positive_prob', 0.0)),
-                            negative_prob=float(row.get('avg_negative_prob', 0.0)),
-                            neutral_prob=float(row.get('avg_neutral_prob', 0.0)),
-                            sentiment_score=score,
-                            sentiment_label='positive' if score > 0.05 else ('negative' if score < -0.05 else 'neutral'),
-                            sentiment_confidence=confidence,
-                        ).model_dump()
-                        grouped['date'] = row.get('date', grouped['date'])
-                        return grouped
-            except Exception:
-                pass
-
-        posts = []
-        pipeline_path = _pipeline_file_path()
-        if os.path.exists(pipeline_path):
-            with open(pipeline_path, 'r') as f:
-                all_posts = json.load(f)
-            posts = [p for p in all_posts if p.get('ticker', '').upper() == ticker]
+        posts = _load_grouped_posts(ticker)
 
         if not posts:
             return {
