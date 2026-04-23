@@ -1,65 +1,36 @@
-"""
-Dashboard Routes
+"""Dashboard routes for aggregated frontend summary data."""
 
-Endpoints for the frontend dashboard to retrieve aggregated data.
+from __future__ import annotations
 
-Author: Mihir (with aggregation from Matthew NLP, Isaac data, Abhi ML)
-Status: Placeholder implementation - awaiting service integrations
-
-Endpoints:
-- GET /dashboard/summary/{ticker} - Get comprehensive dashboard summary for one stock
-- GET /dashboard/summary-batch - Get dashboard summaries for multiple stocks
-
-TODO (Mihir): Add in-memory caching with 1 hour TTL
-TODO (Srish): Add real-time WebSocket or Server-Sent Events (SSE) for live updates
-TODO (Srish): Add historical data support (date range filtering)
-TODO (Mihir): Add performance metrics (query execution time, cache hit rate)
-TODO (Srish): Add pagination support for large watchlists
-TODO (Srish): Add portfolio aggregation (summed sentiment, average prediction)
-"""
+from typing import List
 
 from fastapi import APIRouter, HTTPException, Query
-from typing import List
-from app.models.schemas import DashboardSummary
-from app.services.sentiment_service import SentimentService
-from app.services.prediction_service import PredictionService
+
+from app.models.schemas import AvailabilityStatus, DashboardAvailability, DashboardSummary
 from app.services.data_service import DataService
+from app.services.prediction_service import PredictionService
+from app.services.sentiment_service import SentimentService
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+
+def _availability_status(available: bool, source: str, detail: str, item_count: int | None = None) -> AvailabilityStatus:
+    return AvailabilityStatus(
+        available=available,
+        source=source,
+        detail=detail,
+        item_count=item_count,
+    )
 
 
 @router.get("/summary/{ticker}", response_model=DashboardSummary)
 async def get_dashboard_summary(ticker: str):
     """
-    Get comprehensive dashboard summary for a stock.
+    Get a comprehensive dashboard summary for a stock ticker.
 
-    Combines sentiment, market data, and predictions into a single response
-    for efficient frontend rendering.
-
-    Args:
-        ticker (str): Stock ticker symbol
-
-    Returns:
-        DashboardSummary: Aggregated sentiment, market data, and prediction
-
-    Raises:
-        HTTPException: 404 if ticker not found
-
-    Example:
-        GET /dashboard/summary/NVDA
-        Response: {
-            "ticker": "NVDA",
-            "date": "2026-04-01",
-            "sentiment": {...},
-            "market_data": {...},
-            "prediction": {...}
-        }
-
-    TODO (Mihir): Add @lru_cache to cache dashboard data (1 hour TTL)
-    TODO (Srish): Add optional date parameter to get historical dashboard
-    TODO (Srish): Add sentiment_source_breakdown (Reddit vs News sentiment)
-    TODO (Srish): Add technical indicators (RSI, MACD, Bollinger Bands)
-    TODO (Srish): Add analyst ratings (if available from market data API)
+    Existing contract fields (`ticker`, `date`, `sentiment`, `market_data`, `prediction`)
+    remain unchanged. Additional fields extend the response with headline items,
+    availability metadata, and fundamentals.
     """
     if not ticker or len(ticker) < 1:
         raise HTTPException(status_code=400, detail="Invalid ticker symbol")
@@ -67,21 +38,12 @@ async def get_dashboard_summary(ticker: str):
     try:
         ticker = ticker.upper()
 
-        # Get data from all services
         sentiment_data = SentimentService.get_sentiment_for_ticker(ticker)
         market_data = DataService.get_market_data(ticker)
         prediction_data = PredictionService.predict_for_ticker(ticker)
+        headline_data = DataService.get_headlines_for_ticker(ticker)
+        fundamentals_data = DataService.get_fundamentals_for_ticker(ticker)
 
-        # Handle async returns if services are async
-        import asyncio
-        if asyncio.iscoroutine(sentiment_data):
-            sentiment_data = await sentiment_data
-        if asyncio.iscoroutine(market_data):
-            market_data = await market_data
-        if asyncio.iscoroutine(prediction_data):
-            prediction_data = await prediction_data
-
-        # Validate responses
         if not sentiment_data or "overall_sentiment" not in sentiment_data:
             raise ValueError("Invalid sentiment data")
         if not market_data or not hasattr(market_data, "date"):
@@ -89,60 +51,61 @@ async def get_dashboard_summary(ticker: str):
         if not prediction_data or "prediction" not in prediction_data:
             raise ValueError("Invalid prediction data")
 
-        # Combine into dashboard summary
+        headlines = headline_data.get("headlines", [])
+        fundamentals = fundamentals_data.get("fundamentals")
+
+        availability = DashboardAvailability(
+            sentiment=_availability_status(
+                available=sentiment_data.get("overall_sentiment") is not None,
+                source=sentiment_data.get("source", "unknown"),
+                item_count=sentiment_data.get("item_count"),
+                detail=f"Scored {sentiment_data.get('item_count', 0)} text items",
+            ),
+            prediction=_availability_status(
+                available=prediction_data.get("prediction") is not None,
+                source=prediction_data.get("source", "unknown"),
+                detail="Generated from current market and sentiment inputs",
+            ),
+            headlines=_availability_status(
+                available=len(headlines) > 0,
+                source=headline_data.get("source", "unknown"),
+                item_count=len(headlines),
+                detail=f"{len(headlines)} headline item(s) available",
+            ),
+            fundamentals=_availability_status(
+                available=fundamentals is not None,
+                source=fundamentals_data.get("source", "unknown"),
+                detail="Fundamentals source available" if fundamentals is not None else "No fundamentals source available",
+            ),
+        )
+
         return DashboardSummary(
             ticker=ticker,
             date=market_data.date,
             sentiment=sentiment_data["overall_sentiment"],
             market_data=market_data,
             prediction=prediction_data["prediction"],
+            headlines=headlines,
+            availability=availability,
+            fundamentals=fundamentals,
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error retrieving dashboard data: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error retrieving dashboard data: {str(e)}")
 
 
 @router.get("/summary-batch")
 async def get_dashboard_summary_batch(tickers: List[str] = Query(...)):
-    """
-    Get dashboard summaries for multiple stocks.
-
-    Args:
-        tickers (List[str]): List of stock ticker symbols
-
-    Returns:
-        List[DashboardSummary]: Dashboard data for each ticker
-
-    Example:
-        GET /dashboard/summary-batch?tickers=NVDA&tickers=TSLA
-        Response: [
-            {"ticker": "NVDA", "sentiment": {...}, ...},
-            {"ticker": "TSLA", "sentiment": {...}, ...}
-        ]
-
-    TODO (Mihir): Add @lru_cache with composite cache key of all tickers
-    TODO (Srish): Implement Server-Sent Events (SSE) for live dashboard updates
-    TODO (Srish): Add portfolio-level aggregation (average sentiment, combined signals)
-    TODO (Mihir): Implement streaming response for large ticker lists
-    TODO (Srish): Add sorting/filtering options (by sentiment, prediction, risk)
-    TODO (Srish): Add portfolio performance tracking (aggregate P&L)
-    """
+    """Get dashboard summaries for multiple stocks."""
     if not tickers or len(tickers) == 0:
         raise HTTPException(status_code=400, detail="At least one ticker required")
-    
+
     if len(tickers) > 10:
-        raise HTTPException(
-            status_code=400, detail="Maximum 10 tickers per request"
-        )
+        raise HTTPException(status_code=400, detail="Maximum 10 tickers per request")
 
     try:
         summaries = []
         for ticker in tickers:
-            data = await get_dashboard_summary(ticker.upper())
-            summaries.append(data)
+            summaries.append(await get_dashboard_summary(ticker.upper()))
         return summaries
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Error retrieving dashboard summaries: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error retrieving dashboard summaries: {str(e)}")
