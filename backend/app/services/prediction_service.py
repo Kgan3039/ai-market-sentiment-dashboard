@@ -69,8 +69,8 @@ class PredictionService:
 
                 return PredictionResponse(
                     symbol=ticker,
-                    predicted_movement=result.get('predicted_movement', result.get('direction', 'neutral')),
-                    probability=float(result.get('probability', result.get('confidence', 0.0))),
+                    predicted_movement=result.get('predicted_movement', 'neutral'),
+                    probability=float(result.get('probability', 0.0)),
                     confidence=float(result.get('confidence', 0.0)),
                 )
             except Exception:
