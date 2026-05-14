@@ -18,16 +18,37 @@ TODO (Srish): Add pagination support for large watchlists
 TODO (Srish): Add portfolio aggregation (summed sentiment, average prediction)
 """
 
-from fastapi import APIRouter, HTTPException, Query
-from typing import List
 from datetime import datetime
-from app.models.schemas import DashboardSummary
+from typing import List
+
+from fastapi import APIRouter, HTTPException, Query
+
+from app.models.schemas import (
+    ComponentAvailability,
+    DashboardAvailability,
+    DashboardSummary,
+)
 from app.services.sentiment_service import SentimentService
 from app.services.prediction_service import PredictionService
 from app.services.data_service import DataService
-from datetime import datetime
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+
+def _availability(
+    available: bool,
+    status: str,
+    source: str,
+    message: str,
+    count: int = None,
+) -> ComponentAvailability:
+    return ComponentAvailability(
+        available=available,
+        status=status,
+        source=source,
+        message=message,
+        count=count,
+    )
 
 
 @router.get("/summary/{ticker}", response_model=DashboardSummary)
@@ -73,13 +94,79 @@ async def get_dashboard_summary(ticker: str):
         sentiment_data = SentimentService.get_sentiment_for_ticker(ticker)
         market_data = DataService.get_market_data(ticker)
         prediction_data = PredictionService.predict_for_ticker(ticker)
+        headlines = DataService.get_headlines(ticker)
+        fundamentals = DataService.get_fundamentals(ticker)
+
+        for headline in headlines:
+            headline.sentiment = SentimentService.get_sentiment_for_text(headline.headline)
+
+        overall_sentiment = sentiment_data["overall_sentiment"]
+        prediction = prediction_data["prediction"]
+
+        availability = DashboardAvailability(
+            sentiment=_availability(
+                available=overall_sentiment is not None,
+                status="ready" if overall_sentiment is not None else "unavailable",
+                source="NLP pipeline",
+                message=(
+                    "Sentiment scores are available."
+                    if overall_sentiment is not None
+                    else "No sentiment score was produced."
+                ),
+            ),
+            market_data=_availability(
+                available=market_data.price > 0,
+                status="ready" if market_data.price > 0 else "fallback",
+                source="Pipeline/yfinance",
+                message=(
+                    "Market data is available."
+                    if market_data.price > 0
+                    else "Market provider is unavailable; zero-value fallback is in use."
+                ),
+            ),
+            prediction=_availability(
+                available=prediction is not None,
+                status="ready" if prediction is not None else "unavailable",
+                source=prediction_data.get("model_info", {}).get("name", "Prediction service"),
+                message=(
+                    "Prediction output is available."
+                    if prediction is not None
+                    else "Prediction service did not return an output."
+                ),
+            ),
+            headlines=_availability(
+                available=len(headlines) > 0,
+                status="ready" if headlines else "unavailable",
+                source="Yahoo Finance via yfinance",
+                message=(
+                    f"{len(headlines)} headline items are available."
+                    if headlines
+                    else "Headline provider is unavailable or returned no articles."
+                ),
+                count=len(headlines),
+            ),
+            fundamentals=_availability(
+                available=fundamentals is not None,
+                status="ready" if fundamentals is not None else "unavailable",
+                source="Yahoo Finance via yfinance",
+                message=(
+                    "Company fundamentals are available."
+                    if fundamentals is not None
+                    else "Fundamentals provider is unavailable or returned no usable fields."
+                ),
+            ),
+        )
 
         # Combine into dashboard summary
         return DashboardSummary(
             ticker=ticker,
-            sentiment=sentiment_data["overall_sentiment"],
+            sentiment=overall_sentiment,
             market_data=market_data,
-            prediction=prediction_data["prediction"],
+            prediction=prediction,
+            headlines=headlines,
+            fundamentals=fundamentals,
+            availability=availability,
+            status=availability.model_dump(),
             updated_at=datetime.now(),
         )
     except Exception as e:

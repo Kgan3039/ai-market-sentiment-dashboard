@@ -1,37 +1,40 @@
 import { useState } from "react";
 
-export default function NewsFeed({ news, socialPosts }) {
+export default function NewsFeed({ news = [], socialPosts = [] }) {
   const [activeTab, setActiveTab] = useState("news");
+  const items = activeTab === "news" ? news : socialPosts;
 
   return (
     <section className="card">
       <div className="section-header">
         <h2 className="section-title">Market Pulse</h2>
         <div className="toggle-group">
-          <button className={`toggle-btn ${activeTab === "news" ? "active" : ""}`} onClick={() => setActiveTab("news")}>
+          <button
+            className={`toggle-btn ${activeTab === "news" ? "active" : ""}`}
+            onClick={() => setActiveTab("news")}
+          >
             Headlines
           </button>
-          <button className={`toggle-btn ${activeTab === "social" ? "active" : ""}`} onClick={() => setActiveTab("social")}>
+          <button
+            className={`toggle-btn ${activeTab === "social" ? "active" : ""}`}
+            onClick={() => setActiveTab("social")}
+          >
             Social
           </button>
         </div>
       </div>
 
-      {/* Conditional rendering — show one tab's content based on state */}
-      {activeTab === "news" && (
+      {items.length > 0 ? (
         <div className="feed-list">
-          {/* .map() loops over the array and renders a component for each item */}
-          {news.map((item) => (
-            <NewsItem key={item.id} item={item} />
-          ))}
+          {activeTab === "news"
+            ? news.map((item, index) => <NewsItem key={item.id || index} item={item} />)
+            : socialPosts.map((post, index) => (
+                <SocialPost key={post.id || index} post={post} />
+              ))}
         </div>
-      )}
-
-      {activeTab === "social" && (
-        <div className="feed-list">
-          {socialPosts.map((post) => (
-            <SocialPost key={post.id} post={post} />
-          ))}
+      ) : (
+        <div className="empty-state">
+          This API response does not currently include {activeTab === "news" ? "headline" : "social"} items.
         </div>
       )}
     </section>
@@ -39,14 +42,25 @@ export default function NewsFeed({ news, socialPosts }) {
 }
 
 function NewsItem({ item }) {
+  const sentiment = item.sentiment?.sentiment_label;
+
   return (
-    <a href={item.url} className="news-item">
+    <a
+      href={item.url || "#"}
+      className="news-item"
+      target={item.url ? "_blank" : undefined}
+      rel={item.url ? "noreferrer" : undefined}
+    >
       <div className="news-meta">
-        <span className="news-source">{item.source}</span>
-        <span className="news-time">{item.time}</span>
-        <span className={`sentiment-pill ${item.sentiment}`}>{item.sentiment}</span>
+        <span className="news-source">{item.source || "Source"}</span>
+        <span className="news-time">
+          {sentiment ? `${sentiment} · ` : ""}
+          {item.time || "N/A"}
+        </span>
       </div>
-      <p className="news-headline">{item.headline}</p>
+      <p className="news-headline">
+        {item.headline || item.title || "No headline available."}
+      </p>
     </a>
   );
 }
@@ -55,12 +69,10 @@ function SocialPost({ post }) {
   return (
     <div className="social-post">
       <div className="social-meta">
-        <span className="social-platform">{post.platform}</span>
-        <span className="social-handle">{post.handle}</span>
-        <span className={`sentiment-pill ${post.sentiment}`}>{post.sentiment}</span>
-        <span className="social-likes">♥ {post.likes}</span>
+        <span className="social-platform">{post.platform || "Social"}</span>
+        <span className="social-handle">{post.handle || "Unknown"}</span>
       </div>
-      <p className="social-content">"{post.content}"</p>
+      <p className="social-content">{post.content || "No social post content available."}</p>
     </div>
   );
 }
