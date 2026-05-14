@@ -6,7 +6,7 @@ All endpoints return data matching these schemas.
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 from datetime import datetime
 
 
@@ -102,6 +102,65 @@ class TextAnalysisRequest(BaseModel):
             "text": "NVDA earnings beat expectations by 15% this quarter",
         }
 
+
+class HeadlineItem(BaseModel):
+    """Normalized news/headline item for Market Pulse."""
+
+    id: str = Field(..., description="Stable headline identifier")
+    ticker: str = Field(..., description="Stock ticker symbol")
+    headline: str = Field(..., description="Headline text for frontend display")
+    title: str = Field(..., description="Alias for headline text")
+    source: str = Field(..., description="Publisher or source name")
+    url: Optional[str] = Field(None, description="Canonical article URL")
+    published_at: Optional[datetime] = Field(None, description="Publication timestamp")
+    time: Optional[str] = Field(None, description="Display-friendly publication date")
+    summary: Optional[str] = Field(None, description="Short article summary when available")
+    sentiment: Optional[SentimentScores] = Field(
+        None, description="Optional sentiment score for the headline text"
+    )
+
+
+class Fundamentals(BaseModel):
+    """Company fundamentals and metadata for Financials & Ratios."""
+
+    source: str = Field(..., description="Provider used for fundamentals")
+    company_name: Optional[str] = Field(None, description="Company display name")
+    sector: Optional[str] = Field(None, description="Company sector")
+    industry: Optional[str] = Field(None, description="Company industry")
+    market_cap: Optional[float] = Field(None, description="Market capitalization")
+    trailing_pe: Optional[float] = Field(None, description="Trailing P/E ratio")
+    forward_pe: Optional[float] = Field(None, description="Forward P/E ratio")
+    price_to_book: Optional[float] = Field(None, description="Price/book ratio")
+    dividend_yield: Optional[float] = Field(None, description="Dividend yield")
+    beta: Optional[float] = Field(None, description="Beta")
+    eps: Optional[float] = Field(None, description="Trailing EPS")
+    revenue: Optional[float] = Field(None, description="Total revenue")
+    net_income: Optional[float] = Field(None, description="Net income")
+    operating_cash_flow: Optional[float] = Field(None, description="Operating cash flow")
+    debt_to_equity: Optional[float] = Field(None, description="Debt/equity ratio")
+    currency: Optional[str] = Field(None, description="Currency for monetary values")
+
+
+class ComponentAvailability(BaseModel):
+    """Availability details for a dashboard data component."""
+
+    available: bool = Field(..., description="Whether useful data is present")
+    status: str = Field(..., description="ready, partial, unavailable, or fallback")
+    source: Optional[str] = Field(None, description="Provider or subsystem name")
+    message: Optional[str] = Field(None, description="Human-readable availability note")
+    count: Optional[int] = Field(None, description="Number of items available, if relevant")
+
+
+class DashboardAvailability(BaseModel):
+    """Availability map for dashboard sections."""
+
+    sentiment: ComponentAvailability
+    market_data: ComponentAvailability
+    prediction: ComponentAvailability
+    headlines: ComponentAvailability
+    fundamentals: ComponentAvailability
+
+
 class DashboardSummary(BaseModel):
     """Summary data for dashboard display."""
 
@@ -109,6 +168,18 @@ class DashboardSummary(BaseModel):
     sentiment: SentimentScores = Field(..., description="Current sentiment scores")
     market_data: MarketData = Field(..., description="Current market data")
     prediction: PredictionResponse = Field(..., description="Stock movement prediction")
+    headlines: List[HeadlineItem] = Field(
+        default_factory=list, description="Normalized headline items for Market Pulse"
+    )
+    fundamentals: Optional[Fundamentals] = Field(
+        None, description="Company fundamentals and metadata when available"
+    )
+    availability: Optional[DashboardAvailability] = Field(
+        None, description="Per-section availability details"
+    )
+    status: Dict[str, Any] = Field(
+        default_factory=dict, description="Backend-friendly status alias for availability"
+    )
     updated_at: datetime = Field(..., description="Last update timestamp")
 
     class Config:
@@ -135,5 +206,9 @@ class DashboardSummary(BaseModel):
                 "probability": 0.78,
                 "confidence": 0.85,
             },
+            "headlines": [],
+            "fundamentals": None,
+            "availability": None,
+            "status": {},
             "updated_at": "2026-04-01T10:30:00",
         }
