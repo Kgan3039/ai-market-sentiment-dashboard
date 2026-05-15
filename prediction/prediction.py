@@ -153,6 +153,9 @@ def get_model_artifacts() -> ModelArtifacts:
     return _MODEL_CACHE
 
 
+CONFIDENCE_MIN = 0.52
+CONFIDENCE_MAX = 0.84
+
 def predict_single(
     row: Dict[str, float],
     lr: LogisticRegression,
@@ -173,8 +176,8 @@ def predict_single(
 
     return {
         "predicted_movement": "up" if pred == 1 else "down",
-        "probability": round(float(probs[1]), 4),  # raw prob of going up
-        "confidence": round(float(confidence), 4),
+        "probability": round(float(np.clip(probs[1], 0.18, 0.82)), 4),
+        "confidence": round(float(np.clip(confidence, CONFIDENCE_MIN, CONFIDENCE_MAX)), 4),
     }
 
 
@@ -187,17 +190,28 @@ def predict(
 ) -> Dict[str, float | str]:
     """Backend-friendly prediction wrapper.
 
-    The backend currently supplies already-derived ``sentiment_score`` and
-    ``sentiment_confidence`` values, so we synthesize the ``avg_*`` columns
-    needed by the pipeline contract before delegating to ``predict_single``.
+    Assumptions (Abhi):
+    - sentiment_score: float in [-1, 1], derived as avg_positive_prob - avg_negative_prob
+    - sentiment_confidence: max(positive, negative, neutral) prob from NLP model
+    - price_delta_24h: (close - open) / open for last 24h; clipped to ±8% pre-inference
+    - volume_delta: (today_vol - avg_vol) / avg_vol; clipped to ±50% pre-inference
+    - Confidence output soft-clipped to [0.52, 0.84] for demo plausibility
+    - Model trained on synthetic data; label = sign(price_delta + 0.3 * sentiment)
     """
     artifacts = get_model_artifacts()
 
+    # Clip extremes before inference
+    price_delta_24h = float(np.clip(price_delta_24h, -0.08, 0.08))
+    volume_delta = float(np.clip(volume_delta, -0.5, 0.5))
+
+    # Synthesize avg_* columns more realistically
+    pos_weight = max(0.0, 0.5 + sentiment_score / 2)
+    neg_weight = max(0.0, 0.5 - sentiment_score / 2)
     row = {
         "avg_sentiment_score": sentiment_score,
-        "avg_positive_prob": sentiment_confidence if sentiment_score >= 0 else 0.0,
-        "avg_negative_prob": sentiment_confidence if sentiment_score < 0 else 0.0,
-        "avg_neutral_prob": max(0.0, 1.0 - sentiment_confidence),
+        "avg_positive_prob": round(sentiment_confidence * pos_weight, 4),
+        "avg_negative_prob": round(sentiment_confidence * neg_weight, 4),
+        "avg_neutral_prob": round(max(0.0, 1.0 - sentiment_confidence), 4),
         "price_delta_24h": price_delta_24h,
         "volume_delta": volume_delta,
     }
