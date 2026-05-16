@@ -1,47 +1,72 @@
-export default function PredictionModel({ prediction }) {
-  const { shortTerm, mediumTerm, catalysts } = prediction;
+function getDirectionColor(direction) {
+  if (direction === "up") return "var(--positive)";
+  if (direction === "down") return "var(--negative)";
+  return "var(--accent)";
+}
 
-  const directionColor = (dir) =>
-    dir === "Bullish" ? "var(--positive)" : dir === "Bearish" ? "var(--negative)" : "var(--accent)";
+export default function PredictionModel({ prediction, updatedAt }) {
+  const hasPrediction = Boolean(prediction);
+  const direction = prediction?.predicted_movement || "neutral";
+  const confidence = Math.round((prediction?.confidence || 0) * 100);
+  const probability = Math.round((prediction?.probability || 0) * 100);
+  const color = getDirectionColor(direction);
 
   return (
     <section className="card prediction-card">
-      <h2 className="section-title">Prediction Model</h2>
+      <div className="section-header">
+        <h2 className="section-title">Prediction Model</h2>
+        <span
+          className={`section-status ${
+            hasPrediction ? "status-ready" : "status-unavailable"
+          }`}
+        >
+          {hasPrediction ? "ready" : "unavailable"}
+        </span>
+      </div>
+
+      {!hasPrediction ? (
+        <div className="empty-state">
+          Prediction output is not available in the current summary response.
+        </div>
+      ) : null}
 
       <div className="prediction-grid">
-        <PredictionHorizon data={shortTerm} directionColor={directionColor(shortTerm.direction)} />
-        <PredictionHorizon data={mediumTerm} directionColor={directionColor(mediumTerm.direction)} />
+        <div className="horizon-card">
+          <div className="horizon-label">Predicted Movement</div>
+          <div className="horizon-direction" style={{ color }}>
+            {direction.toUpperCase()}
+          </div>
+          <div className="confidence-bar-label">Confidence: {confidence}%</div>
+          <div className="confidence-track">
+            <div
+              className="confidence-fill"
+              style={{ width: `${confidence}%`, background: color }}
+            />
+          </div>
+          <p className="horizon-rationale">
+            Directly rendered from the backend prediction response.
+          </p>
+        </div>
 
-        {/* Upcoming Catalysts */}
+        <div className="horizon-card">
+          <div className="horizon-label">Probability</div>
+          <div className="horizon-direction">{probability}%</div>
+          <p className="horizon-rationale">
+            Last summary update: {updatedAt || "N/A"}
+          </p>
+        </div>
+
         <div className="catalyst-block">
-          <h3 className="subsection-title">Upcoming Catalysts</h3>
-          {catalysts.map((c, i) => (
-            <div key={i} className={`catalyst-item impact-${c.impact}`}>
-              <span className="catalyst-date">{c.date}</span>
-              <span className="catalyst-event">{c.event}</span>
-              <span className="catalyst-impact">{c.impact}</span>
-            </div>
-          ))}
+          <h3 className="subsection-title">Model Status</h3>
+          <div className="catalyst-item impact-medium">
+            <span className="catalyst-date">API</span>
+            <span className="catalyst-event">
+              The UI is using the existing backend prediction contract without inventing extra horizons or catalysts.
+            </span>
+            <span className="catalyst-impact">live</span>
+          </div>
         </div>
       </div>
     </section>
-  );
-}
-
-function PredictionHorizon({ data, directionColor }) {
-  return (
-    <div className="horizon-card">
-      <div className="horizon-label">{data.horizon}</div>
-      <div className="horizon-direction" style={{ color: directionColor }}>
-        {data.direction}
-      </div>
-      <div className="confidence-bar-wrapper">
-        <div className="confidence-bar-label">Confidence: {data.confidence}%</div>
-        <div className="confidence-track">
-          <div className="confidence-fill" style={{ width: `${data.confidence}%`, background: directionColor }} />
-        </div>
-      </div>
-      <p className="horizon-rationale">{data.rationale}</p>
-    </div>
   );
 }
