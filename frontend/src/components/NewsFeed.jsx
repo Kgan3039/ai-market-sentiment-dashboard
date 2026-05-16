@@ -1,8 +1,14 @@
 import { useState } from "react";
 
-export default function NewsFeed({ news = [], socialPosts = [] }) {
+export default function NewsFeed({
+  news = [],
+  socialPosts = [],
+  availability,
+  loading = false,
+}) {
   const [activeTab, setActiveTab] = useState("news");
   const items = activeTab === "news" ? news : socialPosts;
+  const itemLabel = activeTab === "news" ? "headline" : "social";
 
   return (
     <section className="card">
@@ -24,7 +30,17 @@ export default function NewsFeed({ news = [], socialPosts = [] }) {
         </div>
       </div>
 
-      {items.length > 0 ? (
+      <div className="feed-summary">
+        {loading
+          ? "Fetching market pulse items."
+          : activeTab === "news" && availability?.message
+            ? availability.message
+            : `${items.length} ${itemLabel}${items.length === 1 ? "" : "s"} available.`}
+      </div>
+
+      {loading ? (
+        <div className="empty-state">Loading {itemLabel} items...</div>
+      ) : items.length > 0 ? (
         <div className="feed-list">
           {activeTab === "news"
             ? news.map((item, index) => <NewsItem key={item.id || index} item={item} />)
@@ -34,7 +50,10 @@ export default function NewsFeed({ news = [], socialPosts = [] }) {
         </div>
       ) : (
         <div className="empty-state">
-          This API response does not currently include {activeTab === "news" ? "headline" : "social"} items.
+          {activeTab === "news"
+            ? availability?.message ||
+              "No headline items were returned by the backend summary."
+            : "No social post items are included in the current summary response."}
         </div>
       )}
     </section>
@@ -42,7 +61,8 @@ export default function NewsFeed({ news = [], socialPosts = [] }) {
 }
 
 function NewsItem({ item }) {
-  const sentiment = item.sentiment?.sentiment_label;
+  const sentiment = item.sentiment?.sentiment_label || "neutral";
+  const confidence = Math.round((item.sentiment?.sentiment_confidence || 0) * 100);
 
   return (
     <a
@@ -53,14 +73,16 @@ function NewsItem({ item }) {
     >
       <div className="news-meta">
         <span className="news-source">{item.source || "Source"}</span>
-        <span className="news-time">
-          {sentiment ? `${sentiment} · ` : ""}
-          {item.time || "N/A"}
-        </span>
+        <span className={`sentiment-pill ${sentiment}`}>{sentiment}</span>
+        <span className="news-time">{item.time || "N/A"}</span>
       </div>
       <p className="news-headline">
         {item.headline || item.title || "No headline available."}
       </p>
+      {item.summary ? <p className="news-summary">{item.summary}</p> : null}
+      {confidence > 0 ? (
+        <div className="news-footer">Sentiment confidence {confidence}%</div>
+      ) : null}
     </a>
   );
 }
