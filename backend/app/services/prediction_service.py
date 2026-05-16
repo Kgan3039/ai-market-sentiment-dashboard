@@ -16,6 +16,7 @@ import sys
 from typing import Dict, Any
 from datetime import datetime
 from app.models.schemas import PredictionResponse
+import re
 
 
 class TickerNotFoundError(Exception):
@@ -91,6 +92,9 @@ class PredictionService:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
+        VALID_TICKER = re.compile(r'^[A-Z]{1,5}$')
+        if not VALID_TICKER_RE.match(ticker):
+            raise TickerNotFoundError(f"Unknown ticker symbol: {ticker}")
         sentiment_info = SentimentService.get_sentiment_for_ticker(ticker)
 
         if sentiment_info is None:
