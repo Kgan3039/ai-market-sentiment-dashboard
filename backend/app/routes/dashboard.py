@@ -95,7 +95,9 @@ async def get_dashboard_summary(ticker: str):
         market_data = DataService.get_market_data(ticker)
         prediction_data = PredictionService.predict_for_ticker(ticker)
         headlines = DataService.get_headlines(ticker)
+        headline_status = DataService.get_headlines_status(ticker)
         fundamentals = DataService.get_fundamentals(ticker)
+        fundamentals_status = DataService.get_fundamentals_status(ticker)
 
         for headline in headlines:
             headline.sentiment = SentimentService.get_sentiment_for_text(headline.headline)
@@ -135,24 +137,32 @@ async def get_dashboard_summary(ticker: str):
                 ),
             ),
             headlines=_availability(
-                available=len(headlines) > 0,
-                status="ready" if headlines else "unavailable",
-                source="Yahoo Finance via yfinance",
-                message=(
-                    f"{len(headlines)} headline items are available."
-                    if headlines
-                    else "Headline provider is unavailable or returned no articles."
+                available=headline_status.get("available", len(headlines) > 0),
+                status=headline_status.get("status", "ready" if headlines else "unavailable"),
+                source=headline_status.get("source", "Yahoo Finance via yfinance"),
+                message=headline_status.get(
+                    "message",
+                    (
+                        f"{len(headlines)} headline items are available."
+                        if headlines
+                        else "Headline provider is unavailable or returned no articles."
+                    ),
                 ),
-                count=len(headlines),
+                count=headline_status.get("count", len(headlines)),
             ),
             fundamentals=_availability(
-                available=fundamentals is not None,
-                status="ready" if fundamentals is not None else "unavailable",
-                source="Yahoo Finance via yfinance",
-                message=(
-                    "Company fundamentals are available."
-                    if fundamentals is not None
-                    else "Fundamentals provider is unavailable or returned no usable fields."
+                available=fundamentals_status.get("available", fundamentals is not None),
+                status=fundamentals_status.get(
+                    "status", "ready" if fundamentals is not None else "unavailable"
+                ),
+                source=fundamentals_status.get("source", "Yahoo Finance via yfinance"),
+                message=fundamentals_status.get(
+                    "message",
+                    (
+                        "Company fundamentals are available."
+                        if fundamentals is not None
+                        else "Fundamentals provider is unavailable or returned no usable fields."
+                    ),
                 ),
             ),
         )
