@@ -21,11 +21,97 @@ from app.models.schemas import Fundamentals, HeadlineItem, MarketData
 class DataService:
     """Service for managing data retrieval from external sources."""
 
+    _CACHE_TTL_SECONDS = int(os.getenv("DATA_SERVICE_CACHE_TTL_SECONDS", "900"))
+    _PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
+    _PROVIDER_STATUS: Dict[str, Dict[str, Any]] = {}
+
     @staticmethod
     def _pipeline_file_path() -> str:
         return os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "stock_data.json")
         )
+
+    @staticmethod
+    def _cache_key(provider: str, ticker: str, limit: Optional[int] = None) -> str:
+        suffix = f":{limit}" if limit is not None else ""
+        return f"{provider}:{ticker.upper()}{suffix}"
+
+    @staticmethod
+    def _clone_cached_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return [DataService._clone_cached_value(item) for item in value]
+        if hasattr(value, "model_copy"):
+            return value.model_copy(deep=True)
+        if hasattr(value, "copy"):
+            return value.copy(deep=True)
+        return value
+
+    @staticmethod
+    def _cache_lookup(key: str, allow_expired: bool = False) -> tuple[bool, Any, bool]:
+        entry = DataService._PROVIDER_CACHE.get(key)
+        if entry is None:
+            return False, None, False
+
+        age_seconds = (datetime.now() - entry["stored_at"]).total_seconds()
+        expired = age_seconds > DataService._CACHE_TTL_SECONDS
+        if expired and not allow_expired:
+            return False, None, True
+
+        return True, DataService._clone_cached_value(entry["value"]), expired
+
+    @staticmethod
+    def _cache_set(key: str, value: Any) -> None:
+        DataService._PROVIDER_CACHE[key] = {
+            "stored_at": datetime.now(),
+            "value": DataService._clone_cached_value(value),
+        }
+
+    @staticmethod
+    def _set_provider_status(
+        key: str,
+        *,
+        available: bool,
+        status: str,
+        source: str,
+        message: str,
+        count: Optional[int] = None,
+    ) -> None:
+        DataService._PROVIDER_STATUS[key] = {
+            "available": available,
+            "status": status,
+            "source": source,
+            "message": message,
+            "count": count,
+        }
+
+    @staticmethod
+    def _provider_status(
+        provider: str,
+        ticker: str,
+        *,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        key = DataService._cache_key(provider, ticker, limit)
+        return DataService._PROVIDER_STATUS.get(
+            key,
+            {
+                "available": False,
+                "status": "unavailable",
+                "source": "Yahoo Finance via yfinance",
+                "message": f"{provider.title()} provider has not been queried yet.",
+                "count": 0 if provider == "headlines" else None,
+            },
+        )
+
+    @staticmethod
+    def get_headlines_status(ticker: str, limit: int = 6) -> Dict[str, Any]:
+        """Return provider status for the last headline lookup."""
+        return DataService._provider_status("headlines", ticker, limit=limit)
+
+    @staticmethod
+    def get_fundamentals_status(ticker: str) -> Dict[str, Any]:
+        """Return provider status for the last fundamentals lookup."""
+        return DataService._provider_status("fundamentals", ticker)
 
     @staticmethod
     def _load_pipeline_records() -> List[Dict[str, Any]]:
@@ -139,15 +225,75 @@ class DataService:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
+        cache_key = DataService._cache_key("headlines", ticker, limit)
+
+        cache_hit, cached_headlines, _ = DataService._cache_lookup(cache_key)
+        if cache_hit:
+            DataService._set_provider_status(
+                cache_key,
+                available=len(cached_headlines) > 0,
+                status="ready" if cached_headlines else "unavailable",
+                source="Yahoo Finance via yfinance (cache)",
+                message=(
+                    f"{len(cached_headlines)} cached headline items are available."
+                    if cached_headlines
+                    else "Headline provider recently returned no articles."
+                ),
+                count=len(cached_headlines),
+            )
+            return cached_headlines
 
         try:
-            import yfinance as yf
+            headlines = DataService._fetch_yfinance_headlines(ticker, limit)
+        except Exception as exc:
+            stale_hit, stale_headlines, _ = DataService._cache_lookup(cache_key, allow_expired=True)
+            if stale_hit:
+                DataService._set_provider_status(
+                    cache_key,
+                    available=len(stale_headlines) > 0,
+                    status="fallback",
+                    source="Yahoo Finance via yfinance (stale cache)",
+                    message=(
+                        f"Headline provider failed; using {len(stale_headlines)} cached items."
+                        if stale_headlines
+                        else "Headline provider failed and cached response was empty."
+                    ),
+                    count=len(stale_headlines),
+                )
+                return stale_headlines
 
-            stock = yf.Ticker(ticker)
-            raw_news = stock.news or []
-        except Exception:
+            DataService._cache_set(cache_key, [])
+            DataService._set_provider_status(
+                cache_key,
+                available=False,
+                status="unavailable",
+                source="Yahoo Finance via yfinance",
+                message=f"Headline provider failed: {type(exc).__name__}.",
+                count=0,
+            )
             return []
 
+        DataService._cache_set(cache_key, headlines)
+        DataService._set_provider_status(
+            cache_key,
+            available=len(headlines) > 0,
+            status="ready" if headlines else "unavailable",
+            source="Yahoo Finance via yfinance",
+            message=(
+                f"{len(headlines)} headline items are available."
+                if headlines
+                else "Headline provider returned no articles."
+            ),
+            count=len(headlines),
+        )
+        return headlines
+
+    @staticmethod
+    def _fetch_yfinance_headlines(ticker: str, limit: int) -> List[HeadlineItem]:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        raw_news = stock.news or []
         headlines = []
         for index, item in enumerate(raw_news[:limit]):
             normalized = DataService._normalize_yfinance_news_item(ticker, item, index)
@@ -228,15 +374,73 @@ class DataService:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
+        cache_key = DataService._cache_key("fundamentals", ticker)
+
+        cache_hit, cached_fundamentals, _ = DataService._cache_lookup(cache_key)
+        if cache_hit:
+            DataService._set_provider_status(
+                cache_key,
+                available=cached_fundamentals is not None,
+                status="ready" if cached_fundamentals is not None else "unavailable",
+                source="Yahoo Finance via yfinance (cache)",
+                message=(
+                    "Cached company fundamentals are available."
+                    if cached_fundamentals is not None
+                    else "Fundamentals provider recently returned no usable fields."
+                ),
+            )
+            return cached_fundamentals
 
         try:
-            import yfinance as yf
+            fundamentals = DataService._fetch_yfinance_fundamentals(ticker)
+        except Exception as exc:
+            stale_hit, stale_fundamentals, _ = DataService._cache_lookup(
+                cache_key, allow_expired=True
+            )
+            if stale_hit:
+                DataService._set_provider_status(
+                    cache_key,
+                    available=stale_fundamentals is not None,
+                    status="fallback",
+                    source="Yahoo Finance via yfinance (stale cache)",
+                    message=(
+                        "Fundamentals provider failed; using cached company fundamentals."
+                        if stale_fundamentals is not None
+                        else "Fundamentals provider failed and cached response was empty."
+                    ),
+                )
+                return stale_fundamentals
 
-            stock = yf.Ticker(ticker)
-            info = DataService._safe_dict(stock.get_info())
-            fast_info = DataService._safe_dict(stock.fast_info)
-        except Exception:
+            DataService._set_provider_status(
+                cache_key,
+                available=False,
+                status="unavailable",
+                source="Yahoo Finance via yfinance",
+                message=f"Fundamentals provider failed: {type(exc).__name__}.",
+            )
             return None
+
+        DataService._cache_set(cache_key, fundamentals)
+        DataService._set_provider_status(
+            cache_key,
+            available=fundamentals is not None,
+            status="ready" if fundamentals is not None else "unavailable",
+            source="Yahoo Finance via yfinance",
+            message=(
+                "Company fundamentals are available."
+                if fundamentals is not None
+                else "Fundamentals provider returned no usable fields."
+            ),
+        )
+        return fundamentals
+
+    @staticmethod
+    def _fetch_yfinance_fundamentals(ticker: str) -> Optional[Fundamentals]:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        info = DataService._safe_dict(stock.get_info())
+        fast_info = DataService._safe_dict(stock.fast_info)
 
         if not info and not fast_info:
             return None
