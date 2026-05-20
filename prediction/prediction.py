@@ -172,9 +172,9 @@ def predict_single(
     confidence = probs[pred]
 
     return {
-        "direction": "up" if pred == 1 else "down",
+        "predicted_movement": "up" if pred == 1 else "down",
+        "probability": round(float(probs[1]), 4),  # raw prob of going up
         "confidence": round(float(confidence), 4),
-        "model": model,
     }
 
 
@@ -219,14 +219,21 @@ def predict_batch(
     model: str = "lr",
 ) -> pd.DataFrame:
     """Predict a batch of aggregated pipeline rows."""
-    df = prepare_data(df, require_label=False)
-    X = df[FEATURES]
+    prepared = prepare_data(df, require_label=False)
+    X = prepared[FEATURES]
     X_scaled = scaler.transform(X)
 
     chosen_model = lr if model == "lr" else rf
-    df["prediction"] = chosen_model.predict(X_scaled)
-    df["confidence"] = chosen_model.predict_proba(X_scaled).max(axis=1)
-    return df
+    preds = chosen_model.predict(X_scaled)
+    probs = chosen_model.predict_proba(X_scaled)
+
+    return pd.DataFrame(
+        {
+            "predicted_movement": ["up" if p == 1 else "down" for p in preds],
+            "probability": probs[:, 1].round(4),
+            "confidence": probs[np.arange(len(preds)), preds].round(4),
+        }
+    )
 
 
 if __name__ == "__main__":
@@ -250,3 +257,40 @@ if __name__ == "__main__":
             model="rf",
         )
     )
+
+    result = predict(
+        sentiment_score=0.41,
+        sentiment_confidence=0.58,
+        price_delta_24h=0.012,
+        volume_delta=0.10,
+        model="lr",
+    )
+    assert set(result.keys()) == {"predicted_movement", "probability", "confidence"}, \
+        f"Contract mismatch: {result.keys()}"
+    assert result["predicted_movement"] in ("up", "down")
+    assert 0.0 <= result["probability"] <= 1.0
+    assert 0.0 <= result["confidence"] <= 1.0
+    print("predict() contract verification passed:", result)
+
+    batch_input = pd.DataFrame(
+        [
+            {
+                "avg_sentiment_score": 0.41,
+                "avg_positive_prob": 0.58,
+                "avg_negative_prob": 0.19,
+                "avg_neutral_prob": 0.23,
+                "price_delta_24h": 0.012,
+                "volume_delta": 0.10,
+            }
+        ]
+    )
+    batch_result = predict_batch(
+        batch_input,
+        artifacts.lr,
+        artifacts.rf,
+        artifacts.scaler,
+        model="lr",
+    )
+    assert list(batch_result.columns) == ["predicted_movement", "probability", "confidence"], \
+        f"Batch contract mismatch: {batch_result.columns.tolist()}"
+    print("predict_batch() contract verification passed:", batch_result.to_dict(orient="records"))
