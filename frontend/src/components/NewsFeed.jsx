@@ -1,37 +1,59 @@
 import { useState } from "react";
 
-export default function NewsFeed({ news, socialPosts }) {
+export default function NewsFeed({
+  news = [],
+  socialPosts = [],
+  availability,
+  loading = false,
+}) {
   const [activeTab, setActiveTab] = useState("news");
+  const items = activeTab === "news" ? news : socialPosts;
+  const itemLabel = activeTab === "news" ? "headline" : "social";
 
   return (
     <section className="card">
       <div className="section-header">
         <h2 className="section-title">Market Pulse</h2>
         <div className="toggle-group">
-          <button className={`toggle-btn ${activeTab === "news" ? "active" : ""}`} onClick={() => setActiveTab("news")}>
+          <button
+            className={`toggle-btn ${activeTab === "news" ? "active" : ""}`}
+            onClick={() => setActiveTab("news")}
+          >
             Headlines
           </button>
-          <button className={`toggle-btn ${activeTab === "social" ? "active" : ""}`} onClick={() => setActiveTab("social")}>
+          <button
+            className={`toggle-btn ${activeTab === "social" ? "active" : ""}`}
+            onClick={() => setActiveTab("social")}
+          >
             Social
           </button>
         </div>
       </div>
 
-      {/* Conditional rendering — show one tab's content based on state */}
-      {activeTab === "news" && (
-        <div className="feed-list">
-          {/* .map() loops over the array and renders a component for each item */}
-          {news.map((item) => (
-            <NewsItem key={item.id} item={item} />
-          ))}
-        </div>
-      )}
+      <div className="feed-summary">
+        {loading
+          ? "Fetching market pulse items."
+          : activeTab === "news" && availability?.message
+            ? availability.message
+            : `${items.length} ${itemLabel}${items.length === 1 ? "" : "s"} available.`}
+      </div>
 
-      {activeTab === "social" && (
+      {loading ? (
+        <div className="empty-state">Loading {itemLabel} items...</div>
+      ) : items.length > 0 ? (
         <div className="feed-list">
-          {socialPosts.map((post) => (
-            <SocialPost key={post.id} post={post} />
-          ))}
+          {activeTab === "news"
+            ? news.map((item, index) => <NewsItem key={item.id || index} item={item} />)
+            : socialPosts.map((post, index) => (
+                <SocialPost key={post.id || index} post={post} />
+              ))}
+        </div>
+      ) : (
+        <div className="empty-state">
+          {activeTab === "news"
+            ? availability?.message ||
+              "No headline items were returned by the backend summary."
+            : "No social post items are included in the current summary response."}
         </div>
       )}
     </section>
@@ -39,14 +61,28 @@ export default function NewsFeed({ news, socialPosts }) {
 }
 
 function NewsItem({ item }) {
+  const sentiment = item.sentiment?.sentiment_label || "neutral";
+  const confidence = Math.round((item.sentiment?.sentiment_confidence || 0) * 100);
+
   return (
-    <a href={item.url} className="news-item">
+    <a
+      href={item.url || "#"}
+      className="news-item"
+      target={item.url ? "_blank" : undefined}
+      rel={item.url ? "noreferrer" : undefined}
+    >
       <div className="news-meta">
-        <span className="news-source">{item.source}</span>
-        <span className="news-time">{item.time}</span>
-        <span className={`sentiment-pill ${item.sentiment}`}>{item.sentiment}</span>
+        <span className="news-source">{item.source || "Source"}</span>
+        <span className={`sentiment-pill ${sentiment}`}>{sentiment}</span>
+        <span className="news-time">{item.time || "N/A"}</span>
       </div>
-      <p className="news-headline">{item.headline}</p>
+      <p className="news-headline">
+        {item.headline || item.title || "No headline available."}
+      </p>
+      {item.summary ? <p className="news-summary">{item.summary}</p> : null}
+      {confidence > 0 ? (
+        <div className="news-footer">Sentiment confidence {confidence}%</div>
+      ) : null}
     </a>
   );
 }
@@ -55,12 +91,10 @@ function SocialPost({ post }) {
   return (
     <div className="social-post">
       <div className="social-meta">
-        <span className="social-platform">{post.platform}</span>
-        <span className="social-handle">{post.handle}</span>
-        <span className={`sentiment-pill ${post.sentiment}`}>{post.sentiment}</span>
-        <span className="social-likes">♥ {post.likes}</span>
+        <span className="social-platform">{post.platform || "Social"}</span>
+        <span className="social-handle">{post.handle || "Unknown"}</span>
       </div>
-      <p className="social-content">"{post.content}"</p>
+      <p className="social-content">{post.content || "No social post content available."}</p>
     </div>
   );
 }

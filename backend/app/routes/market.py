@@ -15,7 +15,7 @@ TODO (Isaac): Expose market data through API or file interface
 TODO (Srish): Update frontend to display real-time market data
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from typing import List
 from app.models.schemas import MarketData
 from app.services.data_service import DataService
@@ -24,7 +24,7 @@ router = APIRouter(prefix="/market", tags=["Market Data"])
 
 
 @router.get("/batch", response_model=List[MarketData])
-async def get_market_data_batch(tickers: List[str]):
+async def get_market_data_batch(tickers: List[str] = Query(...)):
     """
     Get market data for multiple stocks at once.
 
