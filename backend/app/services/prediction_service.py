@@ -19,6 +19,9 @@ from app.models.schemas import PredictionResponse
 import re
 
 
+VALID_TICKER_RE = re.compile(r'^[A-Z]{1,5}$')
+
+
 class TickerNotFoundError(Exception):
     pass
 
@@ -92,7 +95,6 @@ class PredictionService:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
-        VALID_TICKER = re.compile(r'^[A-Z]{1,5}$')
         if not VALID_TICKER_RE.match(ticker):
             raise TickerNotFoundError(f"Unknown ticker symbol: {ticker}")
         sentiment_info = SentimentService.get_sentiment_for_ticker(ticker)
@@ -101,8 +103,9 @@ class PredictionService:
             raise TickerNotFoundError(f"No sentiment data found for ticker: {ticker}")
 
         market_info = DataService.get_market_data(ticker)
+        ticker_records = DataService._get_ticker_records(ticker)
 
-        if market_info is None:
+        if market_info is None or (market_info.price <= 0 and not ticker_records):
             raise TickerNotFoundError(f"No market data found for ticker: {ticker}")
 
         overall_sentiment = sentiment_info.get('overall_sentiment')
@@ -115,22 +118,15 @@ class PredictionService:
             'sentiment_confidence': sentiment_confidence,
         }
 
-        try:
-            import json
-            pipeline_path = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "stock_data.json")
+        for row in ticker_records:
+            market_snapshot = row.get('market_data', {}) or {}
+            market_features['price_delta_24h'] = float(
+                market_snapshot.get('price_delta_24h', row.get('price_delta_24h', 0.0)) or 0.0
             )
-            if os.path.exists(pipeline_path):
-                with open(pipeline_path, 'r') as f:
-                    data = json.load(f)
-                for row in data:
-                    if row.get('ticker', '').upper() == ticker:
-                        market_snapshot = row.get('market_data', {}) or {}
-                        market_features['price_delta_24h'] = float(market_snapshot.get('price_delta_24h', 0.0) or 0.0)
-                        market_features['volume_delta'] = 0.0
-                        break
-        except Exception:
-            pass
+            market_features['volume_delta'] = float(
+                market_snapshot.get('volume_delta', row.get('volume_delta', 0.0)) or 0.0
+            )
+            break
 
         prediction, used_ml_model = PredictionService.predict_movement(
             ticker=ticker,
