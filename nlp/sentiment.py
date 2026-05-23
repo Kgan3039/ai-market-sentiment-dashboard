@@ -18,6 +18,53 @@ import pandas as pd
 classifier = None
 _sentiment_cache = {}
 
+POSITIVE_TERMS = {
+    "beat",
+    "beats",
+    "bullish",
+    "gain",
+    "gains",
+    "growth",
+    "jump",
+    "jumps",
+    "outperform",
+    "profit",
+    "rally",
+    "record",
+    "rise",
+    "rises",
+    "strong",
+    "surge",
+    "surges",
+    "upgrade",
+    "upside",
+}
+NEGATIVE_TERMS = {
+    "bearish",
+    "cut",
+    "decline",
+    "declines",
+    "downgrade",
+    "drop",
+    "drops",
+    "fall",
+    "falls",
+    "loss",
+    "miss",
+    "misses",
+    "recall",
+    "risk",
+    "selloff",
+    "slump",
+    "weak",
+    "warning",
+}
+
+MIN_DIRECTIONAL_GAP = 0.12
+SHORT_HEADLINE_WORDS = 12
+SHORT_HEADLINE_CONFIDENCE_CAP = 0.76
+GENERIC_HEADLINE_CONFIDENCE_CAP = 0.82
+
 
 def _get_classifier():
     """Load FinBERT lazily so local API development still works without transformers."""
@@ -40,6 +87,91 @@ def _get_classifier():
     return classifier
 
 
+def _term_hits(text, terms):
+    lower_text = text.lower()
+    return sum(term in lower_text for term in terms)
+
+
+def _normalize_probabilities(positive, negative, neutral):
+    positive = max(0.0, float(positive))
+    negative = max(0.0, float(negative))
+    neutral = max(0.0, float(neutral))
+    total = positive + negative + neutral
+    if total <= 0:
+        return 0.0, 0.0, 1.0
+    return positive / total, negative / total, neutral / total
+
+
+def _cap_winning_confidence(positive, negative, neutral, cap):
+    scores = {"positive": positive, "negative": negative, "neutral": neutral}
+    winning_label = max(scores, key=scores.get)
+    winning_score = scores[winning_label]
+    if winning_label == "neutral" or winning_score <= cap:
+        return positive, negative, neutral
+
+    shift = winning_score - cap
+    if winning_label == "positive":
+        positive -= shift
+    else:
+        negative -= shift
+    neutral += shift
+    return _normalize_probabilities(positive, negative, neutral)
+
+
+def _build_sentiment_result(text, positive, negative, neutral):
+    positive, negative, neutral = _normalize_probabilities(positive, negative, neutral)
+    word_count = len(str(text).split())
+    directional_gap = abs(positive - negative)
+    positive_hits = _term_hits(text, POSITIVE_TERMS)
+    negative_hits = _term_hits(text, NEGATIVE_TERMS)
+    evidence_count = positive_hits + negative_hits
+
+    if directional_gap < MIN_DIRECTIONAL_GAP:
+        neutral += 0.10
+        positive *= 0.95
+        negative *= 0.95
+
+    if evidence_count == 0 and max(positive, negative) > neutral:
+        neutral += 0.12
+        positive *= 0.92
+        negative *= 0.92
+
+    if word_count <= SHORT_HEADLINE_WORDS and evidence_count <= 1:
+        neutral += 0.08
+
+    positive, negative, neutral = _normalize_probabilities(positive, negative, neutral)
+
+    confidence_cap = (
+        SHORT_HEADLINE_CONFIDENCE_CAP
+        if word_count <= SHORT_HEADLINE_WORDS and evidence_count <= 1
+        else GENERIC_HEADLINE_CONFIDENCE_CAP
+    )
+    positive, negative, neutral = _cap_winning_confidence(
+        positive, negative, neutral, confidence_cap
+    )
+
+    if neutral >= max(positive, negative) or (
+        abs(positive - negative) < MIN_DIRECTIONAL_GAP and neutral >= 0.30
+    ):
+        sentiment_label = "neutral"
+    elif positive > negative:
+        sentiment_label = "positive"
+    else:
+        sentiment_label = "negative"
+
+    sentiment_score = positive - negative
+    sentiment_confidence = max(positive, negative, neutral)
+
+    return {
+        "positive_prob": positive,
+        "negative_prob": negative,
+        "neutral_prob": neutral,
+        "sentiment_score": sentiment_score,
+        "sentiment_label": sentiment_label,
+        "sentiment_confidence": sentiment_confidence,
+    }
+
+
 def get_sentiment_scores(text):
     """
     Analyze sentiment of a single text input.
@@ -58,33 +190,21 @@ def get_sentiment_scores(text):
     loaded_classifier = _get_classifier()
 
     if not loaded_classifier:
-        lower_text = text.lower()
-        positive_terms = ["beat", "growth", "bullish", "surge", "strong", "gain", "up"]
-        negative_terms = ["miss", "drop", "bearish", "weak", "fall", "down", "risk"]
-        positive_hits = sum(term in lower_text for term in positive_terms)
-        negative_hits = sum(term in lower_text for term in negative_terms)
+        positive_hits = _term_hits(text, POSITIVE_TERMS)
+        negative_hits = _term_hits(text, NEGATIVE_TERMS)
 
         if positive_hits > negative_hits:
-            positive, negative, neutral = 0.72, 0.10, 0.18
-            sentiment_label = "positive"
+            positive = 0.70 if positive_hits >= 2 else 0.64
+            negative = 0.10
+            neutral = 1.0 - positive - negative
         elif negative_hits > positive_hits:
-            positive, negative, neutral = 0.10, 0.72, 0.18
-            sentiment_label = "negative"
+            negative = 0.70 if negative_hits >= 2 else 0.64
+            positive = 0.10
+            neutral = 1.0 - positive - negative
         else:
-            positive, negative, neutral = 0.20, 0.20, 0.60
-            sentiment_label = "neutral"
+            positive, negative, neutral = 0.18, 0.18, 0.64
 
-        sentiment_score = positive - negative
-        sentiment_confidence = max(positive, negative, neutral)
-
-        result = {
-            "positive_prob": positive,
-            "negative_prob": negative,
-            "neutral_prob": neutral,
-            "sentiment_score": sentiment_score,
-            "sentiment_label": sentiment_label,
-            "sentiment_confidence": sentiment_confidence,
-        }
+        result = _build_sentiment_result(text, positive, negative, neutral)
         _sentiment_cache[text] = result
         return result
 
@@ -105,22 +225,7 @@ def get_sentiment_scores(text):
     negative = scores.get("negative", 0.0)
     neutral = scores.get("neutral", 0.0)
 
-    # Create sentiment score
-    sentiment_score = positive - negative
-
-    # Choose label based on highest probability
-    sentiment_label = max(scores, key=scores.get)
-
-    sentiment_confidence = max(positive, negative, neutral)
-
-    result = {
-        "positive_prob": positive,
-        "negative_prob": negative,
-        "neutral_prob": neutral,
-        "sentiment_score": sentiment_score,
-        "sentiment_label": sentiment_label,
-        "sentiment_confidence": sentiment_confidence,
-    }
+    result = _build_sentiment_result(text, positive, negative, neutral)
     _sentiment_cache[text] = result
     return result
 
@@ -152,14 +257,9 @@ def batch_get_sentiment_scores(texts):
                 negative = scores.get("negative", 0.0)
                 neutral = scores.get("neutral", 0.0)
 
-                _sentiment_cache[text] = {
-                    "positive_prob": positive,
-                    "negative_prob": negative,
-                    "neutral_prob": neutral,
-                    "sentiment_score": positive - negative,
-                    "sentiment_label": max(scores, key=scores.get),
-                    "sentiment_confidence": max(positive, negative, neutral),
-                }
+                _sentiment_cache[text] = _build_sentiment_result(
+                    text, positive, negative, neutral
+                )
 
     return [_sentiment_cache[text] for text in texts]
 
