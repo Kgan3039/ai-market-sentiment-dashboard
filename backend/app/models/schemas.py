@@ -120,6 +120,20 @@ class HeadlineItem(BaseModel):
     )
 
 
+class SocialPostItem(BaseModel):
+    """Normalized social or pipeline post item for Market Pulse."""
+
+    id: Optional[str] = Field(None, description="Stable post identifier when available")
+    ticker: str = Field(..., description="Stock ticker symbol")
+    text: str = Field(..., description="Post text for frontend display")
+    source: str = Field(..., description="Post source name")
+    date: Optional[str] = Field(None, description="Post date when available")
+    post_score: Optional[float] = Field(None, description="Source engagement score when available")
+    sentiment: Optional[SentimentScores] = Field(
+        None, description="Optional sentiment score for the post text"
+    )
+
+
 class Fundamentals(BaseModel):
     """Company fundamentals and metadata for Financials & Ratios."""
 
@@ -158,6 +172,7 @@ class DashboardAvailability(BaseModel):
     market_data: ComponentAvailability
     prediction: ComponentAvailability
     headlines: ComponentAvailability
+    social_posts: Optional[ComponentAvailability] = None
     fundamentals: ComponentAvailability
 
 
@@ -170,6 +185,9 @@ class DashboardSummary(BaseModel):
     prediction: PredictionResponse = Field(..., description="Stock movement prediction")
     headlines: List[HeadlineItem] = Field(
         default_factory=list, description="Normalized headline items for Market Pulse"
+    )
+    social_posts: List[SocialPostItem] = Field(
+        default_factory=list, description="Normalized social or pipeline posts for Market Pulse"
     )
     fundamentals: Optional[Fundamentals] = Field(
         None, description="Company fundamentals and metadata when available"

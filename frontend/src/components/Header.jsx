@@ -13,15 +13,11 @@ export default function Header({ ticker, price, exchange, updatedAt }) {
       <div className="header-right">
         <div className="price-block">
           <span className="current-price">
-            {hasPrice ? `$${price.toFixed(2)}` : "N/A"}
+            {hasPrice ? `$${price.toFixed(2)}` : "Not available"}
           </span>
           <span className="price-change muted">
-            {updatedAt ? `Updated ${updatedAt}` : "Awaiting backend summary"}
+            {updatedAt ? `Last updated ${updatedAt}` : "Data not loaded"}
           </span>
-        </div>
-        <div className="live-dot-wrapper">
-          <span className="live-dot" />
-          <span className="live-label">{hasPrice ? "SYNCED" : "SPARSE"}</span>
         </div>
       </div>
     </header>

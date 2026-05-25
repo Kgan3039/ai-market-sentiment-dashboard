@@ -8,14 +8,12 @@ export default function CompanyOverview({ ticker, fundamentals, updatedAt }) {
     <section className="card overview-card">
       <h2 className="section-title">Dashboard Overview</h2>
       <p className="overview-text">
-        {companyName} is rendered from the live dashboard summary contract for{" "}
-        {ticker}. The response now includes sentiment, market data, prediction
-        output, headline availability, and fundamentals when the provider returns
-        them.
+        {companyName} market summary for {ticker}, including market data,
+        sentiment, model output, headlines, and fundamentals when available.
       </p>
       {businessLine ? <p className="overview-meta">{businessLine}</p> : null}
       <p className="overview-meta">
-        Last backend update: {updatedAt || "N/A"}
+        Last updated: {updatedAt || "Not available"}
       </p>
     </section>
   );

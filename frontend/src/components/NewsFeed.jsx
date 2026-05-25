@@ -3,12 +3,12 @@ import { useState } from "react";
 export default function NewsFeed({
   news = [],
   socialPosts = [],
-  availability,
   loading = false,
 }) {
   const [activeTab, setActiveTab] = useState("news");
   const items = activeTab === "news" ? news : socialPosts;
-  const itemLabel = activeTab === "news" ? "headline" : "social";
+  const itemLabel = activeTab === "news" ? "headline" : "social post";
+  const countLabel = `${items.length} ${itemLabel}${items.length === 1 ? "" : "s"} available.`;
 
   return (
     <section className="card">
@@ -33,9 +33,7 @@ export default function NewsFeed({
       <div className="feed-summary">
         {loading
           ? "Fetching market pulse items."
-          : activeTab === "news" && availability?.message
-            ? availability.message
-            : `${items.length} ${itemLabel}${items.length === 1 ? "" : "s"} available.`}
+          : countLabel}
       </div>
 
       {loading ? (
@@ -49,12 +47,11 @@ export default function NewsFeed({
               ))}
         </div>
       ) : (
-        <div className="empty-state">
-          {activeTab === "news"
-            ? availability?.message ||
-              "No headline items were returned by the backend summary."
-            : "No social post items are included in the current summary response."}
-        </div>
+          <div className="empty-state">
+            {activeTab === "news"
+              ? "No headlines available for this ticker yet."
+              : "No social posts available for this ticker yet."}
+          </div>
       )}
     </section>
   );
@@ -74,7 +71,7 @@ function NewsItem({ item }) {
       <div className="news-meta">
         <span className="news-source">{item.source || "Source"}</span>
         <span className={`sentiment-pill ${sentiment}`}>{sentiment}</span>
-        <span className="news-time">{item.time || "N/A"}</span>
+        {item.time ? <span className="news-time">{item.time}</span> : null}
       </div>
       <p className="news-headline">
         {item.headline || item.title || "No headline available."}
@@ -88,13 +85,20 @@ function NewsItem({ item }) {
 }
 
 function SocialPost({ post }) {
+  const sentiment = post.sentiment?.sentiment_label || "neutral";
+  const confidence = Math.round((post.sentiment?.sentiment_confidence || 0) * 100);
+
   return (
     <div className="social-post">
       <div className="social-meta">
-        <span className="social-platform">{post.platform || "Social"}</span>
-        <span className="social-handle">{post.handle || "Unknown"}</span>
+        <span className="social-platform">{post.source || "Source"}</span>
+        <span className={`sentiment-pill ${sentiment}`}>{sentiment}</span>
+        {post.date ? <span className="social-date">{post.date}</span> : null}
       </div>
-      <p className="social-content">{post.content || "No social post content available."}</p>
+      <p className="social-content">{post.text || "No social post content available."}</p>
+      {confidence > 0 ? (
+        <div className="news-footer">Sentiment confidence {confidence}%</div>
+      ) : null}
     </div>
   );
 }

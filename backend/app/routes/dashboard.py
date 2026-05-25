@@ -96,11 +96,14 @@ async def get_dashboard_summary(ticker: str):
         prediction_data = PredictionService.predict_for_ticker(ticker)
         headlines = DataService.get_headlines(ticker)
         headline_status = DataService.get_headlines_status(ticker)
+        social_posts = DataService.get_social_posts(ticker)
         fundamentals = DataService.get_fundamentals(ticker)
         fundamentals_status = DataService.get_fundamentals_status(ticker)
 
         for headline in headlines:
             headline.sentiment = SentimentService.get_sentiment_for_text(headline.headline)
+        for post in social_posts:
+            post.sentiment = SentimentService.get_sentiment_for_text(post.text)
 
         overall_sentiment = sentiment_data["overall_sentiment"]
         prediction = prediction_data["prediction"]
@@ -109,9 +112,9 @@ async def get_dashboard_summary(ticker: str):
             sentiment=_availability(
                 available=overall_sentiment is not None,
                 status="ready" if overall_sentiment is not None else "unavailable",
-                source="NLP pipeline",
+                source="Sentiment model",
                 message=(
-                    "Sentiment scores are available."
+                    "Sentiment is available."
                     if overall_sentiment is not None
                     else "No sentiment score was produced."
                 ),
@@ -119,21 +122,21 @@ async def get_dashboard_summary(ticker: str):
             market_data=_availability(
                 available=market_data.price > 0,
                 status="ready" if market_data.price > 0 else "fallback",
-                source="Pipeline/yfinance",
+                source="Market data provider",
                 message=(
                     "Market data is available."
                     if market_data.price > 0
-                    else "Market provider is unavailable; zero-value fallback is in use."
+                    else "Market data is not available for this ticker."
                 ),
             ),
             prediction=_availability(
                 available=prediction is not None,
                 status="ready" if prediction is not None else "unavailable",
-                source=prediction_data.get("model_info", {}).get("name", "Prediction service"),
+                source="Prediction model",
                 message=(
-                    "Prediction output is available."
+                    "Prediction is available."
                     if prediction is not None
-                    else "Prediction service did not return an output."
+                    else "Prediction is not available."
                 ),
             ),
             headlines=_availability(
@@ -149,6 +152,17 @@ async def get_dashboard_summary(ticker: str):
                     ),
                 ),
                 count=headline_status.get("count", len(headlines)),
+            ),
+            social_posts=_availability(
+                available=len(social_posts) > 0,
+                status="ready" if social_posts else "unavailable",
+                source="Social posts",
+                message=(
+                    f"{len(social_posts)} social posts are available."
+                    if social_posts
+                    else "No social posts are available for this ticker yet."
+                ),
+                count=len(social_posts),
             ),
             fundamentals=_availability(
                 available=fundamentals_status.get("available", fundamentals is not None),
@@ -174,6 +188,7 @@ async def get_dashboard_summary(ticker: str):
             market_data=market_data,
             prediction=prediction,
             headlines=headlines,
+            social_posts=social_posts,
             fundamentals=fundamentals,
             availability=availability,
             status=availability.model_dump(),
