@@ -17,15 +17,35 @@ function formatTimestamp(value) {
   return parsed.toLocaleString();
 }
 
+function getAvailabilityLabel(item) {
+  if (!item) return "Pending";
+  if (item.status === "fallback" || item.status === "partial") return "Pending";
+  return item.available ? "Available" : "Not available";
+}
+
+function getAvailabilityType(item) {
+  if (!item) return "info";
+  if (item.status === "fallback" || item.status === "partial") return "warning";
+  return item.available ? "success" : "warning";
+}
+
+function getAvailabilityMessage(label, item) {
+  if (item?.available) return `${label} available.`;
+  if (label === "Social posts") return "No social posts available for this ticker yet.";
+  if (label === "Headlines") return "No headlines available for this ticker yet.";
+  if (label === "Fundamentals") return "Fundamentals are not available in the current MVP.";
+  return `${label} not available.`;
+}
+
 function buildStatusAlerts(summary, error, loading) {
   if (error) {
     return [
       {
         id: "api-error",
         type: "danger",
-        title: "API Error",
+        title: "Data request",
         message: error,
-        status: "failed",
+        status: "Not available",
       },
     ];
   }
@@ -35,45 +55,34 @@ function buildStatusAlerts(summary, error, loading) {
       {
         id: "empty",
         type: loading ? "info" : "warning",
-        title: loading ? "Loading Summary" : "No Data Loaded",
+        title: loading ? "Loading data" : "No ticker loaded",
         message: loading
-          ? "Fetching the latest dashboard summary from the backend."
-          : "Load a ticker to render the backend summary response.",
-        status: loading ? "loading" : "empty",
+          ? "Fetching the latest market summary."
+          : "Load a ticker to view the dashboard.",
+        status: loading ? "Pending" : "Not available",
       },
     ];
   }
 
   const availability = summary.availability || summary.status || {};
   const sections = [
+    ["market_data", "Market data"],
     ["sentiment", "Sentiment"],
-    ["market_data", "Market Data"],
     ["prediction", "Prediction"],
     ["headlines", "Headlines"],
-    ["fundamentals", "Fundamentals"],
+    ["social_posts", "Social posts"],
   ];
 
   return sections.map(([key, label]) => {
     const item = availability[key];
-    const available = item?.available ?? false;
-    const status = item?.status || (available ? "ready" : "unavailable");
-    const type =
-      status === "fallback" || status === "partial"
-        ? "warning"
-        : available
-          ? "success"
-          : "warning";
 
     return {
       id: key,
-      type,
+      type: getAvailabilityType(item),
       title: label,
-      status,
-      source: item?.source,
+      status: getAvailabilityLabel(item),
       count: item?.count,
-      message:
-        item?.message ||
-        `${label} data is ${available ? "available" : "not available"}.`,
+      message: getAvailabilityMessage(label, item),
     };
   });
 }
@@ -154,15 +163,10 @@ export default function App() {
             </button>
           </form>
           <div className="status-strip">
-            <span
-              className={`status-pill ${
-                error ? "error" : loading ? "loading" : "idle"
-              }`}
-            >
-              {error ? "Error" : loading ? "Loading" : "Ready"}
-            </span>
             <span className="status-text">
-              Source: `/dashboard/summary/{activeTicker}`
+              {summary?.updated_at
+                ? `Last updated ${formatTimestamp(summary.updated_at)}`
+                : "Enter a ticker to load market data"}
             </span>
           </div>
         </section>
@@ -170,7 +174,7 @@ export default function App() {
         <Header
           ticker={summary?.ticker || activeTicker}
           price={summary?.market_data?.price}
-          exchange={summary ? "API SUMMARY" : "WAITING"}
+          exchange={summary ? "Market summary" : "Waiting for data"}
           updatedAt={formatTimestamp(summary?.updated_at)}
         />
 
@@ -183,7 +187,6 @@ export default function App() {
         <div className="grid-2col">
           <FinancialMetrics
             fundamentals={summary?.fundamentals}
-            availability={summary?.availability?.fundamentals}
             loading={loading && !summary}
           />
           <Alerts alerts={alerts} />
@@ -192,7 +195,7 @@ export default function App() {
         <SentimentPanel sentiment={summary?.sentiment} loading={loading && !summary} />
         <NewsFeed
           news={summary?.headlines || []}
-          availability={summary?.availability?.headlines}
+          socialPosts={summary?.social_posts || []}
           loading={loading && !summary}
         />
         <PredictionModel

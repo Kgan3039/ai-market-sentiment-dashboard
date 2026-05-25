@@ -15,7 +15,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from app.models.schemas import Fundamentals, HeadlineItem, MarketData
+from app.models.schemas import Fundamentals, HeadlineItem, MarketData, SocialPostItem
 
 
 class DataService:
@@ -546,3 +546,32 @@ class DataService:
             "posts": posts,
             "avg_post_score": sum([p.get("post_score", 0) for p in posts]) / max(1, len(posts)),
         }
+
+    @staticmethod
+    def get_social_posts(ticker: str) -> List[SocialPostItem]:
+        """Return real pipeline social/news posts without fabricating fallback content."""
+        if not ticker or len(ticker.strip()) == 0:
+            raise ValueError("Invalid ticker symbol")
+
+        ticker = ticker.upper()
+        posts = []
+        for record_index, record in enumerate(DataService._get_ticker_records(ticker)):
+            record_posts = record.get("posts", []) or []
+            for post_index, post in enumerate(record_posts):
+                text = str(post.get("text", "")).strip()
+                source = str(post.get("source", "Unknown source")).strip() or "Unknown source"
+                if not text or source.lower().startswith("mock"):
+                    continue
+
+                posts.append(
+                    SocialPostItem(
+                        id=str(post.get("id") or f"{ticker}-{record_index}-{post_index}"),
+                        ticker=ticker,
+                        text=text,
+                        source=source,
+                        date=record.get("date"),
+                        post_score=post.get("post_score"),
+                    )
+                )
+
+        return posts
