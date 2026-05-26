@@ -101,9 +101,15 @@ async def get_dashboard_summary(ticker: str):
         fundamentals_status = DataService.get_fundamentals_status(ticker)
 
         for headline in headlines:
-            headline.sentiment = SentimentService.get_sentiment_for_text(headline.headline)
+            try:
+                headline.sentiment = SentimentService.get_sentiment_for_text(headline.headline)
+            except Exception:
+                headline.sentiment = None
         for post in social_posts:
-            post.sentiment = SentimentService.get_sentiment_for_text(post.text)
+            try:
+                post.sentiment = SentimentService.get_sentiment_for_text(post.text)
+            except Exception:
+                post.sentiment = None
 
         overall_sentiment = sentiment_data["overall_sentiment"]
         prediction = prediction_data["prediction"]
@@ -116,7 +122,7 @@ async def get_dashboard_summary(ticker: str):
                 message=(
                     "Sentiment is available."
                     if overall_sentiment is not None
-                    else "No sentiment score was produced."
+                    else "Aggregate sentiment unavailable until enough validated text data is available."
                 ),
             ),
             market_data=_availability(
@@ -136,7 +142,7 @@ async def get_dashboard_summary(ticker: str):
                 message=(
                     "Prediction is available."
                     if prediction is not None
-                    else "Prediction is not available."
+                    else "Prediction unavailable until enough validated input data is available."
                 ),
             ),
             headlines=_availability(

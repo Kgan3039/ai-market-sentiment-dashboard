@@ -135,6 +135,22 @@ class DataService:
         ]
 
     @staticmethod
+    def _is_valid_pipeline_post(text: str, source: str) -> bool:
+        text = str(text or "").strip()
+        source = str(source or "").strip().lower()
+        lowered_text = text.lower()
+
+        if not text or source.startswith("mock"):
+            return False
+
+        placeholder_phrases = (
+            "sample post while waiting for api approval",
+            "sample fallback post",
+            "discussion about",
+        )
+        return not any(phrase in lowered_text for phrase in placeholder_phrases)
+
+    @staticmethod
     def get_market_data(ticker: str) -> MarketData:
         """
         Get current market data for a stock.
@@ -556,11 +572,12 @@ class DataService:
         ticker = ticker.upper()
         posts = []
         for record_index, record in enumerate(DataService._get_ticker_records(ticker)):
-            record_posts = record.get("posts", []) or []
+            nested_posts = record.get("posts")
+            record_posts = nested_posts if isinstance(nested_posts, list) else [record]
             for post_index, post in enumerate(record_posts):
                 text = str(post.get("text", "")).strip()
                 source = str(post.get("source", "Unknown source")).strip() or "Unknown source"
-                if not text or source.lower().startswith("mock"):
+                if not DataService._is_valid_pipeline_post(text, source):
                     continue
 
                 posts.append(

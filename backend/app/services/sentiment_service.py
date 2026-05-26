@@ -60,8 +60,9 @@ def _load_grouped_posts(ticker: str) -> list[dict[str, Any]]:
         if record.get("ticker", "").upper() != ticker:
             continue
 
-        for post in record.get("posts", []) or []:
-            flattened_posts.append(
+        record_posts = record.get("posts")
+        if isinstance(record_posts, list):
+            candidate_posts = [
                 {
                     "ticker": ticker,
                     "date": record.get("date"),
@@ -69,9 +70,40 @@ def _load_grouped_posts(ticker: str) -> list[dict[str, Any]]:
                     "source": post.get("source", "unknown"),
                     "post_score": post.get("post_score", 0),
                 }
-            )
+                for post in record_posts
+            ]
+        else:
+            candidate_posts = [
+                {
+                    "ticker": ticker,
+                    "date": record.get("date"),
+                    "text": record.get("text", ""),
+                    "source": record.get("source", "unknown"),
+                    "post_score": record.get("post_score", 0),
+                }
+            ]
+
+        flattened_posts.extend(
+            post for post in candidate_posts if _is_valid_pipeline_text(post)
+        )
 
     return flattened_posts
+
+
+def _is_valid_pipeline_text(post: dict[str, Any]) -> bool:
+    text = str(post.get("text", "")).strip()
+    source = str(post.get("source", "")).strip().lower()
+    lowered_text = text.lower()
+
+    if not text or source.startswith("mock"):
+        return False
+
+    placeholder_phrases = (
+        "sample post while waiting for api approval",
+        "sample fallback post",
+        "discussion about",
+    )
+    return not any(phrase in lowered_text for phrase in placeholder_phrases)
 
 
 class SentimentService:
@@ -96,24 +128,7 @@ class SentimentService:
             raw = sentiment_module.get_sentiment_scores(str(text))
             return SentimentScores(**raw)
 
-        # Fallback legacy placeholder
-        positive_prob = 0.65
-        negative_prob = 0.20
-        neutral_prob = 0.15
-        sentiment_score = positive_prob - negative_prob
-        sentiment_confidence = max(positive_prob, negative_prob, neutral_prob)
-        sentiment_label = (
-            "positive" if sentiment_score > 0.1 else ("negative" if sentiment_score < -0.1 else "neutral")
-        )
-
-        return SentimentScores(
-            positive_prob=positive_prob,
-            negative_prob=negative_prob,
-            neutral_prob=neutral_prob,
-            sentiment_score=sentiment_score,
-            sentiment_label=sentiment_label,
-            sentiment_confidence=sentiment_confidence,
-        )
+        raise RuntimeError("Sentiment scorer is unavailable")
 
     @staticmethod
     def get_sentiment_for_ticker(ticker: str) -> Dict[str, Any]:
@@ -142,19 +157,7 @@ class SentimentService:
         posts = _load_grouped_posts(ticker)
 
         if not posts:
-            return {
-                'ticker': ticker,
-                'overall_sentiment': SentimentScores(
-                    positive_prob=0.70,
-                    negative_prob=0.15,
-                    neutral_prob=0.15,
-                    sentiment_score=0.55,
-                    sentiment_label='positive',
-                    sentiment_confidence=0.70,
-                ),
-                'source_breakdown': {},
-                'timestamp': grouped['timestamp'],
-            }
+            return grouped
 
         source_stats = {}
         total_score = 0.0
