@@ -39,17 +39,6 @@ class SentimentScores(BaseModel):
         ..., ge=0, le=1, description="Confidence score (highest probability among positive/negative/neutral)"
     )
 
-    class Config:
-        example = {
-            "positive_prob": 0.75,
-            "negative_prob": 0.15,
-            "neutral_prob": 0.10,
-            "sentiment_score": 0.60,
-            "sentiment_label": "positive",
-            "sentiment_confidence": 0.75,
-        }
-
-
 class MarketData(BaseModel):
     """Market data for a stock."""
 
@@ -82,15 +71,6 @@ class PredictionResponse(BaseModel):
     confidence: float = Field(
         ..., ge=0, le=1, description="Model confidence score"
     )
-
-    class Config:
-        example = {
-            "symbol": "NVDA",
-            "predicted_movement": "up",
-            "probability": 0.78,
-            "confidence": 0.85,
-        }
-
 
 class TextAnalysisRequest(BaseModel):
     """Request model for text sentiment analysis."""
@@ -180,9 +160,9 @@ class DashboardSummary(BaseModel):
     """Summary data for dashboard display."""
 
     ticker: str = Field(..., description="Stock ticker symbol")
-    sentiment: SentimentScores = Field(..., description="Current sentiment scores")
+    sentiment: Optional[SentimentScores] = Field(None, description="Current sentiment scores")
     market_data: MarketData = Field(..., description="Current market data")
-    prediction: PredictionResponse = Field(..., description="Stock movement prediction")
+    prediction: Optional[PredictionResponse] = Field(None, description="Stock movement prediction")
     headlines: List[HeadlineItem] = Field(
         default_factory=list, description="Normalized headline items for Market Pulse"
     )
@@ -203,14 +183,7 @@ class DashboardSummary(BaseModel):
     class Config:
         example = {
             "ticker": "NVDA",
-            "sentiment": {
-                "positive_prob": 0.75,
-                "negative_prob": 0.15,
-                "neutral_prob": 0.10,
-                "sentiment_score": 0.60,
-                "sentiment_label": "positive",
-                "sentiment_confidence": 0.75,
-            },
+            "sentiment": None,
             "market_data": {
                 "symbol": "NVDA",
                 "price": 875.50,
@@ -218,12 +191,7 @@ class DashboardSummary(BaseModel):
                 "volume": 45000000,
                 "timestamp": "2026-04-01T10:30:00",
             },
-            "prediction": {
-                "symbol": "NVDA",
-                "predicted_movement": "up",
-                "probability": 0.78,
-                "confidence": 0.85,
-            },
+            "prediction": None,
             "headlines": [],
             "fundamentals": None,
             "availability": None,

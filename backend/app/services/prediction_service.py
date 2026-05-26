@@ -109,8 +109,22 @@ class PredictionService:
             raise TickerNotFoundError(f"No market data found for ticker: {ticker}")
 
         overall_sentiment = sentiment_info.get('overall_sentiment')
-        sentiment_score = overall_sentiment.sentiment_score if overall_sentiment is not None else 0.0
-        sentiment_confidence = overall_sentiment.sentiment_confidence if overall_sentiment is not None else 0.5
+        if overall_sentiment is None:
+            return {
+                'ticker': ticker,
+                'prediction': None,
+                'model_info': {
+                    'name': None,
+                    'version': '0.1.0',
+                    'status': 'unavailable',
+                    'reason': 'Validated aggregate sentiment is unavailable.',
+                    'features_used': [],
+                },
+                'timestamp': datetime.now().isoformat(),
+            }
+
+        sentiment_score = overall_sentiment.sentiment_score
+        sentiment_confidence = overall_sentiment.sentiment_confidence
 
         market_features = {
             'price_delta_24h': 0.0,

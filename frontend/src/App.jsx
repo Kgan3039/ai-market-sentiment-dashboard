@@ -31,6 +31,12 @@ function getAvailabilityType(item) {
 
 function getAvailabilityMessage(label, item) {
   if (item?.available) return `${label} available.`;
+  if (label === "Sentiment") {
+    return "Aggregate sentiment unavailable until enough validated text data is available.";
+  }
+  if (label === "Prediction") {
+    return "Prediction unavailable until enough validated input data is available.";
+  }
   if (label === "Social posts") return "No social posts available for this ticker yet.";
   if (label === "Headlines") return "No headlines available for this ticker yet.";
   if (label === "Fundamentals") return "Fundamentals are not available in the current MVP.";

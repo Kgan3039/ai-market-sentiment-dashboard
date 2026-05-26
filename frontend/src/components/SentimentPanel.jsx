@@ -44,7 +44,7 @@ export default function SentimentPanel({ sentiment, loading = false }) {
 
       {!hasSentiment && !loading ? (
         <div className="empty-state">
-          Sentiment data is not available in the current summary response.
+          Aggregate sentiment unavailable until enough validated text data is available.
         </div>
       ) : null}
 

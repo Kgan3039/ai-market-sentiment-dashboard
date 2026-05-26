@@ -19,7 +19,7 @@ export default function PredictionModel({ prediction, updatedAt }) {
 
       {!hasPrediction ? (
         <div className="empty-state">
-          Prediction output is not available in the current summary response.
+          Prediction unavailable until enough validated input data is available.
         </div>
       ) : null}
 
