@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 
 
@@ -41,20 +42,34 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def build_mock_posts(ticker: str) -> list[dict[str, Any]]:
-    """Return demo-safe placeholder posts when live ingestion is unavailable."""
-    return [
-        {
-            "text": f"{ticker} beat expectations with strong growth and bullish demand signals.",
-            "source": "mock_news",
-            "post_score": 1,
-        },
-        {
-            "text": f"Investors expect further gains as {ticker} shows strong momentum.",
-            "source": "mock_social",
-            "post_score": 1,
-        },
-    ]
+def get_yfinance_posts(ticker: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Fetch company headlines from Yahoo Finance via yfinance."""
+    stock = yf.Ticker(ticker)
+    raw_news = stock.news or []
+    posts = []
+
+    for item in raw_news[:limit]:
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+        title = item.get("title") or content.get("title")
+        if not title:
+            continue
+
+        provider = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+        source = (
+            item.get("publisher")
+            or provider.get("displayName")
+            or provider.get("name")
+            or "Yahoo Finance"
+        )
+        posts.append(
+            {
+                "text": title,
+                "source": source,
+                "post_score": 1,
+            }
+        )
+
+    return posts
 
 
 def build_mock_market_data(ticker: str) -> dict[str, Any]:
@@ -93,9 +108,12 @@ def get_market_snapshot(ticker: str, api_key: str | None) -> dict[str, Any]:
 
 
 def get_posts(ticker: str, api_key: str | None) -> list[dict[str, Any]]:
-    """Fetch company news when available, else use mock posts."""
+    """Fetch company news from real providers without fabricating text."""
     if not api_key:
-        return build_mock_posts(ticker)
+        try:
+            return get_yfinance_posts(ticker)
+        except Exception:
+            return []
 
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
@@ -117,9 +135,15 @@ def get_posts(ticker: str, api_key: str | None) -> list[dict[str, Any]]:
                     "post_score": 1,
                 }
             )
-        return posts or build_mock_posts(ticker)
+        if posts:
+            return posts
     except Exception:
-        return build_mock_posts(ticker)
+        pass
+
+    try:
+        return get_yfinance_posts(ticker)
+    except Exception:
+        return []
 
 
 def build_grouped_record(ticker: str, date: str, api_key: str | None) -> dict[str, Any]:

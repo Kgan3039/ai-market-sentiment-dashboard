@@ -626,7 +626,7 @@ a {
   text-align: right;
 }
 
-/* SVG Chart */
+/* Sentiment position */
 .chart-section {
   border-top: 1px solid var(--border);
   padding-top: 16px;
@@ -650,10 +650,42 @@ a {
   text-transform: uppercase;
 }
 
-.sentiment-chart {
+.chart-note.positive { color: var(--positive); }
+.chart-note.negative { color: var(--negative); }
+
+.history-chart-wrap {
+  margin-top: 6px;
+}
+
+.history-chart {
   width: 100%;
-  height: auto;
+  height: 176px;
   display: block;
+  overflow: visible;
+}
+
+.history-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.history-stats span {
+  padding: 4px 8px;
+  border: 1px solid var(--border-light);
+  border-radius: 99px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  background: var(--bg-card-hover);
+}
+
+.history-empty {
+  border: 1px dashed var(--border-light);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  padding: 16px;
+  font-size: 12px;
 }
 
 .snapshot-copy {

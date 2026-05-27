@@ -198,7 +198,12 @@ export default function App() {
           <Alerts alerts={alerts} />
         </div>
 
-        <SentimentPanel sentiment={summary?.sentiment} loading={loading && !summary} />
+        <SentimentPanel
+          sentiment={summary?.sentiment}
+          marketHistory={summary?.market_history || []}
+          ticker={summary?.ticker || activeTicker}
+          loading={loading && !summary}
+        />
         <NewsFeed
           news={summary?.headlines || []}
           socialPosts={summary?.social_posts || []}

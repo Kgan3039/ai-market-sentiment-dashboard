@@ -93,6 +93,7 @@ async def get_dashboard_summary(ticker: str):
         # Get data from all services
         sentiment_data = SentimentService.get_sentiment_for_ticker(ticker)
         market_data = DataService.get_market_data(ticker)
+        market_history = DataService.get_market_history(ticker)
         prediction_data = PredictionService.predict_for_ticker(ticker)
         headlines = DataService.get_headlines(ticker)
         headline_status = DataService.get_headlines_status(ticker)
@@ -192,6 +193,7 @@ async def get_dashboard_summary(ticker: str):
             ticker=ticker,
             sentiment=overall_sentiment,
             market_data=market_data,
+            market_history=market_history,
             prediction=prediction,
             headlines=headlines,
             social_posts=social_posts,

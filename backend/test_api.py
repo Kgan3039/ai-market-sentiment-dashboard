@@ -47,6 +47,9 @@ def test_endpoint(name: str, method: str, url: str, expected_status: int = 200, 
         print(f"   ❌ Error: {e}")
         return False
 
+
+test_endpoint.__test__ = False
+
 def main():
     """Run all API tests."""
     print("🚀 AI Market Sentiment API Testing Suite")

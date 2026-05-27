@@ -58,6 +58,14 @@ class MarketData(BaseModel):
         }
 
 
+class MarketHistoryPoint(BaseModel):
+    """Historical market point for compact dashboard charts."""
+
+    date: str = Field(..., description="Trading date")
+    close: float = Field(..., description="Close price")
+    volume: Optional[int] = Field(None, description="Trading volume when available")
+
+
 class PredictionResponse(BaseModel):
     """Stock movement prediction response."""
 
@@ -162,6 +170,9 @@ class DashboardSummary(BaseModel):
     ticker: str = Field(..., description="Stock ticker symbol")
     sentiment: Optional[SentimentScores] = Field(None, description="Current sentiment scores")
     market_data: MarketData = Field(..., description="Current market data")
+    market_history: List[MarketHistoryPoint] = Field(
+        default_factory=list, description="Recent historical close prices"
+    )
     prediction: Optional[PredictionResponse] = Field(None, description="Stock movement prediction")
     headlines: List[HeadlineItem] = Field(
         default_factory=list, description="Normalized headline items for Market Pulse"
@@ -191,6 +202,7 @@ class DashboardSummary(BaseModel):
                 "volume": 45000000,
                 "timestamp": "2026-04-01T10:30:00",
             },
+            "market_history": [],
             "prediction": None,
             "headlines": [],
             "fundamentals": None,
