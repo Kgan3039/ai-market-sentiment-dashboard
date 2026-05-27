@@ -15,7 +15,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from app.models.schemas import Fundamentals, HeadlineItem, MarketData, SocialPostItem
+from app.models.schemas import Fundamentals, HeadlineItem, MarketData, MarketHistoryPoint, SocialPostItem
 
 
 class DataService:
@@ -226,6 +226,64 @@ class DataService:
             Dict[str, MarketData]: Market data for each ticker
         """
         return {ticker.upper(): DataService.get_market_data(ticker.upper()) for ticker in tickers}
+
+    @staticmethod
+    def get_market_history(ticker: str, period: str = "1mo") -> List[MarketHistoryPoint]:
+        """Return recent historical close prices for compact dashboard charts."""
+        if not ticker or len(ticker.strip()) == 0:
+            raise ValueError("Invalid ticker symbol")
+
+        ticker = ticker.upper()
+        cache_key = DataService._cache_key(f"market_history:{period}", ticker)
+
+        cache_hit, cached_history, _ = DataService._cache_lookup(cache_key)
+        if cache_hit:
+            return cached_history
+
+        try:
+            history = DataService._fetch_yfinance_market_history(ticker, period)
+        except Exception:
+            stale_hit, stale_history, _ = DataService._cache_lookup(cache_key, allow_expired=True)
+            return stale_history if stale_hit else []
+
+        DataService._cache_set(cache_key, history)
+        return history
+
+    @staticmethod
+    def _fetch_yfinance_market_history(ticker: str, period: str) -> List[MarketHistoryPoint]:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period)
+        if hist.empty:
+            return []
+
+        points = []
+        for index, row in hist.tail(32).iterrows():
+            close = row.get("Close")
+            if close is None:
+                continue
+
+            try:
+                date_value = index.date().isoformat()
+            except Exception:
+                date_value = str(index)
+
+            volume = row.get("Volume")
+            try:
+                volume_value = int(volume) if volume is not None and volume == volume else None
+            except (TypeError, ValueError):
+                volume_value = None
+
+            points.append(
+                MarketHistoryPoint(
+                    date=date_value,
+                    close=round(float(close), 2),
+                    volume=volume_value,
+                )
+            )
+
+        return points
 
     @staticmethod
     def get_headlines(ticker: str, limit: int = 6) -> List[HeadlineItem]:
@@ -519,7 +577,8 @@ class DataService:
     @staticmethod
     def get_social_media_data(ticker: str) -> Dict[str, Any]:
         """
-        Retrieve social media data (Reddit, Twitter, etc.) for a ticker from pipeline.
+        Retrieve text inputs for a ticker from validated pipeline posts, falling
+        back to Yahoo Finance headlines when the pipeline has no real text.
 
         Args:
             ticker (str): Stock ticker symbol
@@ -533,28 +592,41 @@ class DataService:
         ticker = ticker.upper()
         posts = []
         for record in DataService._get_ticker_records(ticker):
-            record_posts = record.get("posts", []) or []
+            nested_posts = record.get("posts")
+            record_posts = nested_posts if isinstance(nested_posts, list) else [record]
             for post in record_posts:
+                text = post.get("text", "")
+                source = post.get("source", "unknown")
+                if not DataService._is_valid_pipeline_post(text, source):
+                    continue
                 posts.append(
                     {
                         "ticker": ticker,
                         "date": record.get("date", datetime.now().date().isoformat()),
-                        "text": post.get("text", ""),
-                        "source": post.get("source", "unknown"),
+                        "text": text,
+                        "source": source,
                         "post_score": post.get("post_score", 0),
                     }
                 )
 
         if not posts:
-            posts = [
-                {
-                    "ticker": ticker,
-                    "date": datetime.now().date().isoformat(),
-                    "text": f"Sample fallback post for {ticker}",
-                    "source": "mock_social",
-                    "post_score": 1,
-                }
-            ]
+            posts = []
+            for headline in DataService.get_headlines(ticker, limit=8):
+                if not DataService._is_valid_pipeline_post(headline.headline, headline.source):
+                    continue
+                posts.append(
+                    {
+                        "ticker": ticker,
+                        "date": (
+                            headline.published_at.date().isoformat()
+                            if headline.published_at
+                            else datetime.now().date().isoformat()
+                        ),
+                        "text": headline.headline,
+                        "source": headline.source,
+                        "post_score": 1,
+                    }
+                )
 
         return {
             "ticker": ticker,

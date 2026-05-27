@@ -2,7 +2,23 @@ function formatLabel(value = "neutral") {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
-export default function SentimentPanel({ sentiment, loading = false }) {
+function formatMoney(value) {
+  if (!Number.isFinite(value)) return "--";
+  return `$${value.toFixed(2)}`;
+}
+
+function formatShortDate(value) {
+  const parsed = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+export default function SentimentPanel({
+  sentiment,
+  marketHistory = [],
+  ticker = "",
+  loading = false,
+}) {
   const hasSentiment = Boolean(sentiment);
   const sentimentScore = sentiment?.sentiment_score ?? 0;
   const normalizedScore = Math.max(
@@ -26,14 +42,19 @@ export default function SentimentPanel({ sentiment, loading = false }) {
     `Neutral probability: ${sourceDistribution.neutral}%`,
   ];
 
-  const W = 600;
-  const H = 112;
-  const PAD = 30;
-  const chartW = W - PAD * 2;
-  const chartH = H - PAD * 2;
-
-  const toX = () => PAD + chartW / 2;
-  const toY = (val) => PAD + chartH - (val / 100) * chartH;
+  const historyPoints = marketHistory
+    .map((point) => ({
+      ...point,
+      close: Number(point.close),
+    }))
+    .filter((point) => Number.isFinite(point.close));
+  const latestHistoryPoint = historyPoints[historyPoints.length - 1];
+  const firstHistoryPoint = historyPoints[0];
+  const historyChange =
+    latestHistoryPoint && firstHistoryPoint && firstHistoryPoint.close
+      ? ((latestHistoryPoint.close - firstHistoryPoint.close) / firstHistoryPoint.close) * 100
+      : 0;
+  const historyTone = historyChange > 0 ? "positive" : historyChange < 0 ? "negative" : "neutral";
   const label = formatLabel(sentiment?.sentiment_label || "neutral");
 
   return (
@@ -89,75 +110,98 @@ export default function SentimentPanel({ sentiment, loading = false }) {
 
           <div className="chart-section">
             <div className="chart-header">
-              <h4 className="subsection-title">Current Sentiment Snapshot</h4>
-              <span className="chart-note">single point</span>
+              <h4 className="subsection-title">{ticker} Price History</h4>
+              <span className={`chart-note ${historyTone}`}>
+                {historyPoints.length > 1
+                  ? `${historyChange >= 0 ? "+" : ""}${historyChange.toFixed(1)}% 1M`
+                  : "history pending"}
+              </span>
             </div>
 
-            <svg
-              viewBox={`0 0 ${W} ${H}`}
-              className="sentiment-chart"
-              preserveAspectRatio="xMidYMid meet"
-            >
-              {[25, 50, 75].map((y) => (
-                <g key={y}>
-                  <line
-                    x1={PAD}
-                    y1={toY(y)}
-                    x2={W - PAD}
-                    y2={toY(y)}
-                    stroke="var(--border)"
-                    strokeDasharray="4 4"
-                    strokeWidth="0.8"
-                  />
-                  <text
-                    x={PAD - 5}
-                    y={toY(y) + 4}
-                    textAnchor="end"
-                    fontSize="9"
-                    fill="var(--text-muted)"
-                  >
-                    {y}
-                  </text>
-                </g>
-              ))}
-
-              <line
-                x1={PAD}
-                y1={toY(normalizedScore)}
-                x2={W - PAD}
-                y2={toY(normalizedScore)}
-                stroke="var(--accent)"
-                strokeWidth="1.5"
-                strokeOpacity="0.5"
-              />
-              <circle cx={toX()} cy={toY(normalizedScore)} r="6" fill="var(--accent)" />
-              <circle
-                cx={toX()}
-                cy={toY(normalizedScore)}
-                r="15"
-                fill="none"
-                stroke="var(--accent)"
-                strokeOpacity="0.3"
-              />
-              <text
-                x={toX()}
-                y={H - 6}
-                textAnchor="middle"
-                fontSize="9"
-                fill="var(--text-muted)"
-              >
-                Latest summary
-              </text>
-            </svg>
+            <PriceHistoryChart points={historyPoints} />
 
             <p className="snapshot-copy">
-              This view shows the latest aggregate sentiment point rather than a
-              historical trend.
+              Recent close-price history from the market data provider, shown alongside the latest sentiment signal.
             </p>
           </div>
         </>
       ) : null}
     </section>
+  );
+}
+
+function PriceHistoryChart({ points }) {
+  const W = 640;
+  const H = 150;
+  const PAD_X = 44;
+  const PAD_TOP = 18;
+  const PAD_BOTTOM = 28;
+  const chartW = W - PAD_X * 2;
+  const chartH = H - PAD_TOP - PAD_BOTTOM;
+
+  if (points.length < 2) {
+    return (
+      <div className="history-empty">
+        Price history unavailable for this ticker right now.
+      </div>
+    );
+  }
+
+  const closes = points.map((point) => point.close);
+  const minClose = Math.min(...closes);
+  const maxClose = Math.max(...closes);
+  const range = maxClose - minClose || Math.max(maxClose * 0.01, 1);
+  const latest = points[points.length - 1];
+  const first = points[0];
+
+  const toX = (index) => PAD_X + (index / (points.length - 1)) * chartW;
+  const toY = (close) => PAD_TOP + chartH - ((close - minClose) / range) * chartH;
+
+  const linePath = points
+    .map((point, index) => `${index === 0 ? "M" : "L"} ${toX(index).toFixed(2)} ${toY(point.close).toFixed(2)}`)
+    .join(" ");
+  const areaPath = `${linePath} L ${toX(points.length - 1).toFixed(2)} ${H - PAD_BOTTOM} L ${PAD_X} ${H - PAD_BOTTOM} Z`;
+
+  return (
+    <div className="history-chart-wrap">
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="history-chart"
+        preserveAspectRatio="none"
+        aria-label="Recent price history"
+      >
+        {[maxClose, (maxClose + minClose) / 2, minClose].map((value) => (
+          <g key={value}>
+            <line
+              x1={PAD_X}
+              y1={toY(value)}
+              x2={W - PAD_X}
+              y2={toY(value)}
+              stroke="var(--border)"
+              strokeDasharray="4 5"
+              strokeWidth="1"
+            />
+            <text x={PAD_X - 8} y={toY(value) + 4} textAnchor="end" fontSize="10" fill="var(--text-muted)">
+              {formatMoney(value)}
+            </text>
+          </g>
+        ))}
+        <path d={areaPath} fill="var(--accent)" opacity="0.08" />
+        <path d={linePath} fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" />
+        <circle cx={toX(points.length - 1)} cy={toY(latest.close)} r="4.5" fill="var(--accent)" />
+        <text x={PAD_X} y={H - 7} fontSize="10" fill="var(--text-muted)">
+          {formatShortDate(first.date)}
+        </text>
+        <text x={W - PAD_X} y={H - 7} textAnchor="end" fontSize="10" fill="var(--text-muted)">
+          {formatShortDate(latest.date)}
+        </text>
+      </svg>
+      <div className="history-stats">
+        <span>Latest {formatMoney(latest.close)}</span>
+        <span>High {formatMoney(maxClose)}</span>
+        <span>Low {formatMoney(minClose)}</span>
+      </div>
+    </div>
   );
 }
 

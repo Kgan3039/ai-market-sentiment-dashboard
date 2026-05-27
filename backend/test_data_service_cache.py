@@ -2,8 +2,12 @@
 """Regression checks for dashboard data provider caching."""
 
 import asyncio
+import os
+import sys
 
 from datetime import datetime
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from app.models.schemas import Fundamentals, HeadlineItem, MarketData, PredictionResponse, SentimentScores
 from app.routes.dashboard import get_dashboard_summary
@@ -112,6 +116,7 @@ def test_dashboard_summary_uses_provider_status() -> None:
     original_sentiment_for_ticker = SentimentService.get_sentiment_for_ticker
     original_sentiment_for_text = SentimentService.get_sentiment_for_text
     original_market_data = DataService.get_market_data
+    original_market_history = DataService.get_market_history
     original_prediction = PredictionService.predict_for_ticker
     original_headlines = DataService.get_headlines
     original_headlines_status = DataService.get_headlines_status
@@ -131,6 +136,7 @@ def test_dashboard_summary_uses_provider_status() -> None:
                 timestamp=datetime(2026, 5, 18),
             )
         )
+        DataService.get_market_history = staticmethod(lambda ticker: [])
         PredictionService.predict_for_ticker = staticmethod(
             lambda ticker: {
                 "prediction": PredictionResponse(
@@ -174,6 +180,7 @@ def test_dashboard_summary_uses_provider_status() -> None:
         SentimentService.get_sentiment_for_ticker = original_sentiment_for_ticker
         SentimentService.get_sentiment_for_text = original_sentiment_for_text
         DataService.get_market_data = original_market_data
+        DataService.get_market_history = original_market_history
         PredictionService.predict_for_ticker = original_prediction
         DataService.get_headlines = original_headlines
         DataService.get_headlines_status = original_headlines_status
@@ -182,8 +189,80 @@ def test_dashboard_summary_uses_provider_status() -> None:
         DataService._PROVIDER_STATUS.clear()
 
 
+def test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction() -> None:
+    DataService._PROVIDER_CACHE.clear()
+    DataService._PROVIDER_STATUS.clear()
+
+    original_fetch = DataService._fetch_yfinance_headlines
+    original_market_data = DataService.get_market_data
+    original_market_history = DataService.get_market_history
+    original_fundamentals = DataService.get_fundamentals
+    original_fundamentals_status = DataService.get_fundamentals_status
+    try:
+        DataService._fetch_yfinance_headlines = staticmethod(
+            lambda ticker, limit: [
+                HeadlineItem(
+                    id=f"{ticker}-real-1",
+                    ticker=ticker,
+                    headline="Nvidia shares rise as data center demand beats expectations",
+                    title="Nvidia shares rise as data center demand beats expectations",
+                    source="Test News",
+                    published_at=datetime(2026, 5, 18),
+                ),
+                HeadlineItem(
+                    id=f"{ticker}-real-2",
+                    ticker=ticker,
+                    headline="Nvidia profit growth offsets investor concerns",
+                    title="Nvidia profit growth offsets investor concerns",
+                    source="Test News",
+                    published_at=datetime(2026, 5, 18),
+                ),
+            ]
+        )
+        DataService.get_market_data = staticmethod(
+            lambda ticker: MarketData(
+                symbol=ticker,
+                price=100.0,
+                day_high=105.0,
+                volume=1_000_000,
+                timestamp=datetime(2026, 5, 18),
+            )
+        )
+        DataService.get_market_history = staticmethod(lambda ticker: [])
+        DataService.get_fundamentals = staticmethod(lambda ticker: None)
+        DataService.get_fundamentals_status = staticmethod(
+            lambda ticker: {
+                "available": False,
+                "status": "unavailable",
+                "source": "Yahoo Finance via yfinance",
+                "message": "Fundamentals provider returned no usable fields.",
+            }
+        )
+
+        sentiment = SentimentService.get_sentiment_for_ticker("NVDA")
+        summary = asyncio.run(get_dashboard_summary("NVDA"))
+
+        assert sentiment["overall_sentiment"] is not None
+        assert sentiment["source_breakdown"]["Test News"]["count"] == 2
+        assert summary.sentiment is not None
+        assert summary.sentiment.sentiment_label in ("positive", "neutral", "negative")
+        assert summary.prediction is not None
+        assert summary.prediction.predicted_movement in ("up", "down", "neutral")
+        assert summary.availability.sentiment.available is True
+        assert summary.availability.prediction.available is True
+    finally:
+        DataService._fetch_yfinance_headlines = original_fetch
+        DataService.get_market_data = original_market_data
+        DataService.get_market_history = original_market_history
+        DataService.get_fundamentals = original_fundamentals
+        DataService.get_fundamentals_status = original_fundamentals_status
+        DataService._PROVIDER_CACHE.clear()
+        DataService._PROVIDER_STATUS.clear()
+
+
 if __name__ == "__main__":
     test_headline_cache_falls_back_to_stale_data()
     test_fundamentals_cache_falls_back_to_stale_data()
     test_dashboard_summary_uses_provider_status()
+    test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction()
     print("Data provider cache tests passed.")

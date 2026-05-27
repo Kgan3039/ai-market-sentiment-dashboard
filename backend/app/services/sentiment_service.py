@@ -8,7 +8,7 @@ Integration Points:
 - Consumes social media data from Isaac data pipeline
 - Returns results to Sentim ent routes for API endpoints
 
-Current Status: Placeholder implementation - awaiting NLP integration
+Current Status: Active integration with validated pipeline text and news headlines
 """
 
 import os
@@ -45,49 +45,84 @@ def _pipeline_file_path() -> str:
 
 
 def _load_grouped_posts(ticker: str) -> list[dict[str, Any]]:
+    """Load validated text for aggregate sentiment.
+
+    Pipeline posts remain the preferred source, but the committed pipeline file can
+    contain only placeholder text when Finnhub is not configured. In that case,
+    reuse the existing Yahoo Finance headline provider instead of scoring mock
+    content.
+    """
     pipeline_path = _pipeline_file_path()
-    if not os.path.exists(pipeline_path):
-        return []
+    flattened_posts = []
+
+    if os.path.exists(pipeline_path):
+        try:
+            with open(pipeline_path, "r") as file:
+                records = json.load(file)
+        except Exception:
+            records = []
+
+        for record in records:
+            if record.get("ticker", "").upper() != ticker:
+                continue
+
+            record_posts = record.get("posts")
+            if isinstance(record_posts, list):
+                candidate_posts = [
+                    {
+                        "ticker": ticker,
+                        "date": record.get("date"),
+                        "text": post.get("text", ""),
+                        "source": post.get("source", "unknown"),
+                        "post_score": post.get("post_score", 0),
+                    }
+                    for post in record_posts
+                ]
+            else:
+                candidate_posts = [
+                    {
+                        "ticker": ticker,
+                        "date": record.get("date"),
+                        "text": record.get("text", ""),
+                        "source": record.get("source", "unknown"),
+                        "post_score": record.get("post_score", 0),
+                    }
+                ]
+
+            flattened_posts.extend(
+                post for post in candidate_posts if _is_valid_pipeline_text(post)
+            )
+
+    if flattened_posts:
+        return flattened_posts
 
     try:
-        with open(pipeline_path, "r") as file:
-            records = json.load(file)
+        from app.services.data_service import DataService
+
+        headlines = DataService.get_headlines(ticker, limit=8)
     except Exception:
-        return []
+        headlines = []
 
-    flattened_posts = []
-    for record in records:
-        if record.get("ticker", "").upper() != ticker:
-            continue
-
-        record_posts = record.get("posts")
-        if isinstance(record_posts, list):
-            candidate_posts = [
-                {
-                    "ticker": ticker,
-                    "date": record.get("date"),
-                    "text": post.get("text", ""),
-                    "source": post.get("source", "unknown"),
-                    "post_score": post.get("post_score", 0),
-                }
-                for post in record_posts
-            ]
-        else:
-            candidate_posts = [
-                {
-                    "ticker": ticker,
-                    "date": record.get("date"),
-                    "text": record.get("text", ""),
-                    "source": record.get("source", "unknown"),
-                    "post_score": record.get("post_score", 0),
-                }
-            ]
-
-        flattened_posts.extend(
-            post for post in candidate_posts if _is_valid_pipeline_text(post)
+    return [
+        {
+            "ticker": ticker,
+            "date": (
+                headline.published_at.date().isoformat()
+                if headline.published_at
+                else datetime.now().date().isoformat()
+            ),
+            "text": headline.headline,
+            "source": headline.source or "Yahoo Finance via yfinance",
+            "post_score": 1,
+        }
+        for headline in headlines
+        if _is_valid_pipeline_text(
+            {
+                "text": headline.headline,
+                "source": headline.source or "Yahoo Finance via yfinance",
+            }
         )
-
-    return flattened_posts
+    ]
 
 
 def _is_valid_pipeline_text(post: dict[str, Any]) -> bool:
