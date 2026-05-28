@@ -49,26 +49,36 @@ class PredictionService:
     @staticmethod
     def predict_movement(
         ticker: str, sentiment_score: float, market_features: Dict[str, float]
-    ) -> PredictionResponse:
+    ) -> tuple[PredictionResponse, Dict[str, Any]]:
         prediction_module = _load_prediction_module()
-        used_ml_model = False
 
         if prediction_module is not None and hasattr(prediction_module, 'predict'):
             try:
+                model_key = 'rf'
                 result = prediction_module.predict(
                     sentiment_score=sentiment_score,
                     sentiment_confidence=market_features.get('sentiment_confidence', 0.5),
                     price_delta_24h=market_features.get('price_delta_24h', 0.0),
                     volume_delta=market_features.get('volume_delta', 0.0),
-                    model='rf'
+                    model=model_key
                 )
-                used_ml_model = True
+                if hasattr(prediction_module, 'get_model_provenance'):
+                    model_info = prediction_module.get_model_provenance(model_key)
+                else:
+                    model_info = {
+                        'name': 'RandomForestClassifier',
+                        'version': '0.1.0',
+                        'artifact_source': 'unknown',
+                    }
+                model_info['status'] = 'ready'
+
                 return PredictionResponse(
                     symbol=ticker,
                     predicted_movement=result.get('predicted_movement', 'neutral'),
                     probability=float(result.get('probability', 0.5)),
                     confidence=float(result.get('confidence', 0.5)),
-                ), used_ml_model
+                    model_info=model_info,
+                ), model_info
             except Exception:
                 pass
 
@@ -79,12 +89,26 @@ class PredictionService:
         probability = round(0.5 + 0.2 * magnitude, 4)
         confidence = round(0.5 + 0.15 * magnitude, 4)
 
+        model_info = {
+            'name': 'FallbackRule',
+            'version': '0.1.0',
+            'status': 'fallback',
+            'artifact_source': 'none',
+            'features_used': [
+                'sentiment_score',
+                'sentiment_confidence',
+                'price_delta_24h',
+                'volume_delta',
+            ],
+        }
+
         return PredictionResponse(
             symbol=ticker,
             predicted_movement=movement,
             probability=probability,
             confidence=confidence,
-        ), used_ml_model
+            model_info=model_info,
+        ), model_info
 
     @staticmethod
     def predict_for_ticker(ticker: str) -> Dict[str, Any]:
@@ -142,24 +166,22 @@ class PredictionService:
             )
             break
 
-        prediction, used_ml_model = PredictionService.predict_movement(
+        prediction, model_info = PredictionService.predict_movement(
             ticker=ticker,
             sentiment_score=sentiment_score,
             market_features=market_features,
         )
 
+        model_info.setdefault('features_used', [
+            'sentiment_score',
+            'sentiment_confidence',
+            'price_delta_24h',
+            'volume_delta',
+        ])
+
         return {
             'ticker': ticker,
             'prediction': prediction,
-            'model_info': {
-                'name': 'RandomForestClassifier' if used_ml_model else 'FallbackRule',
-                'version': '0.1.0',
-                'features_used': [
-                    'sentiment_score',
-                    'sentiment_confidence',
-                    'price_delta_24h',
-                    'volume_delta',
-                ],
-            },
+            'model_info': model_info,
             'timestamp': datetime.now().isoformat(),
         }

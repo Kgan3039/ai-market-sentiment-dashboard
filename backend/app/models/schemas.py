@@ -5,7 +5,7 @@ These models define the contract between backend and frontend.
 All endpoints return data matching these schemas.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Any, Optional, Dict, List
 from datetime import datetime
 
@@ -69,6 +69,8 @@ class MarketHistoryPoint(BaseModel):
 class PredictionResponse(BaseModel):
     """Stock movement prediction response."""
 
+    model_config = ConfigDict(protected_namespaces=())
+
     symbol: str = Field(..., description="Stock ticker symbol")
     predicted_movement: str = Field(
         ..., description="Predicted movement: 'up', 'down', or 'neutral'"
@@ -78,6 +80,9 @@ class PredictionResponse(BaseModel):
     )
     confidence: float = Field(
         ..., ge=0, le=1, description="Model confidence score"
+    )
+    model_info: Optional[Dict[str, Any]] = Field(
+        None, description="Optional model provenance for the serving predictor"
     )
 
 class TextAnalysisRequest(BaseModel):

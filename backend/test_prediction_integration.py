@@ -60,6 +60,7 @@ def test_predict_for_ticker_contract():
     assert hasattr(prediction, "predicted_movement"), "Missing field: predicted_movement"
     assert hasattr(prediction, "probability"), "Missing field: probability"
     assert hasattr(prediction, "confidence"), "Missing field: confidence"
+    assert hasattr(prediction, "model_info"), "Missing field: model_info"
  
     assert prediction.predicted_movement in ("up", "down", "neutral"), \
         f"Unexpected predicted_movement value: {prediction.predicted_movement}"
@@ -71,7 +72,12 @@ def test_predict_for_ticker_contract():
     assert prediction.predicted_movement != "neutral", \
         "ML model path is being bypassed — endpoint is falling back to rule-based. " \
         "Check that prediction module loads correctly and predict() is being called."
- 
+    assert prediction.model_info["name"] == "RandomForestClassifier"
+    assert prediction.model_info["artifact_source"] in (
+        "disk",
+        "trained_and_persisted",
+    )
+
     print(f"✓ predicted_movement : {prediction.predicted_movement}")
     print(f"✓ probability        : {prediction.probability}")
     print(f"✓ confidence         : {prediction.confidence}")
