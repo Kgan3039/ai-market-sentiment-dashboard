@@ -9,8 +9,12 @@ This module keeps the project aligned with ``docs/dataset_format.md``:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import os
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
@@ -39,6 +43,9 @@ FEATURES = [
 ]
 
 TARGET = "label"
+ARTIFACT_VERSION = "synthetic-demo-v1"
+ARTIFACT_SCHEMA_VERSION = 1
+DEFAULT_ARTIFACT_PATH = Path(__file__).with_name("models") / "model_artifacts.joblib"
 
 
 @dataclass
@@ -47,9 +54,15 @@ class ModelArtifacts:
     rf: RandomForestClassifier
     scaler: StandardScaler
     results: Dict[str, float]
+    provenance: Dict[str, object]
 
 
 _MODEL_CACHE: Optional[ModelArtifacts] = None
+
+
+def _artifact_path() -> Path:
+    configured = os.getenv("PREDICTION_MODEL_ARTIFACT_PATH")
+    return Path(configured).expanduser() if configured else DEFAULT_ARTIFACT_PATH
 
 
 def _build_synthetic_training_data(size: int = 500) -> pd.DataFrame:
@@ -141,16 +154,140 @@ def train_models(df: pd.DataFrame) -> Tuple[LogisticRegression, RandomForestClas
     return lr, rf, scaler, results
 
 
+def _build_model_artifacts() -> ModelArtifacts:
+    training_df = _build_synthetic_training_data()
+    lr, rf, scaler, results = train_models(training_df)
+    now = datetime.now(timezone.utc).isoformat()
+    provenance = {
+        "artifact_version": ARTIFACT_VERSION,
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "trained_at": now,
+        "training_data": "deterministic_synthetic_v1",
+        "training_rows": len(training_df),
+        "features": FEATURES,
+        "calibration": {
+            "confidence_min": CONFIDENCE_MIN,
+            "confidence_max": CONFIDENCE_MAX,
+            "probability_clip": [0.18, 0.82],
+        },
+        "metrics": results,
+    }
+    return ModelArtifacts(lr=lr, rf=rf, scaler=scaler, results=results, provenance=provenance)
+
+
+def save_model_artifacts(artifacts: ModelArtifacts, artifact_path: Optional[Path] = None) -> Path:
+    """Persist trained models, scaler, metrics, and provenance to disk."""
+    path = artifact_path or _artifact_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
+        "artifact_version": ARTIFACT_VERSION,
+        "lr": artifacts.lr,
+        "rf": artifacts.rf,
+        "scaler": artifacts.scaler,
+        "results": artifacts.results,
+        "provenance": artifacts.provenance,
+    }
+    joblib.dump(payload, path)
+    return path
+
+
+def load_model_artifacts(artifact_path: Optional[Path] = None) -> ModelArtifacts:
+    """Load persisted model artifacts from disk."""
+    path = artifact_path or _artifact_path()
+    payload = joblib.load(path)
+
+    required_keys = {"schema_version", "artifact_version", "lr", "rf", "scaler", "results", "provenance"}
+    missing = required_keys - set(payload)
+    if missing:
+        raise ValueError(f"Model artifact missing keys: {sorted(missing)}")
+    if payload["schema_version"] != ARTIFACT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported model artifact schema: {payload['schema_version']}"
+        )
+
+    provenance = dict(payload["provenance"])
+    provenance.update(
+        {
+            "artifact_source": "disk",
+            "artifact_path": str(path),
+        }
+    )
+    return ModelArtifacts(
+        lr=payload["lr"],
+        rf=payload["rf"],
+        scaler=payload["scaler"],
+        results=payload["results"],
+        provenance=provenance,
+    )
+
+
 def get_model_artifacts() -> ModelArtifacts:
-    """Lazily train local demo models once and cache them."""
+    """Load persisted demo models, training and saving only when artifacts are absent."""
     global _MODEL_CACHE
 
     if _MODEL_CACHE is None:
-        training_df = _build_synthetic_training_data()
-        lr, rf, scaler, results = train_models(training_df)
-        _MODEL_CACHE = ModelArtifacts(lr=lr, rf=rf, scaler=scaler, results=results)
+        path = _artifact_path()
+        if path.exists():
+            _MODEL_CACHE = load_model_artifacts(path)
+        else:
+            artifacts = _build_model_artifacts()
+            try:
+                saved_path = save_model_artifacts(artifacts, path)
+                artifacts.provenance.update(
+                    {
+                        "artifact_source": "trained_and_persisted",
+                        "artifact_path": str(saved_path),
+                    }
+                )
+            except Exception:
+                artifacts.provenance.update(
+                    {
+                        "artifact_source": "trained_in_memory",
+                        "artifact_path": str(path),
+                    }
+                )
+            _MODEL_CACHE = artifacts
 
     return _MODEL_CACHE
+
+
+def bootstrap_model_artifacts(force_retrain: bool = False) -> ModelArtifacts:
+    """Ensure a persisted artifact exists and return the loaded artifacts."""
+    global _MODEL_CACHE
+    if force_retrain:
+        artifacts = _build_model_artifacts()
+        saved_path = save_model_artifacts(artifacts)
+        _MODEL_CACHE = None
+        loaded = load_model_artifacts(saved_path)
+        _MODEL_CACHE = loaded
+        return loaded
+
+    return get_model_artifacts()
+
+
+def get_model_provenance(model: str = "rf") -> Dict[str, object]:
+    """Return lightweight metadata about the serving prediction model."""
+    artifacts = get_model_artifacts()
+    model_name = "LogisticRegression" if model == "lr" else "RandomForestClassifier"
+    metric_prefix = "lr" if model == "lr" else "rf"
+    metrics = {
+        key: value
+        for key, value in artifacts.results.items()
+        if key.startswith(metric_prefix)
+    }
+
+    return {
+        "name": model_name,
+        "version": artifacts.provenance.get("artifact_version", ARTIFACT_VERSION),
+        "artifact_source": artifacts.provenance.get("artifact_source"),
+        "artifact_path": artifacts.provenance.get("artifact_path"),
+        "trained_at": artifacts.provenance.get("trained_at"),
+        "training_data": artifacts.provenance.get("training_data"),
+        "features_used": FEATURES,
+        "calibration": artifacts.provenance.get("calibration"),
+        "metrics": metrics,
+    }
 
 
 CONFIDENCE_MIN = 0.52
