@@ -418,7 +418,11 @@ class DataService:
             source=source,
             url=url,
             published_at=published_at,
-            time=published_at.strftime("%b %-d, %Y") if published_at else None,
+            time=(
+                f"{published_at:%b} {published_at.day}, {published_at:%Y}"
+                if published_at
+                else None
+            ),
             summary=summary,
         )
 
