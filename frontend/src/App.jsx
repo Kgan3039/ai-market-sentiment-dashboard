@@ -8,7 +8,7 @@ import Alerts from "./components/Alerts";
 import PredictionModel from "./components/PredictionModel";
 import "./App.css";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
 function formatTimestamp(value) {
   if (!value) return null;
