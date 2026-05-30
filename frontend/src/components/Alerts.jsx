@@ -21,10 +21,12 @@ function AlertItem({ alert }) {
       <div className="alert-body">
         <div className="alert-title-row">
           <div className="alert-title">{alert.title}</div>
+          {alert.status ? <span className="alert-status">{alert.status}</span> : null}
         </div>
         <div className="alert-message">{alert.message}</div>
-        {typeof alert.count === "number" ? (
+        {alert.source || typeof alert.count === "number" ? (
           <div className="alert-meta">
+            {alert.source ? <span>{alert.source}</span> : null}
             {typeof alert.count === "number" ? <span>{alert.count} items</span> : null}
           </div>
         ) : null}

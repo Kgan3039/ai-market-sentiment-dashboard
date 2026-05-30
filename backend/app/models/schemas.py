@@ -46,6 +46,11 @@ class MarketData(BaseModel):
     price: float = Field(..., description="Current stock price")
     day_high: float = Field(..., description="Day high price")
     volume: int = Field(..., description="Trading volume")
+    price_delta_24h: Optional[float] = Field(None, description="Absolute close-price change from the prior trading day")
+    percent_change_24h: Optional[float] = Field(None, description="Percent close-price change from the prior trading day")
+    volume_delta: Optional[float] = Field(None, description="Relative volume delta versus recent trading volume")
+    source: Optional[str] = Field(None, description="Provider or committed data source for this market snapshot")
+    status: Optional[str] = Field(None, description="Availability status for this market snapshot")
     timestamp: datetime = Field(..., description="Data timestamp")
 
     class Config:
@@ -54,6 +59,11 @@ class MarketData(BaseModel):
             "price": 875.50,
             "day_high": 885.00,
             "volume": 45000000,
+            "price_delta_24h": 8.25,
+            "percent_change_24h": 0.95,
+            "volume_delta": 0.18,
+            "source": "Yahoo Finance via yfinance",
+            "status": "ready",
             "timestamp": "2026-04-01T10:30:00",
         }
 
@@ -205,6 +215,11 @@ class DashboardSummary(BaseModel):
                 "price": 875.50,
                 "day_high": 885.00,
                 "volume": 45000000,
+                "price_delta_24h": 8.25,
+                "percent_change_24h": 0.95,
+                "volume_delta": 0.18,
+                "source": "Yahoo Finance via yfinance",
+                "status": "ready",
                 "timestamp": "2026-04-01T10:30:00",
             },
             "market_history": [],

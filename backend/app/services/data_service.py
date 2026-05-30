@@ -151,6 +151,67 @@ class DataService:
         return not any(phrase in lowered_text for phrase in placeholder_phrases)
 
     @staticmethod
+    def _optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _market_data_from_snapshot(ticker: str, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        price = float(market_snapshot.get("price", 0.0) or 0.0)
+        status = market_snapshot.get("status") or ("ready" if price > 0 else "unavailable")
+        source = market_snapshot.get("source") or (
+            "Pipeline market snapshot" if price > 0 else "unavailable"
+        )
+
+        return {
+            "symbol": ticker,
+            "price": price,
+            "day_high": float(market_snapshot.get("day_high", price) or price),
+            "volume": int(market_snapshot.get("volume", 0) or 0),
+            "price_delta_24h": DataService._optional_float(market_snapshot.get("price_delta_24h")),
+            "percent_change_24h": DataService._optional_float(market_snapshot.get("percent_change_24h")),
+            "volume_delta": DataService._optional_float(market_snapshot.get("volume_delta")),
+            "source": source,
+            "status": status,
+            "timestamp": datetime.now(),
+        }
+
+    @staticmethod
+    def _market_data_from_history(ticker: str, hist: Any, source: str) -> Optional[Dict[str, Any]]:
+        if hist is None or hist.empty:
+            return None
+
+        latest = hist.iloc[-1]
+        previous = hist.iloc[-2] if len(hist) > 1 else latest
+        price = float(latest.get("Close", 0.0) or 0.0)
+        previous_close = float(previous.get("Close", price) or price)
+        price_delta = price - previous_close
+        percent_change = (price_delta / previous_close * 100) if previous_close else 0.0
+
+        previous_volume = hist["Volume"].iloc[-6:-1] if len(hist) > 1 else hist["Volume"].iloc[-1:]
+        average_volume = float(previous_volume.mean() or 0.0)
+        volume = int(latest.get("Volume", 0) or 0)
+        volume_delta = ((volume - average_volume) / average_volume) if average_volume else 0.0
+
+        return {
+            "symbol": ticker,
+            "price": price,
+            "day_high": float(latest.get("High", price) or price),
+            "volume": volume,
+            "price_delta_24h": price_delta,
+            "percent_change_24h": percent_change,
+            "volume_delta": volume_delta,
+            "source": source,
+            "status": "ready" if price > 0 else "unavailable",
+            "timestamp": datetime.now(),
+        }
+
+    @staticmethod
     def get_market_data(ticker: str) -> MarketData:
         """
         Get current market data for a stock.
@@ -172,14 +233,7 @@ class DataService:
         if ticker_records:
             latest = sorted(ticker_records, key=lambda r: r.get("date", ""), reverse=True)[0]
             market_snapshot = latest.get("market_data", {}) or {}
-            price = float(market_snapshot.get("price", 0.0) or 0.0)
-            market_data = {
-                "symbol": ticker,
-                "price": price,
-                "day_high": price,
-                "volume": int(market_snapshot.get("volume", 0) or 0),
-                "timestamp": datetime.now(),
-            }
+            market_data = DataService._market_data_from_snapshot(ticker, market_snapshot)
 
         # Fallback to yfinance if pipeline data is unavailable or incomplete
         if market_data is None or market_data['price'] <= 0:
@@ -187,19 +241,12 @@ class DataService:
                 import yfinance as yf
 
                 stock = yf.Ticker(ticker)
-                hist = stock.history(period='1d')
-                if not hist.empty:
-                    price = float(hist['Close'].iloc[-1])
-                    day_high = float(hist['High'].iloc[-1])
-                    volume = int(hist['Volume'].iloc[-1])
-
-                    market_data = {
-                        'symbol': ticker,
-                        'price': price,
-                        'day_high': day_high,
-                        'volume': volume,
-                        'timestamp': datetime.now(),
-                    }
+                hist = stock.history(period='1mo')
+                market_data = DataService._market_data_from_history(
+                    ticker,
+                    hist,
+                    "Yahoo Finance via yfinance",
+                )
             except Exception:
                 market_data = None
 
@@ -209,6 +256,11 @@ class DataService:
                 'price': 0.0,
                 'day_high': 0.0,
                 'volume': 0,
+                'price_delta_24h': 0.0,
+                'percent_change_24h': 0.0,
+                'volume_delta': 0.0,
+                'source': 'unavailable',
+                'status': 'unavailable',
                 'timestamp': datetime.now(),
             }
 
