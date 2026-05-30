@@ -114,6 +114,16 @@ async def get_dashboard_summary(ticker: str):
 
         overall_sentiment = sentiment_data["overall_sentiment"]
         prediction = prediction_data["prediction"]
+        market_status = market_data.status or ("ready" if market_data.price > 0 else "unavailable")
+        market_source = market_data.source or "source not reported"
+        market_available = market_data.price > 0 and market_status != "unavailable"
+        market_message = (
+            f"Market snapshot is available from {market_source}."
+            if market_available
+            else "Market snapshot unavailable from configured providers."
+        )
+        if market_available and market_data.volume_delta is not None:
+            market_message = f"{market_message} Volume delta {market_data.volume_delta:+.1%}."
 
         availability = DashboardAvailability(
             sentiment=_availability(
@@ -127,14 +137,10 @@ async def get_dashboard_summary(ticker: str):
                 ),
             ),
             market_data=_availability(
-                available=market_data.price > 0,
-                status="ready" if market_data.price > 0 else "fallback",
-                source="Market data provider",
-                message=(
-                    "Market data is available."
-                    if market_data.price > 0
-                    else "Market data is not available for this ticker."
-                ),
+                available=market_available,
+                status=market_status,
+                source=market_source,
+                message=market_message,
             ),
             prediction=_availability(
                 available=prediction is not None,

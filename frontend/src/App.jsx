@@ -18,29 +18,20 @@ function formatTimestamp(value) {
 }
 
 function getAvailabilityLabel(item) {
-  if (!item) return "Pending";
-  if (item.status === "fallback" || item.status === "partial") return "Pending";
-  return item.available ? "Available" : "Not available";
+  if (!item) return "Not queried";
+  return item.status || (item.available ? "ready" : "unavailable");
 }
 
 function getAvailabilityType(item) {
   if (!item) return "info";
+  if (item.status === "ready") return "success";
   if (item.status === "fallback" || item.status === "partial") return "warning";
+  if (item.status === "unavailable") return "warning";
   return item.available ? "success" : "warning";
 }
 
-function getAvailabilityMessage(label, item) {
-  if (item?.available) return `${label} available.`;
-  if (label === "Sentiment") {
-    return "Aggregate sentiment unavailable until enough validated text data is available.";
-  }
-  if (label === "Prediction") {
-    return "Prediction unavailable until enough validated input data is available.";
-  }
-  if (label === "Social posts") return "No social posts available for this ticker yet.";
-  if (label === "Headlines") return "No headlines available for this ticker yet.";
-  if (label === "Fundamentals") return "Fundamentals are not available in the current MVP.";
-  return `${label} not available.`;
+function getAvailabilityMessage(item) {
+  return item?.message || "Backend availability has not been reported yet.";
 }
 
 function buildStatusAlerts(summary, error, loading) {
@@ -88,7 +79,8 @@ function buildStatusAlerts(summary, error, loading) {
       title: label,
       status: getAvailabilityLabel(item),
       count: item?.count,
-      message: getAvailabilityMessage(label, item),
+      source: item?.source,
+      message: getAvailabilityMessage(item),
     };
   });
 }
@@ -179,7 +171,7 @@ export default function App() {
 
         <Header
           ticker={summary?.ticker || activeTicker}
-          price={summary?.market_data?.price}
+          marketData={summary?.market_data}
           exchange={summary ? "Market summary" : "Waiting for data"}
           updatedAt={formatTimestamp(summary?.updated_at)}
         />

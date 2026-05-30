@@ -285,6 +285,7 @@ a {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
+  gap: 4px;
 }
 
 .current-price {
@@ -302,6 +303,34 @@ a {
 .price-change.positive { color: var(--positive); }
 .price-change.negative { color: var(--negative); }
 .price-change.muted { color: var(--text-secondary); }
+
+.market-provenance {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 520px;
+}
+
+.market-provenance span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 5px 8px;
+}
+
+.market-provenance .market-status {
+  color: var(--text-primary);
+  text-transform: uppercase;
+}
+
+.market-updated {
+  color: var(--text-muted);
+  font-size: 11px;
+}
 
 /* =============================================
    COMPANY OVERVIEW
@@ -746,6 +775,14 @@ a {
   margin-bottom: 3px;
 }
 
+.alert-status {
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .alert-title-row {
   align-items: center;
   display: flex;
@@ -834,6 +871,63 @@ a {
 
 /* Catalysts */
 .catalyst-block {}
+
+.model-source {
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+}
+
+.model-source span {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.model-source strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  text-align: right;
+}
+
+.model-source.ready {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+}
+
+.model-source.fallback {
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.model-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.model-meta span {
+  background: var(--bg-card-hover);
+  border: 1px solid var(--border-light);
+  border-radius: 99px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  padding: 3px 7px;
+}
+
+.model-honesty {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 10px;
+}
 
 .catalyst-item {
   display: flex;

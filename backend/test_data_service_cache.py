@@ -13,6 +13,7 @@ from app.models.schemas import Fundamentals, HeadlineItem, MarketData, Predictio
 from app.routes.dashboard import get_dashboard_summary
 from app.services.data_service import DataService
 from app.services.prediction_service import PredictionService
+from app.services import sentiment_service
 from app.services.sentiment_service import SentimentService
 
 
@@ -133,6 +134,11 @@ def test_dashboard_summary_uses_provider_status() -> None:
                 price=100.0,
                 day_high=105.0,
                 volume=1_000_000,
+                price_delta_24h=2.5,
+                percent_change_24h=2.56,
+                volume_delta=0.2,
+                source="Yahoo Finance via yfinance",
+                status="ready",
                 timestamp=datetime(2026, 5, 18),
             )
         )
@@ -174,6 +180,9 @@ def test_dashboard_summary_uses_provider_status() -> None:
         assert summary.availability.headlines.status == "fallback"
         assert summary.availability.headlines.count == 1
         assert summary.availability.fundamentals.status == "fallback"
+        assert summary.availability.market_data.status == "ready"
+        assert summary.availability.market_data.source == "Yahoo Finance via yfinance"
+        assert "Volume delta +20.0%" in summary.availability.market_data.message
         assert summary.status["headlines"]["status"] == "fallback"
         assert summary.headlines[0].sentiment is not None
     finally:
@@ -198,7 +207,11 @@ def test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction() ->
     original_market_history = DataService.get_market_history
     original_fundamentals = DataService.get_fundamentals
     original_fundamentals_status = DataService.get_fundamentals_status
+    original_pipeline_file_path = sentiment_service._pipeline_file_path
     try:
+        sentiment_service._pipeline_file_path = lambda: os.path.join(
+            os.path.dirname(__file__), "missing_stock_data.json"
+        )
         DataService._fetch_yfinance_headlines = staticmethod(
             lambda ticker, limit: [
                 HeadlineItem(
@@ -225,6 +238,8 @@ def test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction() ->
                 price=100.0,
                 day_high=105.0,
                 volume=1_000_000,
+                source="Yahoo Finance via yfinance",
+                status="ready",
                 timestamp=datetime(2026, 5, 18),
             )
         )
@@ -256,8 +271,44 @@ def test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction() ->
         DataService.get_market_history = original_market_history
         DataService.get_fundamentals = original_fundamentals
         DataService.get_fundamentals_status = original_fundamentals_status
+        sentiment_service._pipeline_file_path = original_pipeline_file_path
         DataService._PROVIDER_CACHE.clear()
         DataService._PROVIDER_STATUS.clear()
+
+
+def test_market_data_preserves_pipeline_provenance() -> None:
+    original_records = DataService._get_ticker_records
+    original_load = DataService._load_pipeline_records
+    try:
+        DataService._get_ticker_records = staticmethod(
+            lambda ticker: [
+                {
+                    "ticker": ticker,
+                    "date": "2026-05-29",
+                    "market_data": {
+                        "price": 135.13,
+                        "day_high": 139.35,
+                        "volume": 313_566_600,
+                        "price_delta_24h": -3.11,
+                        "percent_change_24h": -2.2497,
+                        "volume_delta": 0.3223,
+                        "source": "Yahoo Finance via yfinance",
+                        "status": "ready",
+                    },
+                }
+            ]
+        )
+        DataService._load_pipeline_records = staticmethod(lambda: [])
+
+        market_data = DataService.get_market_data("NVDA")
+
+        assert market_data.source == "Yahoo Finance via yfinance"
+        assert market_data.status == "ready"
+        assert market_data.price_delta_24h == -3.11
+        assert market_data.volume_delta == 0.3223
+    finally:
+        DataService._get_ticker_records = original_records
+        DataService._load_pipeline_records = original_load
 
 
 if __name__ == "__main__":

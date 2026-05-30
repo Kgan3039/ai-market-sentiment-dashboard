@@ -1,0 +1,132 @@
+[
+  {
+    "ticker": "NVDA",
+    "date": "2026-05-29",
+    "posts": [
+      {
+        "text": "Nvidia, AMD, & other chip names in focus at Computex 2026",
+        "source": "Yahoo Finance Video",
+        "post_score": 1
+      },
+      {
+        "text": "Dell stock unexpectedly booms on AI demand: What investors may have missed",
+        "source": "Yahoo Finance Video",
+        "post_score": 1
+      },
+      {
+        "text": "Republican lawmakers are trading like Trump, piling into Big Tech stocks",
+        "source": "Yahoo Finance Video",
+        "post_score": 1
+      },
+      {
+        "text": "Why PagerDuty Just Popped 30% Today",
+        "source": "Motley Fool",
+        "post_score": 1
+      },
+      {
+        "text": "Why American Eagle Outfitters Stock Fell Today",
+        "source": "Motley Fool",
+        "post_score": 1
+      },
+      {
+        "text": "What Historically Happens to Stocks When the Fed Goes Silent in Summer",
+        "source": "Motley Fool",
+        "post_score": 1
+      },
+      {
+        "text": "Zillow Just Painted a Grim Outlook for the Housing Market. Here Are 3 Beaten-Down Stocks to Buy Anyway.",
+        "source": "Motley Fool",
+        "post_score": 1
+      },
+      {
+        "text": "Buy, Hold, or Sell: Is This Cloud Automation Juggernaut a Steal Following Its Massive Valuation Reset?",
+        "source": "24/7 Wall St.",
+        "post_score": 1
+      },
+      {
+        "text": "Bank of America Could Be a Bargain After Strong Q1 Earnings",
+        "source": "24/7 Wall St.",
+        "post_score": 1
+      },
+      {
+        "text": "$15 Under-the-Radar Enterprise AI Stock To Buy Today",
+        "source": "24/7 Wall St.",
+        "post_score": 1
+      }
+    ],
+    "market_data": {
+      "price": 211.14,
+      "price_delta_24h": -3.11,
+      "percent_change_24h": -1.45,
+      "volume": 230465710,
+      "volume_delta": 0.3223,
+      "source": "Yahoo Finance via yfinance",
+      "status": "ready"
+    }
+  },
+  {
+    "ticker": "TSLA",
+    "date": "2026-05-29",
+    "posts": [
+      {
+        "text": "'Volatility equals opportunity' in options trades as tech soars",
+        "source": "Yahoo Finance Video",
+        "post_score": 1
+      },
+      {
+        "text": "Republican lawmakers are trading like Trump, piling into Big Tech stocks",
+        "source": "Yahoo Finance Video",
+        "post_score": 1
+      },
+      {
+        "text": "Why the SpaceX, Tesla merger could hurt Tesla shareholders",
+        "source": "Yahoo Finance Video",
+        "post_score": 1
+      },
+      {
+        "text": "Waymo Unveils Ojai Robotaxi As Driverless Race Heats Up",
+        "source": "GuruFocus.com",
+        "post_score": 1
+      },
+      {
+        "text": "Rivian Rallies 8% as Tesla, Nio Stall: R2 Launch and Software Growth in Focus",
+        "source": "24/7 Wall St.",
+        "post_score": 1
+      },
+      {
+        "text": "Sell in May? You Would\u2019ve Missed One of the S&P 500\u2019s Best Mays Since the \u201850s.",
+        "source": "Barrons.com",
+        "post_score": 1
+      },
+      {
+        "text": "Raydium Tops $1 Trillion in Volume as RAY Token Lists on Robinhood and Revolut",
+        "source": "CryptoProwl",
+        "post_score": 1
+      },
+      {
+        "text": "Tesla Prepares To Use Cybercabs As Robotaxis. Here's How Big Its Fleet Is.",
+        "source": "Investor's Business Daily",
+        "post_score": 1
+      },
+      {
+        "text": "Tesla Robotaxi Fleet Trails Waymo in Texas",
+        "source": "GuruFocus.com",
+        "post_score": 1
+      },
+      {
+        "text": "Tesla Stock Fans Just Got Worrying News From Texas",
+        "source": "GuruFocus.com",
+        "post_score": 1
+      }
+    ],
+    "market_data": {
+      "price": 435.79,
+      "price_delta_24h": -6.31,
+      "percent_change_24h": -1.43,
+      "volume": 42778281,
+      "volume_delta": 0.0113,
+      "source": "Yahoo Finance via yfinance",
+      "status": "ready"
+    }
+  }
+]
