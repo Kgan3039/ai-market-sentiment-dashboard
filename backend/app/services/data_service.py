@@ -151,6 +151,42 @@ class DataService:
         return not any(phrase in lowered_text for phrase in placeholder_phrases)
 
     @staticmethod
+    def _pipeline_headlines(ticker: str, limit: int = 6) -> List[HeadlineItem]:
+        headlines: List[HeadlineItem] = []
+
+        for record_index, record in enumerate(DataService._get_ticker_records(ticker)):
+            nested_posts = record.get("posts")
+            record_posts = nested_posts if isinstance(nested_posts, list) else [record]
+            for post_index, post in enumerate(record_posts):
+                text = str(post.get("text", "")).strip()
+                source = str(post.get("source", "Committed demo dataset")).strip()
+                if not DataService._is_valid_pipeline_post(text, source):
+                    continue
+
+                published_at = None
+                date_value = record.get("date")
+                if date_value:
+                    try:
+                        published_at = datetime.fromisoformat(str(date_value))
+                    except ValueError:
+                        published_at = None
+
+                headlines.append(
+                    HeadlineItem(
+                        id=str(post.get("id") or f"{ticker}-dataset-{record_index}-{post_index}"),
+                        ticker=ticker,
+                        headline=text,
+                        title=text,
+                        source=source,
+                        published_at=published_at,
+                    )
+                )
+                if len(headlines) >= limit:
+                    return headlines
+
+        return headlines
+
+    @staticmethod
     def _optional_float(value: Any) -> Optional[float]:
         if value is None:
             return None
@@ -163,7 +199,7 @@ class DataService:
     @staticmethod
     def _market_data_from_snapshot(ticker: str, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
         price = float(market_snapshot.get("price", 0.0) or 0.0)
-        status = market_snapshot.get("status") or ("ready" if price > 0 else "unavailable")
+        status = market_snapshot.get("status") or ("cached" if price > 0 else "unavailable")
         source = market_snapshot.get("source") or (
             "Pipeline market snapshot" if price > 0 else "unavailable"
         )
@@ -207,7 +243,7 @@ class DataService:
             "percent_change_24h": percent_change,
             "volume_delta": volume_delta,
             "source": source,
-            "status": "ready" if price > 0 else "unavailable",
+            "status": "live" if price > 0 else "unavailable",
             "timestamp": datetime.now(),
         }
 
@@ -355,11 +391,13 @@ class DataService:
 
         cache_hit, cached_headlines, _ = DataService._cache_lookup(cache_key)
         if cache_hit:
+            previous_status = DataService._PROVIDER_STATUS.get(cache_key, {})
+            cached_source = previous_status.get("source", "Yahoo Finance via yfinance (cache)")
             DataService._set_provider_status(
                 cache_key,
                 available=len(cached_headlines) > 0,
-                status="ready" if cached_headlines else "unavailable",
-                source="Yahoo Finance via yfinance (cache)",
+                status="cached" if cached_headlines else "unavailable",
+                source=cached_source,
                 message=(
                     f"{len(cached_headlines)} cached headline items are available."
                     if cached_headlines
@@ -388,6 +426,21 @@ class DataService:
                 )
                 return stale_headlines
 
+            pipeline_headlines = DataService._pipeline_headlines(ticker, limit)
+            if pipeline_headlines:
+                DataService._cache_set(cache_key, pipeline_headlines)
+                DataService._set_provider_status(
+                    cache_key,
+                    available=True,
+                    status="cached",
+                    source="Committed demo dataset",
+                    message=(
+                        f"Headline provider failed; using {len(pipeline_headlines)} committed demo headlines."
+                    ),
+                    count=len(pipeline_headlines),
+                )
+                return pipeline_headlines
+
             DataService._cache_set(cache_key, [])
             DataService._set_provider_status(
                 cache_key,
@@ -399,11 +452,25 @@ class DataService:
             )
             return []
 
+        if not headlines:
+            pipeline_headlines = DataService._pipeline_headlines(ticker, limit)
+            if pipeline_headlines:
+                DataService._cache_set(cache_key, pipeline_headlines)
+                DataService._set_provider_status(
+                    cache_key,
+                    available=True,
+                    status="cached",
+                    source="Committed demo dataset",
+                    message=f"Using {len(pipeline_headlines)} committed demo headlines.",
+                    count=len(pipeline_headlines),
+                )
+                return pipeline_headlines
+
         DataService._cache_set(cache_key, headlines)
         DataService._set_provider_status(
             cache_key,
             available=len(headlines) > 0,
-            status="ready" if headlines else "unavailable",
+            status="live" if headlines else "unavailable",
             source="Yahoo Finance via yfinance",
             message=(
                 f"{len(headlines)} headline items are available."
@@ -511,7 +578,7 @@ class DataService:
             DataService._set_provider_status(
                 cache_key,
                 available=cached_fundamentals is not None,
-                status="ready" if cached_fundamentals is not None else "unavailable",
+                status="cached" if cached_fundamentals is not None else "unavailable",
                 source="Yahoo Finance via yfinance (cache)",
                 message=(
                     "Cached company fundamentals are available."
@@ -554,7 +621,7 @@ class DataService:
         DataService._set_provider_status(
             cache_key,
             available=fundamentals is not None,
-            status="ready" if fundamentals is not None else "unavailable",
+            status="live" if fundamentals is not None else "unavailable",
             source="Yahoo Finance via yfinance",
             message=(
                 "Company fundamentals are available."

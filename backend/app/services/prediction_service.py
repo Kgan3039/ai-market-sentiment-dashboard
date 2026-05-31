@@ -47,6 +47,30 @@ def _load_prediction_module():
 class PredictionService:
 
     @staticmethod
+    def _fractional_price_delta(*sources: Dict[str, Any]) -> float:
+        for source in sources:
+            if not source:
+                continue
+            percent_change = source.get('percent_change_24h')
+            if percent_change is not None:
+                try:
+                    return float(percent_change) / 100
+                except (TypeError, ValueError):
+                    pass
+
+        for source in sources:
+            if not source:
+                continue
+            price_delta = source.get('price_delta_24h')
+            if price_delta is not None:
+                try:
+                    return float(price_delta)
+                except (TypeError, ValueError):
+                    pass
+
+        return 0.0
+
+    @staticmethod
     def predict_movement(
         ticker: str, sentiment_score: float, market_features: Dict[str, float]
     ) -> tuple[PredictionResponse, Dict[str, Any]]:
@@ -149,17 +173,19 @@ class PredictionService:
 
         sentiment_score = overall_sentiment.sentiment_score
         sentiment_confidence = overall_sentiment.sentiment_confidence
+        market_info_features = market_info.model_dump()
 
         market_features = {
-            'price_delta_24h': 0.0,
-            'volume_delta': 0.0,
+            'price_delta_24h': PredictionService._fractional_price_delta(market_info_features),
+            'volume_delta': float(market_info.volume_delta or 0.0),
             'sentiment_confidence': sentiment_confidence,
         }
 
         for row in ticker_records:
             market_snapshot = row.get('market_data', {}) or {}
-            market_features['price_delta_24h'] = float(
-                market_snapshot.get('price_delta_24h', row.get('price_delta_24h', 0.0)) or 0.0
+            market_features['price_delta_24h'] = PredictionService._fractional_price_delta(
+                market_snapshot,
+                row,
             )
             market_features['volume_delta'] = float(
                 market_snapshot.get('volume_delta', row.get('volume_delta', 0.0)) or 0.0

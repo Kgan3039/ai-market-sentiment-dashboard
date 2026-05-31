@@ -46,6 +46,16 @@ TARGET = "label"
 ARTIFACT_VERSION = "synthetic-demo-v1"
 ARTIFACT_SCHEMA_VERSION = 1
 DEFAULT_ARTIFACT_PATH = Path(__file__).with_name("models") / "model_artifacts.joblib"
+RUNTIME_CALIBRATION_VERSION = "demo-runtime-calibration-v2"
+PROBABILITY_CLIP = (0.18, 0.82)
+MODEL_PROBABILITY_WEIGHT = 0.60
+SIGNAL_PROBABILITY_WEIGHT = 1.0 - MODEL_PROBABILITY_WEIGHT
+SIGNAL_SENTIMENT_WEIGHT = 0.35
+SIGNAL_PRICE_WEIGHT = 1.50
+SIGNAL_SCALE = 8.0
+NEUTRAL_BAND = 0.02
+CONFIDENCE_MIN = 0.52
+CONFIDENCE_MAX = 0.78
 
 
 @dataclass
@@ -168,7 +178,11 @@ def _build_model_artifacts() -> ModelArtifacts:
         "calibration": {
             "confidence_min": CONFIDENCE_MIN,
             "confidence_max": CONFIDENCE_MAX,
-            "probability_clip": [0.18, 0.82],
+            "probability_clip": list(PROBABILITY_CLIP),
+            "model_probability_weight": MODEL_PROBABILITY_WEIGHT,
+            "signal_probability_weight": SIGNAL_PROBABILITY_WEIGHT,
+            "neutral_band": NEUTRAL_BAND,
+            "runtime_calibration_version": RUNTIME_CALIBRATION_VERSION,
         },
         "metrics": results,
     }
@@ -285,13 +299,45 @@ def get_model_provenance(model: str = "rf") -> Dict[str, object]:
         "trained_at": artifacts.provenance.get("trained_at"),
         "training_data": artifacts.provenance.get("training_data"),
         "features_used": FEATURES,
-        "calibration": artifacts.provenance.get("calibration"),
+        "calibration": {
+            **(artifacts.provenance.get("calibration") or {}),
+            "confidence_min": CONFIDENCE_MIN,
+            "confidence_max": CONFIDENCE_MAX,
+            "probability_clip": list(PROBABILITY_CLIP),
+            "model_probability_weight": MODEL_PROBABILITY_WEIGHT,
+            "signal_probability_weight": SIGNAL_PROBABILITY_WEIGHT,
+            "neutral_band": NEUTRAL_BAND,
+            "runtime_calibration_version": RUNTIME_CALIBRATION_VERSION,
+        },
         "metrics": metrics,
     }
 
 
-CONFIDENCE_MIN = 0.52
-CONFIDENCE_MAX = 0.84
+def _bounded_signal_probability(row: Dict[str, float]) -> float:
+    signal = (
+        SIGNAL_SENTIMENT_WEIGHT * float(row.get("sentiment_score", 0.0))
+        + SIGNAL_PRICE_WEIGHT * float(row.get("price_delta_24h", 0.0))
+    )
+    return float(1.0 / (1.0 + np.exp(-SIGNAL_SCALE * signal)))
+
+
+def _calibrate_probability(row: Dict[str, float], model_probability: float) -> float:
+    clipped_model_probability = float(np.clip(model_probability, *PROBABILITY_CLIP))
+    signal_probability = _bounded_signal_probability(row)
+    blended_probability = (
+        MODEL_PROBABILITY_WEIGHT * clipped_model_probability
+        + SIGNAL_PROBABILITY_WEIGHT * signal_probability
+    )
+    return round(float(np.clip(blended_probability, *PROBABILITY_CLIP)), 4)
+
+
+def _calibrate_confidence(row: Dict[str, float], probability: float) -> float:
+    price_evidence = min(abs(float(row.get("price_delta_24h", 0.0))) * 2.0, 0.04)
+    sentiment_evidence = min(abs(float(row.get("sentiment_score", 0.0))) * 0.06, 0.04)
+    volume_evidence = min(abs(float(row.get("volume_delta", 0.0))) * 0.02, 0.02)
+    confidence = max(probability, 1.0 - probability)
+    confidence += price_evidence + sentiment_evidence + volume_evidence
+    return round(float(np.clip(confidence, CONFIDENCE_MIN, CONFIDENCE_MAX)), 4)
 
 def predict_single(
     row: Dict[str, float],
@@ -307,14 +353,20 @@ def predict_single(
     X_new_scaled = scaler.transform(X_new)
 
     chosen_model = lr if model == "lr" else rf
-    pred = chosen_model.predict(X_new_scaled)[0]
     probs = chosen_model.predict_proba(X_new_scaled)[0]
-    confidence = probs[pred]
+    probability = _calibrate_probability(row, float(probs[1]))
+    confidence = _calibrate_confidence(row, probability)
+    if probability > 0.5 + NEUTRAL_BAND:
+        movement = "up"
+    elif probability < 0.5 - NEUTRAL_BAND:
+        movement = "down"
+    else:
+        movement = "neutral"
 
     return {
-        "predicted_movement": "up" if pred == 1 else "down",
-        "probability": round(float(np.clip(probs[1], 0.18, 0.82)), 4),
-        "confidence": round(float(np.clip(confidence, CONFIDENCE_MIN, CONFIDENCE_MAX)), 4),
+        "predicted_movement": movement,
+        "probability": probability,
+        "confidence": confidence,
     }
 
 

@@ -162,7 +162,7 @@ class ComponentAvailability(BaseModel):
     """Availability details for a dashboard data component."""
 
     available: bool = Field(..., description="Whether useful data is present")
-    status: str = Field(..., description="ready, partial, unavailable, or fallback")
+    status: str = Field(..., description="live, cached, fallback, ready, partial, or unavailable")
     source: Optional[str] = Field(None, description="Provider or subsystem name")
     message: Optional[str] = Field(None, description="Human-readable availability note")
     count: Optional[int] = Field(None, description="Number of items available, if relevant")

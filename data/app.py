@@ -115,7 +115,7 @@ def get_yfinance_market_snapshot(ticker: str) -> dict[str, Any]:
         "volume": volume,
         "volume_delta": round(volume_delta, 4),
         "source": "Yahoo Finance via yfinance",
-        "status": "ready" if price > 0 else "unavailable",
+        "status": "cached" if price > 0 else "unavailable",
     }
 
 
@@ -139,7 +139,7 @@ def get_market_snapshot(ticker: str, api_key: str | None) -> dict[str, Any]:
             "volume": _safe_int(quote.get("v"), default=0),
             "volume_delta": 0.0,
             "source": "finnhub",
-            "status": "ready",
+            "status": "cached",
         }
     except Exception:
         try:
