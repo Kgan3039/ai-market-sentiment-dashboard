@@ -28,7 +28,7 @@ export default function Header({ ticker, marketData, exchange, updatedAt }) {
   const hasDelta = typeof priceDelta === "number" && Number.isFinite(priceDelta);
   const deltaClass = hasDelta ? (priceDelta >= 0 ? "positive" : "negative") : "muted";
   const source = marketData?.source || "Source not reported";
-  const status = marketData?.status || (hasPrice ? "ready" : "unavailable");
+  const status = marketData?.status || (hasPrice ? "live" : "unavailable");
   const volumeDeltaLabel =
     typeof volumeDelta === "number" && Number.isFinite(volumeDelta)
       ? formatVolumeDelta(volumeDelta)

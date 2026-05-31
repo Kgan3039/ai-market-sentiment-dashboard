@@ -59,7 +59,7 @@ def test_headline_cache_falls_back_to_stale_data() -> None:
     try:
         DataService._fetch_yfinance_headlines = staticmethod(lambda ticker, limit: [_headline()])
         assert len(DataService.get_headlines("NVDA")) == 1
-        assert DataService.get_headlines_status("NVDA")["status"] == "ready"
+        assert DataService.get_headlines_status("NVDA")["status"] == "live"
 
         DataService._CACHE_TTL_SECONDS = -1
 
@@ -81,6 +81,50 @@ def test_headline_cache_falls_back_to_stale_data() -> None:
         DataService._PROVIDER_STATUS.clear()
 
 
+def test_headlines_use_committed_dataset_when_provider_fails() -> None:
+    DataService._PROVIDER_CACHE.clear()
+    DataService._PROVIDER_STATUS.clear()
+
+    original_fetch = DataService._fetch_yfinance_headlines
+    original_records = DataService._get_ticker_records
+    try:
+        DataService._fetch_yfinance_headlines = staticmethod(
+            lambda ticker, limit: (_ for _ in ()).throw(RuntimeError("provider unavailable"))
+        )
+        DataService._get_ticker_records = staticmethod(
+            lambda ticker: [
+                {
+                    "ticker": ticker,
+                    "date": "2026-05-31",
+                    "posts": [
+                        {
+                            "text": "Nvidia shares rise as AI demand beats expectations",
+                            "source": "Yahoo Finance",
+                            "post_score": 1,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        headlines = DataService.get_headlines("NVDA")
+        status = DataService.get_headlines_status("NVDA")
+        cached_headlines = DataService.get_headlines("NVDA")
+        cached_status = DataService.get_headlines_status("NVDA")
+
+        assert len(headlines) == 1
+        assert headlines[0].headline == "Nvidia shares rise as AI demand beats expectations"
+        assert status["status"] == "cached"
+        assert status["source"] == "Committed demo dataset"
+        assert len(cached_headlines) == 1
+        assert cached_status["source"] == "Committed demo dataset"
+    finally:
+        DataService._fetch_yfinance_headlines = original_fetch
+        DataService._get_ticker_records = original_records
+        DataService._PROVIDER_CACHE.clear()
+        DataService._PROVIDER_STATUS.clear()
+
+
 def test_fundamentals_cache_falls_back_to_stale_data() -> None:
     DataService._PROVIDER_CACHE.clear()
     DataService._PROVIDER_STATUS.clear()
@@ -90,7 +134,7 @@ def test_fundamentals_cache_falls_back_to_stale_data() -> None:
     try:
         DataService._fetch_yfinance_fundamentals = staticmethod(lambda ticker: _fundamentals())
         assert DataService.get_fundamentals("NVDA") is not None
-        assert DataService.get_fundamentals_status("NVDA")["status"] == "ready"
+        assert DataService.get_fundamentals_status("NVDA")["status"] == "live"
 
         DataService._CACHE_TTL_SECONDS = -1
 

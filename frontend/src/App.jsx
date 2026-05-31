@@ -24,7 +24,7 @@ function getAvailabilityLabel(item) {
 
 function getAvailabilityType(item) {
   if (!item) return "info";
-  if (item.status === "ready") return "success";
+  if (item.status === "ready" || item.status === "live" || item.status === "cached") return "success";
   if (item.status === "fallback" || item.status === "partial") return "warning";
   if (item.status === "unavailable") return "warning";
   return item.available ? "success" : "warning";
