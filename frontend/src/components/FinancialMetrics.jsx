@@ -15,7 +15,30 @@ function formatNumber(value, suffix = "") {
   }).format(value)}${suffix}`;
 }
 
-export default function FinancialMetrics({ fundamentals, loading = false }) {
+function formatStatus(status) {
+  if (!status) return null;
+  const labels = {
+    live: "Live",
+    cached: "Cached",
+    fallback: "Fallback",
+    ready: "Available",
+    unavailable: "Unavailable",
+  };
+  return labels[status] || status.replace(/_/g, " ");
+}
+
+function getFundamentalsNote(fundamentals, availability, loading) {
+  if (loading) return "Loading company fundamentals.";
+  if (availability?.message) return availability.message;
+  if (fundamentals) return "Company fundamentals are available.";
+  return "Fundamentals are unavailable from the configured providers.";
+}
+
+export default function FinancialMetrics({
+  fundamentals,
+  availability,
+  loading = false,
+}) {
   const metrics = [
     ["Revenue", formatMoney(fundamentals?.revenue, fundamentals?.currency)],
     ["Net Income", formatMoney(fundamentals?.net_income, fundamentals?.currency)],
@@ -33,6 +56,11 @@ export default function FinancialMetrics({ fundamentals, loading = false }) {
     fundamentals?.sector,
     fundamentals?.industry,
   ].filter(Boolean);
+  const statusLabel = formatStatus(
+    availability?.status || (fundamentals ? "ready" : "unavailable")
+  );
+  const sourceLabel = availability?.source || fundamentals?.source;
+  const note = getFundamentalsNote(fundamentals, availability, loading);
 
   return (
     <section className="card">
@@ -40,13 +68,14 @@ export default function FinancialMetrics({ fundamentals, loading = false }) {
         <h2 className="section-title">Financials & Ratios</h2>
       </div>
 
-      <p className="support-note">
-        {loading
-          ? "Loading company fundamentals."
-          : fundamentals
-          ? "Company fundamentals available."
-          : "Fundamentals are not available in the current MVP."}
-      </p>
+      <p className="support-note">{note}</p>
+
+      {statusLabel || sourceLabel ? (
+        <div className="fundamentals-status">
+          {statusLabel ? <span>{statusLabel}</span> : null}
+          {sourceLabel ? <span>{sourceLabel}</span> : null}
+        </div>
+      ) : null}
 
       {context.length > 0 ? (
         <div className="fundamentals-context">
@@ -70,7 +99,7 @@ export default function FinancialMetrics({ fundamentals, loading = false }) {
         </div>
       ) : (
         <div className="empty-state">
-          Fundamentals are not available in the current MVP.
+          {note}
         </div>
       )}
     </section>

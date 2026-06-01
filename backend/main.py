@@ -16,10 +16,16 @@ To run locally:
     # ReDoc documentation at http://localhost:8000/redoc
 """
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.routes import health, sentiment, prediction, market, dashboard
+from app.services.prediction_service import PredictionService
+
+
+logger = logging.getLogger("uvicorn.error")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -61,7 +67,27 @@ async def startup_event():
     """
     print(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     print(f"Debug mode: {settings.DEBUG}")
-    # Startup initialization code goes here
+    try:
+        prewarm_info = PredictionService.prewarm_model_artifacts()
+        if prewarm_info.get("status") == "ready":
+            logger.info(
+                "Prediction artifacts preloaded: source=%s version=%s path=%s trained_at=%s",
+                prewarm_info.get("artifact_source") or "unknown",
+                prewarm_info.get("version") or "unknown",
+                prewarm_info.get("artifact_path") or "unknown",
+                prewarm_info.get("trained_at") or "unknown",
+            )
+        else:
+            logger.warning(
+                "Prediction artifact preload skipped: %s. Runtime prediction will load lazily.",
+                prewarm_info.get("reason") or "artifact loader unavailable",
+            )
+    except Exception as exc:
+        logger.warning(
+            "Prediction artifact preload failed (%s: %s). Runtime prediction will load lazily.",
+            type(exc).__name__,
+            exc,
+        )
 
 
 @app.on_event("shutdown")

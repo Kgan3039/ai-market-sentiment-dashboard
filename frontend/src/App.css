@@ -351,6 +351,11 @@ a {
   font-size: 11px;
 }
 
+.dashboard-error-state {
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+
 /* =============================================
    FINANCIAL METRICS
    ============================================= */
@@ -393,6 +398,23 @@ a {
   color: var(--text-secondary);
   font-size: 12px;
   margin-bottom: 14px;
+}
+
+.fundamentals-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -4px 0 14px;
+}
+
+.fundamentals-status span {
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 4px 8px;
+  text-transform: uppercase;
 }
 
 .fundamentals-context {

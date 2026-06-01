@@ -36,12 +36,18 @@ function getAvailabilityMessage(item) {
 
 function buildStatusAlerts(summary, error, loading) {
   if (error) {
+    const isUnknownTicker = error.status === 404;
+    const isInvalidTicker = error.status === 400;
     return [
       {
         id: "api-error",
-        type: "danger",
-        title: "Data request",
-        message: error,
+        type: isUnknownTicker || isInvalidTicker ? "warning" : "danger",
+        title: isUnknownTicker
+          ? "Unknown symbol"
+          : isInvalidTicker
+          ? "Invalid ticker"
+          : "Data request",
+        message: error.message || "Unable to load dashboard data.",
         status: "Not available",
       },
     ];
@@ -68,6 +74,7 @@ function buildStatusAlerts(summary, error, loading) {
     ["prediction", "Prediction"],
     ["headlines", "Headlines"],
     ["social_posts", "Social posts"],
+    ["fundamentals", "Fundamentals"],
   ];
 
   return sections.map(([key, label]) => {
@@ -106,7 +113,16 @@ export default function App() {
         );
 
         if (!response.ok) {
-          throw new Error(`Request failed with status ${response.status}`);
+          let detail = `Request failed with status ${response.status}`;
+          try {
+            const errorPayload = await response.json();
+            detail = errorPayload?.detail || detail;
+          } catch {
+            // Keep the generic status message when the API does not return JSON.
+          }
+          const requestError = new Error(detail);
+          requestError.status = response.status;
+          throw requestError;
         }
 
         const payload = await response.json();
@@ -115,7 +131,10 @@ export default function App() {
         if (err.name === "AbortError") return;
         console.error(err);
         setSummary(null);
-        setError(err.message || "Unable to load dashboard data.");
+        setError({
+          message: err.message || "Unable to load dashboard data.",
+          status: err.status,
+        });
       } finally {
         setLoading(false);
       }
@@ -136,6 +155,8 @@ export default function App() {
     () => buildStatusAlerts(summary, error, loading),
     [summary, error, loading]
   );
+  const availability = summary?.availability || summary?.status || {};
+  const errorMessage = error?.message || null;
 
   return (
     <div className="app">
@@ -162,12 +183,23 @@ export default function App() {
           </form>
           <div className="status-strip">
             <span className="status-text">
-              {summary?.updated_at
+              {errorMessage
+                ? errorMessage
+                : summary?.updated_at
                 ? `Last updated ${formatTimestamp(summary.updated_at)}`
                 : "Enter a ticker to load market data"}
             </span>
           </div>
         </section>
+
+        {errorMessage && !loading ? (
+          <section className="card dashboard-error-state">
+            <h2 className="section-title">
+              {error?.status === 404 ? "Symbol not found" : "Unable to load ticker"}
+            </h2>
+            <p className="overview-text">{errorMessage}</p>
+          </section>
+        ) : null}
 
         <Header
           ticker={summary?.ticker || activeTicker}
@@ -185,6 +217,7 @@ export default function App() {
         <div className="grid-2col">
           <FinancialMetrics
             fundamentals={summary?.fundamentals}
+            availability={availability?.fundamentals}
             loading={loading && !summary}
           />
           <Alerts alerts={alerts} />

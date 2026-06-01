@@ -19,6 +19,7 @@ TODO (Srish): Add portfolio aggregation (summed sentiment, average prediction)
 """
 
 from datetime import datetime
+import re
 from typing import List
 
 from fastapi import APIRouter, HTTPException, Query
@@ -29,10 +30,11 @@ from app.models.schemas import (
     DashboardSummary,
 )
 from app.services.sentiment_service import SentimentService
-from app.services.prediction_service import PredictionService
+from app.services.prediction_service import PredictionService, TickerNotFoundError
 from app.services.data_service import DataService
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
 
 def _availability(
@@ -84,12 +86,14 @@ async def get_dashboard_summary(ticker: str):
     TODO (Srish): Add technical indicators (RSI, MACD, Bollinger Bands)
     TODO (Srish): Add analyst ratings (if available from market data API)
     """
-    if not ticker or len(ticker) < 1:
-        raise HTTPException(status_code=400, detail="Invalid ticker symbol")
+    ticker = (ticker or "").strip().upper()
+    if not ticker or not VALID_TICKER_RE.match(ticker):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid ticker symbol using 1-5 letters.",
+        )
 
     try:
-        ticker = ticker.upper()
-
         # Get data from all services
         sentiment_data = SentimentService.get_sentiment_for_ticker(ticker)
         market_data = DataService.get_market_data(ticker)
@@ -208,6 +212,15 @@ async def get_dashboard_summary(ticker: str):
             status=availability.model_dump(),
             updated_at=datetime.now(),
         )
+    except HTTPException:
+        raise
+    except TickerNotFoundError as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No dashboard data found for {ticker}. Try NVDA or TSLA for the local demo.",
+        ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error retrieving dashboard data: {str(e)}"
@@ -253,6 +266,8 @@ async def get_dashboard_summary_batch(tickers: List[str] = Query(...)):
             data = await get_dashboard_summary(ticker.upper())
             summaries.append(data)
         return summaries
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error retrieving dashboard summaries: {str(e)}"

@@ -47,6 +47,36 @@ def _load_prediction_module():
 class PredictionService:
 
     @staticmethod
+    def prewarm_model_artifacts() -> Dict[str, Any]:
+        """Load persisted prediction artifacts into memory before first request."""
+        prediction_module = _load_prediction_module()
+
+        if prediction_module is None:
+            return {
+                'status': 'unavailable',
+                'reason': 'Prediction module could not be loaded.',
+            }
+
+        if hasattr(prediction_module, 'bootstrap_model_artifacts'):
+            artifacts = prediction_module.bootstrap_model_artifacts(force_retrain=False)
+        elif hasattr(prediction_module, 'get_model_artifacts'):
+            artifacts = prediction_module.get_model_artifacts()
+        else:
+            return {
+                'status': 'unavailable',
+                'reason': 'Prediction module does not expose artifact loading.',
+            }
+
+        provenance = getattr(artifacts, 'provenance', {}) or {}
+        return {
+            'status': 'ready',
+            'artifact_source': provenance.get('artifact_source'),
+            'artifact_path': provenance.get('artifact_path'),
+            'version': provenance.get('artifact_version'),
+            'trained_at': provenance.get('trained_at'),
+        }
+
+    @staticmethod
     def _fractional_price_delta(*sources: Dict[str, Any]) -> float:
         for source in sources:
             if not source:
