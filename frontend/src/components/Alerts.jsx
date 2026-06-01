@@ -15,19 +15,27 @@ export default function Alerts({ alerts = [] }) {
   );
 }
 
+function formatAlertStatus(status) {
+  if (!status) return null;
+  return status.replace(/_/g, " ");
+}
+
 function AlertItem({ alert }) {
+  const statusLabel = formatAlertStatus(alert.status);
+  const itemLabel = alert.count === 1 ? "item" : "items";
+
   return (
     <div className={`alert-item alert-${alert.type || "info"}`}>
       <div className="alert-body">
         <div className="alert-title-row">
           <div className="alert-title">{alert.title}</div>
-          {alert.status ? <span className="alert-status">{alert.status}</span> : null}
+          {statusLabel ? <span className="alert-status">{statusLabel}</span> : null}
         </div>
         <div className="alert-message">{alert.message}</div>
         {alert.source || typeof alert.count === "number" ? (
           <div className="alert-meta">
             {alert.source ? <span>{alert.source}</span> : null}
-            {typeof alert.count === "number" ? <span>{alert.count} items</span> : null}
+            {typeof alert.count === "number" ? <span>{alert.count} {itemLabel}</span> : null}
           </div>
         ) : null}
       </div>
