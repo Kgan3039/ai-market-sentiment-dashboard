@@ -82,6 +82,13 @@ a {
   gap: 16px;
 }
 
+.search-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
 .search-form {
   display: flex;
   align-items: center;
@@ -120,6 +127,54 @@ a {
   color: var(--accent);
   font-family: var(--font-display);
   cursor: pointer;
+}
+
+.search-submit:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.demo-presets {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.demo-presets-label {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.preset-button {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.preset-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.preset-button.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.preset-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 .status-strip {
@@ -354,6 +409,13 @@ a {
 .dashboard-error-state {
   border-color: #fde68a;
   background: #fffbeb;
+}
+
+.error-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
 }
 
 /* =============================================
@@ -981,6 +1043,11 @@ a {
    ============================================= */
 @media (max-width: 900px) {
   .search-bar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .search-controls {
     align-items: flex-start;
     flex-direction: column;
   }
