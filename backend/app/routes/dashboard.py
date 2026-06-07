@@ -53,6 +53,53 @@ def _availability(
     )
 
 
+def _social_posts_availability(social_posts) -> ComponentAvailability:
+    if not social_posts:
+        return _availability(
+            available=False,
+            status="unavailable",
+            source="Social posts",
+            message="No social posts are available for this ticker yet.",
+            count=0,
+        )
+
+    social_count = sum(
+        1 for post in social_posts if getattr(post, "content_type", None) == "social_post"
+    )
+    publisher_count = len(social_posts) - social_count
+
+    if social_count == 0 and publisher_count > 0:
+        return _availability(
+            available=True,
+            status="cached",
+            source="Publisher headlines",
+            message=(
+                f"{publisher_count} publisher headline items are available. "
+                "These are not social chatter."
+            ),
+            count=publisher_count,
+        )
+
+    if publisher_count > 0:
+        return _availability(
+            available=True,
+            status="partial",
+            source="Social posts and publisher headlines",
+            message=(
+                f"{social_count} social posts and {publisher_count} publisher headline items are available."
+            ),
+            count=len(social_posts),
+        )
+
+    return _availability(
+        available=True,
+        status="ready",
+        source="Social posts",
+        message=f"{social_count} social posts are available.",
+        count=social_count,
+    )
+
+
 @router.get("/summary/{ticker}", response_model=DashboardSummary)
 async def get_dashboard_summary(ticker: str):
     """
@@ -170,17 +217,7 @@ async def get_dashboard_summary(ticker: str):
                 ),
                 count=headline_status.get("count", len(headlines)),
             ),
-            social_posts=_availability(
-                available=len(social_posts) > 0,
-                status="ready" if social_posts else "unavailable",
-                source="Social posts",
-                message=(
-                    f"{len(social_posts)} social posts are available."
-                    if social_posts
-                    else "No social posts are available for this ticker yet."
-                ),
-                count=len(social_posts),
-            ),
+            social_posts=_social_posts_availability(social_posts),
             fundamentals=_availability(
                 available=fundamentals_status.get("available", fundamentals is not None),
                 status=fundamentals_status.get(

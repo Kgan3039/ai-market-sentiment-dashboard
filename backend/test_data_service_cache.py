@@ -100,6 +100,98 @@ def test_dashboard_summary_returns_404_for_unknown_ticker() -> None:
         PredictionService.predict_for_ticker = original_prediction
 
 
+def test_dashboard_summary_labels_publisher_posts_honestly() -> None:
+    original_sentiment_for_ticker = SentimentService.get_sentiment_for_ticker
+    original_sentiment_for_text = SentimentService.get_sentiment_for_text
+    original_market_data = DataService.get_market_data
+    original_market_history = DataService.get_market_history
+    original_prediction = PredictionService.predict_for_ticker
+    original_headlines = DataService.get_headlines
+    original_headlines_status = DataService.get_headlines_status
+    original_fundamentals = DataService.get_fundamentals
+    original_fundamentals_status = DataService.get_fundamentals_status
+    original_records = DataService._get_ticker_records
+    try:
+        SentimentService.get_sentiment_for_ticker = staticmethod(
+            lambda ticker: {"overall_sentiment": _sentiment()}
+        )
+        SentimentService.get_sentiment_for_text = staticmethod(lambda text: _sentiment())
+        DataService.get_market_data = staticmethod(
+            lambda ticker: MarketData(
+                symbol=ticker,
+                price=100.0,
+                day_high=105.0,
+                volume=1_000_000,
+                source="Yahoo Finance via yfinance",
+                status="cached",
+                timestamp=datetime(2026, 5, 18),
+            )
+        )
+        DataService.get_market_history = staticmethod(lambda ticker: [])
+        PredictionService.predict_for_ticker = staticmethod(
+            lambda ticker: {
+                "prediction": PredictionResponse(
+                    symbol=ticker,
+                    predicted_movement="up",
+                    probability=0.62,
+                    confidence=0.68,
+                ),
+                "model_info": {"name": "Test model"},
+            }
+        )
+        DataService.get_headlines = staticmethod(lambda ticker: [])
+        DataService.get_headlines_status = staticmethod(
+            lambda ticker: {
+                "available": False,
+                "status": "unavailable",
+                "source": "Yahoo Finance via yfinance",
+                "message": "Headline provider unavailable.",
+                "count": 0,
+            }
+        )
+        DataService.get_fundamentals = staticmethod(lambda ticker: None)
+        DataService.get_fundamentals_status = staticmethod(
+            lambda ticker: {
+                "available": False,
+                "status": "unavailable",
+                "source": "Yahoo Finance via yfinance",
+                "message": "Fundamentals unavailable.",
+            }
+        )
+        DataService._get_ticker_records = staticmethod(
+            lambda ticker: [
+                {
+                    "ticker": ticker,
+                    "date": "2026-05-31",
+                    "posts": [
+                        {
+                            "text": "Nvidia headline from a publisher",
+                            "source": "Yahoo Finance",
+                            "post_score": 1,
+                        }
+                    ],
+                }
+            ]
+        )
+
+        summary = asyncio.run(get_dashboard_summary("NVDA"))
+
+        assert summary.social_posts[0].content_type == "publisher_headline"
+        assert summary.availability.social_posts.source == "Publisher headlines"
+        assert "not social chatter" in summary.availability.social_posts.message
+    finally:
+        SentimentService.get_sentiment_for_ticker = original_sentiment_for_ticker
+        SentimentService.get_sentiment_for_text = original_sentiment_for_text
+        DataService.get_market_data = original_market_data
+        DataService.get_market_history = original_market_history
+        PredictionService.predict_for_ticker = original_prediction
+        DataService.get_headlines = original_headlines
+        DataService.get_headlines_status = original_headlines_status
+        DataService.get_fundamentals = original_fundamentals
+        DataService.get_fundamentals_status = original_fundamentals_status
+        DataService._get_ticker_records = original_records
+
+
 def test_headline_cache_falls_back_to_stale_data() -> None:
     DataService._PROVIDER_CACHE.clear()
     DataService._PROVIDER_STATUS.clear()
@@ -164,6 +256,8 @@ def test_headlines_use_committed_dataset_when_provider_fails() -> None:
 
         assert len(headlines) == 1
         assert headlines[0].headline == "Nvidia shares rise as AI demand beats expectations"
+        assert headlines[0].published_at == datetime(2026, 5, 31)
+        assert headlines[0].time == "May 31, 2026"
         assert status["status"] == "cached"
         assert status["source"] == "Committed demo dataset"
         assert len(cached_headlines) == 1

@@ -65,6 +65,7 @@ def get_yfinance_posts(ticker: str, limit: int = 15) -> list[dict[str, Any]]:
             {
                 "text": title,
                 "source": source,
+                "content_type": "publisher_headline",
                 "post_score": 1,
             }
         )
@@ -173,6 +174,7 @@ def get_posts(ticker: str, api_key: str | None) -> list[dict[str, Any]]:
                 {
                     "text": article.get("headline", ""),
                     "source": article.get("source", "finnhub"),
+                    "content_type": "publisher_headline",
                     "post_score": 1,
                 }
             )

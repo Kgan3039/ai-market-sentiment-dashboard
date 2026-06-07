@@ -130,6 +130,9 @@ class SocialPostItem(BaseModel):
     ticker: str = Field(..., description="Stock ticker symbol")
     text: str = Field(..., description="Post text for frontend display")
     source: str = Field(..., description="Post source name")
+    content_type: Optional[str] = Field(
+        None, description="Source-aware item type such as social_post or publisher_headline"
+    )
     date: Optional[str] = Field(None, description="Post date when available")
     post_score: Optional[float] = Field(None, description="Source engagement score when available")
     sentiment: Optional[SentimentScores] = Field(

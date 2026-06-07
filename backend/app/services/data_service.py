@@ -151,6 +151,19 @@ class DataService:
         return not any(phrase in lowered_text for phrase in placeholder_phrases)
 
     @staticmethod
+    def _post_content_type(post: Dict[str, Any], source: str) -> str:
+        explicit_type = str(post.get("content_type") or "").strip().lower()
+        if explicit_type in {"social_post", "publisher_headline", "news_headline"}:
+            return "publisher_headline" if explicit_type == "news_headline" else explicit_type
+
+        source_text = str(source or "").strip().lower()
+        social_sources = ("reddit", "twitter", "x.com", "stocktwits", "discord", "telegram")
+        if any(source_name in source_text for source_name in social_sources):
+            return "social_post"
+
+        return "publisher_headline"
+
+    @staticmethod
     def _pipeline_headlines(ticker: str, limit: int = 6) -> List[HeadlineItem]:
         headlines: List[HeadlineItem] = []
 
@@ -179,6 +192,11 @@ class DataService:
                         title=text,
                         source=source,
                         published_at=published_at,
+                        time=(
+                            f"{published_at:%b} {published_at.day}, {published_at:%Y}"
+                            if published_at
+                            else None
+                        ),
                     )
                 )
                 if len(headlines) >= limit:
@@ -781,6 +799,7 @@ class DataService:
                         ticker=ticker,
                         text=text,
                         source=source,
+                        content_type=DataService._post_content_type(post, source),
                         date=record.get("date"),
                         post_score=post.get("post_score"),
                     )

@@ -9,6 +9,7 @@ import PredictionModel from "./components/PredictionModel";
 import "./App.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+const DEMO_TICKERS = ["NVDA", "TSLA"];
 
 function formatTimestamp(value) {
   if (!value) return null;
@@ -32,6 +33,13 @@ function getAvailabilityType(item) {
 
 function getAvailabilityMessage(item) {
   return item?.message || "Backend availability has not been reported yet.";
+}
+
+function getAvailabilityTitle(key, label, item) {
+  if (key === "social_posts" && item?.source?.toLowerCase().includes("publisher")) {
+    return "Publisher items";
+  }
+  return label;
 }
 
 function buildStatusAlerts(summary, error, loading) {
@@ -83,7 +91,7 @@ function buildStatusAlerts(summary, error, loading) {
     return {
       id: key,
       type: getAvailabilityType(item),
-      title: label,
+      title: getAvailabilityTitle(key, label, item),
       status: getAvailabilityLabel(item),
       count: item?.count,
       source: item?.source,
@@ -148,7 +156,13 @@ export default function App() {
     event.preventDefault();
     const normalized = queryTicker.trim().toUpperCase();
     if (!normalized) return;
+    setQueryTicker(normalized);
     setActiveTicker(normalized);
+  }
+
+  function loadTicker(ticker) {
+    setQueryTicker(ticker);
+    setActiveTicker(ticker);
   }
 
   const alerts = useMemo(
@@ -157,34 +171,54 @@ export default function App() {
   );
   const availability = summary?.availability || summary?.status || {};
   const errorMessage = error?.message || null;
+  const isUnsupportedTicker = error?.status === 404 || error?.status === 400;
+  const showDashboardContent = !errorMessage || loading;
 
   return (
     <div className="app">
       <div className="app-bg" />
       <div className="dashboard">
         <section className="card search-bar">
-          <form className="search-form" onSubmit={handleSubmit}>
-            <label className="search-label" htmlFor="ticker-input">
-              Ticker
-            </label>
-            <input
-              id="ticker-input"
-              className="ticker-input"
-              type="text"
-              value={queryTicker}
-              placeholder="NVDA"
-              onChange={(event) =>
-                setQueryTicker(event.target.value.toUpperCase())
-              }
-            />
-            <button className="search-submit" type="submit">
-              Load
-            </button>
-          </form>
+          <div className="search-controls">
+            <form className="search-form" onSubmit={handleSubmit}>
+              <label className="search-label" htmlFor="ticker-input">
+                Ticker
+              </label>
+              <input
+                id="ticker-input"
+                className="ticker-input"
+                type="text"
+                value={queryTicker}
+                placeholder="NVDA"
+                onChange={(event) =>
+                  setQueryTicker(event.target.value.toUpperCase())
+                }
+              />
+              <button className="search-submit" type="submit" disabled={loading}>
+                Load
+              </button>
+            </form>
+            <div className="demo-presets" aria-label="Demo tickers">
+              <span className="demo-presets-label">Demo-ready</span>
+              {DEMO_TICKERS.map((ticker) => (
+                <button
+                  key={ticker}
+                  className={`preset-button ${activeTicker === ticker ? "active" : ""}`}
+                  type="button"
+                  onClick={() => loadTicker(ticker)}
+                  disabled={loading && activeTicker === ticker}
+                >
+                  {ticker}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="status-strip">
             <span className="status-text">
               {errorMessage
-                ? errorMessage
+                ? isUnsupportedTicker
+                  ? "Local demo data is ready for NVDA and TSLA."
+                  : errorMessage
                 : summary?.updated_at
                 ? `Last updated ${formatTimestamp(summary.updated_at)}`
                 : "Enter a ticker to load market data"}
@@ -195,49 +229,72 @@ export default function App() {
         {errorMessage && !loading ? (
           <section className="card dashboard-error-state">
             <h2 className="section-title">
-              {error?.status === 404 ? "Symbol not found" : "Unable to load ticker"}
+              {error?.status === 404
+                ? "Symbol not found"
+                : error?.status === 400
+                ? "Check ticker format"
+                : "Unable to load ticker"}
             </h2>
             <p className="overview-text">{errorMessage}</p>
+            {isUnsupportedTicker ? (
+              <div className="error-actions" aria-label="Load demo ticker">
+                {DEMO_TICKERS.map((ticker) => (
+                  <button
+                    key={ticker}
+                    className="preset-button active"
+                    type="button"
+                    onClick={() => loadTicker(ticker)}
+                  >
+                    Load {ticker}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </section>
         ) : null}
 
-        <Header
-          ticker={summary?.ticker || activeTicker}
-          marketData={summary?.market_data}
-          exchange={summary ? "Market summary" : "Waiting for data"}
-          updatedAt={formatTimestamp(summary?.updated_at)}
-        />
+        {showDashboardContent ? (
+          <>
+            <Header
+              ticker={summary?.ticker || activeTicker}
+              marketData={summary?.market_data}
+              exchange={summary ? "Market summary" : "Waiting for data"}
+              updatedAt={formatTimestamp(summary?.updated_at)}
+            />
 
-        <CompanyOverview
-          ticker={summary?.ticker || activeTicker}
-          fundamentals={summary?.fundamentals}
-          updatedAt={formatTimestamp(summary?.updated_at)}
-        />
+            <CompanyOverview
+              ticker={summary?.ticker || activeTicker}
+              fundamentals={summary?.fundamentals}
+              updatedAt={formatTimestamp(summary?.updated_at)}
+            />
 
-        <div className="grid-2col">
-          <FinancialMetrics
-            fundamentals={summary?.fundamentals}
-            availability={availability?.fundamentals}
-            loading={loading && !summary}
-          />
-          <Alerts alerts={alerts} />
-        </div>
+            <div className="grid-2col">
+              <FinancialMetrics
+                fundamentals={summary?.fundamentals}
+                availability={availability?.fundamentals}
+                loading={loading && !summary}
+              />
+              <Alerts alerts={alerts} />
+            </div>
 
-        <SentimentPanel
-          sentiment={summary?.sentiment}
-          marketHistory={summary?.market_history || []}
-          ticker={summary?.ticker || activeTicker}
-          loading={loading && !summary}
-        />
-        <NewsFeed
-          news={summary?.headlines || []}
-          socialPosts={summary?.social_posts || []}
-          loading={loading && !summary}
-        />
-        <PredictionModel
-          prediction={summary?.prediction}
-          updatedAt={formatTimestamp(summary?.updated_at)}
-        />
+            <SentimentPanel
+              sentiment={summary?.sentiment}
+              marketHistory={summary?.market_history || []}
+              ticker={summary?.ticker || activeTicker}
+              loading={loading && !summary}
+            />
+            <NewsFeed
+              news={summary?.headlines || []}
+              socialPosts={summary?.social_posts || []}
+              socialAvailability={availability?.social_posts}
+              loading={loading && !summary}
+            />
+            <PredictionModel
+              prediction={summary?.prediction}
+              updatedAt={formatTimestamp(summary?.updated_at)}
+            />
+          </>
+        ) : null}
       </div>
     </div>
   );
