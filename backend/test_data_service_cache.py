@@ -7,12 +7,15 @@ import sys
 
 from datetime import datetime
 
+import pytest
+from fastapi import HTTPException
+
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from app.models.schemas import Fundamentals, HeadlineItem, MarketData, PredictionResponse, SentimentScores
 from app.routes.dashboard import get_dashboard_summary
 from app.services.data_service import DataService
-from app.services.prediction_service import PredictionService
+from app.services.prediction_service import PredictionService, TickerNotFoundError
 from app.services import sentiment_service
 from app.services.sentiment_service import SentimentService
 
@@ -48,6 +51,53 @@ def _sentiment() -> SentimentScores:
         sentiment_label="positive",
         sentiment_confidence=0.72,
     )
+
+
+def test_dashboard_summary_rejects_invalid_ticker_format() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(get_dashboard_summary("BAD!"))
+
+    assert exc_info.value.status_code == 400
+    assert "valid ticker symbol" in exc_info.value.detail
+
+
+def test_dashboard_summary_returns_404_for_unknown_ticker() -> None:
+    original_sentiment_for_ticker = SentimentService.get_sentiment_for_ticker
+    original_market_data = DataService.get_market_data
+    original_market_history = DataService.get_market_history
+    original_prediction = PredictionService.predict_for_ticker
+    try:
+        SentimentService.get_sentiment_for_ticker = staticmethod(
+            lambda ticker: {"overall_sentiment": _sentiment()}
+        )
+        DataService.get_market_data = staticmethod(
+            lambda ticker: MarketData(
+                symbol=ticker,
+                price=0.0,
+                day_high=0.0,
+                volume=0,
+                source="unavailable",
+                status="unavailable",
+                timestamp=datetime(2026, 5, 18),
+            )
+        )
+        DataService.get_market_history = staticmethod(lambda ticker: [])
+        PredictionService.predict_for_ticker = staticmethod(
+            lambda ticker: (_ for _ in ()).throw(
+                TickerNotFoundError(f"No market data found for ticker: {ticker}")
+            )
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(get_dashboard_summary("AAPL"))
+
+        assert exc_info.value.status_code == 404
+        assert "No dashboard data found for AAPL" in exc_info.value.detail
+    finally:
+        SentimentService.get_sentiment_for_ticker = original_sentiment_for_ticker
+        DataService.get_market_data = original_market_data
+        DataService.get_market_history = original_market_history
+        PredictionService.predict_for_ticker = original_prediction
 
 
 def test_headline_cache_falls_back_to_stale_data() -> None:
