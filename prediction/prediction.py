@@ -298,6 +298,7 @@ def get_model_provenance(model: str = "rf") -> Dict[str, object]:
         "artifact_path": artifacts.provenance.get("artifact_path"),
         "trained_at": artifacts.provenance.get("trained_at"),
         "training_data": artifacts.provenance.get("training_data"),
+        "real_training_data": False,   # flip to True when trained on real historical outcomes
         "features_used": FEATURES,
         "calibration": {
             **(artifacts.provenance.get("calibration") or {}),
