@@ -79,7 +79,7 @@ function buildStatusAlerts(summary, error, loading) {
   const sections = [
     ["market_data", "Market data"],
     ["sentiment", "Sentiment"],
-    ["prediction", "Prediction"],
+    ["prediction", "Experimental signal"],
     ["headlines", "Headlines"],
     ["social_posts", "Social posts"],
     ["fundamentals", "Fundamentals"],

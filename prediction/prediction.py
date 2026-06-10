@@ -43,10 +43,10 @@ FEATURES = [
 ]
 
 TARGET = "label"
-ARTIFACT_VERSION = "synthetic-demo-v1"
+ARTIFACT_VERSION = "experimental-synthetic-v1"
 ARTIFACT_SCHEMA_VERSION = 1
 DEFAULT_ARTIFACT_PATH = Path(__file__).with_name("models") / "model_artifacts.joblib"
-RUNTIME_CALIBRATION_VERSION = "demo-runtime-calibration-v2"
+RUNTIME_CALIBRATION_VERSION = "experimental-calibration-v2"
 PROBABILITY_CLIP = (0.18, 0.82)
 MODEL_PROBABILITY_WEIGHT = 0.60
 SIGNAL_PROBABILITY_WEIGHT = 1.0 - MODEL_PROBABILITY_WEIGHT

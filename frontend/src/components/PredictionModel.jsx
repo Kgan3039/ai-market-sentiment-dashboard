@@ -22,7 +22,7 @@ function formatModelDetail(modelInfo) {
   const trainingData = modelInfo.training_data
     ? modelInfo.training_data.replaceAll("_", " ")
     : "training data not reported";
-  return `${modelInfo.name || "Prediction model"} serving from ${version}; trained on ${trainingData}.`;
+  return `${modelInfo.name || "Experimental signal"} serving from ${version}; trained on ${trainingData}.`;
 }
 
 function formatMetric(value) {
@@ -39,7 +39,6 @@ export default function PredictionModel({ prediction, updatedAt }) {
   const sourceLabel = formatModelSource(modelInfo);
   const modelDetail = formatModelDetail(modelInfo);
   const servingStatus = modelInfo?.status === "fallback" ? "Fallback" : "Serving";
-  const auc = formatMetric(modelInfo?.metrics?.rf_auc || modelInfo?.metrics?.lr_auc);
   const trainedAt = modelInfo?.trained_at
     ? new Date(modelInfo.trained_at).toLocaleDateString()
     : null;
@@ -47,24 +46,24 @@ export default function PredictionModel({ prediction, updatedAt }) {
   return (
     <section className="card prediction-card">
       <div className="section-header">
-        <h2 className="section-title">Prediction Model</h2>
+        <h2 className="section-title">Experimental Signal</h2>
       </div>
 
       {!hasPrediction ? (
         <div className="empty-state">
-          Prediction unavailable until enough validated input data is available.
+          Signal unavailable until enough validated input data is available.
         </div>
       ) : null}
 
       {hasPrediction ? (
         <div className="prediction-grid">
           <div className="horizon-card">
-            <div className="horizon-label">Predicted direction</div>
+            <div className="horizon-label">Signal direction</div>
             <div className="horizon-direction" style={{ color }}>
               {direction.toUpperCase()}
             </div>
             <div className="confidence-bar-label">
-              Model confidence: {confidence}%
+              	Signal confidence: {confidence}%
             </div>
             <div className="confidence-track">
               <div
@@ -78,7 +77,7 @@ export default function PredictionModel({ prediction, updatedAt }) {
           </div>
 
           <div className="horizon-card">
-            <div className="horizon-label">Model probability</div>
+            <div className="horizon-label">Signal probability</div>
             <div className="horizon-direction">{probability}%</div>
             <p className="horizon-rationale">
               Last updated: {updatedAt || "Not available"}
@@ -95,7 +94,6 @@ export default function PredictionModel({ prediction, updatedAt }) {
             <div className="model-meta">
               {modelInfo?.version ? <span>{modelInfo.version}</span> : null}
               {trainedAt ? <span>Trained {trainedAt}</span> : null}
-              {auc ? <span>AUC {auc}</span> : null}
             </div>
             <p className="model-honesty">
               Experimental analytics only; outputs depend on available sentiment and market data.
