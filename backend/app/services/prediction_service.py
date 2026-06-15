@@ -1,4 +1,4 @@
-"""Prediction Service - API interface to stock movement prediction model.
+"""Experimental Signal Service - API interface to the experimental movement signal.
 
 Author: Mihir (with integration from Abhi ML model)
 
@@ -7,8 +7,9 @@ Assumptions:
 - sentiment_confidence: max(positive, negative, neutral) prob from NLP model
 - price_delta_24h: (close - open) / open for last 24h; clipped to ±8% in predict()
 - volume_delta: (today_vol - avg_vol) / avg_vol; clipped to ±50% in predict()
-- ML model: RandomForestClassifier trained on synthetic data (see prediction.py)
-- Confidence output is soft-clipped to [0.52, 0.84] in ML module for demo plausibility
+- ML model: RandomForestClassifier trained on synthetic data only (see prediction.py)
+- real_training_data in model_info will be False until trained on real historical outcomes
+- Confidence output is soft-clipped for bounded experimental output
 """
 
 import os

@@ -21,12 +21,21 @@ async def get_prediction(ticker: str):
 
     try:
         result = PredictionService.predict_for_ticker(ticker.upper())
-        if result["prediction"] is None:
+        prediction = result["prediction"]
+        if prediction is None:
             raise HTTPException(
                 status_code=404,
-                detail="Prediction unavailable until enough validated input data is available.",
+                detail="Signal unavailable until enough validated input data is available.",
             )
-        return result["prediction"]
+        if not (prediction.model_info or {}).get("real_training_data"):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Experimental signal only — not available until the model is trained "
+                    "and evaluated on real historical outcomes."
+                ),
+            )
+        return prediction
     except TickerNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except HTTPException:

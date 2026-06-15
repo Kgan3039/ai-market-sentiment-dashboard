@@ -37,6 +37,25 @@ router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 VALID_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
 
 
+def _prediction_availability_status(prediction) -> str:
+    if prediction is None:
+        return "unavailable"
+    if not (prediction.model_info or {}).get("real_training_data"):
+        return "experimental"
+    return "ready"
+
+
+def _prediction_availability_message(prediction) -> str:
+    if prediction is None:
+        return "Signal unavailable until enough validated input data is available."
+    if not (prediction.model_info or {}).get("real_training_data"):
+        return (
+            "Experimental signal only — trained on synthetic data, "
+            "not validated against real historical outcomes."
+        )
+    return "Experimental signal available (validated model)."
+
+
 def _availability(
     available: bool,
     status: str,
@@ -194,14 +213,10 @@ async def get_dashboard_summary(ticker: str):
                 message=market_message,
             ),
             prediction=_availability(
-                available=prediction is not None,
-                status="ready" if prediction is not None else "unavailable",
-                source="Prediction model",
-                message=(
-                    "Prediction is available."
-                    if prediction is not None
-                    else "Prediction unavailable until enough validated input data is available."
-                ),
+                available=False,
+                status=_prediction_availability_status(prediction),
+                source="Experimental signal",
+                message=_prediction_availability_message(prediction),
             ),
             headlines=_availability(
                 available=headline_status.get("available", len(headlines) > 0),

@@ -76,7 +76,7 @@ def _artifact_path() -> Path:
 
 
 def _build_synthetic_training_data(size: int = 500) -> pd.DataFrame:
-    """Create deterministic fallback training data for local/demo inference."""
+    """Create deterministic fallback training data for local/experimental inference only."""
     np.random.seed(42)
 
     avg_positive_prob = np.random.uniform(0.2, 0.9, size)
@@ -237,7 +237,7 @@ def load_model_artifacts(artifact_path: Optional[Path] = None) -> ModelArtifacts
 
 
 def get_model_artifacts() -> ModelArtifacts:
-    """Load persisted demo models, training and saving only when artifacts are absent."""
+    """Load persisted model artifacts, training and saving only when artifacts are absent."""
     global _MODEL_CACHE
 
     if _MODEL_CACHE is None:
