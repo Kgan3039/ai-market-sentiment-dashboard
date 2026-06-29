@@ -77,7 +77,7 @@ class MarketHistoryPoint(BaseModel):
 
 
 class PredictionResponse(BaseModel):
-    """Experimental signal response based on synthetic-trained model."""
+    """Validated experimental signal response."""
 
     model_config = ConfigDict(protected_namespaces=())
 
@@ -86,13 +86,13 @@ class PredictionResponse(BaseModel):
         ..., description="Experimental signal direction: 'up', 'down', or 'neutral'"
     )
     probability: float = Field(
-        ..., ge=0, le=1, description="Signal probability score (synthetic-trained model)"
+        ..., ge=0, le=1, description="Internal signal score exposed only for validated real-outcome models"
     )
     confidence: float = Field(
-        ..., ge=0, le=1, description="Signal confidence score (synthetic-trained model)"
+        ..., ge=0, le=1, description="Internal signal strength exposed only for validated real-outcome models"
     )
     model_info: Optional[Dict[str, Any]] = Field(
-        None, description="Optional model provenance for the serving predictor"
+        None, description="Optional provenance for the serving experimental signal"
     )
 
 class TextAnalysisRequest(BaseModel):
@@ -191,7 +191,9 @@ class DashboardSummary(BaseModel):
     market_history: List[MarketHistoryPoint] = Field(
         default_factory=list, description="Recent historical close prices"
     )
-    prediction: Optional[PredictionResponse] = Field(None, description="Stock movement prediction")
+    prediction: Optional[PredictionResponse] = Field(
+        None, description="Validated experimental signal when available"
+    )
     headlines: List[HeadlineItem] = Field(
         default_factory=list, description="Normalized headline items for Market Pulse"
     )

@@ -14,32 +14,26 @@ function formatModelSource(modelInfo) {
 }
 
 function formatModelDetail(modelInfo) {
-  if (!modelInfo) return "Model provenance is not available for this response.";
+  if (!modelInfo) return "Signal provenance is not available for this response.";
   if (modelInfo.name === "FallbackRule") {
-    return "Fallback rule used because the persisted model path was unavailable.";
+    return "No validated artifact is available for this response.";
   }
   const version = modelInfo.version ? `version ${modelInfo.version}` : "unversioned artifact";
   const trainingData = modelInfo.training_data
     ? modelInfo.training_data.replaceAll("_", " ")
     : "training data not reported";
-  return `${modelInfo.name || "Experimental signal"} serving from ${version}; trained on ${trainingData}.`;
-}
-
-function formatMetric(value) {
-  return typeof value === "number" ? value.toFixed(3) : null;
+  return `${modelInfo.name || "Experimental signal"} using ${version}; trained on ${trainingData}.`;
 }
 
 export default function PredictionModel({ prediction, updatedAt }) {
   const hasPrediction = Boolean(prediction);
   const hasRealModel = prediction?.model_info?.real_training_data === true;
   const direction = prediction?.predicted_movement || "neutral";
-  const confidence = Math.round((prediction?.confidence || 0) * 100);
-  const probability = Math.round((prediction?.probability || 0) * 100);
   const color = getDirectionColor(direction);
   const modelInfo = prediction?.model_info;
   const sourceLabel = formatModelSource(modelInfo);
   const modelDetail = formatModelDetail(modelInfo);
-  const servingStatus = modelInfo?.status === "fallback" ? "Fallback" : "Serving";
+  const servingStatus = modelInfo?.status === "ready" ? "Available" : "Unavailable";
   const trainedAt = modelInfo?.trained_at
     ? new Date(modelInfo.trained_at).toLocaleDateString()
     : null;
@@ -52,14 +46,16 @@ export default function PredictionModel({ prediction, updatedAt }) {
 
       {!hasPrediction ? (
     <div className="empty-state">
-      Signal unavailable until enough validated input data is available.
+      No validated experimental signal is available. Synthetic or demo-trained
+      outputs are withheld until a model is trained and evaluated on real
+      historical outcomes.
     </div>
   ) : null}
 
   {hasPrediction && !hasRealModel ? (
     <div className="empty-state">
-      Experimental signal is trained on synthetic data only. Output will appear
-      once the model is evaluated against real historical outcomes.
+      This artifact is synthetic-only, so its output is withheld until it is
+      evaluated against real historical outcomes.
     </div>
   ) : null}
 
@@ -70,23 +66,14 @@ export default function PredictionModel({ prediction, updatedAt }) {
         <div className="horizon-direction" style={{ color }}>
           {direction.toUpperCase()}
         </div>
-        <div className="confidence-bar-label">
-          Signal confidence: {confidence}%
-        </div>
-        <div className="confidence-track">
-          <div
-            className="confidence-fill"
-            style={{ width: `${confidence}%`, background: color }}
-          />
-        </div>
         <p className="horizon-rationale">
-          For informational use only. This model output is not financial advice.
+          Experimental analytics only. This signal is not financial advice.
         </p>
       </div>
 
       <div className="horizon-card">
-        <div className="horizon-label">Signal probability</div>
-        <div className="horizon-direction">{probability}%</div>
+        <div className="horizon-label">Signal status</div>
+        <div className="horizon-direction">VALIDATED</div>
         <p className="horizon-rationale">
           Last updated: {updatedAt || "Not available"}
         </p>

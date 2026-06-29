@@ -386,7 +386,7 @@ def test_dashboard_summary_uses_provider_status() -> None:
         DataService._PROVIDER_STATUS.clear()
 
 
-def test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction() -> None:
+def test_dashboard_summary_uses_headlines_for_demo_sentiment_and_withholds_synthetic_signal() -> None:
     DataService._PROVIDER_CACHE.clear()
     DataService._PROVIDER_STATUS.clear()
 
@@ -449,10 +449,13 @@ def test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction() ->
         assert sentiment["source_breakdown"]["Test News"]["count"] == 2
         assert summary.sentiment is not None
         assert summary.sentiment.sentiment_label in ("positive", "neutral", "negative")
-        assert summary.prediction is not None
-        assert summary.prediction.predicted_movement in ("up", "down", "neutral")
+        assert summary.prediction is None
         assert summary.availability.sentiment.available is True
-        assert summary.availability.prediction.available is True
+        assert summary.availability.prediction.available is False
+        assert summary.availability.prediction.status == "unavailable"
+        assert summary.availability.prediction.source == "Experimental signal"
+        assert "synthetic data" in summary.availability.prediction.message
+        assert "real historical outcomes" in summary.availability.prediction.message
     finally:
         DataService._fetch_yfinance_headlines = original_fetch
         DataService.get_market_data = original_market_data
@@ -503,5 +506,5 @@ if __name__ == "__main__":
     test_headline_cache_falls_back_to_stale_data()
     test_fundamentals_cache_falls_back_to_stale_data()
     test_dashboard_summary_uses_provider_status()
-    test_dashboard_summary_uses_headlines_for_demo_sentiment_and_prediction()
+    test_dashboard_summary_uses_headlines_for_demo_sentiment_and_withholds_synthetic_signal()
     print("Data provider cache tests passed.")

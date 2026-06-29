@@ -281,7 +281,7 @@ def bootstrap_model_artifacts(force_retrain: bool = False) -> ModelArtifacts:
 
 
 def get_model_provenance(model: str = "rf") -> Dict[str, object]:
-    """Return lightweight metadata about the serving prediction model."""
+    """Return lightweight metadata about the serving experimental signal artifact."""
     artifacts = get_model_artifacts()
     model_name = "LogisticRegression" if model == "lr" else "RandomForestClassifier"
     metric_prefix = "lr" if model == "lr" else "rf"
