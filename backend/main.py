@@ -4,7 +4,7 @@ AI Market Sentiment Dashboard - Backend API
 Main FastAPI application entry point that aggregates data from all team members:
 - Isaac: Data pipeline (raw social media posts + market data)
 - Matthew: NLP sentiment analysis (FinBERT sentiment scores)
-- Abhi: ML prediction model (stock movement predictions)
+- Abhi: Experimental market signal artifacts
 - Srish: Frontend (React dashboard served at /)
 - Mihir: Backend API (integrates all components)
 
@@ -31,7 +31,7 @@ logger = logging.getLogger("uvicorn.error")
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="Financial sentiment analysis and stock prediction API",
+    description="Financial sentiment analysis and experimental market signal API",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -59,7 +59,7 @@ async def startup_event():
     Initialize app on startup.
     
     TODO (Mihir): Initialize database connections (if using database)
-    TODO (Mihir + Abhi): Load pre-trained ML models into memory for fast inference
+    TODO (Mihir + Abhi): Load validated market signal artifacts into memory for fast inference
     TODO (Mihir): Verify connections to Isaac's data pipeline
     TODO (Mihir): Verify connections to Matthew's NLP module
     TODO (Mihir): Run health checks on dependent services
@@ -71,7 +71,7 @@ async def startup_event():
         prewarm_info = PredictionService.prewarm_model_artifacts()
         if prewarm_info.get("status") == "ready":
             logger.info(
-                "Prediction artifacts preloaded: source=%s version=%s path=%s trained_at=%s",
+                "Experimental signal artifacts preloaded: source=%s version=%s path=%s trained_at=%s",
                 prewarm_info.get("artifact_source") or "unknown",
                 prewarm_info.get("version") or "unknown",
                 prewarm_info.get("artifact_path") or "unknown",
@@ -79,12 +79,12 @@ async def startup_event():
             )
         else:
             logger.warning(
-                "Prediction artifact preload skipped: %s. Runtime prediction will load lazily.",
+                "Experimental signal artifact preload skipped: %s. Runtime signal loading will remain lazy.",
                 prewarm_info.get("reason") or "artifact loader unavailable",
             )
     except Exception as exc:
         logger.warning(
-            "Prediction artifact preload failed (%s: %s). Runtime prediction will load lazily.",
+            "Experimental signal artifact preload failed (%s: %s). Runtime signal loading will remain lazy.",
             type(exc).__name__,
             exc,
         )

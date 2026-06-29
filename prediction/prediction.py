@@ -43,10 +43,10 @@ FEATURES = [
 ]
 
 TARGET = "label"
-ARTIFACT_VERSION = "synthetic-demo-v1"
+ARTIFACT_VERSION = "experimental-synthetic-v1"
 ARTIFACT_SCHEMA_VERSION = 1
 DEFAULT_ARTIFACT_PATH = Path(__file__).with_name("models") / "model_artifacts.joblib"
-RUNTIME_CALIBRATION_VERSION = "demo-runtime-calibration-v2"
+RUNTIME_CALIBRATION_VERSION = "experimental-calibration-v2"
 PROBABILITY_CLIP = (0.18, 0.82)
 MODEL_PROBABILITY_WEIGHT = 0.60
 SIGNAL_PROBABILITY_WEIGHT = 1.0 - MODEL_PROBABILITY_WEIGHT
@@ -281,7 +281,7 @@ def bootstrap_model_artifacts(force_retrain: bool = False) -> ModelArtifacts:
 
 
 def get_model_provenance(model: str = "rf") -> Dict[str, object]:
-    """Return lightweight metadata about the serving prediction model."""
+    """Return lightweight metadata about the serving experimental signal artifact."""
     artifacts = get_model_artifacts()
     model_name = "LogisticRegression" if model == "lr" else "RandomForestClassifier"
     metric_prefix = "lr" if model == "lr" else "rf"
@@ -298,6 +298,7 @@ def get_model_provenance(model: str = "rf") -> Dict[str, object]:
         "artifact_path": artifacts.provenance.get("artifact_path"),
         "trained_at": artifacts.provenance.get("trained_at"),
         "training_data": artifacts.provenance.get("training_data"),
+        "real_training_data": False,   # flip to True when trained on real historical outcomes
         "features_used": FEATURES,
         "calibration": {
             **(artifacts.provenance.get("calibration") or {}),

@@ -15,7 +15,7 @@ TODO (Srish): Add real-time WebSocket or Server-Sent Events (SSE) for live updat
 TODO (Srish): Add historical data support (date range filtering)
 TODO (Mihir): Add performance metrics (query execution time, cache hit rate)
 TODO (Srish): Add pagination support for large watchlists
-TODO (Srish): Add portfolio aggregation (summed sentiment, average prediction)
+TODO (Srish): Add portfolio aggregation (summed sentiment, combined validated signals)
 """
 
 from datetime import datetime
@@ -105,14 +105,14 @@ async def get_dashboard_summary(ticker: str):
     """
     Get comprehensive dashboard summary for a stock.
 
-    Combines sentiment, market data, and predictions into a single response
+    Combines sentiment, market data, and experimental signal availability into a single response
     for efficient frontend rendering.
 
     Args:
         ticker (str): Stock ticker symbol
 
     Returns:
-        DashboardSummary: Aggregated sentiment, market data, and prediction
+        DashboardSummary: Aggregated sentiment, market data, and signal availability
 
     Raises:
         HTTPException: 404 if ticker not found
@@ -123,7 +123,7 @@ async def get_dashboard_summary(ticker: str):
             "ticker": "NVDA",
             "sentiment": {...},
             "market_data": {...},
-            "prediction": {...},
+            "prediction": null,
             "updated_at": "2026-04-01T10:30:00"
         }
 
@@ -165,6 +165,7 @@ async def get_dashboard_summary(ticker: str):
 
         overall_sentiment = sentiment_data["overall_sentiment"]
         prediction = prediction_data["prediction"]
+        prediction_model_info = prediction_data.get("model_info") or {}
         market_status = market_data.status or ("ready" if market_data.price > 0 else "unavailable")
         market_source = market_data.source or "source not reported"
         market_available = market_data.price > 0 and market_status != "unavailable"
@@ -194,13 +195,23 @@ async def get_dashboard_summary(ticker: str):
                 message=market_message,
             ),
             prediction=_availability(
-                available=prediction is not None,
-                status="ready" if prediction is not None else "unavailable",
-                source="Prediction model",
-                message=(
-                    "Prediction is available."
+                available=prediction is not None
+                and prediction_model_info.get("real_training_data") is True,
+                status=(
+                    "ready"
                     if prediction is not None
-                    else "Prediction unavailable until enough validated input data is available."
+                    and prediction_model_info.get("real_training_data") is True
+                    else "unavailable"
+                ),
+                source="Experimental signal",
+                message=(
+                    "Experimental signal is available from a real-outcome validated model."
+                    if prediction is not None
+                    and prediction_model_info.get("real_training_data") is True
+                    else prediction_model_info.get(
+                        "reason",
+                        "Experimental signal unavailable until a model is trained and evaluated on real historical outcomes.",
+                    )
                 ),
             ),
             headlines=_availability(
@@ -286,7 +297,7 @@ async def get_dashboard_summary_batch(tickers: List[str] = Query(...)):
     TODO (Srish): Implement Server-Sent Events (SSE) for live dashboard updates
     TODO (Srish): Add portfolio-level aggregation (average sentiment, combined signals)
     TODO (Mihir): Implement streaming response for large ticker lists
-    TODO (Srish): Add sorting/filtering options (by sentiment, prediction, risk)
+    TODO (Srish): Add sorting/filtering options (by sentiment, validated signal, risk)
     TODO (Srish): Add portfolio performance tracking (aggregate P&L)
     """
     if not tickers or len(tickers) == 0:

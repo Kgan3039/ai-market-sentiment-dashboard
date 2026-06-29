@@ -1,4 +1,4 @@
-"""Regression checks for backend prediction artifact prewarming."""
+"""Regression checks for backend experimental signal artifact prewarming."""
 
 import asyncio
 import logging
@@ -19,7 +19,7 @@ def test_prediction_prewarm_uses_bootstrap_artifacts(monkeypatch) -> None:
         provenance = {
             "artifact_source": "disk",
             "artifact_path": "/tmp/model_artifacts.joblib",
-            "artifact_version": "synthetic-demo-v1",
+            "artifact_version": "experimental-synthetic-v1",
             "trained_at": "2026-05-28T03:49:52+00:00",
         }
 
@@ -43,12 +43,12 @@ def test_prediction_prewarm_uses_bootstrap_artifacts(monkeypatch) -> None:
         "status": "ready",
         "artifact_source": "disk",
         "artifact_path": "/tmp/model_artifacts.joblib",
-        "version": "synthetic-demo-v1",
+        "version": "experimental-synthetic-v1",
         "trained_at": "2026-05-28T03:49:52+00:00",
     }
 
 
-def test_startup_event_handles_prediction_prewarm_failure(monkeypatch, caplog) -> None:
+def test_startup_event_handles_signal_prewarm_failure(monkeypatch, caplog) -> None:
     def fail_prewarm():
         raise RuntimeError("artifact file is unreadable")
 
@@ -61,5 +61,5 @@ def test_startup_event_handles_prediction_prewarm_failure(monkeypatch, caplog) -
     with caplog.at_level(logging.WARNING, logger="uvicorn.error"):
         asyncio.run(backend_main.startup_event())
 
-    assert "Prediction artifact preload failed" in caplog.text
-    assert "Runtime prediction will load lazily" in caplog.text
+    assert "Experimental signal artifact preload failed" in caplog.text
+    assert "Runtime signal loading will remain lazy" in caplog.text

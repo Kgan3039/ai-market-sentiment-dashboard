@@ -1,4 +1,4 @@
-"""Prediction Service - API interface to stock movement prediction model.
+"""Experimental signal service for stock movement research.
 
 Author: Mihir (with integration from Abhi ML model)
 
@@ -7,13 +7,13 @@ Assumptions:
 - sentiment_confidence: max(positive, negative, neutral) prob from NLP model
 - price_delta_24h: (close - open) / open for last 24h; clipped to ±8% in predict()
 - volume_delta: (today_vol - avg_vol) / avg_vol; clipped to ±50% in predict()
-- ML model: RandomForestClassifier trained on synthetic data (see prediction.py)
-- Confidence output is soft-clipped to [0.52, 0.84] in ML module for demo plausibility
+- Synthetic model artifacts are not exposed as actionable prediction outputs.
+- A real signal may be exposed only after training/evaluation on historical outcomes.
 """
 
 import os
 import sys
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
 from app.models.schemas import PredictionResponse
 import re
@@ -45,16 +45,34 @@ def _load_prediction_module():
 
 
 class PredictionService:
+    SYNTHETIC_UNAVAILABLE_REASON = (
+        "Experimental signal unavailable: current artifacts are trained on synthetic data "
+        "and have not been evaluated against real historical outcomes."
+    )
+
+    @staticmethod
+    def _unavailable_model_info(reason: str, model_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        info = dict(model_info or {})
+        info.update(
+            {
+                'status': 'unavailable',
+                'reason': reason,
+                'real_training_data': False,
+                'exposes_actionable_output': False,
+            }
+        )
+        info.setdefault('features_used', [])
+        return info
 
     @staticmethod
     def prewarm_model_artifacts() -> Dict[str, Any]:
-        """Load persisted prediction artifacts into memory before first request."""
+        """Load persisted experimental signal artifacts into memory before first request."""
         prediction_module = _load_prediction_module()
 
         if prediction_module is None:
             return {
                 'status': 'unavailable',
-                'reason': 'Prediction module could not be loaded.',
+                'reason': 'Experimental signal module could not be loaded.',
             }
 
         if hasattr(prediction_module, 'bootstrap_model_artifacts'):
@@ -64,7 +82,7 @@ class PredictionService:
         else:
             return {
                 'status': 'unavailable',
-                'reason': 'Prediction module does not expose artifact loading.',
+                'reason': 'Experimental signal module does not expose artifact loading.',
             }
 
         provenance = getattr(artifacts, 'provenance', {}) or {}
@@ -103,7 +121,7 @@ class PredictionService:
     @staticmethod
     def predict_movement(
         ticker: str, sentiment_score: float, market_features: Dict[str, float]
-    ) -> tuple[PredictionResponse, Dict[str, Any]]:
+    ) -> tuple[Optional[PredictionResponse], Dict[str, Any]]:
         prediction_module = _load_prediction_module()
 
         if prediction_module is not None and hasattr(prediction_module, 'predict'):
@@ -124,7 +142,14 @@ class PredictionService:
                         'version': '0.1.0',
                         'artifact_source': 'unknown',
                     }
+                if model_info.get('real_training_data') is not True:
+                    return None, PredictionService._unavailable_model_info(
+                        PredictionService.SYNTHETIC_UNAVAILABLE_REASON,
+                        model_info,
+                    )
+
                 model_info['status'] = 'ready'
+                model_info['exposes_actionable_output'] = True
 
                 return PredictionResponse(
                     symbol=ticker,
@@ -136,33 +161,16 @@ class PredictionService:
             except Exception:
                 pass
 
-        # Fallback: rule-based, clearly marked
-        movement = "up" if sentiment_score > 0.2 else ("down" if sentiment_score < -0.2 else "neutral")
-        # Derive soft probability from sentiment magnitude rather than hardcoding
-        magnitude = min(abs(sentiment_score), 1.0)
-        probability = round(0.5 + 0.2 * magnitude, 4)
-        confidence = round(0.5 + 0.15 * magnitude, 4)
-
         model_info = {
             'name': 'FallbackRule',
             'version': '0.1.0',
-            'status': 'fallback',
             'artifact_source': 'none',
-            'features_used': [
-                'sentiment_score',
-                'sentiment_confidence',
-                'price_delta_24h',
-                'volume_delta',
-            ],
         }
 
-        return PredictionResponse(
-            symbol=ticker,
-            predicted_movement=movement,
-            probability=probability,
-            confidence=confidence,
-            model_info=model_info,
-        ), model_info
+        return None, PredictionService._unavailable_model_info(
+            "Experimental signal unavailable: no validated model artifact is available.",
+            model_info,
+        )
 
     @staticmethod
     def predict_for_ticker(ticker: str) -> Dict[str, Any]:
@@ -196,6 +204,8 @@ class PredictionService:
                     'version': '0.1.0',
                     'status': 'unavailable',
                     'reason': 'Validated aggregate sentiment is unavailable.',
+                    'real_training_data': False,
+                    'exposes_actionable_output': False,
                     'features_used': [],
                 },
                 'timestamp': datetime.now().isoformat(),

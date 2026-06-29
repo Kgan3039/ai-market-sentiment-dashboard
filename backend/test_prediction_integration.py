@@ -1,8 +1,7 @@
-"""End-to-end integration test for the prediction path.
+"""End-to-end integration test for the experimental signal path.
  
-Verifies that PredictionService.predict_for_ticker() returns the correct
-API contract keys and that the ML model path is not silently falling back
-to the rule-based fallback.
+Verifies that PredictionService.predict_for_ticker() still exercises the
+artifact path while withholding synthetic-only outputs from the product API.
  
 Run from the backend/ directory:
     python test_prediction_integration.py
@@ -57,40 +56,30 @@ def test_predict_for_ticker_contract():
 
         result = PredictionService.predict_for_ticker("NVDA")
         prediction = result["prediction"]
+        model_info = result["model_info"]
     finally:
         DataService._fetch_yfinance_headlines = original_fetch
         DataService.get_market_data = original_market_data
         DataService._PROVIDER_CACHE.clear()
         DataService._PROVIDER_STATUS.clear()
  
-    assert hasattr(prediction, "predicted_movement"), "Missing field: predicted_movement"
-    assert hasattr(prediction, "probability"), "Missing field: probability"
-    assert hasattr(prediction, "confidence"), "Missing field: confidence"
-    assert hasattr(prediction, "model_info"), "Missing field: model_info"
- 
-    assert prediction.predicted_movement in ("up", "down", "neutral"), \
-        f"Unexpected predicted_movement value: {prediction.predicted_movement}"
-    assert 0.0 <= prediction.probability <= 1.0, \
-        f"probability out of range: {prediction.probability}"
-    assert 0.0 <= prediction.confidence <= 1.0, \
-        f"confidence out of range: {prediction.confidence}"
- 
-    assert prediction.predicted_movement != "neutral", \
-        "ML model path is being bypassed — endpoint is falling back to rule-based. " \
-        "Check that prediction module loads correctly and predict() is being called."
-    assert prediction.model_info["name"] == "RandomForestClassifier"
-    assert prediction.model_info["artifact_source"] in (
+    assert prediction is None
+    assert model_info["status"] == "unavailable"
+    assert model_info["real_training_data"] is False
+    assert model_info["exposes_actionable_output"] is False
+    assert "synthetic data" in model_info["reason"]
+    assert "real historical outcomes" in model_info["reason"]
+    assert model_info["name"] == "RandomForestClassifier"
+    assert model_info["artifact_source"] in (
         "disk",
         "trained_and_persisted",
     )
-    assert prediction.model_info["calibration"]["runtime_calibration_version"] == (
+    assert model_info["calibration"]["runtime_calibration_version"] == (
         prediction_module.RUNTIME_CALIBRATION_VERSION
     )
 
-    print(f"✓ predicted_movement : {prediction.predicted_movement}")
-    print(f"✓ probability        : {prediction.probability}")
-    print(f"✓ confidence         : {prediction.confidence}")
-    print("predict_for_ticker('NVDA') end-to-end check passed.")
+    print("✓ synthetic-only artifact output withheld")
+    print("predict_for_ticker('NVDA') experimental signal contract check passed.")
 
 
 def test_predict_for_ticker_uses_percent_market_delta():
@@ -140,7 +129,8 @@ def test_predict_for_ticker_uses_percent_market_delta():
         DataService._PROVIDER_CACHE.clear()
         DataService._PROVIDER_STATUS.clear()
 
-    assert result["prediction"] is not None
+    assert result["prediction"] is None
+    assert result["model_info"]["status"] == "unavailable"
     assert captured["price_delta_24h"] == 0.02
     assert captured["volume_delta"] == 0.15
  
