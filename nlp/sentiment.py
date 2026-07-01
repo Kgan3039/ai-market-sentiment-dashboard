@@ -61,6 +61,7 @@ NEGATIVE_TERMS = {
 }
 
 MIN_DIRECTIONAL_GAP = 0.12
+NO_EVIDENCE_NEUTRAL_MARGIN = 0.08
 SHORT_HEADLINE_WORDS = 12
 SHORT_HEADLINE_CONFIDENCE_CAP = 0.76
 GENERIC_HEADLINE_CONFIDENCE_CAP = 0.82
@@ -131,7 +132,11 @@ def _build_sentiment_result(text, positive, negative, neutral):
         positive *= 0.95
         negative *= 0.95
 
-    if evidence_count == 0 and max(positive, negative) > neutral:
+    directional_neutral_margin = max(positive, negative) - neutral
+    if (
+        evidence_count == 0
+        and 0 < directional_neutral_margin < NO_EVIDENCE_NEUTRAL_MARGIN
+    ):
         neutral += 0.12
         positive *= 0.92
         negative *= 0.92

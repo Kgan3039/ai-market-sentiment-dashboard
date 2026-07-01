@@ -37,8 +37,21 @@ def test_directional_headlines_keep_signal() -> None:
     assert negative["sentiment_confidence"] <= 0.82
 
 
+def test_raw_directional_finbert_score_without_keywords_keeps_signal() -> None:
+    result = sentiment._build_sentiment_result(
+        "Coca-Cola launches exclusive soda flavor at fast-food giant",
+        0.5368,
+        0.0163,
+        0.4469,
+    )
+
+    assert result["sentiment_label"] == "positive"
+    assert result["positive_prob"] > result["neutral_prob"]
+
+
 if __name__ == "__main__":
     test_generic_headline_stays_neutral()
     test_short_market_move_is_not_overconfident()
     test_directional_headlines_keep_signal()
+    test_raw_directional_finbert_score_without_keywords_keeps_signal()
     print("Sentiment quality tests passed.")
