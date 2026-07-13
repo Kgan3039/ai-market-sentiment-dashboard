@@ -1,0 +1,41 @@
+# Phase 0 generated-copy guardrails. Do NOT apply these rules to raw publisher
+# headlines, descriptions, or source quotes. Match all rules case-insensitively.
+#
+# Machine-readable format (one rule per non-comment line):
+# category<TAB>match_type<TAB>pattern
+# match_type is literal (phrase match with word boundaries) or regex (Python
+# regular expression). Regex families are deliberately narrow: they target
+# generated causal, predictive, advisory, certainty, and model-score claims.
+
+causal_price	literal	the stock fell because
+causal_price	literal	the stock rose because
+causal_price	literal	this move was driven by
+causal_price	literal	explains today's decline
+causal_price	regex	\b(?:the\s+)?stock\s+(?:fell|rose|dropped|gained)\s+because\b
+causal_price	regex	\b(?:this|today'?s)\s+(?:move|decline|drop|rise|rally)\s+(?:was|is)\s+(?:driven|caused)\s+by\b
+causal_price	regex	\bexplains?\s+(?:today'?s\s+)?(?:decline|drop|rise|rally)\b
+
+prediction	literal	will rise
+prediction	literal	will fall
+prediction	literal	expected to rise
+prediction	literal	expected to fall
+prediction	regex	\b(?:is|are)\s+expected\s+to\s+(?:rise|fall|increase|decrease)\b
+prediction	regex	\b(?:will|going\s+to)\s+(?:rise|fall|rally|decline)\b
+
+# Advisory rules target product endorsement or a direct trading instruction,
+# not factual, attributed reporting of an analyst's rating or price target.
+advisory	regex	\b(?:[A-Z]{2,5}|Tesla|NVIDIA|Apple|Meta|AMD|the\s+(?:stock|company)|shares?)\s+(?:is|are)\s+(?:a\s+)?(?:strong\s+)?buy\b
+advisory	regex	\b(?:we|investors?)\s+(?:should|must)\s+(?:buy|sell|hold)\b
+advisory	regex	\byou\s+(?:should|must)\s+(?:buy|sell|hold)\b
+advisory	regex	\bthis\s+is\s+a\s+strong\s+buy\s+(?:opportunity|recommendation)\b
+advisory	regex	\b(?:buy|sell|hold)\s+(?:shares?\s+of\s+)?(?:TSLA|NVDA|AMD|AAPL|META|Tesla|NVIDIA|Apple|Meta)\b
+advisory	regex	\b(?:the\s+)?price\s+target\s+implies\s+(?:the\s+)?(?:stock|shares?)\s+(?:will|should)\s+(?:rise|fall|increase|decrease)\b
+
+unsupported_certainty	regex	\b(?:will|is)\s+(?:certain|guaranteed)\s+to\b
+unsupported_certainty	regex	\b(?:definitively|certainly)\s+(?:explains|proves|will)\b
+
+model_confidence	literal	confidence score
+model_confidence	literal	probability of moving
+model_confidence	regex	\b(?:model|prediction)\s+confidence\b
+model_confidence	regex	\bprobability\s+of\s+(?:moving|rising|falling)\b
+model_confidence	regex	\b\d{1,3}%\s+(?:probability|chance)\s+(?:of\s+)?(?:a\s+)?(?:move|rise|fall)\b
