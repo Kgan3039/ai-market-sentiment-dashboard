@@ -53,4 +53,8 @@ predict a move, or give investment advice.
 It must not be applied to raw publisher headlines, descriptions, or source
 quotes. Match rules case-insensitively. Future linter work may add context-aware
 checks, but must preserve the literal and regex rule semantics documented in
-that file.
+that file. The executable content-scope contract is:
+
+- Apply rules to `generated_summary`, `generated_label`, and `product_ui_copy`.
+- Do not apply rules to `publisher_headline`, `publisher_description`, or
+  `publisher_quotation`.

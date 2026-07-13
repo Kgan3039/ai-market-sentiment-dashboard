@@ -27,6 +27,10 @@ REQUIRED_CATEGORIES = {
     "model_confidence",
 }
 VALID_MATCH_TYPES = {"literal", "regex"}
+GENERATED_CONTENT_SCOPES = frozenset({"generated_summary", "generated_label", "product_ui_copy"})
+RAW_SOURCE_CONTENT_SCOPES = frozenset(
+    {"publisher_headline", "publisher_description", "publisher_quotation"}
+)
 
 
 def load_copy_deck() -> str:
@@ -63,7 +67,21 @@ def rule_matches(text: str, match_type: str, pattern: str) -> bool:
     return bool(re.search(expression, text, re.IGNORECASE))
 
 
-def detected_categories(text: str, rules: list[tuple[str, str, str]]) -> set[str]:
+def rules_apply_to_scope(content_scope: str) -> bool:
+    """Executable contract for the future linter's allowed input scopes."""
+    if content_scope in GENERATED_CONTENT_SCOPES:
+        return True
+    if content_scope in RAW_SOURCE_CONTENT_SCOPES:
+        return False
+    raise ValueError(f"unknown content scope: {content_scope}")
+
+
+def detected_categories(
+    text: str, rules: list[tuple[str, str, str]], *, content_scope: str
+) -> set[str]:
+    """Return matches only when the caller explicitly declares an allowed scope."""
+    if not rules_apply_to_scope(content_scope):
+        return set()
     return {category for category, match_type, pattern in rules if rule_matches(text, match_type, pattern)}
 
 

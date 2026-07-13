@@ -21,14 +21,17 @@ prediction	literal	expected to rise
 prediction	literal	expected to fall
 prediction	regex	\b(?:is|are)\s+expected\s+to\s+(?:rise|fall|increase|decrease)\b
 prediction	regex	\b(?:will|going\s+to)\s+(?:rise|fall|rally|decline)\b
+prediction	regex	\bshares?\s+will\s+(?:be\s+)?(?:higher|lower|rise|fall|rally|decline)\b
+prediction	regex	\bshares?\s+will\s+move\s+(?:higher|lower)\b
+prediction	regex	\b(?:the\s+)?stock\s+is\s+going\s+to\s+(?:rally|decline|rise|fall)\b
 
 # Advisory rules target product endorsement or a direct trading instruction,
 # not factual, attributed reporting of an analyst's rating or price target.
-advisory	regex	\b(?:[A-Z]{2,5}|Tesla|NVIDIA|Apple|Meta|AMD|the\s+(?:stock|company)|shares?)\s+(?:is|are)\s+(?:a\s+)?(?:strong\s+)?buy\b
-advisory	regex	\b(?:we|investors?)\s+(?:should|must)\s+(?:buy|sell|hold)\b
-advisory	regex	\byou\s+(?:should|must)\s+(?:buy|sell|hold)\b
+advisory	regex	\b(?:Tesla|NVIDIA|Apple|Meta|AMD|TSLA|NVDA|AAPL|META|the\s+(?:stock|company)|this\s+stock|shares?)\s+(?:is|are|looks?\s+like)\s+(?:a\s+)?(?:strong\s+)?buy\b
+advisory	regex	\b(?:we|you|investors?)\s+(?:should|must|recommend(?:\s+that)?|advise(?:\s+to)?)\s+(?:buy|sell|hold|buying|selling|holding)\b
 advisory	regex	\bthis\s+is\s+a\s+strong\s+buy\s+(?:opportunity|recommendation)\b
 advisory	regex	\b(?:buy|sell|hold)\s+(?:shares?\s+of\s+)?(?:TSLA|NVDA|AMD|AAPL|META|Tesla|NVIDIA|Apple|Meta)\b
+advisory	regex	\b(?:buy|sell|hold)\s+(?:the\s+)?(?:stock|shares?)\b
 advisory	regex	\b(?:the\s+)?price\s+target\s+implies\s+(?:the\s+)?(?:stock|shares?)\s+(?:will|should)\s+(?:rise|fall|increase|decrease)\b
 
 unsupported_certainty	regex	\b(?:will|is)\s+(?:certain|guaranteed)\s+to\b
