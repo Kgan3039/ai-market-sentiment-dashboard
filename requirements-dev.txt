@@ -1,0 +1,2 @@
+# Small dependency set for repository validation utilities.
+PyYAML==6.0.2
