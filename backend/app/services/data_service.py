@@ -1,21 +1,29 @@
-"""Data Service - API interface to the data pipeline and market metadata sources."""
+"""Data Service - API interface to data pipeline.
 
-from __future__ import annotations
+Author: Mihir (with integration from Isaac data pipeline)
+Responsibility: Provide data access layer for market and social media data
+
+Integration Points:
+- Loads data from Isaac data pipeline (../data/app.py)
+- Reads from stock_data.json containing raw posts with market features
+- Provides market data and social media data to other services
+
+Current Status: Active integration with pipeline data when available
+"""
 
 import json
 import os
-from datetime import datetime
 from typing import Any, Dict, List, Optional
-
-from app.models.schemas import FundamentalsData, FundamentalRatios, FinancialSnapshot, HeadlineItem, MarketData
+from datetime import datetime
+from app.models.schemas import Fundamentals, HeadlineItem, MarketData, MarketHistoryPoint, SocialPostItem
 
 
 class DataService:
-    """Service for managing data retrieval from pipeline output and market sources."""
+    """Service for managing data retrieval from external sources."""
 
-    @staticmethod
-    def _current_date() -> str:
-        return datetime.now().date().isoformat()
+    _CACHE_TTL_SECONDS = int(os.getenv("DATA_SERVICE_CACHE_TTL_SECONDS", "900"))
+    _PROVIDER_CACHE: Dict[str, Dict[str, Any]] = {}
+    _PROVIDER_STATUS: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _pipeline_file_path() -> str:
@@ -24,42 +32,86 @@ class DataService:
         )
 
     @staticmethod
-    def _safe_float(value: Any, default: Optional[float] = 0.0) -> Optional[float]:
-        try:
-            if value is None:
-                return default
-            return float(value)
-        except (TypeError, ValueError):
-            return default
+    def _cache_key(provider: str, ticker: str, limit: Optional[int] = None) -> str:
+        suffix = f":{limit}" if limit is not None else ""
+        return f"{provider}:{ticker.upper()}{suffix}"
 
     @staticmethod
-    def _safe_int(value: Any, default: Optional[int] = 0) -> Optional[int]:
-        try:
-            if value is None:
-                return default
-            return int(value)
-        except (TypeError, ValueError):
-            return default
+    def _clone_cached_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return [DataService._clone_cached_value(item) for item in value]
+        if hasattr(value, "model_copy"):
+            return value.model_copy(deep=True)
+        if hasattr(value, "copy"):
+            return value.copy(deep=True)
+        return value
 
     @staticmethod
-    def _coerce_date(value: Any) -> str:
-        if value is None:
-            return DataService._current_date()
+    def _cache_lookup(key: str, allow_expired: bool = False) -> tuple[bool, Any, bool]:
+        entry = DataService._PROVIDER_CACHE.get(key)
+        if entry is None:
+            return False, None, False
 
-        if isinstance(value, (int, float)):
-            try:
-                return datetime.fromtimestamp(value).date().isoformat()
-            except (OverflowError, OSError, ValueError):
-                return DataService._current_date()
+        age_seconds = (datetime.now() - entry["stored_at"]).total_seconds()
+        expired = age_seconds > DataService._CACHE_TTL_SECONDS
+        if expired and not allow_expired:
+            return False, None, True
 
-        text = str(value).strip()
-        if not text:
-            return DataService._current_date()
+        return True, DataService._clone_cached_value(entry["value"]), expired
 
-        if "T" in text or " " in text:
-            return text
+    @staticmethod
+    def _cache_set(key: str, value: Any) -> None:
+        DataService._PROVIDER_CACHE[key] = {
+            "stored_at": datetime.now(),
+            "value": DataService._clone_cached_value(value),
+        }
 
-        return text
+    @staticmethod
+    def _set_provider_status(
+        key: str,
+        *,
+        available: bool,
+        status: str,
+        source: str,
+        message: str,
+        count: Optional[int] = None,
+    ) -> None:
+        DataService._PROVIDER_STATUS[key] = {
+            "available": available,
+            "status": status,
+            "source": source,
+            "message": message,
+            "count": count,
+        }
+
+    @staticmethod
+    def _provider_status(
+        provider: str,
+        ticker: str,
+        *,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        key = DataService._cache_key(provider, ticker, limit)
+        return DataService._PROVIDER_STATUS.get(
+            key,
+            {
+                "available": False,
+                "status": "unavailable",
+                "source": "Yahoo Finance via yfinance",
+                "message": f"{provider.title()} provider has not been queried yet.",
+                "count": 0 if provider == "headlines" else None,
+            },
+        )
+
+    @staticmethod
+    def get_headlines_status(ticker: str, limit: int = 6) -> Dict[str, Any]:
+        """Return provider status for the last headline lookup."""
+        return DataService._provider_status("headlines", ticker, limit=limit)
+
+    @staticmethod
+    def get_fundamentals_status(ticker: str) -> Dict[str, Any]:
+        """Return provider status for the last fundamentals lookup."""
+        return DataService._provider_status("fundamentals", ticker)
 
     @staticmethod
     def _load_pipeline_records() -> List[Dict[str, Any]]:
@@ -84,275 +136,135 @@ class DataService:
         ]
 
     @staticmethod
-    def _extract_posts_from_record(record: Dict[str, Any], ticker: str) -> List[Dict[str, Any]]:
-        record_date = DataService._coerce_date(record.get("date"))
-        posts = record.get("posts")
+    def _is_valid_pipeline_post(text: str, source: str) -> bool:
+        text = str(text or "").strip()
+        source = str(source or "").strip().lower()
+        lowered_text = text.lower()
 
-        if isinstance(posts, list):
-            normalized_posts = []
-            for post in posts:
-                text = post.get("text") or post.get("headline") or post.get("title") or ""
-                if not str(text).strip():
+        if not text or source.startswith("mock"):
+            return False
+
+        placeholder_phrases = (
+            "sample post while waiting for api approval",
+            "sample fallback post",
+            "discussion about",
+        )
+        return not any(phrase in lowered_text for phrase in placeholder_phrases)
+
+    @staticmethod
+    def _post_content_type(post: Dict[str, Any], source: str) -> str:
+        explicit_type = str(post.get("content_type") or "").strip().lower()
+        if explicit_type in {"social_post", "publisher_headline", "news_headline"}:
+            return "publisher_headline" if explicit_type == "news_headline" else explicit_type
+
+        source_text = str(source or "").strip().lower()
+        social_sources = ("reddit", "twitter", "x.com", "stocktwits", "discord", "telegram")
+        if any(source_name in source_text for source_name in social_sources):
+            return "social_post"
+
+        return "publisher_headline"
+
+    @staticmethod
+    def _pipeline_headlines(ticker: str, limit: int = 6) -> List[HeadlineItem]:
+        headlines: List[HeadlineItem] = []
+
+        for record_index, record in enumerate(DataService._get_ticker_records(ticker)):
+            nested_posts = record.get("posts")
+            record_posts = nested_posts if isinstance(nested_posts, list) else [record]
+            for post_index, post in enumerate(record_posts):
+                text = str(post.get("text", "")).strip()
+                source = str(post.get("source", "Committed demo dataset")).strip()
+                if not DataService._is_valid_pipeline_post(text, source):
                     continue
-                normalized_posts.append(
-                    {
-                        "ticker": ticker,
-                        "date": DataService._coerce_date(post.get("published_at") or post.get("date") or record_date),
-                        "text": str(text).strip(),
-                        "source": post.get("source") or post.get("publisher") or "pipeline",
-                        "post_score": DataService._safe_int(post.get("post_score"), 1) or 1,
-                        "url": post.get("url") or post.get("link"),
-                    }
+
+                published_at = None
+                date_value = record.get("date")
+                if date_value:
+                    try:
+                        published_at = datetime.fromisoformat(str(date_value))
+                    except ValueError:
+                        published_at = None
+
+                headlines.append(
+                    HeadlineItem(
+                        id=str(post.get("id") or f"{ticker}-dataset-{record_index}-{post_index}"),
+                        ticker=ticker,
+                        headline=text,
+                        title=text,
+                        source=source,
+                        published_at=published_at,
+                        time=(
+                            f"{published_at:%b} {published_at.day}, {published_at:%Y}"
+                            if published_at
+                            else None
+                        ),
+                    )
                 )
-            return normalized_posts
+                if len(headlines) >= limit:
+                    return headlines
 
-        text = record.get("text") or record.get("headline") or record.get("title")
-        if text:
-            return [
-                {
-                    "ticker": ticker,
-                    "date": record_date,
-                    "text": str(text).strip(),
-                    "source": record.get("source", "pipeline"),
-                    "post_score": DataService._safe_int(record.get("post_score"), 1) or 1,
-                    "url": record.get("url") or record.get("link"),
-                }
-            ]
-
-        return []
+        return headlines
 
     @staticmethod
-    def _extract_headlines_from_record(record: Dict[str, Any], ticker: str) -> List[HeadlineItem]:
-        record_date = DataService._coerce_date(record.get("date"))
-        headline_candidates = record.get("headlines")
-
-        if not isinstance(headline_candidates, list):
-            headline_candidates = record.get("posts") if isinstance(record.get("posts"), list) else [record]
-
-        items: List[HeadlineItem] = []
-        for index, candidate in enumerate(headline_candidates):
-            headline = candidate.get("headline") or candidate.get("title") or candidate.get("text") or ""
-            if not str(headline).strip():
-                continue
-
-            items.append(
-                HeadlineItem(
-                    id=str(candidate.get("id") or f"{ticker}-{record_date}-{index}"),
-                    ticker=ticker,
-                    headline=str(headline).strip(),
-                    source=candidate.get("source") or candidate.get("publisher") or "pipeline",
-                    url=candidate.get("url") or candidate.get("link"),
-                    published_at=DataService._coerce_date(
-                        candidate.get("published_at")
-                        or candidate.get("datetime")
-                        or candidate.get("date")
-                        or record_date
-                    ),
-                    sentiment_label=candidate.get("sentiment_label"),
-                    sentiment_score=DataService._safe_float(candidate.get("sentiment_score"), None),
-                )
-            )
-
-        return items
-
-    @staticmethod
-    def _extract_market_snapshot(record: Dict[str, Any], ticker: str) -> Optional[Dict[str, Any]]:
-        market_snapshot = record.get("market_data") if isinstance(record.get("market_data"), dict) else {}
-        date = DataService._coerce_date(record.get("date"))
-
-        price = DataService._safe_float(
-            market_snapshot.get("price") if market_snapshot else record.get("price"),
-            None,
-        )
-        if price is None:
+    def _optional_float(value: Any) -> Optional[float]:
+        if value is None:
             return None
 
-        day_high = DataService._safe_float(
-            market_snapshot.get("day_high") or market_snapshot.get("high") or record.get("day_high"),
-            price,
-        )
-        volume = DataService._safe_int(
-            market_snapshot.get("volume") if market_snapshot else record.get("volume"),
-            0,
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _market_data_from_snapshot(ticker: str, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        price = float(market_snapshot.get("price", 0.0) or 0.0)
+        status = market_snapshot.get("status") or ("cached" if price > 0 else "unavailable")
+        source = market_snapshot.get("source") or (
+            "Pipeline market snapshot" if price > 0 else "unavailable"
         )
 
         return {
-            "ticker": ticker,
+            "symbol": ticker,
             "price": price,
-            "day_high": day_high if day_high is not None else price,
-            "volume": volume or 0,
-            "date": date,
+            "day_high": float(market_snapshot.get("day_high", price) or price),
+            "volume": int(market_snapshot.get("volume", 0) or 0),
+            "price_delta_24h": DataService._optional_float(market_snapshot.get("price_delta_24h")),
+            "percent_change_24h": DataService._optional_float(market_snapshot.get("percent_change_24h")),
+            "volume_delta": DataService._optional_float(market_snapshot.get("volume_delta")),
+            "source": source,
+            "status": status,
+            "timestamp": datetime.now(),
         }
 
     @staticmethod
-    def _extract_feature_snapshot(record: Dict[str, Any]) -> Dict[str, float]:
-        market_snapshot = record.get("market_data") if isinstance(record.get("market_data"), dict) else {}
+    def _market_data_from_history(ticker: str, hist: Any, source: str) -> Optional[Dict[str, Any]]:
+        if hist is None or hist.empty:
+            return None
+
+        latest = hist.iloc[-1]
+        previous = hist.iloc[-2] if len(hist) > 1 else latest
+        price = float(latest.get("Close", 0.0) or 0.0)
+        previous_close = float(previous.get("Close", price) or price)
+        price_delta = price - previous_close
+        percent_change = (price_delta / previous_close * 100) if previous_close else 0.0
+
+        previous_volume = hist["Volume"].iloc[-6:-1] if len(hist) > 1 else hist["Volume"].iloc[-1:]
+        average_volume = float(previous_volume.mean() or 0.0)
+        volume = int(latest.get("Volume", 0) or 0)
+        volume_delta = ((volume - average_volume) / average_volume) if average_volume else 0.0
 
         return {
-            "price_delta_24h": DataService._safe_float(
-                market_snapshot.get("price_delta_24h") if market_snapshot else record.get("price_delta_24h"),
-                0.0,
-            ) or 0.0,
-            "volume_delta": DataService._safe_float(
-                market_snapshot.get("volume_delta") if market_snapshot else record.get("volume_delta"),
-                0.0,
-            ) or 0.0,
+            "symbol": ticker,
+            "price": price,
+            "day_high": float(latest.get("High", price) or price),
+            "volume": volume,
+            "price_delta_24h": price_delta,
+            "percent_change_24h": percent_change,
+            "volume_delta": volume_delta,
+            "source": source,
+            "status": "live" if price > 0 else "unavailable",
+            "timestamp": datetime.now(),
         }
-
-    @staticmethod
-    def _fetch_yfinance_market_snapshot(ticker: str) -> Optional[Dict[str, Any]]:
-        try:
-            import yfinance as yf
-
-            stock = yf.Ticker(ticker)
-            hist = stock.history(period="1d")
-            if hist.empty:
-                return None
-
-            return {
-                "ticker": ticker,
-                "price": float(hist["Close"].iloc[-1]),
-                "day_high": float(hist["High"].iloc[-1]),
-                "volume": int(hist["Volume"].iloc[-1]),
-                "date": DataService._current_date(),
-            }
-        except Exception:
-            return None
-
-    @staticmethod
-    def _fetch_yfinance_news(ticker: str, max_items: int) -> List[HeadlineItem]:
-        try:
-            import yfinance as yf
-
-            news_items = getattr(yf.Ticker(ticker), "news", []) or []
-        except Exception:
-            return []
-
-        normalized: List[HeadlineItem] = []
-        for index, item in enumerate(news_items[:max_items]):
-            content = item.get("content") if isinstance(item.get("content"), dict) else item
-            headline = content.get("title") or content.get("headline")
-            if not headline:
-                continue
-
-            canonical_url = content.get("canonicalUrl")
-            if isinstance(canonical_url, dict):
-                url = canonical_url.get("url")
-            else:
-                url = content.get("link") or content.get("url")
-
-            normalized.append(
-                HeadlineItem(
-                    id=str(content.get("uuid") or content.get("id") or f"{ticker}-yf-{index}"),
-                    ticker=ticker,
-                    headline=str(headline).strip(),
-                    source=content.get("provider") or content.get("publisher") or "yfinance",
-                    url=url,
-                    published_at=DataService._coerce_date(
-                        content.get("pubDate") or content.get("providerPublishTime") or DataService._current_date()
-                    ),
-                )
-            )
-
-        return normalized
-
-    @staticmethod
-    def _statement_value(statement: Any, labels: List[str]) -> Optional[float]:
-        if statement is None:
-            return None
-
-        try:
-            if statement.empty:
-                return None
-        except Exception:
-            return None
-
-        normalized_index = {str(index).strip().lower(): index for index in getattr(statement, "index", [])}
-        for label in labels:
-            matched_index = normalized_index.get(label.lower())
-            if matched_index is None:
-                continue
-
-            series = statement.loc[matched_index]
-            try:
-                cleaned = series.dropna()
-                if not cleaned.empty:
-                    return DataService._safe_float(cleaned.iloc[0], None)
-            except Exception:
-                return DataService._safe_float(series, None)
-
-        return None
-
-    @staticmethod
-    def _build_fundamentals_from_yfinance(ticker: str) -> Optional[FundamentalsData]:
-        try:
-            import yfinance as yf
-
-            stock = yf.Ticker(ticker)
-            info = getattr(stock, "info", {}) or {}
-            annual_income = getattr(stock, "financials", None)
-            quarterly_income = getattr(stock, "quarterly_financials", None)
-            annual_cashflow = getattr(stock, "cashflow", None)
-            quarterly_cashflow = getattr(stock, "quarterly_cashflow", None)
-        except Exception:
-            return None
-
-        annual = FinancialSnapshot(
-            revenue=DataService._statement_value(annual_income, ["Total Revenue", "Operating Revenue"]),
-            net_income=DataService._statement_value(annual_income, ["Net Income", "Net Income Common Stockholders"]),
-            operating_cash_flow=DataService._statement_value(annual_cashflow, ["Operating Cash Flow"]),
-            eps=DataService._safe_float(info.get("trailingEps"), None),
-        )
-        quarterly = FinancialSnapshot(
-            revenue=DataService._statement_value(quarterly_income, ["Total Revenue", "Operating Revenue"]),
-            net_income=DataService._statement_value(quarterly_income, ["Net Income", "Net Income Common Stockholders"]),
-            operating_cash_flow=DataService._statement_value(quarterly_cashflow, ["Operating Cash Flow"]),
-            eps=DataService._safe_float(info.get("currentEps") or info.get("trailingEps"), None),
-        )
-        ratios = FundamentalRatios(
-            pe=DataService._safe_float(info.get("trailingPE"), None),
-            eps=DataService._safe_float(info.get("trailingEps"), None),
-            roe=DataService._safe_float(info.get("returnOnEquity"), None),
-            debt_to_equity=DataService._safe_float(info.get("debtToEquity"), None),
-            revenue_growth_yoy=DataService._safe_float(info.get("revenueGrowth"), None),
-            gross_margin=DataService._safe_float(info.get("grossMargins"), None),
-        )
-
-        if not any(
-            value is not None
-            for value in [
-                annual.revenue,
-                annual.net_income,
-                annual.operating_cash_flow,
-                annual.eps,
-                quarterly.revenue,
-                quarterly.net_income,
-                quarterly.operating_cash_flow,
-                quarterly.eps,
-                ratios.pe,
-                ratios.eps,
-                ratios.roe,
-                ratios.debt_to_equity,
-                ratios.revenue_growth_yoy,
-                ratios.gross_margin,
-                info.get("longName"),
-            ]
-        ):
-            return None
-
-        return FundamentalsData(
-            ticker=ticker,
-            company_name=info.get("longName") or info.get("shortName"),
-            exchange=info.get("exchange"),
-            sector=info.get("sector"),
-            industry=info.get("industry"),
-            market_cap=DataService._safe_float(info.get("marketCap"), None),
-            currency=info.get("currency"),
-            annual=annual,
-            quarterly=quarterly,
-            ratios=ratios,
-            source="yfinance",
-        )
 
     @staticmethod
     def get_market_data(ticker: str) -> MarketData:
@@ -368,21 +280,39 @@ class DataService:
         )
 
         market_data = None
-        for record in ticker_records:
-            market_data = DataService._extract_market_snapshot(record, ticker)
-            if market_data and market_data["price"] > 0:
-                break
+        ticker_records = DataService._get_ticker_records(ticker)
+        if ticker_records:
+            latest = sorted(ticker_records, key=lambda r: r.get("date", ""), reverse=True)[0]
+            market_snapshot = latest.get("market_data", {}) or {}
+            market_data = DataService._market_data_from_snapshot(ticker, market_snapshot)
 
-        if market_data is None or market_data["price"] <= 0:
-            market_data = DataService._fetch_yfinance_market_snapshot(ticker)
+        # Fallback to yfinance if pipeline data is unavailable or incomplete
+        if market_data is None or market_data['price'] <= 0:
+            try:
+                import yfinance as yf
+
+                stock = yf.Ticker(ticker)
+                hist = stock.history(period='1mo')
+                market_data = DataService._market_data_from_history(
+                    ticker,
+                    hist,
+                    "Yahoo Finance via yfinance",
+                )
+            except Exception:
+                market_data = None
 
         if market_data is None:
             market_data = {
-                "ticker": ticker,
-                "price": 0.0,
-                "day_high": 0.0,
-                "volume": 0,
-                "date": DataService._current_date(),
+                'symbol': ticker,
+                'price': 0.0,
+                'day_high': 0.0,
+                'volume': 0,
+                'price_delta_24h': 0.0,
+                'percent_change_24h': 0.0,
+                'volume_delta': 0.0,
+                'source': 'unavailable',
+                'status': 'unavailable',
+                'timestamp': datetime.now(),
             }
 
         return MarketData(**market_data)
@@ -393,28 +323,440 @@ class DataService:
         return {ticker.upper(): DataService.get_market_data(ticker.upper()) for ticker in tickers}
 
     @staticmethod
+    def get_market_history(ticker: str, period: str = "1mo") -> List[MarketHistoryPoint]:
+        """Return recent historical close prices for compact dashboard charts."""
+        if not ticker or len(ticker.strip()) == 0:
+            raise ValueError("Invalid ticker symbol")
+
+        ticker = ticker.upper()
+        cache_key = DataService._cache_key(f"market_history:{period}", ticker)
+
+        cache_hit, cached_history, _ = DataService._cache_lookup(cache_key)
+        if cache_hit:
+            return cached_history
+
+        try:
+            history = DataService._fetch_yfinance_market_history(ticker, period)
+        except Exception:
+            stale_hit, stale_history, _ = DataService._cache_lookup(cache_key, allow_expired=True)
+            return stale_history if stale_hit else []
+
+        DataService._cache_set(cache_key, history)
+        return history
+
+    @staticmethod
+    def _fetch_yfinance_market_history(ticker: str, period: str) -> List[MarketHistoryPoint]:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period)
+        if hist.empty:
+            return []
+
+        points = []
+        for index, row in hist.tail(32).iterrows():
+            close = row.get("Close")
+            if close is None:
+                continue
+
+            try:
+                date_value = index.date().isoformat()
+            except Exception:
+                date_value = str(index)
+
+            volume = row.get("Volume")
+            try:
+                volume_value = int(volume) if volume is not None and volume == volume else None
+            except (TypeError, ValueError):
+                volume_value = None
+
+            points.append(
+                MarketHistoryPoint(
+                    date=date_value,
+                    close=round(float(close), 2),
+                    volume=volume_value,
+                )
+            )
+
+        return points
+
+    @staticmethod
+    def get_headlines(ticker: str, limit: int = 6) -> List[HeadlineItem]:
+        """
+        Get normalized headline items for a ticker.
+
+        Uses yfinance/Yahoo Finance news because the project already depends on
+        yfinance for market data and the same source can also provide company
+        metadata for fundamentals. Returns an empty list when the provider is
+        unavailable instead of fabricating demo headlines.
+        """
+        if not ticker or len(ticker.strip()) == 0:
+            raise ValueError("Invalid ticker symbol")
+
+        ticker = ticker.upper()
+        cache_key = DataService._cache_key("headlines", ticker, limit)
+
+        cache_hit, cached_headlines, _ = DataService._cache_lookup(cache_key)
+        if cache_hit:
+            previous_status = DataService._PROVIDER_STATUS.get(cache_key, {})
+            cached_source = previous_status.get("source", "Yahoo Finance via yfinance (cache)")
+            DataService._set_provider_status(
+                cache_key,
+                available=len(cached_headlines) > 0,
+                status="cached" if cached_headlines else "unavailable",
+                source=cached_source,
+                message=(
+                    f"{len(cached_headlines)} cached headline items are available."
+                    if cached_headlines
+                    else "Headline provider recently returned no articles."
+                ),
+                count=len(cached_headlines),
+            )
+            return cached_headlines
+
+        try:
+            headlines = DataService._fetch_yfinance_headlines(ticker, limit)
+        except Exception as exc:
+            stale_hit, stale_headlines, _ = DataService._cache_lookup(cache_key, allow_expired=True)
+            if stale_hit:
+                DataService._set_provider_status(
+                    cache_key,
+                    available=len(stale_headlines) > 0,
+                    status="fallback",
+                    source="Yahoo Finance via yfinance (stale cache)",
+                    message=(
+                        f"Headline provider failed; using {len(stale_headlines)} cached items."
+                        if stale_headlines
+                        else "Headline provider failed and cached response was empty."
+                    ),
+                    count=len(stale_headlines),
+                )
+                return stale_headlines
+
+            pipeline_headlines = DataService._pipeline_headlines(ticker, limit)
+            if pipeline_headlines:
+                DataService._cache_set(cache_key, pipeline_headlines)
+                DataService._set_provider_status(
+                    cache_key,
+                    available=True,
+                    status="cached",
+                    source="Committed demo dataset",
+                    message=(
+                        f"Headline provider failed; using {len(pipeline_headlines)} committed demo headlines."
+                    ),
+                    count=len(pipeline_headlines),
+                )
+                return pipeline_headlines
+
+            DataService._cache_set(cache_key, [])
+            DataService._set_provider_status(
+                cache_key,
+                available=False,
+                status="unavailable",
+                source="Yahoo Finance via yfinance",
+                message=f"Headline provider failed: {type(exc).__name__}.",
+                count=0,
+            )
+            return []
+
+        if not headlines:
+            pipeline_headlines = DataService._pipeline_headlines(ticker, limit)
+            if pipeline_headlines:
+                DataService._cache_set(cache_key, pipeline_headlines)
+                DataService._set_provider_status(
+                    cache_key,
+                    available=True,
+                    status="cached",
+                    source="Committed demo dataset",
+                    message=f"Using {len(pipeline_headlines)} committed demo headlines.",
+                    count=len(pipeline_headlines),
+                )
+                return pipeline_headlines
+
+        DataService._cache_set(cache_key, headlines)
+        DataService._set_provider_status(
+            cache_key,
+            available=len(headlines) > 0,
+            status="live" if headlines else "unavailable",
+            source="Yahoo Finance via yfinance",
+            message=(
+                f"{len(headlines)} headline items are available."
+                if headlines
+                else "Headline provider returned no articles."
+            ),
+            count=len(headlines),
+        )
+        return headlines
+
+    @staticmethod
+    def _fetch_yfinance_headlines(ticker: str, limit: int) -> List[HeadlineItem]:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        raw_news = stock.news or []
+        headlines = []
+        for index, item in enumerate(raw_news[:limit]):
+            normalized = DataService._normalize_yfinance_news_item(ticker, item, index)
+            if normalized is not None:
+                headlines.append(normalized)
+
+        return headlines
+
+    @staticmethod
+    def _normalize_yfinance_news_item(
+        ticker: str, item: Dict[str, Any], index: int
+    ) -> Optional[HeadlineItem]:
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+
+        title = item.get("title") or content.get("title")
+        if not title:
+            return None
+
+        provider = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+        canonical_url = content.get("canonicalUrl")
+        click_url = content.get("clickThroughUrl")
+
+        url = item.get("link")
+        if not url and isinstance(canonical_url, dict):
+            url = canonical_url.get("url")
+        if not url and isinstance(click_url, dict):
+            url = click_url.get("url")
+
+        published_at = DataService._parse_publish_time(
+            item.get("providerPublishTime") or content.get("pubDate") or content.get("displayTime")
+        )
+
+        source = (
+            item.get("publisher")
+            or provider.get("displayName")
+            or provider.get("name")
+            or "Yahoo Finance"
+        )
+
+        headline_id = str(item.get("id") or content.get("id") or f"{ticker}-{index}")
+        summary = item.get("summary") or content.get("summary")
+
+        return HeadlineItem(
+            id=headline_id,
+            ticker=ticker,
+            headline=title,
+            title=title,
+            source=source,
+            url=url,
+            published_at=published_at,
+            time=(
+                f"{published_at:%b} {published_at.day}, {published_at:%Y}"
+                if published_at
+                else None
+            ),
+            summary=summary,
+        )
+
+    @staticmethod
+    def _parse_publish_time(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value)
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def get_fundamentals(ticker: str) -> Optional[Fundamentals]:
+        """
+        Get company fundamentals and metadata for a ticker.
+
+        yfinance exposes both comprehensive company info and a faster
+        dictionary-like fast_info surface. The method merges the two so the UI
+        can render ratios even when only lightweight metadata is available.
+        """
+        if not ticker or len(ticker.strip()) == 0:
+            raise ValueError("Invalid ticker symbol")
+
+        ticker = ticker.upper()
+        cache_key = DataService._cache_key("fundamentals", ticker)
+
+        cache_hit, cached_fundamentals, _ = DataService._cache_lookup(cache_key)
+        if cache_hit:
+            DataService._set_provider_status(
+                cache_key,
+                available=cached_fundamentals is not None,
+                status="cached" if cached_fundamentals is not None else "unavailable",
+                source="Yahoo Finance via yfinance (cache)",
+                message=(
+                    "Cached company fundamentals are available."
+                    if cached_fundamentals is not None
+                    else "Fundamentals provider recently returned no usable fields."
+                ),
+            )
+            return cached_fundamentals
+
+        try:
+            fundamentals = DataService._fetch_yfinance_fundamentals(ticker)
+        except Exception as exc:
+            stale_hit, stale_fundamentals, _ = DataService._cache_lookup(
+                cache_key, allow_expired=True
+            )
+            if stale_hit:
+                DataService._set_provider_status(
+                    cache_key,
+                    available=stale_fundamentals is not None,
+                    status="fallback",
+                    source="Yahoo Finance via yfinance (stale cache)",
+                    message=(
+                        "Fundamentals provider failed; using cached company fundamentals."
+                        if stale_fundamentals is not None
+                        else "Fundamentals provider failed and cached response was empty."
+                    ),
+                )
+                return stale_fundamentals
+
+            DataService._set_provider_status(
+                cache_key,
+                available=False,
+                status="unavailable",
+                source="Yahoo Finance via yfinance",
+                message=f"Fundamentals provider failed: {type(exc).__name__}.",
+            )
+            return None
+
+        DataService._cache_set(cache_key, fundamentals)
+        DataService._set_provider_status(
+            cache_key,
+            available=fundamentals is not None,
+            status="live" if fundamentals is not None else "unavailable",
+            source="Yahoo Finance via yfinance",
+            message=(
+                "Company fundamentals are available."
+                if fundamentals is not None
+                else "Fundamentals provider returned no usable fields."
+            ),
+        )
+        return fundamentals
+
+    @staticmethod
+    def _fetch_yfinance_fundamentals(ticker: str) -> Optional[Fundamentals]:
+        import yfinance as yf
+
+        stock = yf.Ticker(ticker)
+        info = DataService._safe_dict(stock.get_info())
+        fast_info = DataService._safe_dict(stock.fast_info)
+
+        if not info and not fast_info:
+            return None
+
+        fundamentals = Fundamentals(
+            source="Yahoo Finance via yfinance",
+            company_name=info.get("longName") or info.get("shortName"),
+            sector=info.get("sector"),
+            industry=info.get("industry"),
+            market_cap=DataService._first_number(info, fast_info, "marketCap", "market_cap"),
+            trailing_pe=DataService._first_number(info, fast_info, "trailingPE", "trailing_pe"),
+            forward_pe=DataService._first_number(info, fast_info, "forwardPE", "forward_pe"),
+            price_to_book=DataService._first_number(info, fast_info, "priceToBook", "price_to_book"),
+            dividend_yield=DataService._first_number(info, fast_info, "dividendYield", "dividend_yield"),
+            beta=DataService._first_number(info, fast_info, "beta"),
+            eps=DataService._first_number(info, fast_info, "trailingEps", "eps"),
+            revenue=DataService._first_number(info, fast_info, "totalRevenue", "revenue"),
+            net_income=DataService._first_number(info, fast_info, "netIncomeToCommon", "net_income"),
+            operating_cash_flow=DataService._first_number(
+                info, fast_info, "operatingCashflow", "operating_cash_flow"
+            ),
+            debt_to_equity=DataService._first_number(info, fast_info, "debtToEquity", "debt_to_equity"),
+            currency=info.get("financialCurrency") or info.get("currency") or fast_info.get("currency"),
+        )
+
+        useful_values = fundamentals.model_dump(exclude={"source"}, exclude_none=True)
+        if not useful_values:
+            return None
+
+        return fundamentals
+
+    @staticmethod
+    def _safe_dict(value: Any) -> Dict[str, Any]:
+        if not value:
+            return {}
+        if isinstance(value, dict):
+            return value
+        try:
+            return dict(value)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _first_number(*sources_and_keys: Any) -> Optional[float]:
+        sources = [value for value in sources_and_keys if isinstance(value, dict)]
+        keys = [value for value in sources_and_keys if isinstance(value, str)]
+
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+
+        return None
+
+    @staticmethod
     def get_social_media_data(ticker: str) -> Dict[str, Any]:
-        """Retrieve social/news text items for a ticker from the pipeline."""
+        """
+        Retrieve text inputs for a ticker from validated pipeline posts, falling
+        back to Yahoo Finance headlines when the pipeline has no real text.
+
+        Args:
+            ticker (str): Stock ticker symbol
+
+        Returns:
+            Dict: Social media posts and engagement metrics
+        """
         if not ticker or len(ticker.strip()) == 0:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
         posts: List[Dict[str, Any]] = []
         for record in DataService._get_ticker_records(ticker):
-            posts.extend(DataService._extract_posts_from_record(record, ticker))
+            nested_posts = record.get("posts")
+            record_posts = nested_posts if isinstance(nested_posts, list) else [record]
+            for post in record_posts:
+                text = post.get("text", "")
+                source = post.get("source", "unknown")
+                if not DataService._is_valid_pipeline_post(text, source):
+                    continue
+                posts.append(
+                    {
+                        "ticker": ticker,
+                        "date": record.get("date", datetime.now().date().isoformat()),
+                        "text": text,
+                        "source": source,
+                        "post_score": post.get("post_score", 0),
+                    }
+                )
 
-        source = "pipeline_posts" if posts else "fallback"
         if not posts:
-            posts = [
-                {
-                    "ticker": ticker,
-                    "date": DataService._current_date(),
-                    "text": f"Sample fallback post for {ticker}",
-                    "source": "fallback",
-                    "post_score": 1,
-                    "url": None,
-                }
-            ]
+            posts = []
+            for headline in DataService.get_headlines(ticker, limit=8):
+                if not DataService._is_valid_pipeline_post(headline.headline, headline.source):
+                    continue
+                posts.append(
+                    {
+                        "ticker": ticker,
+                        "date": (
+                            headline.published_at.date().isoformat()
+                            if headline.published_at
+                            else datetime.now().date().isoformat()
+                        ),
+                        "text": headline.headline,
+                        "source": headline.source,
+                        "post_score": 1,
+                    }
+                )
 
         latest_date = max((str(post.get("date", "")) for post in posts), default=DataService._current_date())
         return {
@@ -423,171 +765,36 @@ class DataService:
             "source": source,
             "post_count": len(posts),
             "posts": posts,
-            "avg_post_score": sum(post.get("post_score", 0) for post in posts) / max(1, len(posts)),
+            "avg_post_score": sum([p.get("post_score", 0) for p in posts]) / max(1, len(posts)),
         }
 
     @staticmethod
-    def get_feature_snapshot(ticker: str) -> Dict[str, float]:
-        """Get model input feature deltas from the pipeline when present."""
+    def get_social_posts(ticker: str) -> List[SocialPostItem]:
+        """Return real pipeline social/news posts without fabricating fallback content."""
         if not ticker or len(ticker.strip()) == 0:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
-        ticker_records = sorted(
-            DataService._get_ticker_records(ticker),
-            key=lambda record: str(record.get("date", "")),
-            reverse=True,
-        )
-        if not ticker_records:
-            return {"price_delta_24h": 0.0, "volume_delta": 0.0}
-
-        return DataService._extract_feature_snapshot(ticker_records[0])
-
-    @staticmethod
-    def get_headlines_for_ticker(ticker: str, max_items: int = 8) -> Dict[str, Any]:
-        """Get headline items for the dashboard Market Pulse section."""
-        if not ticker or len(ticker.strip()) == 0:
-            raise ValueError("Invalid ticker symbol")
-
-        ticker = ticker.upper()
-        dedupe: set[tuple[str, str]] = set()
-        headlines: List[HeadlineItem] = []
-
-        ticker_records = sorted(
-            DataService._get_ticker_records(ticker),
-            key=lambda record: str(record.get("date", "")),
-            reverse=True,
-        )
-        for record in ticker_records:
-            for headline in DataService._extract_headlines_from_record(record, ticker):
-                dedupe_key = (headline.headline, headline.source)
-                if dedupe_key in dedupe:
+        posts = []
+        for record_index, record in enumerate(DataService._get_ticker_records(ticker)):
+            nested_posts = record.get("posts")
+            record_posts = nested_posts if isinstance(nested_posts, list) else [record]
+            for post_index, post in enumerate(record_posts):
+                text = str(post.get("text", "")).strip()
+                source = str(post.get("source", "Unknown source")).strip() or "Unknown source"
+                if not DataService._is_valid_pipeline_post(text, source):
                     continue
-                dedupe.add(dedupe_key)
-                headlines.append(headline)
-                if len(headlines) >= max_items:
-                    return {
-                        "ticker": ticker,
-                        "source": "pipeline",
-                        "headlines": headlines,
-                    }
 
-        if headlines:
-            return {
-                "ticker": ticker,
-                "source": "pipeline",
-                "headlines": headlines,
-            }
-
-        fallback_news = DataService._fetch_yfinance_news(ticker, max_items=max_items)
-        if fallback_news:
-            return {
-                "ticker": ticker,
-                "source": "yfinance_news",
-                "headlines": fallback_news,
-            }
-
-        return {
-            "ticker": ticker,
-            "source": "unavailable",
-            "headlines": [],
-        }
-
-    @staticmethod
-    def get_fundamentals_for_ticker(ticker: str) -> Dict[str, Any]:
-        """Get company fundamentals and related metadata when available."""
-        if not ticker or len(ticker.strip()) == 0:
-            raise ValueError("Invalid ticker symbol")
-
-        ticker = ticker.upper()
-        for record in DataService._get_ticker_records(ticker):
-            fundamentals = record.get("fundamentals")
-            if isinstance(fundamentals, dict):
-                try:
-                    payload = FundamentalsData(
+                posts.append(
+                    SocialPostItem(
+                        id=str(post.get("id") or f"{ticker}-{record_index}-{post_index}"),
                         ticker=ticker,
-                        company_name=fundamentals.get("company_name") or fundamentals.get("companyName"),
-                        exchange=fundamentals.get("exchange"),
-                        sector=fundamentals.get("sector"),
-                        industry=fundamentals.get("industry"),
-                        market_cap=DataService._safe_float(
-                            fundamentals.get("market_cap") or fundamentals.get("marketCap"),
-                            None,
-                        ),
-                        currency=fundamentals.get("currency"),
-                        annual=FinancialSnapshot(
-                            revenue=DataService._safe_float(
-                                (fundamentals.get("annual") or {}).get("revenue"),
-                                None,
-                            ),
-                            net_income=DataService._safe_float(
-                                (fundamentals.get("annual") or {}).get("net_income"),
-                                None,
-                            ),
-                            operating_cash_flow=DataService._safe_float(
-                                (fundamentals.get("annual") or {}).get("operating_cash_flow"),
-                                None,
-                            ),
-                            eps=DataService._safe_float(
-                                (fundamentals.get("annual") or {}).get("eps"),
-                                None,
-                            ),
-                        ),
-                        quarterly=FinancialSnapshot(
-                            revenue=DataService._safe_float(
-                                (fundamentals.get("quarterly") or {}).get("revenue"),
-                                None,
-                            ),
-                            net_income=DataService._safe_float(
-                                (fundamentals.get("quarterly") or {}).get("net_income"),
-                                None,
-                            ),
-                            operating_cash_flow=DataService._safe_float(
-                                (fundamentals.get("quarterly") or {}).get("operating_cash_flow"),
-                                None,
-                            ),
-                            eps=DataService._safe_float(
-                                (fundamentals.get("quarterly") or {}).get("eps"),
-                                None,
-                            ),
-                        ),
-                        ratios=FundamentalRatios(
-                            pe=DataService._safe_float((fundamentals.get("ratios") or {}).get("pe"), None),
-                            eps=DataService._safe_float((fundamentals.get("ratios") or {}).get("eps"), None),
-                            roe=DataService._safe_float((fundamentals.get("ratios") or {}).get("roe"), None),
-                            debt_to_equity=DataService._safe_float(
-                                (fundamentals.get("ratios") or {}).get("debt_to_equity"),
-                                None,
-                            ),
-                            revenue_growth_yoy=DataService._safe_float(
-                                (fundamentals.get("ratios") or {}).get("revenue_growth_yoy"),
-                                None,
-                            ),
-                            gross_margin=DataService._safe_float(
-                                (fundamentals.get("ratios") or {}).get("gross_margin"),
-                                None,
-                            ),
-                        ),
-                        source=fundamentals.get("source", "pipeline"),
+                        text=text,
+                        source=source,
+                        content_type=DataService._post_content_type(post, source),
+                        date=record.get("date"),
+                        post_score=post.get("post_score"),
                     )
-                    return {
-                        "ticker": ticker,
-                        "source": "pipeline",
-                        "fundamentals": payload,
-                    }
-                except Exception:
-                    break
+                )
 
-        payload = DataService._build_fundamentals_from_yfinance(ticker)
-        if payload is not None:
-            return {
-                "ticker": ticker,
-                "source": payload.source,
-                "fundamentals": payload,
-            }
-
-        return {
-            "ticker": ticker,
-            "source": "unavailable",
-            "fundamentals": None,
-        }
+        return posts

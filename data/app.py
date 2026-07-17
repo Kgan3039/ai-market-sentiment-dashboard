@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 
 
@@ -41,41 +42,91 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def build_mock_posts(ticker: str) -> list[dict[str, Any]]:
-    """Return demo-safe placeholder posts when live ingestion is unavailable."""
-    return [
-        {
-            "text": f"{ticker} beat expectations with strong growth and bullish demand signals.",
-            "source": "mock_news",
-            "post_score": 1,
-        },
-        {
-            "text": f"Investors expect further gains as {ticker} shows strong momentum.",
-            "source": "mock_social",
-            "post_score": 1,
-        },
-    ]
+def get_yfinance_posts(ticker: str, limit: int = 15) -> list[dict[str, Any]]:
+    """Fetch company headlines from Yahoo Finance via yfinance."""
+    stock = yf.Ticker(ticker)
+    raw_news = stock.news or []
+    posts = []
+
+    for item in raw_news[:limit]:
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+        title = item.get("title") or content.get("title")
+        if not title:
+            continue
+
+        provider = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+        source = (
+            item.get("publisher")
+            or provider.get("displayName")
+            or provider.get("name")
+            or "Yahoo Finance"
+        )
+        posts.append(
+            {
+                "text": title,
+                "source": source,
+                "content_type": "publisher_headline",
+                "post_score": 1,
+            }
+        )
+
+    return posts
 
 
-def build_mock_market_data(ticker: str) -> dict[str, Any]:
-    """Return stable placeholder market data for local development."""
-    base_prices = {"NVDA": 910.5, "TSLA": 174.2}
-    base_price = base_prices.get(ticker, 100.0)
-    price_delta = 2.5 if ticker == "NVDA" else -1.2
-    percent_change = (price_delta / base_price) * 100 if base_price else 0.0
+def build_unavailable_market_data() -> dict[str, Any]:
+    """Return an honest empty market snapshot when providers are unavailable."""
+    return {
+        "price": 0.0,
+        "price_delta_24h": 0.0,
+        "percent_change_24h": 0.0,
+        "volume": 0,
+        "volume_delta": 0.0,
+        "source": "unavailable",
+        "status": "unavailable",
+    }
+
+
+def get_yfinance_market_snapshot(ticker: str) -> dict[str, Any]:
+    """Fetch a recent market snapshot and deltas from Yahoo Finance history."""
+    stock = yf.Ticker(ticker)
+    history = stock.history(period="1mo")
+    if history.empty:
+        return build_unavailable_market_data()
+
+    latest = history.iloc[-1]
+    previous = history.iloc[-2] if len(history) > 1 else latest
+    price = _safe_float(latest.get("Close"))
+    previous_close = _safe_float(previous.get("Close"), default=price)
+    price_delta = price - previous_close
+    percent_change = (price_delta / previous_close) * 100 if previous_close else 0.0
+
+    volume = _safe_int(latest.get("Volume"))
+    prior_volume = history["Volume"].iloc[:-1].tail(5)
+    avg_prior_volume = _safe_float(prior_volume.mean(), default=0.0)
+    volume_delta = (
+        (volume - avg_prior_volume) / avg_prior_volume
+        if avg_prior_volume
+        else 0.0
+    )
 
     return {
-        "price": round(base_price, 2),
+        "price": round(price, 2),
         "price_delta_24h": round(price_delta, 2),
         "percent_change_24h": round(percent_change, 2),
-        "volume": 1_250_000 if ticker == "NVDA" else 980_000,
+        "volume": volume,
+        "volume_delta": round(volume_delta, 4),
+        "source": "Yahoo Finance via yfinance",
+        "status": "cached" if price > 0 else "unavailable",
     }
 
 
 def get_market_snapshot(ticker: str, api_key: str | None) -> dict[str, Any]:
-    """Fetch market snapshot when a Finnhub key is configured, else use mock data."""
+    """Fetch market snapshot from real providers without fabricating prices."""
     if not api_key:
-        return build_mock_market_data(ticker)
+        try:
+            return get_yfinance_market_snapshot(ticker)
+        except Exception:
+            return build_unavailable_market_data()
 
     quote_url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
     try:
@@ -87,15 +138,24 @@ def get_market_snapshot(ticker: str, api_key: str | None) -> dict[str, Any]:
             "price_delta_24h": _safe_float(quote.get("d")),
             "percent_change_24h": _safe_float(quote.get("dp")),
             "volume": _safe_int(quote.get("v"), default=0),
+            "volume_delta": 0.0,
+            "source": "finnhub",
+            "status": "cached",
         }
     except Exception:
-        return build_mock_market_data(ticker)
+        try:
+            return get_yfinance_market_snapshot(ticker)
+        except Exception:
+            return build_unavailable_market_data()
 
 
 def get_posts(ticker: str, api_key: str | None) -> list[dict[str, Any]]:
-    """Fetch company news when available, else use mock posts."""
+    """Fetch company news from real providers without fabricating text."""
     if not api_key:
-        return build_mock_posts(ticker)
+        try:
+            return get_yfinance_posts(ticker)
+        except Exception:
+            return []
 
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
@@ -114,12 +174,19 @@ def get_posts(ticker: str, api_key: str | None) -> list[dict[str, Any]]:
                 {
                     "text": article.get("headline", ""),
                     "source": article.get("source", "finnhub"),
+                    "content_type": "publisher_headline",
                     "post_score": 1,
                 }
             )
-        return posts or build_mock_posts(ticker)
+        if posts:
+            return posts
     except Exception:
-        return build_mock_posts(ticker)
+        pass
+
+    try:
+        return get_yfinance_posts(ticker)
+    except Exception:
+        return []
 
 
 def build_grouped_record(ticker: str, date: str, api_key: str | None) -> dict[str, Any]:

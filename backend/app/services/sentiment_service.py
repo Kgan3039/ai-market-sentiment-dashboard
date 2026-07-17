@@ -1,6 +1,15 @@
-"""Sentiment Analysis Service - backend integration layer for NLP scoring."""
+"""Sentiment Analysis Service - API interface to NLP sentiment model.
 
-from __future__ import annotations
+Author: Mihir (with integration from Matthew NLP module)
+Responsibility: Provide REST API endpoints for sentiment analysis
+
+Integration Points:
+- Calls Matthew NLP sentiment analysis (../nlp/sentiment.py)
+- Consumes social media data from Isaac data pipeline
+- Returns results to Sentim ent routes for API endpoints
+
+Current Status: Active integration with validated pipeline text and news headlines
+"""
 
 import os
 import sys
@@ -35,6 +44,109 @@ def _load_nlp_module():
             return None
 
 
+def _pipeline_file_path() -> str:
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "stock_data.json")
+    )
+
+
+def _load_grouped_posts(ticker: str) -> list[dict[str, Any]]:
+    """Load validated text for aggregate sentiment.
+
+    Pipeline posts remain the preferred source, but the committed pipeline file can
+    contain only placeholder text when Finnhub is not configured. In that case,
+    reuse the existing Yahoo Finance headline provider instead of scoring mock
+    content.
+    """
+    pipeline_path = _pipeline_file_path()
+    flattened_posts = []
+
+    if os.path.exists(pipeline_path):
+        try:
+            with open(pipeline_path, "r") as file:
+                records = json.load(file)
+        except Exception:
+            records = []
+
+        for record in records:
+            if record.get("ticker", "").upper() != ticker:
+                continue
+
+            record_posts = record.get("posts")
+            if isinstance(record_posts, list):
+                candidate_posts = [
+                    {
+                        "ticker": ticker,
+                        "date": record.get("date"),
+                        "text": post.get("text", ""),
+                        "source": post.get("source", "unknown"),
+                        "post_score": post.get("post_score", 0),
+                    }
+                    for post in record_posts
+                ]
+            else:
+                candidate_posts = [
+                    {
+                        "ticker": ticker,
+                        "date": record.get("date"),
+                        "text": record.get("text", ""),
+                        "source": record.get("source", "unknown"),
+                        "post_score": record.get("post_score", 0),
+                    }
+                ]
+
+            flattened_posts.extend(
+                post for post in candidate_posts if _is_valid_pipeline_text(post)
+            )
+
+    if flattened_posts:
+        return flattened_posts
+
+    try:
+        from app.services.data_service import DataService
+
+        headlines = DataService.get_headlines(ticker, limit=8)
+    except Exception:
+        headlines = []
+
+    return [
+        {
+            "ticker": ticker,
+            "date": (
+                headline.published_at.date().isoformat()
+                if headline.published_at
+                else datetime.now().date().isoformat()
+            ),
+            "text": headline.headline,
+            "source": headline.source or "Yahoo Finance via yfinance",
+            "post_score": 1,
+        }
+        for headline in headlines
+        if _is_valid_pipeline_text(
+            {
+                "text": headline.headline,
+                "source": headline.source or "Yahoo Finance via yfinance",
+            }
+        )
+    ]
+
+
+def _is_valid_pipeline_text(post: dict[str, Any]) -> bool:
+    text = str(post.get("text", "")).strip()
+    source = str(post.get("source", "")).strip().lower()
+    lowered_text = text.lower()
+
+    if not text or source.startswith("mock"):
+        return False
+
+    placeholder_phrases = (
+        "sample post while waiting for api approval",
+        "sample fallback post",
+        "discussion about",
+    )
+    return not any(phrase in lowered_text for phrase in placeholder_phrases)
+
+
 class SentimentService:
     """Service for managing sentiment analysis operations."""
 
@@ -49,23 +161,7 @@ class SentimentService:
             raw = sentiment_module.get_sentiment_scores(str(text))
             return SentimentScores(**raw)
 
-        positive_prob = 0.65
-        negative_prob = 0.20
-        neutral_prob = 0.15
-        sentiment_score = positive_prob - negative_prob
-        sentiment_confidence = max(positive_prob, negative_prob, neutral_prob)
-        sentiment_label = (
-            "positive" if sentiment_score > 0.1 else ("negative" if sentiment_score < -0.1 else "neutral")
-        )
-
-        return SentimentScores(
-            positive_prob=positive_prob,
-            negative_prob=negative_prob,
-            neutral_prob=neutral_prob,
-            sentiment_score=sentiment_score,
-            sentiment_label=sentiment_label,
-            sentiment_confidence=sentiment_confidence,
-        )
+        raise RuntimeError("Sentiment scorer is unavailable")
 
     @staticmethod
     def get_sentiment_for_ticker(ticker: str) -> Dict[str, Any]:
@@ -79,22 +175,7 @@ class SentimentService:
         posts = post_bundle.get("posts", [])
 
         if not posts:
-            fallback = SentimentScores(
-                positive_prob=0.70,
-                negative_prob=0.15,
-                neutral_prob=0.15,
-                sentiment_score=0.55,
-                sentiment_label="positive",
-                sentiment_confidence=0.70,
-            )
-            return {
-                "ticker": ticker,
-                "date": datetime.now().date().isoformat(),
-                "overall_sentiment": fallback,
-                "source_breakdown": {},
-                "source": "fallback",
-                "item_count": 0,
-            }
+            return grouped
 
         source_stats: Dict[str, Dict[str, float | int]] = {}
         total_score = 0.0

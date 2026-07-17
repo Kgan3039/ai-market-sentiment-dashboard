@@ -1,17 +1,31 @@
-"""Prediction Service - backend integration layer for stock movement predictions."""
+"""Experimental signal service for stock movement research.
 
-from __future__ import annotations
+Author: Mihir (with integration from Abhi ML model)
+
+Assumptions:
+- sentiment_score: float in [-1, 1], derived as avg_positive_prob - avg_negative_prob
+- sentiment_confidence: max(positive, negative, neutral) prob from NLP model
+- price_delta_24h: (close - open) / open for last 24h; clipped to ±8% in predict()
+- volume_delta: (today_vol - avg_vol) / avg_vol; clipped to ±50% in predict()
+- Synthetic model artifacts are not exposed as actionable prediction outputs.
+- A real signal may be exposed only after training/evaluation on historical outcomes.
+"""
 
 import os
 import sys
+from typing import Dict, Any, Optional
 from datetime import datetime
 from typing import Any, Dict, Tuple
 
 from app.models.schemas import PredictionResponse
+import re
 
 
-def _repo_root() -> str:
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+VALID_TICKER_RE = re.compile(r'^[A-Z]{1,5}$')
+
+
+class TickerNotFoundError(Exception):
+    pass
 
 
 def _load_prediction_module():
@@ -35,124 +49,209 @@ def _load_prediction_module():
 
 
 class PredictionService:
-    """Service for managing stock movement predictions."""
+    SYNTHETIC_UNAVAILABLE_REASON = (
+        "Experimental signal unavailable: current artifacts are trained on synthetic data "
+        "and have not been evaluated against real historical outcomes."
+    )
 
     @staticmethod
-    def _normalize_prediction_payload(
-        prediction: PredictionResponse | Dict[str, Any],
-        ticker: str,
-    ) -> PredictionResponse:
-        """Return a canonical prediction object that matches the API schema."""
-        if isinstance(prediction, PredictionResponse):
-            return prediction
+    def _unavailable_model_info(reason: str, model_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        info = dict(model_info or {})
+        info.update(
+            {
+                'status': 'unavailable',
+                'reason': reason,
+                'real_training_data': False,
+                'exposes_actionable_output': False,
+            }
+        )
+        info.setdefault('features_used', [])
+        return info
 
-        if isinstance(prediction, dict):
-            if {"ticker", "date", "label", "confidence"}.issubset(prediction):
-                return PredictionResponse(**prediction)
+    @staticmethod
+    def prewarm_model_artifacts() -> Dict[str, Any]:
+        """Load persisted experimental signal artifacts into memory before first request."""
+        prediction_module = _load_prediction_module()
 
-            return PredictionResponse(
-                ticker=ticker,
-                date=prediction.get("date", datetime.now().date().isoformat()),
-                label=prediction.get("label", prediction.get("direction", prediction.get("predicted_movement", "neutral"))),
-                confidence=float(prediction.get("confidence", prediction.get("probability", 0.0))),
-            )
+        if prediction_module is None:
+            return {
+                'status': 'unavailable',
+                'reason': 'Experimental signal module could not be loaded.',
+            }
 
-        raise ValueError("Prediction payload must be a PredictionResponse or dict")
+        if hasattr(prediction_module, 'bootstrap_model_artifacts'):
+            artifacts = prediction_module.bootstrap_model_artifacts(force_retrain=False)
+        elif hasattr(prediction_module, 'get_model_artifacts'):
+            artifacts = prediction_module.get_model_artifacts()
+        else:
+            return {
+                'status': 'unavailable',
+                'reason': 'Experimental signal module does not expose artifact loading.',
+            }
+
+        provenance = getattr(artifacts, 'provenance', {}) or {}
+        return {
+            'status': 'ready',
+            'artifact_source': provenance.get('artifact_source'),
+            'artifact_path': provenance.get('artifact_path'),
+            'version': provenance.get('artifact_version'),
+            'trained_at': provenance.get('trained_at'),
+        }
+
+    @staticmethod
+    def _fractional_price_delta(*sources: Dict[str, Any]) -> float:
+        for source in sources:
+            if not source:
+                continue
+            percent_change = source.get('percent_change_24h')
+            if percent_change is not None:
+                try:
+                    return float(percent_change) / 100
+                except (TypeError, ValueError):
+                    pass
+
+        for source in sources:
+            if not source:
+                continue
+            price_delta = source.get('price_delta_24h')
+            if price_delta is not None:
+                try:
+                    return float(price_delta)
+                except (TypeError, ValueError):
+                    pass
+
+        return 0.0
 
     @staticmethod
     def predict_movement(
-        ticker: str,
-        sentiment_score: float,
-        market_features: Dict[str, float],
-    ) -> Tuple[PredictionResponse, str]:
-        """Generate a prediction using the shared ML module when available."""
+        ticker: str, sentiment_score: float, market_features: Dict[str, float]
+    ) -> tuple[Optional[PredictionResponse], Dict[str, Any]]:
         prediction_module = _load_prediction_module()
 
         if prediction_module is not None and hasattr(prediction_module, "predict"):
             try:
+                model_key = 'rf'
                 result = prediction_module.predict(
                     sentiment_score=sentiment_score,
-                    sentiment_confidence=market_features.get("sentiment_confidence", 0.75),
-                    price_delta_24h=market_features.get("price_delta_24h", 0.0),
-                    volume_delta=market_features.get("volume_delta", 0.0),
-                    model="rf",
+                    sentiment_confidence=market_features.get('sentiment_confidence', 0.5),
+                    price_delta_24h=market_features.get('price_delta_24h', 0.0),
+                    volume_delta=market_features.get('volume_delta', 0.0),
+                    model=model_key
                 )
-                return (
-                    PredictionService._normalize_prediction_payload(
-                        {
-                            "ticker": ticker,
-                            "date": datetime.now().date().isoformat(),
-                            "label": result.get("label", result.get("direction", result.get("predicted_movement", "neutral"))),
-                            "confidence": result.get("confidence", result.get("probability", 0.0)),
-                        },
-                        ticker,
-                    ),
-                    "prediction_model",
-                )
+                if hasattr(prediction_module, 'get_model_provenance'):
+                    model_info = prediction_module.get_model_provenance(model_key)
+                else:
+                    model_info = {
+                        'name': 'RandomForestClassifier',
+                        'version': '0.1.0',
+                        'artifact_source': 'unknown',
+                    }
+                if model_info.get('real_training_data') is not True:
+                    return None, PredictionService._unavailable_model_info(
+                        PredictionService.SYNTHETIC_UNAVAILABLE_REASON,
+                        model_info,
+                    )
+
+                model_info['status'] = 'ready'
+                model_info['exposes_actionable_output'] = True
+
+                return PredictionResponse(
+                    symbol=ticker,
+                    predicted_movement=result.get('predicted_movement', 'neutral'),
+                    probability=float(result.get('probability', 0.5)),
+                    confidence=float(result.get('confidence', 0.5)),
+                    model_info=model_info,
+                ), model_info
             except Exception:
                 pass
 
-        movement = "up" if sentiment_score > 0.2 else ("down" if sentiment_score < -0.2 else "neutral")
-        confidence = 0.75 if movement == "up" else 0.65 if movement == "down" else 0.5
-        return (
-            PredictionResponse(
-                ticker=ticker,
-                date=datetime.now().date().isoformat(),
-                label=movement,
-                confidence=confidence,
-            ),
-            "fallback_rule",
+        model_info = {
+            'name': 'FallbackRule',
+            'version': '0.1.0',
+            'artifact_source': 'none',
+        }
+
+        return None, PredictionService._unavailable_model_info(
+            "Experimental signal unavailable: no validated model artifact is available.",
+            model_info,
         )
 
     @staticmethod
     def predict_for_ticker(ticker: str) -> Dict[str, Any]:
-        """Generate full prediction metadata for a ticker."""
-        from app.services.data_service import DataService
         from app.services.sentiment_service import SentimentService
 
         if not ticker or len(ticker.strip()) == 0:
             raise ValueError("Invalid ticker symbol")
 
         ticker = ticker.upper()
+        if not VALID_TICKER_RE.match(ticker):
+            raise TickerNotFoundError(f"Unknown ticker symbol: {ticker}")
         sentiment_info = SentimentService.get_sentiment_for_ticker(ticker)
-        overall_sentiment = sentiment_info.get("overall_sentiment")
 
-        if isinstance(overall_sentiment, dict):
-            sentiment_score = float(overall_sentiment.get("sentiment_score", 0.0))
-            sentiment_confidence = float(overall_sentiment.get("sentiment_confidence", 0.0))
-        elif overall_sentiment is not None:
-            sentiment_score = getattr(overall_sentiment, "sentiment_score", 0.0)
-            sentiment_confidence = getattr(overall_sentiment, "sentiment_confidence", 0.0)
-        else:
-            sentiment_score = 0.0
-            sentiment_confidence = 0.0
+        if sentiment_info is None:
+            raise TickerNotFoundError(f"No sentiment data found for ticker: {ticker}")
+
+        market_info = DataService.get_market_data(ticker)
+        ticker_records = DataService._get_ticker_records(ticker)
+
+        if market_info is None or (market_info.price <= 0 and not ticker_records):
+            raise TickerNotFoundError(f"No market data found for ticker: {ticker}")
+
+        overall_sentiment = sentiment_info.get('overall_sentiment')
+        if overall_sentiment is None:
+            return {
+                'ticker': ticker,
+                'prediction': None,
+                'model_info': {
+                    'name': None,
+                    'version': '0.1.0',
+                    'status': 'unavailable',
+                    'reason': 'Validated aggregate sentiment is unavailable.',
+                    'real_training_data': False,
+                    'exposes_actionable_output': False,
+                    'features_used': [],
+                },
+                'timestamp': datetime.now().isoformat(),
+            }
+
+        sentiment_score = overall_sentiment.sentiment_score
+        sentiment_confidence = overall_sentiment.sentiment_confidence
+        market_info_features = market_info.model_dump()
 
         feature_snapshot = DataService.get_feature_snapshot(ticker)
         market_features = {
-            "price_delta_24h": feature_snapshot.get("price_delta_24h", 0.0),
-            "volume_delta": feature_snapshot.get("volume_delta", 0.0),
-            "sentiment_confidence": sentiment_confidence,
+            'price_delta_24h': PredictionService._fractional_price_delta(market_info_features),
+            'volume_delta': float(market_info.volume_delta or 0.0),
+            'sentiment_confidence': sentiment_confidence,
         }
 
-        prediction_payload, source = PredictionService.predict_movement(
+        for row in ticker_records:
+            market_snapshot = row.get('market_data', {}) or {}
+            market_features['price_delta_24h'] = PredictionService._fractional_price_delta(
+                market_snapshot,
+                row,
+            )
+            market_features['volume_delta'] = float(
+                market_snapshot.get('volume_delta', row.get('volume_delta', 0.0)) or 0.0
+            )
+            break
+
+        prediction, model_info = PredictionService.predict_movement(
             ticker=ticker,
             sentiment_score=sentiment_score,
             market_features=market_features,
         )
 
+        model_info.setdefault('features_used', [
+            'sentiment_score',
+            'sentiment_confidence',
+            'price_delta_24h',
+            'volume_delta',
+        ])
+
         return {
-            "ticker": ticker,
-            "date": prediction_payload.date,
-            "prediction": prediction_payload,
-            "source": source,
-            "model_info": {
-                "name": "RandomForestClassifier" if source == "prediction_model" else "FallbackRule",
-                "version": "0.1.0",
-                "features_used": [
-                    "sentiment_score",
-                    "sentiment_confidence",
-                    "price_delta_24h",
-                    "volume_delta",
-                ],
-            },
+            'ticker': ticker,
+            'prediction': prediction,
+            'model_info': model_info,
+            'timestamp': datetime.now().isoformat(),
         }

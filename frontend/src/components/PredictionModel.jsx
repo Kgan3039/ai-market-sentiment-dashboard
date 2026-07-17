@@ -1,47 +1,101 @@
-export default function PredictionModel({ prediction }) {
-  const { shortTerm, mediumTerm, catalysts } = prediction;
+function getDirectionColor(direction) {
+  if (direction === "up") return "var(--positive)";
+  if (direction === "down") return "var(--negative)";
+  return "var(--accent)";
+}
 
-  const directionColor = (dir) =>
-    dir === "Bullish" ? "var(--positive)" : dir === "Bearish" ? "var(--negative)" : "var(--accent)";
+function formatModelSource(modelInfo) {
+  const source = modelInfo?.artifact_source;
+  if (source === "disk") return "Persisted artifact";
+  if (source === "trained_and_persisted") return "Fresh artifact";
+  if (source === "trained_in_memory") return "In-memory training";
+  if (source === "none" || modelInfo?.name === "FallbackRule") return "Fallback rule";
+  return "Model source unavailable";
+}
+
+function formatModelDetail(modelInfo) {
+  if (!modelInfo) return "Signal provenance is not available for this response.";
+  if (modelInfo.name === "FallbackRule") {
+    return "No validated artifact is available for this response.";
+  }
+  const version = modelInfo.version ? `version ${modelInfo.version}` : "unversioned artifact";
+  const trainingData = modelInfo.training_data
+    ? modelInfo.training_data.replaceAll("_", " ")
+    : "training data not reported";
+  return `${modelInfo.name || "Experimental signal"} using ${version}; trained on ${trainingData}.`;
+}
+
+export default function PredictionModel({ prediction, updatedAt }) {
+  const hasPrediction = Boolean(prediction);
+  const hasRealModel = prediction?.model_info?.real_training_data === true;
+  const direction = prediction?.predicted_movement || "neutral";
+  const color = getDirectionColor(direction);
+  const modelInfo = prediction?.model_info;
+  const sourceLabel = formatModelSource(modelInfo);
+  const modelDetail = formatModelDetail(modelInfo);
+  const servingStatus = modelInfo?.status === "ready" ? "Available" : "Unavailable";
+  const trainedAt = modelInfo?.trained_at
+    ? new Date(modelInfo.trained_at).toLocaleDateString()
+    : null;
 
   return (
     <section className="card prediction-card">
-      <h2 className="section-title">Prediction Model</h2>
-
-      <div className="prediction-grid">
-        <PredictionHorizon data={shortTerm} directionColor={directionColor(shortTerm.direction)} />
-        <PredictionHorizon data={mediumTerm} directionColor={directionColor(mediumTerm.direction)} />
-
-        {/* Upcoming Catalysts */}
-        <div className="catalyst-block">
-          <h3 className="subsection-title">Upcoming Catalysts</h3>
-          {catalysts.map((c, i) => (
-            <div key={i} className={`catalyst-item impact-${c.impact}`}>
-              <span className="catalyst-date">{c.date}</span>
-              <span className="catalyst-event">{c.event}</span>
-              <span className="catalyst-impact">{c.impact}</span>
-            </div>
-          ))}
-        </div>
+      <div className="section-header">
+        <h2 className="section-title">Experimental Signal</h2>
       </div>
-    </section>
-  );
-}
 
-function PredictionHorizon({ data, directionColor }) {
-  return (
-    <div className="horizon-card">
-      <div className="horizon-label">{data.horizon}</div>
-      <div className="horizon-direction" style={{ color: directionColor }}>
-        {data.direction}
-      </div>
-      <div className="confidence-bar-wrapper">
-        <div className="confidence-bar-label">Confidence: {data.confidence}%</div>
-        <div className="confidence-track">
-          <div className="confidence-fill" style={{ width: `${data.confidence}%`, background: directionColor }} />
-        </div>
-      </div>
-      <p className="horizon-rationale">{data.rationale}</p>
+      {!hasPrediction ? (
+    <div className="empty-state">
+      No validated experimental signal is available. Synthetic or demo-trained
+      outputs are withheld until a model is trained and evaluated on real
+      historical outcomes.
     </div>
+  ) : null}
+
+  {hasPrediction && !hasRealModel ? (
+    <div className="empty-state">
+      This artifact is synthetic-only, so its output is withheld until it is
+      evaluated against real historical outcomes.
+    </div>
+  ) : null}
+
+  {hasPrediction && hasRealModel ? (
+    <div className="prediction-grid">
+      <div className="horizon-card">
+        <div className="horizon-label">Signal direction</div>
+        <div className="horizon-direction" style={{ color }}>
+          {direction.toUpperCase()}
+        </div>
+        <p className="horizon-rationale">
+          Experimental analytics only. This signal is not financial advice.
+        </p>
+      </div>
+
+      <div className="horizon-card">
+        <div className="horizon-label">Signal status</div>
+        <div className="horizon-direction">VALIDATED</div>
+        <p className="horizon-rationale">
+          Last updated: {updatedAt || "Not available"}
+        </p>
+      </div>
+
+      <div className="catalyst-block">
+        <h3 className="subsection-title">Model provenance</h3>
+        <div className={`model-source ${modelInfo?.status === "fallback" ? "fallback" : "ready"}`}>
+          <span>{servingStatus}</span>
+          <strong>{sourceLabel}</strong>
+        </div>
+        <p className="horizon-rationale">{modelDetail}</p>
+        <div className="model-meta">
+          {modelInfo?.version ? <span>{modelInfo.version}</span> : null}
+          {trainedAt ? <span>Trained {trainedAt}</span> : null}
+        </div>
+        <p className="model-honesty">
+          Experimental analytics only; outputs depend on available sentiment and market data.
+        </p>
+      </div>
+    </div>
+  ) : null}
+    </section>
   );
 }

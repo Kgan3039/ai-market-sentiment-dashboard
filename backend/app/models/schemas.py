@@ -7,7 +7,9 @@ All endpoints return data matching these schemas.
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Optional, Dict, List
+from datetime import datetime
 
 
 class HealthCheckResponse(BaseModel):
@@ -39,17 +41,6 @@ class SentimentScores(BaseModel):
         ..., ge=0, le=1, description="Confidence score (highest probability among positive/negative/neutral)"
     )
 
-    class Config:
-        example = {
-            "positive_prob": 0.75,
-            "negative_prob": 0.15,
-            "neutral_prob": 0.10,
-            "sentiment_score": 0.60,
-            "sentiment_label": "positive",
-            "sentiment_confidence": 0.75,
-        }
-
-
 class MarketData(BaseModel):
     """Market data for a stock."""
 
@@ -57,7 +48,12 @@ class MarketData(BaseModel):
     price: float = Field(..., description="Current stock price")
     day_high: float = Field(..., description="Day high price")
     volume: int = Field(..., description="Trading volume")
-    date: str = Field(..., description="ISO date string for the market data snapshot")
+    price_delta_24h: Optional[float] = Field(None, description="Absolute close-price change from the prior trading day")
+    percent_change_24h: Optional[float] = Field(None, description="Percent close-price change from the prior trading day")
+    volume_delta: Optional[float] = Field(None, description="Relative volume delta versus recent trading volume")
+    source: Optional[str] = Field(None, description="Provider or committed data source for this market snapshot")
+    status: Optional[str] = Field(None, description="Availability status for this market snapshot")
+    timestamp: datetime = Field(..., description="Data timestamp")
 
     class Config:
         example = {
@@ -65,26 +61,41 @@ class MarketData(BaseModel):
             "price": 875.50,
             "day_high": 885.00,
             "volume": 45000000,
-            "date": "2026-04-01",
+            "price_delta_24h": 8.25,
+            "percent_change_24h": 0.95,
+            "volume_delta": 0.18,
+            "source": "Yahoo Finance via yfinance",
+            "status": "ready",
+            "timestamp": "2026-04-01T10:30:00",
         }
+
+
+class MarketHistoryPoint(BaseModel):
+    """Historical market point for compact dashboard charts."""
+
+    date: str = Field(..., description="Trading date")
+    close: float = Field(..., description="Close price")
+    volume: Optional[int] = Field(None, description="Trading volume when available")
 
 
 class PredictionResponse(BaseModel):
-    """Stock movement prediction response."""
+    """Validated experimental signal response."""
 
-    ticker: str = Field(..., description="Stock ticker symbol")
-    date: str = Field(..., description="ISO date string for the prediction")
-    label: str = Field(..., description="Predicted movement label: 'up', 'down', or 'neutral'")
-    confidence: float = Field(..., ge=0, le=1, description="Model confidence score")
+    model_config = ConfigDict(protected_namespaces=())
 
-    class Config:
-        example = {
-            "ticker": "NVDA",
-            "date": "2026-04-01",
-            "label": "up",
-            "confidence": 0.85,
-        }
-
+    symbol: str = Field(..., description="Stock ticker symbol")
+    predicted_movement: str = Field(
+        ..., description="Experimental signal direction: 'up', 'down', or 'neutral'"
+    )
+    probability: float = Field(
+        ..., ge=0, le=1, description="Internal signal score exposed only for validated real-outcome models"
+    )
+    confidence: float = Field(
+        ..., ge=0, le=1, description="Internal signal strength exposed only for validated real-outcome models"
+    )
+    model_info: Optional[Dict[str, Any]] = Field(
+        None, description="Optional provenance for the serving experimental signal"
+    )
 
 class TextAnalysisRequest(BaseModel):
     """Request model for text sentiment analysis."""
@@ -98,190 +109,131 @@ class TextAnalysisRequest(BaseModel):
 
 
 class HeadlineItem(BaseModel):
-    """Headline/news item for dashboard market pulse."""
+    """Normalized news/headline item for Market Pulse."""
 
-    id: str = Field(..., description="Stable identifier for the headline item")
-    ticker: str = Field(..., description="Ticker associated with the headline")
-    headline: str = Field(..., description="Headline text")
-    source: str = Field(..., description="Headline source or publisher")
-    url: Optional[str] = Field(None, description="Source URL for the headline")
-    published_at: Optional[str] = Field(None, description="ISO timestamp/date when available")
-    sentiment_label: Optional[str] = Field(None, description="Optional sentiment label for the headline")
-    sentiment_score: Optional[float] = Field(None, description="Optional sentiment score for the headline")
-
-    class Config:
-        example = {
-            "id": "NVDA-0",
-            "ticker": "NVDA",
-            "headline": "Nvidia expands enterprise AI partnerships",
-            "source": "Reuters",
-            "url": "https://example.com/article",
-            "published_at": "2026-04-23T10:00:00Z",
-            "sentiment_label": "positive",
-            "sentiment_score": 0.42,
-        }
-
-
-class AvailabilityStatus(BaseModel):
-    """Availability metadata for one dashboard section."""
-
-    available: bool = Field(..., description="Whether the section has usable data")
-    source: str = Field(..., description="Primary source used for the section")
-    item_count: Optional[int] = Field(None, description="Number of records contributing to the section")
-    detail: Optional[str] = Field(None, description="Short explanatory detail")
-
-    class Config:
-        example = {
-            "available": True,
-            "source": "pipeline_posts",
-            "item_count": 5,
-            "detail": "Generated from 5 pipeline headline items",
-        }
-
-
-class DashboardAvailability(BaseModel):
-    """Availability metadata for dashboard sections."""
-
-    sentiment: AvailabilityStatus
-    prediction: AvailabilityStatus
-    headlines: AvailabilityStatus
-    fundamentals: AvailabilityStatus
-
-
-class FinancialSnapshot(BaseModel):
-    """Financial statement values for one reporting period."""
-
-    revenue: Optional[float] = Field(None, description="Revenue value for the period")
-    net_income: Optional[float] = Field(None, description="Net income value for the period")
-    operating_cash_flow: Optional[float] = Field(None, description="Operating cash flow for the period")
-    eps: Optional[float] = Field(None, description="Earnings per share for the period")
-
-
-class FundamentalRatios(BaseModel):
-    """Key financial ratios for the ticker."""
-
-    pe: Optional[float] = Field(None, description="Price-to-earnings ratio")
-    eps: Optional[float] = Field(None, description="Trailing EPS")
-    roe: Optional[float] = Field(None, description="Return on equity")
-    debt_to_equity: Optional[float] = Field(None, description="Debt-to-equity ratio")
-    revenue_growth_yoy: Optional[float] = Field(None, description="Revenue growth year-over-year")
-    gross_margin: Optional[float] = Field(None, description="Gross margin ratio")
-
-
-class FundamentalsData(BaseModel):
-    """Company fundamentals and metadata for dashboard display."""
-
+    id: str = Field(..., description="Stable headline identifier")
     ticker: str = Field(..., description="Stock ticker symbol")
-    company_name: Optional[str] = Field(None, description="Company name")
-    exchange: Optional[str] = Field(None, description="Primary exchange")
+    headline: str = Field(..., description="Headline text for frontend display")
+    title: str = Field(..., description="Alias for headline text")
+    source: str = Field(..., description="Publisher or source name")
+    url: Optional[str] = Field(None, description="Canonical article URL")
+    published_at: Optional[datetime] = Field(None, description="Publication timestamp")
+    time: Optional[str] = Field(None, description="Display-friendly publication date")
+    summary: Optional[str] = Field(None, description="Short article summary when available")
+    sentiment: Optional[SentimentScores] = Field(
+        None, description="Optional sentiment score for the headline text"
+    )
+
+
+class SocialPostItem(BaseModel):
+    """Normalized social or pipeline post item for Market Pulse."""
+
+    id: Optional[str] = Field(None, description="Stable post identifier when available")
+    ticker: str = Field(..., description="Stock ticker symbol")
+    text: str = Field(..., description="Post text for frontend display")
+    source: str = Field(..., description="Post source name")
+    content_type: Optional[str] = Field(
+        None, description="Source-aware item type such as social_post or publisher_headline"
+    )
+    date: Optional[str] = Field(None, description="Post date when available")
+    post_score: Optional[float] = Field(None, description="Source engagement score when available")
+    sentiment: Optional[SentimentScores] = Field(
+        None, description="Optional sentiment score for the post text"
+    )
+
+
+class Fundamentals(BaseModel):
+    """Company fundamentals and metadata for Financials & Ratios."""
+
+    source: str = Field(..., description="Provider used for fundamentals")
+    company_name: Optional[str] = Field(None, description="Company display name")
     sector: Optional[str] = Field(None, description="Company sector")
     industry: Optional[str] = Field(None, description="Company industry")
     market_cap: Optional[float] = Field(None, description="Market capitalization")
-    currency: Optional[str] = Field(None, description="Reporting currency")
-    annual: FinancialSnapshot = Field(default_factory=FinancialSnapshot, description="Annual financial values")
-    quarterly: FinancialSnapshot = Field(default_factory=FinancialSnapshot, description="Quarterly financial values")
-    ratios: FundamentalRatios = Field(default_factory=FundamentalRatios, description="Key financial ratios")
-    source: str = Field(..., description="Source used to populate fundamentals")
+    trailing_pe: Optional[float] = Field(None, description="Trailing P/E ratio")
+    forward_pe: Optional[float] = Field(None, description="Forward P/E ratio")
+    price_to_book: Optional[float] = Field(None, description="Price/book ratio")
+    dividend_yield: Optional[float] = Field(None, description="Dividend yield")
+    beta: Optional[float] = Field(None, description="Beta")
+    eps: Optional[float] = Field(None, description="Trailing EPS")
+    revenue: Optional[float] = Field(None, description="Total revenue")
+    net_income: Optional[float] = Field(None, description="Net income")
+    operating_cash_flow: Optional[float] = Field(None, description="Operating cash flow")
+    debt_to_equity: Optional[float] = Field(None, description="Debt/equity ratio")
+    currency: Optional[str] = Field(None, description="Currency for monetary values")
 
-    class Config:
-        example = {
-            "ticker": "NVDA",
-            "company_name": "NVIDIA Corporation",
-            "exchange": "NASDAQ",
-            "sector": "Technology",
-            "industry": "Semiconductors",
-            "market_cap": 2200000000000,
-            "currency": "USD",
-            "annual": {
-                "revenue": 60922000000,
-                "net_income": 29760000000,
-                "operating_cash_flow": 28090000000,
-                "eps": 12.05,
-            },
-            "quarterly": {
-                "revenue": 26044000000,
-                "net_income": 14881000000,
-                "operating_cash_flow": 15000000000,
-                "eps": 5.98,
-            },
-            "ratios": {
-                "pe": 68.1,
-                "eps": 12.05,
-                "roe": 0.89,
-                "debt_to_equity": 0.22,
-                "revenue_growth_yoy": 1.26,
-                "gross_margin": 0.76,
-            },
-            "source": "yfinance",
-        }
+
+class ComponentAvailability(BaseModel):
+    """Availability details for a dashboard data component."""
+
+    available: bool = Field(..., description="Whether useful data is present")
+    status: str = Field(..., description="live, cached, fallback, ready, partial, or unavailable")
+    source: Optional[str] = Field(None, description="Provider or subsystem name")
+    message: Optional[str] = Field(None, description="Human-readable availability note")
+    count: Optional[int] = Field(None, description="Number of items available, if relevant")
+
+
+class DashboardAvailability(BaseModel):
+    """Availability map for dashboard sections."""
+
+    sentiment: ComponentAvailability
+    market_data: ComponentAvailability
+    prediction: ComponentAvailability
+    headlines: ComponentAvailability
+    social_posts: Optional[ComponentAvailability] = None
+    fundamentals: ComponentAvailability
 
 
 class DashboardSummary(BaseModel):
     """Summary data for dashboard display."""
 
     ticker: str = Field(..., description="Stock ticker symbol")
-    date: str = Field(..., description="ISO date string for the dashboard snapshot")
-    sentiment: SentimentScores = Field(..., description="Current sentiment scores")
+    sentiment: Optional[SentimentScores] = Field(None, description="Current sentiment scores")
     market_data: MarketData = Field(..., description="Current market data")
-    prediction: PredictionResponse = Field(..., description="Stock movement prediction")
-    headlines: list[HeadlineItem] = Field(default_factory=list, description="Headline items for Market Pulse")
-    availability: DashboardAvailability = Field(..., description="Availability metadata for dashboard sections")
-    fundamentals: Optional[FundamentalsData] = Field(None, description="Company fundamentals when available")
+    market_history: List[MarketHistoryPoint] = Field(
+        default_factory=list, description="Recent historical close prices"
+    )
+    prediction: Optional[PredictionResponse] = Field(
+        None, description="Validated experimental signal when available"
+    )
+    headlines: List[HeadlineItem] = Field(
+        default_factory=list, description="Normalized headline items for Market Pulse"
+    )
+    social_posts: List[SocialPostItem] = Field(
+        default_factory=list, description="Normalized social or pipeline posts for Market Pulse"
+    )
+    fundamentals: Optional[Fundamentals] = Field(
+        None, description="Company fundamentals and metadata when available"
+    )
+    availability: Optional[DashboardAvailability] = Field(
+        None, description="Per-section availability details"
+    )
+    status: Dict[str, Any] = Field(
+        default_factory=dict, description="Backend-friendly status alias for availability"
+    )
+    updated_at: datetime = Field(..., description="Last update timestamp")
 
     class Config:
         example = {
             "ticker": "NVDA",
-            "date": "2026-04-01",
-            "sentiment": {
-                "positive_prob": 0.75,
-                "negative_prob": 0.15,
-                "neutral_prob": 0.10,
-                "sentiment_score": 0.60,
-                "sentiment_label": "positive",
-                "sentiment_confidence": 0.75,
-            },
+            "sentiment": None,
             "market_data": {
                 "ticker": "NVDA",
                 "price": 875.50,
                 "day_high": 885.00,
                 "volume": 45000000,
-                "date": "2026-04-01",
+                "price_delta_24h": 8.25,
+                "percent_change_24h": 0.95,
+                "volume_delta": 0.18,
+                "source": "Yahoo Finance via yfinance",
+                "status": "ready",
+                "timestamp": "2026-04-01T10:30:00",
             },
-            "prediction": {
-                "ticker": "NVDA",
-                "date": "2026-04-01",
-                "label": "up",
-                "confidence": 0.85,
-            },
-            "headlines": [
-                {
-                    "id": "NVDA-0",
-                    "ticker": "NVDA",
-                    "headline": "Nvidia expands enterprise AI partnerships",
-                    "source": "Reuters",
-                    "url": "https://example.com/article",
-                    "published_at": "2026-04-01T10:00:00Z",
-                    "sentiment_label": "positive",
-                    "sentiment_score": 0.42,
-                }
-            ],
-            "availability": {
-                "sentiment": {"available": True, "source": "pipeline_posts", "item_count": 8, "detail": "Scored 8 text items"},
-                "prediction": {"available": True, "source": "prediction_model", "detail": "Generated from current market and sentiment inputs"},
-                "headlines": {"available": True, "source": "pipeline_posts", "item_count": 5, "detail": "5 recent headline items"},
-                "fundamentals": {"available": True, "source": "yfinance", "detail": "Company profile and financial ratios loaded"},
-            },
-            "fundamentals": {
-                "ticker": "NVDA",
-                "company_name": "NVIDIA Corporation",
-                "exchange": "NASDAQ",
-                "sector": "Technology",
-                "industry": "Semiconductors",
-                "market_cap": 2200000000000,
-                "currency": "USD",
-                "annual": {"revenue": 60922000000, "net_income": 29760000000, "operating_cash_flow": 28090000000, "eps": 12.05},
-                "quarterly": {"revenue": 26044000000, "net_income": 14881000000, "operating_cash_flow": 15000000000, "eps": 5.98},
-                "ratios": {"pe": 68.1, "eps": 12.05, "roe": 0.89, "debt_to_equity": 0.22, "revenue_growth_yoy": 1.26, "gross_margin": 0.76},
-                "source": "yfinance",
-            },
+            "market_history": [],
+            "prediction": None,
+            "headlines": [],
+            "fundamentals": None,
+            "availability": None,
+            "status": {},
+            "updated_at": "2026-04-01T10:30:00",
         }

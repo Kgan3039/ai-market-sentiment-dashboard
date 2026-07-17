@@ -57,7 +57,14 @@ async def get_sentiment(ticker: str):
 
     try:
         result = SentimentService.get_sentiment_for_ticker(ticker.upper())
+        if result["overall_sentiment"] is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Aggregate sentiment unavailable until enough validated text data is available.",
+            )
         return result["overall_sentiment"]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error retrieving sentiment data: {str(e)}"

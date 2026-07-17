@@ -1,0 +1,170 @@
+# Phase 0 ticker-mapping policy. Match phrases case-insensitively with word
+# boundaries against the concatenated title and description. An item matching
+# more than one ticker is ambiguous and must be flagged rather than assigned.
+version: 1
+matching:
+  case_insensitive: true
+  fields:
+    - title
+    - description
+  phrase_boundaries: word
+  ambiguous_match_action: flag_do_not_assign
+  exclusions_override_matches: true
+  notes:
+    - "Symbols and cashtags are strong matches when delimited from surrounding letters and digits."
+    - "Aliases listed in context_required_aliases need at least one same-item context term."
+    - "Do not infer a ticker from a person, sector, competitor, or product family unless it is listed below."
+
+tickers:
+  - ticker: TSLA
+    cashtag: "$TSLA"
+    official_company_name: Tesla, Inc.
+    strong_aliases:
+      - Tesla Inc
+      - Tesla Motors
+      - Tesla Energy
+      - Tesla Semi
+      - Cybertruck
+      - Gigafactory
+    context_required_aliases:
+      - Tesla
+    context_terms:
+      - Tesla Inc
+      - Tesla Motors
+      - Tesla Energy
+      - Tesla Semi
+      - Cybertruck
+      - Gigafactory
+      - automaker
+      - electric vehicle
+      - EV
+      - earnings
+      - revenue
+      - shares
+      - stock
+    exclusion_terms:
+      - Nikola Tesla
+      - Tesla coil
+      - Tesla unit
+      - Tesla Science Center
+    notes: "Bare Tesla needs company, product, or market context; Elon Musk alone is never a TSLA match."
+
+  - ticker: NVDA
+    cashtag: "$NVDA"
+    official_company_name: NVIDIA Corporation
+    strong_aliases:
+      - NVIDIA
+      - Nvidia Corporation
+      - GeForce
+      - CUDA
+      - DGX
+      - Blackwell GPU
+      - H100
+      - H200
+      - B200
+    context_required_aliases: []
+    context_terms: []
+    exclusion_terms: []
+    notes: "NVIDIA and its branded compute products are company references; do not map generic GPU coverage without one of these terms."
+
+  - ticker: AMD
+    cashtag: "$AMD"
+    official_company_name: Advanced Micro Devices, Inc.
+    strong_aliases:
+      - Advanced Micro Devices
+      - AMD Inc
+      - AMD Ryzen
+      - AMD Radeon
+      - AMD EPYC
+      - Ryzen
+      - Radeon
+      - EPYC
+      - earnings
+      - stock
+      - shares
+    context_required_aliases:
+      - AMD
+    context_terms:
+      - Advanced Micro Devices
+      - semiconductor
+      - chip
+      - chips
+      - processor
+      - CPU
+      - GPU
+      - data center
+      - Ryzen
+      - Radeon
+      - EPYC
+    exclusion_terms:
+      - age-related macular degeneration
+      - advanced manufacturing district
+      - automated market data
+    notes: "The bare acronym AMD needs same-item semiconductor or company context; it is never sufficient by itself."
+
+  - ticker: AAPL
+    cashtag: "$AAPL"
+    official_company_name: Apple Inc.
+    strong_aliases:
+      - Apple Inc
+      - Apple Computer
+      - iPhone
+      - iPad
+      - MacBook
+      - Apple Watch
+      - App Store
+      - Apple Intelligence
+      - Cupertino-based Apple
+    context_required_aliases:
+      - Apple
+    context_terms:
+      - Apple Inc
+      - iPhone
+      - iPad
+      - Mac
+      - MacBook
+      - iOS
+      - App Store
+      - Tim Cook
+      - Cupertino
+    exclusion_terms:
+      - apple pie
+      - apple recipe
+      - apple orchard
+      - apple harvest
+      - apple cider
+      - Apple Records
+    notes: "The bare word Apple needs device, company, executive, or Cupertino context; food and unrelated-business references are excluded."
+
+  - ticker: META
+    cashtag: "$META"
+    official_company_name: Meta Platforms, Inc.
+    strong_aliases:
+      - Meta Platforms
+      - Meta Platforms Inc
+      - Facebook
+      - Instagram
+      - WhatsApp
+      - Reality Labs
+      - Meta Quest
+      - Facebook parent Meta
+    context_required_aliases:
+      - Meta
+    context_terms:
+      - Meta Platforms
+      - Facebook
+      - Instagram
+      - WhatsApp
+      - Reality Labs
+      - Quest headset
+      - Mark Zuckerberg
+      - earnings
+      - stock
+      - shares
+    exclusion_terms:
+      - meta-analysis
+      - metadata
+      - metaverse
+      - meta tag
+      - Meta Quest competitor
+    notes: "The bare word meta (including an uncontextualized META) is never enough; it needs an explicit Meta Platforms, product, service, executive, or financial context."

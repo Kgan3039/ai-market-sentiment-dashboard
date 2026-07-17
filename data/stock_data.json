@@ -1,0 +1,152 @@
+[
+  {
+    "ticker": "NVDA",
+    "date": "2026-05-31",
+    "posts": [
+      {
+        "text": "GOP lawmakers' portfolios are migrating to Trump favorites like Intel and bitcoin",
+        "source": "Yahoo Finance",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Is This New Quantum Computing IPO the Best Under-the-Radar Stock of 2026?",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Why This Asia Fund Investor Favors South Korean Stocks Over China\u2019s Internet Giants",
+        "source": "Barrons.com",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Can Arm Holdings Triple Your Money by the End of the Year?",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Americans Have Never Been This Pessimistic. The Stock Market Doesn't Agree, and History Says the Market Wins.",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "If I Could Only Buy 1 Artificial Intelligence (AI) Stock Right Now, This Would Be It.",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Chevron's Earnings Dropped Year Over Year, but Production Surged. Here's What Investors Need to Know.",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Dow Jones Futures: Trump Makes This Iran Move; Nvidia, Tesla Lead 5 Titans Near Buy Points",
+        "source": "Investor's Business Daily",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Why Did South Korea Just Order $4.2 Billion in Military Helicopters From Boeing and Lockheed?",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "This AI Chip Giant Quietly Became Worth More Than Tesla, and Many Investors Still Overlook It",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      }
+    ],
+    "market_data": {
+      "price": 211.14,
+      "price_delta_24h": -3.11,
+      "percent_change_24h": -1.45,
+      "volume": 288291500,
+      "volume_delta": 0.6541,
+      "source": "Yahoo Finance via yfinance",
+      "status": "cached"
+    }
+  },
+  {
+    "ticker": "TSLA",
+    "date": "2026-05-31",
+    "posts": [
+      {
+        "text": "Dow Jones Futures: Trump Makes This Iran Move; Nvidia, Tesla Lead 5 Titans Near Buy Points",
+        "source": "Investor's Business Daily",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "This AI Chip Giant Quietly Became Worth More Than Tesla, and Many Investors Still Overlook It",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Why 2026 Is a Year of Foundational Growth for Tesla",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Could the Next Great Space Stock Come From Japan?",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Tesla\u2019s Next Act? Wall Street Begins Weighing a SpaceX Combination",
+        "source": "InvestorsHub",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Meet This Pick-and-Shovel AI Stock That Just Joined Meta, Tesla, and Broadcom as the Newest Member of the $1 Trillion Club",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Jensen Huang\u2019s $40 Trillion Robot Call Echoes the 1913 Moving Assembly Line. The Pattern Says Buy the Picks and Shovels",
+        "source": "24/7 Wall St.",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "This Is SpaceX's Biggest Market, and It Might Surprise You (Spoiler Alert: It Has Nothing to Do With Space)",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Here Are the 3 Cheapest Magnificent Seven Stocks According to a Popular Metric. Are They Buys?",
+        "source": "Motley Fool",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      },
+      {
+        "text": "Danish Pension Blacklists SpaceX Over \u2018Catastrophic Governance\u2019",
+        "source": "Bloomberg",
+        "post_score": 1,
+        "content_type": "publisher_headline"
+      }
+    ],
+    "market_data": {
+      "price": 435.79,
+      "price_delta_24h": -6.31,
+      "percent_change_24h": -1.43,
+      "volume": 45059400,
+      "volume_delta": 0.0653,
+      "source": "Yahoo Finance via yfinance",
+      "status": "cached"
+    }
+  }
+]

@@ -1,0 +1,46 @@
+# Phase 0 RSS sources. Keep this list at three feeds or fewer.
+version: 1
+feeds:
+  - id: marketwatch-top-stories
+    name: MarketWatch Top Stories
+    url: https://feeds.content.dowjones.io/public/rss/mw_topstories
+    enabled: true
+    format: rss2
+    intended_role: supplemental general financial and market coverage
+    expected_fields:
+      title: title
+      url: link
+      description: description
+      published_at: pubDate
+    polling:
+      interval_minutes: 30
+      conditional_get: true
+      timeout_seconds: 20
+    notes:
+      - "Supplemental general financial and market coverage; Yahoo Finance remains the primary ticker-specific source."
+      - "Ticker relevance must be determined from title and description."
+      - "Public RSS endpoint returned RSS XML with title, link, description, and pubDate during Phase 0 validation."
+      - "Preserve MarketWatch attribution and article links; store only feed metadata and do not republish full article text."
+      - "Feed-specific reuse terms were not located during selection; review before any public or commercial deployment."
+
+  - id: techcrunch-latest
+    name: TechCrunch Latest
+    url: https://techcrunch.com/feed/
+    enabled: true
+    format: rss2
+    intended_role: supplemental technology, product, and company coverage; not comprehensive financial-market coverage
+    expected_fields:
+      title: title
+      url: link
+      description: description
+      published_at: pubDate
+    polling:
+      interval_minutes: 30
+      conditional_get: true
+      timeout_seconds: 20
+    notes:
+      - "Supplemental technology, product, and company coverage; not comprehensive financial-market coverage."
+      - "Yahoo Finance remains the primary ticker-specific source; TechCrunch complements the markets-focused MarketWatch feed."
+      - "Public RSS endpoint returned RSS XML with title, link, description, and pubDate during Phase 0 validation."
+      - "TechCrunch RSS terms allow display of feed-provided content with attribution and a link to the full TechCrunch article; do not modify feed content or add advertising."
+      - "TechCrunch may discontinue the feed; treat a failed fetch as a source-local error."
