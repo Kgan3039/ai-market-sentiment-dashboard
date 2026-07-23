@@ -5,3 +5,4 @@ data/*.json
 data/phase0.sqlite3
 data/phase0.sqlite3-shm
 data/phase0.sqlite3-wal
+data/.yfinance-cache/
