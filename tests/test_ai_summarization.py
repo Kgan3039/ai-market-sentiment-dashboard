@@ -8,6 +8,8 @@ import re
 import unittest
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from ai.summarization import (
     DEFAULT_TEMPERATURE,
     MAX_LABEL_WORDS,
@@ -15,6 +17,7 @@ from ai.summarization import (
     MIN_SENTENCES,
     SYSTEM_PROMPT,
     MemberStory,
+    Sentence,
     SummarizationError,
     ThemeInput,
     ThemeSummary,
@@ -133,6 +136,26 @@ class BlankSentenceGeminiClient:
         )
 
 
+class ForeignCitationGeminiClient:
+    """Always cites a real story id that belongs to a different theme."""
+
+    def __init__(self, foreign_citation_id: str) -> None:
+        self.calls = 0
+        self._foreign_citation_id = foreign_citation_id
+
+    def generate(self, system_prompt: str, user_prompt: str, response_schema):
+        self.calls += 1
+        return response_schema.model_validate(
+            {
+                "label": "Coverage of recent developments",
+                "sentences": [
+                    {"text": "First sentence about the theme.", "citation_ids": [self._foreign_citation_id]},
+                    {"text": "Second sentence about the theme.", "citation_ids": [self._foreign_citation_id]},
+                ],
+            }
+        )
+
+
 class SummarizeFixtureTests(unittest.TestCase):
     """Covers the issue #65 DoD: valid JSON across all 20 fixture themes."""
 
@@ -206,6 +229,29 @@ class SummarizeRetryTests(unittest.TestCase):
         with self.assertRaises(SummarizationError):
             summarize(self.theme, client=client)
         self.assertEqual(client.calls, 2)  # initial attempt + one retry
+
+    def test_citation_id_valid_for_a_different_theme_is_rejected(self) -> None:
+        # A story id that is real, but belongs to another theme entirely -
+        # resolve_citations must check against *this* theme's member stories,
+        # not against any story id ever seen.
+        other_theme = load_fixture_themes()[1]
+        foreign_citation_id = other_theme.member_stories[0].id
+        self.assertNotIn(foreign_citation_id, {story.id for story in self.theme.member_stories})
+
+        client = ForeignCitationGeminiClient(foreign_citation_id)
+        with self.assertRaises(SummarizationError):
+            summarize(self.theme, client=client)
+        self.assertEqual(client.calls, 2)  # initial attempt + one retry
+
+
+class SentenceSchemaTests(unittest.TestCase):
+    def test_rejects_empty_string_text(self) -> None:
+        with self.assertRaises(ValidationError):
+            Sentence(text="", citation_ids=["story-1"])
+
+    def test_rejects_whitespace_only_text(self) -> None:
+        with self.assertRaises(ValidationError):
+            Sentence(text="   ", citation_ids=["story-1"])
 
 
 class ResolveCitationsTests(unittest.TestCase):
