@@ -93,6 +93,46 @@ class FlakyGeminiClient:
         return self._fake.generate(system_prompt, user_prompt, response_schema)
 
 
+class InventedCitationGeminiClient:
+    """Always cites a story id that was never in the prompt - simulates the
+    model hallucinating a citation instead of using a real member story."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, system_prompt: str, user_prompt: str, response_schema):
+        self.calls += 1
+        return response_schema.model_validate(
+            {
+                "label": "Coverage of recent developments",
+                "sentences": [
+                    {"text": "First sentence about the theme.", "citation_ids": ["not-a-real-story-id"]},
+                    {"text": "Second sentence about the theme.", "citation_ids": ["not-a-real-story-id"]},
+                ],
+            }
+        )
+
+
+class BlankSentenceGeminiClient:
+    """Returns a sentence with whitespace-only text, citing a real story id."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, system_prompt: str, user_prompt: str, response_schema):
+        self.calls += 1
+        story_ids = ID_LINE_RE.findall(user_prompt)
+        return response_schema.model_validate(
+            {
+                "label": "Coverage of recent developments",
+                "sentences": [
+                    {"text": "   ", "citation_ids": [story_ids[0]]},
+                    {"text": "Second sentence about the theme.", "citation_ids": [story_ids[0]]},
+                ],
+            }
+        )
+
+
 class SummarizeFixtureTests(unittest.TestCase):
     """Covers the issue #65 DoD: valid JSON across all 20 fixture themes."""
 
@@ -154,6 +194,18 @@ class SummarizeRetryTests(unittest.TestCase):
         empty_theme = ThemeInput(ticker="TSLA", member_stories=[])
         with self.assertRaises(SummarizationError):
             summarize(empty_theme, client=FakeGeminiClient())
+
+    def test_raises_summarization_error_on_invented_citation_id(self) -> None:
+        client = InventedCitationGeminiClient()
+        with self.assertRaises(SummarizationError):
+            summarize(self.theme, client=client)
+        self.assertEqual(client.calls, 2)  # initial attempt + one retry
+
+    def test_raises_summarization_error_on_blank_sentence_text(self) -> None:
+        client = BlankSentenceGeminiClient()
+        with self.assertRaises(SummarizationError):
+            summarize(self.theme, client=client)
+        self.assertEqual(client.calls, 2)  # initial attempt + one retry
 
 
 class ResolveCitationsTests(unittest.TestCase):

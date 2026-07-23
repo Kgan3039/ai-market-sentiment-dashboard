@@ -82,6 +82,13 @@ class Sentence(BaseModel):
     text: str
     citation_ids: list[str] = Field(min_length=1)
 
+    @field_validator("text")
+    @classmethod
+    def _text_not_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("sentence text must not be blank")
+        return value
+
 
 class ThemeSummary(BaseModel):
     label: str
@@ -174,10 +181,12 @@ class GeminiClient:
 def summarize(theme: ThemeInput, *, client: Optional[GeminiClient] = None) -> ThemeSummary:
     """Generate a cited ThemeSummary for `theme`.
 
-    Retries once on a structurally malformed provider response, then raises
-    SummarizationError. Does not retry or degrade on semantic guardrail
-    failures (banned language, citation resolution) - that loop belongs to
-    A2's guardrail chain, which wraps this function.
+    Retries once on a structurally malformed provider response - including a
+    response whose citation_ids don't all resolve to a real member story,
+    which is treated as invalid output rather than allowed through - then
+    raises SummarizationError. Does not retry or degrade on banned-language
+    guardrail failures; that loop belongs to A2's guardrail chain, which
+    wraps this function.
     """
     if not theme.member_stories:
         raise SummarizationError("theme has no member stories to summarize")
@@ -191,8 +200,14 @@ def summarize(theme: ThemeInput, *, client: Optional[GeminiClient] = None) -> Th
             result = active_client.generate(SYSTEM_PROMPT, user_prompt, ThemeSummary)
             if not isinstance(result, ThemeSummary):
                 result = ThemeSummary.model_validate(result)
+            unresolved = resolve_citations(theme, result)
+            if unresolved:
+                raise SummarizationError(
+                    f"summary cited unknown story id(s): {sorted(unresolved)}"
+                )
             return result
-        except Exception as exc:  # noqa: BLE001 - provider/parse failure, retried once
+        except Exception as exc:
+            # Provider/parse/citation failure - retried once, then raised below.
             last_error = exc
 
     raise SummarizationError(
