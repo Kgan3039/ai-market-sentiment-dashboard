@@ -1,0 +1,590 @@
+[
+  {
+    "theme_id": "tsla-q2-deliveries",
+    "ticker": "TSLA",
+    "trading_day": "2026-07-13",
+    "member_stories": [
+      {
+        "id": "tsla-q2-deliveries-1",
+        "title": "Tesla Q2 deliveries top Wall Street estimates",
+        "description": "Tesla reported roughly 462,000 vehicle deliveries for the second quarter, ahead of the analyst consensus of 445,000.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-13T09:05:00Z"
+      },
+      {
+        "id": "tsla-q2-deliveries-2",
+        "title": "Tesla beats delivery expectations for Q2",
+        "description": "Tesla's second-quarter delivery figures came in above consensus, driven by strong Model Y demand in China.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-13T09:20:00Z"
+      },
+      {
+        "id": "tsla-q2-deliveries-3",
+        "title": "Tesla shares climb after delivery beat",
+        "description": "Shares moved higher in premarket trading following the delivery report, with several desks noting improved China sales.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-13T10:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "tsla-robotaxi-expansion",
+    "ticker": "TSLA",
+    "trading_day": "2026-07-13",
+    "member_stories": [
+      {
+        "id": "tsla-robotaxi-1",
+        "title": "Tesla expands robotaxi service to two new metro areas",
+        "description": "Tesla's robotaxi pilot is expanding beyond Austin into Phoenix and Miami, with a limited fleet of Model Y vehicles.",
+        "outlet": "Bloomberg",
+        "published_at": "2026-07-12T14:10:00Z"
+      },
+      {
+        "id": "tsla-robotaxi-2",
+        "title": "Tesla robotaxi rides begin in Phoenix",
+        "description": "Riders in Phoenix can now hail a Tesla robotaxi through the company's app, part of a phased regional rollout.",
+        "outlet": "TechCrunch",
+        "published_at": "2026-07-12T16:45:00Z"
+      },
+      {
+        "id": "tsla-robotaxi-3",
+        "title": "Regulators to review Tesla robotaxi safety data",
+        "description": "State regulators said they will review incident data from Tesla's robotaxi pilot before approving further expansion.",
+        "outlet": "Axios",
+        "published_at": "2026-07-13T08:30:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "tsla-analyst-targets",
+    "ticker": "TSLA",
+    "trading_day": "2026-07-11",
+    "member_stories": [
+      {
+        "id": "tsla-analyst-1",
+        "title": "Morgan Stanley raises Tesla price target to $310",
+        "description": "Morgan Stanley lifted its Tesla price target, citing optimism about the robotaxi rollout and energy storage growth.",
+        "outlet": "Barron's",
+        "published_at": "2026-07-11T11:00:00Z"
+      },
+      {
+        "id": "tsla-analyst-2",
+        "title": "Wedbush reiterates Tesla outperform rating",
+        "description": "Wedbush analysts kept an outperform rating on Tesla, pointing to autonomy progress as a key catalyst.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-11T12:15:00Z"
+      },
+      {
+        "id": "tsla-analyst-3",
+        "title": "Tesla shares will rise on autonomy progress, analyst says",
+        "description": "One analyst wrote that Tesla shares will rise further as autonomy milestones are reached over the coming quarters.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-11T13:40:00Z"
+      },
+      {
+        "id": "tsla-analyst-4",
+        "title": "Wall Street split on Tesla ahead of earnings",
+        "description": "Price targets on Tesla range widely ahead of earnings, with bulls citing autonomy and bears citing margin pressure.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-11T15:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "tsla-energy-storage",
+    "ticker": "TSLA",
+    "trading_day": "2026-07-10",
+    "member_stories": [
+      {
+        "id": "tsla-energy-1",
+        "title": "Tesla Energy signs large Megapack order",
+        "description": "Tesla's energy division signed a multi-gigawatt-hour Megapack supply agreement with a utility in Texas.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-10T10:00:00Z"
+      },
+      {
+        "id": "tsla-energy-2",
+        "title": "Tesla Energy backlog grows on utility demand",
+        "description": "Tesla's energy storage backlog has grown this quarter as utilities sign new Megapack contracts.",
+        "outlet": "Bloomberg",
+        "published_at": "2026-07-10T13:20:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "nvda-blackwell-demand",
+    "ticker": "NVDA",
+    "trading_day": "2026-07-14",
+    "member_stories": [
+      {
+        "id": "nvda-blackwell-1",
+        "title": "Nvidia says Blackwell demand remains stronger than supply",
+        "description": "Nvidia's CEO said Blackwell GPU demand continues to outstrip supply, with cloud providers placing large orders.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-14T13:00:00Z"
+      },
+      {
+        "id": "nvda-blackwell-2",
+        "title": "Nvidia: Blackwell orders exceed available supply",
+        "description": "Nvidia executives reiterated that Blackwell chip demand is outpacing production, according to a wire report.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-14T13:05:00Z"
+      },
+      {
+        "id": "nvda-blackwell-3",
+        "title": "Nvidia CEO: Blackwell supply still constrained",
+        "description": "Speaking at a conference, Nvidia's CEO said Blackwell supply constraints are expected to ease later this year.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-14T13:10:00Z"
+      },
+      {
+        "id": "nvda-blackwell-4",
+        "title": "Cloud giants scramble for Nvidia Blackwell allocation",
+        "description": "Major cloud providers are reportedly competing for larger allocations of Nvidia's Blackwell GPUs.",
+        "outlet": "The Information",
+        "published_at": "2026-07-14T15:30:00Z"
+      },
+      {
+        "id": "nvda-blackwell-5",
+        "title": "Nvidia shares rise on Blackwell demand commentary",
+        "description": "Nvidia shares moved higher after the company's comments on continued strong Blackwell demand.",
+        "outlet": "Bloomberg",
+        "published_at": "2026-07-14T16:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "nvda-china-export-controls",
+    "ticker": "NVDA",
+    "trading_day": "2026-07-09",
+    "member_stories": [
+      {
+        "id": "nvda-china-1",
+        "title": "US weighs new export limits on Nvidia AI chips to China",
+        "description": "The US government is reportedly considering additional restrictions on Nvidia AI chip sales to China.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-09T09:00:00Z"
+      },
+      {
+        "id": "nvda-china-2",
+        "title": "Nvidia China chip sales face fresh scrutiny",
+        "description": "Nvidia's China-specific chip sales are under renewed scrutiny amid ongoing export control discussions.",
+        "outlet": "Wall Street Journal",
+        "published_at": "2026-07-09T10:30:00Z"
+      },
+      {
+        "id": "nvda-china-3",
+        "title": "Nvidia says it is monitoring export policy changes",
+        "description": "In a statement, Nvidia said it continues to monitor evolving export policy and will comply with any new rules.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-09T12:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "nvda-earnings-preview",
+    "ticker": "NVDA",
+    "trading_day": "2026-07-08",
+    "member_stories": [
+      {
+        "id": "nvda-earnings-1",
+        "title": "Nvidia earnings expected to show continued data center growth",
+        "description": "Analysts expect Nvidia's upcoming earnings report to show continued strength in data center revenue.",
+        "outlet": "Barron's",
+        "published_at": "2026-07-08T09:15:00Z"
+      },
+      {
+        "id": "nvda-earnings-2",
+        "title": "What to watch in Nvidia's next earnings report",
+        "description": "Analysts are focused on data center revenue growth and gross margin trends heading into Nvidia's earnings.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-08T10:00:00Z"
+      },
+      {
+        "id": "nvda-earnings-3",
+        "title": "Nvidia options market prices in a large earnings move",
+        "description": "Options pricing implies traders expect a large stock move around Nvidia's upcoming earnings release.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-08T11:45:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "nvda-cloud-partnership",
+    "ticker": "NVDA",
+    "trading_day": "2026-07-07",
+    "member_stories": [
+      {
+        "id": "nvda-partner-1",
+        "title": "Nvidia expands partnership with major cloud provider",
+        "description": "Nvidia announced an expanded multi-year partnership to supply GPUs for a cloud provider's AI infrastructure.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-07T14:00:00Z"
+      },
+      {
+        "id": "nvda-partner-2",
+        "title": "Nvidia deepens cloud AI infrastructure deal",
+        "description": "The expanded deal covers new GPU generations for the cloud provider's AI data centers over multiple years.",
+        "outlet": "TechCrunch",
+        "published_at": "2026-07-07T15:20:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "amd-mi300-launch",
+    "ticker": "AMD",
+    "trading_day": "2026-07-13",
+    "member_stories": [
+      {
+        "id": "amd-mi300-1",
+        "title": "AMD launches next-generation MI350 AI accelerator",
+        "description": "AMD unveiled its MI350 AI accelerator chip, claiming improved performance over the prior MI300 generation.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-13T09:00:00Z"
+      },
+      {
+        "id": "amd-mi300-2",
+        "title": "AMD's new MI350 chip targets Nvidia's data center lead",
+        "description": "AMD's newly announced MI350 accelerator is aimed at large AI training and inference workloads in data centers.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-13T09:40:00Z"
+      },
+      {
+        "id": "amd-mi300-3",
+        "title": "Early benchmarks show AMD MI350 gains on select workloads",
+        "description": "Independent benchmarks published this week show the MI350 outperforming its predecessor on some AI workloads.",
+        "outlet": "The Verge",
+        "published_at": "2026-07-13T12:00:00Z"
+      },
+      {
+        "id": "amd-mi300-4",
+        "title": "AMD shares rise on MI350 launch",
+        "description": "AMD shares moved higher following the MI350 launch event and accompanying analyst commentary.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-13T13:15:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "amd-market-share",
+    "ticker": "AMD",
+    "trading_day": "2026-07-06",
+    "member_stories": [
+      {
+        "id": "amd-share-1",
+        "title": "AMD gains server CPU market share in latest data",
+        "description": "Third-party tracking data shows AMD gained server CPU market share against its main competitor last quarter.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-06T10:00:00Z"
+      },
+      {
+        "id": "amd-share-2",
+        "title": "AMD server chips keep taking share from Intel",
+        "description": "AMD's EPYC server processors continued taking market share, according to newly published industry data.",
+        "outlet": "Barron's",
+        "published_at": "2026-07-06T11:30:00Z"
+      },
+      {
+        "id": "amd-share-3",
+        "title": "Analysts point to AMD server momentum",
+        "description": "Several analysts cited AMD's growing server market share as a positive data point heading into earnings season.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-06T14:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "amd-guidance-miss",
+    "ticker": "AMD",
+    "trading_day": "2026-07-05",
+    "member_stories": [
+      {
+        "id": "amd-guidance-1",
+        "title": "AMD stock fell because guidance missed expectations",
+        "description": "AMD shares declined after the company issued quarterly guidance that came in below analyst expectations.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-05T16:10:00Z"
+      },
+      {
+        "id": "amd-guidance-2",
+        "title": "AMD guidance disappoints investors",
+        "description": "AMD's forward guidance for the current quarter fell short of Wall Street's revenue expectations.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-05T16:20:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "amd-datacenter-deal",
+    "ticker": "AMD",
+    "trading_day": "2026-07-03",
+    "member_stories": [
+      {
+        "id": "amd-dc-1",
+        "title": "AMD wins multi-year data center supply agreement",
+        "description": "AMD signed a multi-year agreement to supply EPYC processors for a hyperscale data center operator.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-03T09:30:00Z"
+      },
+      {
+        "id": "amd-dc-2",
+        "title": "AMD lands large hyperscaler CPU deal",
+        "description": "The new supply agreement covers several years of EPYC processor deliveries to the hyperscale customer.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-03T10:15:00Z"
+      },
+      {
+        "id": "amd-dc-3",
+        "title": "AMD data center deal seen as share-gain signal",
+        "description": "Analysts described the new hyperscaler agreement as further evidence of AMD's data center share gains.",
+        "outlet": "Barron's",
+        "published_at": "2026-07-03T12:40:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "aapl-iphone-sales",
+    "ticker": "AAPL",
+    "trading_day": "2026-07-13",
+    "member_stories": [
+      {
+        "id": "aapl-iphone-1",
+        "title": "Apple iPhone sales data shows steady demand in China",
+        "description": "Weekly sales tracking data indicates steady iPhone demand in China following recent promotional pricing.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-13T08:00:00Z"
+      },
+      {
+        "id": "aapl-iphone-2",
+        "title": "iPhone demand holds up in China market",
+        "description": "Third-party data suggests iPhone demand in China has remained resilient over the past month.",
+        "outlet": "Bloomberg",
+        "published_at": "2026-07-13T08:45:00Z"
+      },
+      {
+        "id": "aapl-iphone-3",
+        "title": "Apple supplier orders point to solid iPhone build plan",
+        "description": "Reports from Apple's supply chain indicate production plans consistent with steady iPhone demand this quarter.",
+        "outlet": "The Information",
+        "published_at": "2026-07-13T11:00:00Z"
+      },
+      {
+        "id": "aapl-iphone-4",
+        "title": "Apple shares tick up on China demand data",
+        "description": "Apple shares edged higher after the release of data pointing to steady iPhone demand in China.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-13T14:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "aapl-ai-features",
+    "ticker": "AAPL",
+    "trading_day": "2026-07-11",
+    "member_stories": [
+      {
+        "id": "aapl-ai-1",
+        "title": "Apple expands Apple Intelligence features in latest update",
+        "description": "Apple's newest software update adds several Apple Intelligence features, including expanded on-device summarization.",
+        "outlet": "TechCrunch",
+        "published_at": "2026-07-11T10:00:00Z"
+      },
+      {
+        "id": "aapl-ai-2",
+        "title": "Apple Intelligence update rolls out to more devices",
+        "description": "The expanded Apple Intelligence feature set is now rolling out to a wider range of eligible devices.",
+        "outlet": "The Verge",
+        "published_at": "2026-07-11T10:30:00Z"
+      },
+      {
+        "id": "aapl-ai-3",
+        "title": "Developers react to new Apple Intelligence APIs",
+        "description": "Third-party developers are beginning to integrate the newly released Apple Intelligence APIs into their apps.",
+        "outlet": "Axios",
+        "published_at": "2026-07-11T13:15:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "aapl-supplier-disruption",
+    "ticker": "AAPL",
+    "trading_day": "2026-07-04",
+    "member_stories": [
+      {
+        "id": "aapl-supplier-1",
+        "title": "Apple supplier reports temporary production disruption",
+        "description": "A key Apple assembly supplier reported a temporary production slowdown due to a regional power outage.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-04T07:30:00Z"
+      },
+      {
+        "id": "aapl-supplier-2",
+        "title": "Apple assembly partner resumes operations after outage",
+        "description": "The affected Apple supplier said operations have resumed after a brief outage-related disruption.",
+        "outlet": "Bloomberg",
+        "published_at": "2026-07-04T12:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "aapl-buyback",
+    "ticker": "AAPL",
+    "trading_day": "2026-07-02",
+    "member_stories": [
+      {
+        "id": "aapl-buyback-1",
+        "title": "Apple board authorizes new share buyback program",
+        "description": "Apple's board approved a new multi-billion-dollar share repurchase authorization.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-02T20:15:00Z"
+      },
+      {
+        "id": "aapl-buyback-2",
+        "title": "Apple announces expanded buyback authorization",
+        "description": "The newly approved buyback program expands on Apple's existing share repurchase activity.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-02T20:30:00Z"
+      },
+      {
+        "id": "aapl-buyback-3",
+        "title": "Apple's buyback program among largest in the market",
+        "description": "Apple's newly authorized buyback ranks among the largest repurchase programs of any public company.",
+        "outlet": "Barron's",
+        "published_at": "2026-07-02T21:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "meta-ai-capex",
+    "ticker": "META",
+    "trading_day": "2026-07-14",
+    "member_stories": [
+      {
+        "id": "meta-capex-1",
+        "title": "Meta raises AI infrastructure spending forecast",
+        "description": "Meta said it now expects to spend more on AI infrastructure this year than previously forecast.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-14T08:00:00Z"
+      },
+      {
+        "id": "meta-capex-2",
+        "title": "Meta lifts capex guidance on AI data center buildout",
+        "description": "The increased spending forecast is tied to Meta's ongoing AI data center expansion, the company said.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-14T08:20:00Z"
+      },
+      {
+        "id": "meta-capex-3",
+        "title": "Meta's higher AI spending draws mixed analyst reaction",
+        "description": "Analysts had mixed reactions to Meta's higher AI infrastructure spending forecast, citing both opportunity and margin risk.",
+        "outlet": "Barron's",
+        "published_at": "2026-07-14T10:00:00Z"
+      },
+      {
+        "id": "meta-capex-4",
+        "title": "Meta shares fall after capex guidance raise",
+        "description": "Meta shares declined after the company raised its AI infrastructure spending guidance for the year.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-14T13:30:00Z"
+      },
+      {
+        "id": "meta-capex-5",
+        "title": "Meta AI spending plans compared to peers",
+        "description": "Meta's updated AI infrastructure spending plans put it among the largest capital spenders in the sector this year.",
+        "outlet": "Bloomberg",
+        "published_at": "2026-07-14T15:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "meta-reality-labs",
+    "ticker": "META",
+    "trading_day": "2026-07-09",
+    "member_stories": [
+      {
+        "id": "meta-reality-1",
+        "title": "Meta unveils next-generation mixed reality headset",
+        "description": "Meta's Reality Labs division showed off a new mixed reality headset targeted at both consumer and enterprise buyers.",
+        "outlet": "The Verge",
+        "published_at": "2026-07-09T16:00:00Z"
+      },
+      {
+        "id": "meta-reality-2",
+        "title": "Meta's new headset targets enterprise customers",
+        "description": "The newly unveiled headset includes features aimed specifically at enterprise and productivity use cases.",
+        "outlet": "TechCrunch",
+        "published_at": "2026-07-09T16:30:00Z"
+      },
+      {
+        "id": "meta-reality-3",
+        "title": "Reality Labs losses continue despite new hardware",
+        "description": "Meta's Reality Labs division continues to post losses even as the company ships new hardware, per recent filings.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-09T18:00:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "meta-ad-revenue",
+    "ticker": "META",
+    "trading_day": "2026-07-08",
+    "member_stories": [
+      {
+        "id": "meta-ad-1",
+        "title": "Meta advertising revenue tops estimates on AI targeting gains",
+        "description": "Meta's advertising revenue beat analyst estimates, which the company attributed to improved AI-driven ad targeting.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-08T20:05:00Z"
+      },
+      {
+        "id": "meta-ad-2",
+        "title": "Meta ad business posts strong quarter",
+        "description": "Meta's core advertising business posted stronger-than-expected results, led by gains in ad pricing.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-08T20:15:00Z"
+      },
+      {
+        "id": "meta-ad-3",
+        "title": "Analyst upgrades Meta to buy after ad revenue beat",
+        "description": "One analyst upgraded Meta to a buy rating, citing the advertising revenue beat and improved targeting technology.",
+        "outlet": "Barron's",
+        "published_at": "2026-07-08T21:30:00Z"
+      },
+      {
+        "id": "meta-ad-4",
+        "title": "Meta shares jump on advertising strength",
+        "description": "Meta shares rose in after-hours trading following the stronger-than-expected advertising revenue results.",
+        "outlet": "MarketWatch",
+        "published_at": "2026-07-08T21:45:00Z"
+      }
+    ]
+  },
+  {
+    "theme_id": "meta-eu-regulatory",
+    "ticker": "META",
+    "trading_day": "2026-07-01",
+    "member_stories": [
+      {
+        "id": "meta-eu-1",
+        "title": "EU regulators open new inquiry into Meta ad practices",
+        "description": "European Union regulators opened a new inquiry into Meta's advertising data practices under existing digital rules.",
+        "outlet": "Reuters",
+        "published_at": "2026-07-01T09:00:00Z"
+      },
+      {
+        "id": "meta-eu-2",
+        "title": "Meta faces fresh EU scrutiny over ad targeting",
+        "description": "The new EU inquiry focuses on how Meta's platforms use user data for advertising targeting.",
+        "outlet": "Wall Street Journal",
+        "published_at": "2026-07-01T09:40:00Z"
+      },
+      {
+        "id": "meta-eu-3",
+        "title": "Meta says it will cooperate with EU inquiry",
+        "description": "In a statement, Meta said it intends to cooperate fully with the new European Union regulatory inquiry.",
+        "outlet": "CNBC",
+        "published_at": "2026-07-01T11:00:00Z"
+      }
+    ]
+  }
+]
