@@ -1,0 +1,12 @@
+# Install with: crontab deploy/phase0-pipeline.cron
+# Set PROJECT_DIR, PYTHON_BIN, and a persistent PHASE0_DATABASE_PATH in the
+# wrapper/environment before production use. America/New_York handles EST/EDT.
+CRON_TZ=America/New_York
+
+# Every 30 minutes from 09:00 through 16:30 ET on weekdays.
+0,30 9-16 * * 1-5 cd /opt/ticker-narratives && .venv/bin/python pipeline.py >> /var/log/ticker-narratives-pipeline.log 2>&1
+
+# Hourly outside the market-hour window (weekdays before 09:00/after 16:30,
+# plus all weekend hours).
+0 0-8,17-23 * * 1-5 cd /opt/ticker-narratives && .venv/bin/python pipeline.py >> /var/log/ticker-narratives-pipeline.log 2>&1
+0 * * * 0,6 cd /opt/ticker-narratives && .venv/bin/python pipeline.py >> /var/log/ticker-narratives-pipeline.log 2>&1
