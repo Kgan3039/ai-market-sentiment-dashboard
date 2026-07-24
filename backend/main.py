@@ -21,6 +21,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
+from app.phase0 import routes as phase0_routes
 from app.routes import health, sentiment, prediction, market, dashboard
 from app.services.prediction_service import PredictionService
 
@@ -51,6 +52,7 @@ app.include_router(sentiment.router)
 app.include_router(prediction.router)
 app.include_router(market.router)
 app.include_router(dashboard.router)
+app.include_router(phase0_routes.router)
 
 
 @app.on_event("startup")

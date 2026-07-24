@@ -1,5 +1,5 @@
 # FastAPI framework
-fastapi==0.109.0
+fastapi==0.115.6
 uvicorn[standard]==0.27.0
 
 # Data validation & serialization
@@ -16,16 +16,20 @@ python-dotenv==1.0.1
 sqlalchemy==2.0.23
 
 # Async support
-aiohttp==3.9.1
+aiohttp==3.12.15
 
 # Development
 pytest==7.4.3
+# This FastAPI/Starlette pair supports TestClient with google-genai's httpx requirement.
+starlette==0.41.3
+httpx==0.28.1
+PyYAML==6.0.2
 black==23.12.1
 flake8==6.1.0
 
 # Shared dependencies with other modules
-pandas==2.2.1
-numpy==1.24.3
+pandas==2.2.3
+numpy==2.2.6
 scikit-learn==1.6.1
 yfinance==0.2.65
 
