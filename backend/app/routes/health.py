@@ -6,18 +6,18 @@ Simple endpoint to verify the API is running and operational.
 
 from fastapi import APIRouter
 from app.config import settings
-from app.models.schemas import HealthCheckResponse
+from app.phase0.schemas import HealthResponse
 
 router = APIRouter()
 
 
-@router.get("/test", response_model=HealthCheckResponse, tags=["Health"])
+@router.get("/test", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """
     Health check endpoint.
 
     Returns:
-        HealthCheckResponse: API status and version information
+        HealthResponse: API status and version information
 
     Example:
         GET /test
@@ -27,7 +27,7 @@ async def health_check():
             "message": "API is running and ready to serve requests"
         }
     """
-    return HealthCheckResponse(
+    return HealthResponse(
         status="ok",
         version=settings.APP_VERSION,
         message=f"{settings.APP_NAME} is running and ready to serve requests",

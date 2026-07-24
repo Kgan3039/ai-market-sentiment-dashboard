@@ -1,15 +1,16 @@
-# AI Market Sentiment Dashboard
+# Ticker Narratives
 
 ## Overview
-This project analyzes financial sentiment and predicts stock movement.
+Phase 0 validates a cited-news dashboard for tech and growth swing traders. It
+surfaces themes dominating current coverage without claiming to predict or
+explain stock-price movement.
 
 ## Team Roles
 Project Manager: Kartik,
 Data Engineer: Isaac,
 NLP Engineer: Matthew,
-Prediction Engineer: Abhi,
-Backend Engineer: Mihir,
-Frontend Engineer: Srish
+AI Engineer: Abhi,
+Backend/Frontend Engineer: Mihir
 
 ## Pipeline
-Data --> Sentiment --> Prediction --> API --> Dashboard
+Headlines --> relevance --> deduplication --> themes --> cited summaries --> API --> ticker page

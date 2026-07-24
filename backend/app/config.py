@@ -6,7 +6,7 @@ Uses pydantic-settings for type-safe configuration management.
 """
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 
@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     """Application settings from environment variables."""
 
     # App settings
-    APP_NAME: str = "AI Market Sentiment API"
-    APP_VERSION: str = "0.1.0"
+    APP_NAME: str = "Ticker Narratives API"
+    APP_VERSION: str = "1.0.0-phase0"
     DEBUG: bool = False
 
     # Server settings
@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     REDDIT_CLIENT_SECRET: Optional[str] = None
     REDDIT_USER_AGENT: Optional[str] = None
 
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+
     @field_validator("DEBUG", mode="before")
     @classmethod
     def parse_debug(cls, value):
@@ -43,11 +45,6 @@ class Settings(BaseSettings):
             if normalized in {"debug", "dev", "development", "true", "1", "yes", "on"}:
                 return True
         return value
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-
 
 # Create settings instance (singleton pattern)
 settings = Settings()

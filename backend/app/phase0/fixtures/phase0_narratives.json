@@ -1,0 +1,140 @@
+{
+  "tickers": [
+    {"ticker": "TSLA", "company_name": "Tesla"},
+    {"ticker": "NVDA", "company_name": "NVIDIA"},
+    {"ticker": "AMD", "company_name": "Advanced Micro Devices"},
+    {"ticker": "AAPL", "company_name": "Apple"},
+    {"ticker": "META", "company_name": "Meta Platforms"}
+  ],
+  "ticker_days": {
+    "TSLA": {
+      "2026-07-15": {
+        "data_as_of": "2026-07-15T15:30:00Z",
+        "themes": [
+          {
+            "id": "tsla-deliveries",
+            "label": "Delivery updates",
+            "rank": 1,
+            "sentences": [],
+            "citations": [
+              {"id": "tsla-1", "headline": "Tesla reports updated delivery figures", "outlet": "Fixture Markets", "url": "https://example.com/tsla-deliveries", "published_at": "2026-07-15T13:15:00Z"},
+              {"id": "tsla-2", "headline": "Analysts review Tesla delivery update", "outlet": "Fixture Wire", "url": "https://example.com/tsla-review", "published_at": "2026-07-15T14:20:00Z"}
+            ],
+            "stories": [
+              {"id": "tsla-1", "headline": "Tesla reports updated delivery figures", "outlet": "Fixture Markets", "url": "https://example.com/tsla-deliveries", "published_at": "2026-07-15T13:15:00Z"},
+              {"id": "tsla-2", "headline": "Analysts review Tesla delivery update", "outlet": "Fixture Wire", "url": "https://example.com/tsla-review", "published_at": "2026-07-15T14:20:00Z"}
+            ],
+            "outlet_count": 2,
+            "story_count": 2,
+            "degraded": true
+          }
+        ],
+        "other_coverage": {"outlet_count": 0, "story_count": 0, "stories": []}
+      }
+    },
+    "NVDA": {
+      "2026-07-15": {
+        "data_as_of": "2026-07-15T15:30:00Z",
+        "themes": [
+          {
+            "id": "nvda-ai-infrastructure",
+            "label": "AI infrastructure spending",
+            "rank": 1,
+            "sentences": [
+              {"text": "Coverage today focused on AI infrastructure spending and NVIDIA's role in supplying related computing systems.", "citation_ids": ["nvda-1", "nvda-2"]},
+              {"text": "Several outlets also discussed demand updates from companies building AI capacity.", "citation_ids": ["nvda-2"]}
+            ],
+            "citations": [
+              {"id": "nvda-1", "headline": "Chipmakers discuss AI infrastructure demand", "outlet": "Fixture Markets", "url": "https://example.com/nvda-infrastructure", "published_at": "2026-07-15T12:30:00Z"},
+              {"id": "nvda-2", "headline": "Enterprise AI spending remains in focus", "outlet": "Fixture Wire", "url": "https://example.com/nvda-enterprise-ai", "published_at": "2026-07-15T14:05:00Z"}
+            ],
+            "stories": [
+              {"id": "nvda-1", "headline": "Chipmakers discuss AI infrastructure demand", "outlet": "Fixture Markets", "url": "https://example.com/nvda-infrastructure", "published_at": "2026-07-15T12:30:00Z"},
+              {"id": "nvda-2", "headline": "Enterprise AI spending remains in focus", "outlet": "Fixture Wire", "url": "https://example.com/nvda-enterprise-ai", "published_at": "2026-07-15T14:05:00Z"}
+            ],
+            "outlet_count": 2,
+            "story_count": 2,
+            "degraded": false
+          }
+        ],
+        "other_coverage": {
+          "outlet_count": 1,
+          "story_count": 1,
+          "stories": [
+            {"id": "nvda-3", "headline": "NVIDIA event schedule draws attention", "outlet": "Fixture Tech", "url": "https://example.com/nvda-events", "published_at": "2026-07-15T11:10:00Z"}
+          ]
+        }
+      }
+    },
+    "AMD": {
+      "2026-07-15": {
+        "data_as_of": "2026-07-15T15:30:00Z",
+        "themes": [],
+        "other_coverage": {"outlet_count": 0, "story_count": 0, "stories": []}
+      }
+    },
+    "AAPL": {
+      "2026-07-15": {
+        "data_as_of": "2026-07-15T15:30:00Z",
+        "themes": [
+          {
+            "id": "aapl-services",
+            "label": "Services and ecosystem updates",
+            "rank": 1,
+            "sentences": [
+              {"text": "Current coverage highlighted updates across Apple's services and device ecosystem.", "citation_ids": ["aapl-1"]}
+            ],
+            "citations": [
+              {"id": "aapl-1", "headline": "Apple services updates remain in focus", "outlet": "Fixture Markets", "url": "https://example.com/aapl-services", "published_at": "2026-07-15T13:40:00Z"}
+            ],
+            "stories": [
+              {"id": "aapl-1", "headline": "Apple services updates remain in focus", "outlet": "Fixture Markets", "url": "https://example.com/aapl-services", "published_at": "2026-07-15T13:40:00Z"}
+            ],
+            "outlet_count": 1,
+            "story_count": 1,
+            "degraded": false
+          }
+        ],
+        "other_coverage": {"outlet_count": 0, "story_count": 0, "stories": []}
+      }
+    },
+    "META": {
+      "2026-07-15": {
+        "data_as_of": "2026-07-15T15:30:00Z",
+        "themes": [
+          {
+            "id": "meta-advertising",
+            "label": "Advertising and platform updates",
+            "rank": 1,
+            "sentences": [
+              {"text": "Coverage today centered on advertising trends and updates across Meta's platforms.", "citation_ids": ["meta-1", "meta-2"]}
+            ],
+            "citations": [
+              {"id": "meta-1", "headline": "Digital advertising trends remain in focus", "outlet": "Fixture Wire", "url": "https://example.com/meta-advertising", "published_at": "2026-07-15T12:10:00Z"},
+              {"id": "meta-2", "headline": "Meta platform updates draw coverage", "outlet": "Fixture Tech", "url": "https://example.com/meta-platforms", "published_at": "2026-07-15T14:35:00Z"}
+            ],
+            "stories": [
+              {"id": "meta-1", "headline": "Digital advertising trends remain in focus", "outlet": "Fixture Wire", "url": "https://example.com/meta-advertising", "published_at": "2026-07-15T12:10:00Z"},
+              {"id": "meta-2", "headline": "Meta platform updates draw coverage", "outlet": "Fixture Tech", "url": "https://example.com/meta-platforms", "published_at": "2026-07-15T14:35:00Z"}
+            ],
+            "outlet_count": 2,
+            "story_count": 2,
+            "degraded": false
+          }
+        ],
+        "other_coverage": {"outlet_count": 0, "story_count": 0, "stories": []}
+      }
+    }
+  },
+  "status": {
+    "data_as_of": "2026-07-15T15:30:00Z",
+    "is_stale": false,
+    "last_runs": [
+      {"stage": "fetch", "status": "success", "started_at": "2026-07-15T15:00:00Z", "completed_at": "2026-07-15T15:04:00Z", "duration_ms": 240000, "error_count": 0},
+      {"stage": "relevance", "status": "success", "started_at": "2026-07-15T15:04:00Z", "completed_at": "2026-07-15T15:05:00Z", "duration_ms": 60000, "error_count": 0},
+      {"stage": "dedup", "status": "success", "started_at": "2026-07-15T15:05:00Z", "completed_at": "2026-07-15T15:07:00Z", "duration_ms": 120000, "error_count": 0},
+      {"stage": "cluster", "status": "success", "started_at": "2026-07-15T15:07:00Z", "completed_at": "2026-07-15T15:08:00Z", "duration_ms": 60000, "error_count": 0},
+      {"stage": "summarize", "status": "success", "started_at": "2026-07-15T15:08:00Z", "completed_at": "2026-07-15T15:10:00Z", "duration_ms": 120000, "error_count": 0}
+    ]
+  }
+}
