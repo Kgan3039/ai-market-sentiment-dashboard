@@ -124,8 +124,8 @@ export default function App() {
   const [activeTicker, setActiveTicker] = useState("TSLA");
   const [themesPayload, setThemesPayload] = useState(null);
   const [metaStatus, setMetaStatus] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
+  const [pageMetaError, setPageMetaError] = useState(false);
+  const [themeErrorTicker, setThemeErrorTicker] = useState(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -145,7 +145,7 @@ export default function App() {
             : tickerPayload.tickers[0]?.ticker || "TSLA"
         );
       } catch (requestError) {
-        if (requestError.name !== "AbortError") setError(true);
+        if (requestError.name !== "AbortError") setPageMetaError(true);
       }
     }
 
@@ -155,20 +155,19 @@ export default function App() {
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
-    setError(false);
 
     async function loadThemes() {
       try {
         const payload = await requestJson(`/api/v1/tickers/${activeTicker}/themes`, controller.signal);
-        setThemesPayload(payload);
+        if (!controller.signal.aborted) {
+          setThemesPayload(payload);
+          setThemeErrorTicker(null);
+        }
       } catch (requestError) {
         if (requestError.name !== "AbortError") {
           setThemesPayload(null);
-          setError(true);
+          setThemeErrorTicker(activeTicker);
         }
-      } finally {
-        if (!controller.signal.aborted) setLoading(false);
       }
     }
 
@@ -180,6 +179,9 @@ export default function App() {
   const dataAsOf = themesPayload?.data_as_of || metaStatus?.data_as_of;
   const isStale = metaStatus?.is_stale || activeTickerData?.is_stale;
   const activeLabel = formatTickerLabel(activeTickerData || { ticker: activeTicker });
+  const hasThemeError = themeErrorTicker === activeTicker;
+  const hasError = pageMetaError || hasThemeError;
+  const isLoading = !hasError && themesPayload?.ticker !== activeTicker;
 
   return (
     <main className="narratives-app">
@@ -215,17 +217,17 @@ export default function App() {
         <span>{activeLabel}</span>
       </section>
 
-      {loading ? <section className="state-card">Loading current coverage…</section> : null}
-      {error ? <section className="state-card error">Coverage is temporarily unavailable. Please try again shortly.</section> : null}
+      {isLoading ? <section className="state-card">Loading current coverage…</section> : null}
+      {hasError ? <section className="state-card error">Coverage is temporarily unavailable. Please try again shortly.</section> : null}
 
-      {!loading && !error && themesPayload?.themes.length === 0 ? (
+      {!isLoading && !hasError && themesPayload?.themes.length === 0 ? (
         <section className="state-card">
           <p>No current coverage for {activeTicker}.</p>
           <p>Check back after the next update.</p>
         </section>
       ) : null}
 
-      {!loading && !error && themesPayload?.themes.length ? (
+      {!isLoading && !hasError && themesPayload?.themes.length ? (
         <section className="theme-grid">
           {themesPayload.themes.map((theme) => (
             <ThemeCard key={theme.id} theme={theme} />
@@ -233,7 +235,7 @@ export default function App() {
         </section>
       ) : null}
 
-      {!loading && !error && themesPayload?.other_coverage?.story_count ? (
+      {!isLoading && !hasError && themesPayload?.other_coverage?.story_count ? (
         <section className="other-coverage">
           <div>
             <p className="eyebrow">Other coverage</p>

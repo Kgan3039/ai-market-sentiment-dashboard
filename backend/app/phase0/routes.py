@@ -5,7 +5,11 @@ from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .repository import NarrativeReadRepository, get_narrative_repository
-from .schemas import MetaStatusResponse, TickerListResponse, TickerThemesResponse
+from .schemas import (
+    MetaStatusResponse,
+    TickerListResponse,
+    TickerThemesResponse,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["Ticker Narratives"])
 
@@ -18,9 +22,11 @@ def repository_dependency() -> NarrativeReadRepository:
 def list_tickers(
     repository: NarrativeReadRepository = Depends(repository_dependency),
 ) -> TickerListResponse:
-    """Return the fixed Phase 0 ticker universe and its current coverage counts."""
+    """Return the fixed ticker universe and its current coverage counts."""
     status = repository.get_status()
-    return TickerListResponse(data_as_of=status.data_as_of, tickers=repository.list_tickers())
+    return TickerListResponse(
+        data_as_of=status.data_as_of, tickers=repository.list_tickers()
+    )
 
 
 @router.get("/tickers/{ticker}/themes", response_model=TickerThemesResponse)
@@ -29,9 +35,11 @@ def get_ticker_themes(
     date_value: date | None = Query(default=None, alias="date"),
     repository: NarrativeReadRepository = Depends(repository_dependency),
 ) -> TickerThemesResponse:
-    """Return ranked, cited coverage themes for one ticker and optional trading day."""
+    """Return ranked, cited themes for one ticker and optional trading day."""
     try:
-        return repository.get_themes(ticker, date_value.isoformat() if date_value else None)
+        return repository.get_themes(
+            ticker, date_value.isoformat() if date_value else None
+        )
     except KeyError as exc:
         raise HTTPException(
             status_code=404,

@@ -27,7 +27,7 @@ class CitedSentence(BaseModel):
 
     @field_validator("citation_ids")
     @classmethod
-    def validate_unique_citation_ids(cls, citation_ids: list[str]) -> list[str]:
+    def validate_unique_ids(cls, citation_ids: list[str]) -> list[str]:
         if len(citation_ids) != len(set(citation_ids)):
             raise ValueError("Sentence citation ids must be unique")
         return citation_ids
@@ -39,7 +39,7 @@ class Theme(BaseModel):
     id: str
     label: str = Field(min_length=1, max_length=120)
     rank: int = Field(ge=1)
-    # Mirrors ai.summarization.ThemeSummary so pipeline output can pass through unchanged.
+    # Matches ai.summarization.ThemeSummary so pipeline output passes through.
     sentences: list[CitedSentence] = Field(default_factory=list)
     citations: list[Citation] = Field(default_factory=list)
     stories: list[Story] = Field(default_factory=list)
@@ -50,9 +50,11 @@ class Theme(BaseModel):
     @model_validator(mode="after")
     def validate_theme_integrity(self):
         if self.degraded and self.sentences:
-            raise ValueError("Degraded themes must not include generated summary sentences")
+            raise ValueError(
+                "Degraded themes must not include generated summary sentences"
+            )
         if not self.degraded and not 2 <= len(self.sentences) <= 4:
-            raise ValueError("Non-degraded themes must include 2 to 4 cited summary sentences")
+            raise ValueError("Non-degraded themes need 2 to 4 cited sentences")
 
         story_ids = [story.id for story in self.stories]
         citation_ids = [citation.id for citation in self.citations]
@@ -61,23 +63,27 @@ class Theme(BaseModel):
         if len(citation_ids) != len(set(citation_ids)):
             raise ValueError("Theme citations must have unique ids")
         if self.story_count != len(self.stories):
-            raise ValueError("Theme story_count must match the returned story list")
+            raise ValueError("Theme story_count must match returned stories")
         if self.outlet_count != len({story.outlet for story in self.stories}):
-            raise ValueError("Theme outlet_count must match the returned story list")
+            raise ValueError("Theme outlet_count must match returned stories")
 
         story_by_id = {story.id: story for story in self.stories}
         for citation in self.citations:
             story = story_by_id.get(citation.id)
             if story is None:
-                raise ValueError("Theme citations must belong to returned member stories")
+                raise ValueError(
+                    "Theme citations must belong to returned member stories"
+                )
             if citation.model_dump() != story.model_dump():
-                raise ValueError("Theme citations must match their returned member stories")
+                raise ValueError(
+                    "Theme citations must match their returned member stories"
+                )
 
         citation_id_set = set(citation_ids)
         for sentence in self.sentences:
             unknown_ids = set(sentence.citation_ids) - citation_id_set
             if unknown_ids:
-                raise ValueError(f"Summary references unknown citations: {sorted(unknown_ids)}")
+                raise ValueError(f"Unknown citations: {sorted(unknown_ids)}")
         return self
 
 
@@ -94,9 +100,9 @@ class OtherCoverage(BaseModel):
         if len(story_ids) != len(set(story_ids)):
             raise ValueError("Other coverage stories must have unique ids")
         if self.story_count != len(self.stories):
-            raise ValueError("Other coverage story_count must match the returned story list")
+            raise ValueError("Other coverage story_count must match stories")
         if self.outlet_count != len({story.outlet for story in self.stories}):
-            raise ValueError("Other coverage outlet_count must match the returned story list")
+            raise ValueError("Other coverage outlet_count must match stories")
         return self
 
 
@@ -115,13 +121,13 @@ class TickerThemesResponse(BaseModel):
         if len(ranks) != len(set(ranks)):
             raise ValueError("Theme ranks must be unique for a ticker day")
 
-        story_ids = [
-            story.id
-            for theme in self.themes
-            for story in theme.stories
-        ] + [story.id for story in self.other_coverage.stories]
+        themed_story_ids = [
+            story.id for theme in self.themes for story in theme.stories
+        ]
+        other_story_ids = [story.id for story in self.other_coverage.stories]
+        story_ids = themed_story_ids + other_story_ids
         if len(story_ids) != len(set(story_ids)):
-            raise ValueError("A story can appear in only one theme or Other coverage")
+            raise ValueError("A story has only one theme or Other coverage")
         return self
 
 
