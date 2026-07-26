@@ -153,9 +153,7 @@ class FixtureNarrativeRepository:
         status_payload = dict(self.fixture["status"])
         data_as_of = _parse_timestamp(status_payload.get("data_as_of"))
         if data_as_of is None:
-            data_as_of = self._latest_fixture_timestamp()
-        if data_as_of is None:
-            raise ValueError("Fixture status needs a valid timestamp")
+            raise ValueError("Fixture status data_as_of must be valid")
 
         status_payload["data_as_of"] = data_as_of
         status_payload["is_stale"] = is_stale_during_market_hours(
@@ -167,16 +165,6 @@ class FixtureNarrativeRepository:
     def _latest_day(self, ticker: str) -> dict:
         days = self.fixture["ticker_days"][ticker]
         return days[max(days)]
-
-    def _latest_fixture_timestamp(self) -> datetime | None:
-        timestamps = []
-        ticker_days = self.fixture.get("ticker_days", {})
-        for days in ticker_days.values():
-            for day in days.values():
-                timestamp = _parse_timestamp(day.get("data_as_of"))
-                if timestamp is not None:
-                    timestamps.append(timestamp)
-        return max(timestamps, default=None)
 
 
 @lru_cache(maxsize=1)

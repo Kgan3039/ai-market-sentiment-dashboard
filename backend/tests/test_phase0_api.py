@@ -20,7 +20,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 app = importlib.import_module("main").app
 phase0_repository = importlib.import_module("app.phase0.repository")
 FixtureNarrativeRepository = phase0_repository.FixtureNarrativeRepository
-is_stale_during_market_hours = phase0_repository.is_stale_during_market_hours
 phase0_schemas = importlib.import_module("app.phase0.schemas")
 CitedSentence = phase0_schemas.CitedSentence
 Citation = phase0_schemas.Citation
@@ -180,18 +179,23 @@ def test_fixture_freshness_is_not_stale_outside_market_hours():
 
 
 @pytest.mark.parametrize("status_timestamp", [None, "not-a-timestamp"])
-def test_fixture_freshness_handles_missing_or_malformed_timestamps(
+def test_fixture_status_rejects_missing_or_malformed_data_as_of(
     status_timestamp,
 ):
     now = datetime(2026, 7, 15, 17, 0, tzinfo=timezone.utc)
     repository = _fixture_repository(status_timestamp, now)
 
-    status = repository.get_status()
+    with pytest.raises(ValueError, match="data_as_of"):
+        repository.get_status()
 
-    expected_timestamp = datetime.fromisoformat("2026-07-15T15:30:00+00:00")
-    assert status.data_as_of == expected_timestamp
-    assert status.is_stale is True
-    assert is_stale_during_market_hours("not-a-timestamp", now) is False
+
+def test_fixture_freshness_is_not_stale_on_weekends():
+    repository = _fixture_repository(
+        "2026-07-15T13:30:00Z",
+        datetime(2026, 7, 18, 15, 15, tzinfo=timezone.utc),
+    )
+
+    assert repository.get_status().is_stale is False
 
 
 def test_fixture_read_p95_is_under_300ms():

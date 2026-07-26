@@ -32,6 +32,10 @@ Every theme contains `id`, `label`, `rank`, `sentences`, `citations`,
 record per pipeline stage. A record contains `stage`, `status`, `started_at`,
 `completed_at`, `duration_ms`, and `error_count`.
 
+`status.data_as_of` is required, authoritative pipeline metadata. Missing or
+unparseable values are invalid pipeline output and are never inferred from
+ticker coverage timestamps.
+
 ## Fixture Source
 
 The committed source is
