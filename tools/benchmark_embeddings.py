@@ -1,9 +1,9 @@
 """Reproducible real-model benchmark for GitHub issue #63.
 
 This script intentionally sits outside the ordinary test suite because model
-availability and hardware performance vary.  It builds a representative
-250-item day (50 items for each Phase 0 ticker) from committed story fixtures,
-warms the model once, and times one batch encoding pass.
+availability and hardware performance vary. It builds a fixture-derived
+250-item warm-model load (50 items for each Phase 0 ticker), warms the model
+once, and times one batch encoding pass.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from typing import Any
 
 from nlp.embeddings import (
     DEFAULT_MODEL_NAME,
-    DEFAULT_MODEL_REVISION,
     EmbeddingService,
 )
 
@@ -55,7 +54,7 @@ def _fixture_records(items_per_ticker: int) -> list[tuple[str, str | None]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
-    parser.add_argument("--model-revision", default=DEFAULT_MODEL_REVISION)
+    parser.add_argument("--model-revision")
     parser.add_argument("--cache-location")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--items-per-ticker", type=int, default=50)
@@ -76,11 +75,11 @@ def main() -> int:
         json.dumps(
             {
                 "batch_size": args.batch_size,
-                "condition": "warm",
+                "condition": "fixture-derived warm-model load",
                 "elapsed_seconds": round(elapsed, 3),
                 "item_count": len(records),
                 "model": args.model,
-                "model_revision": args.model_revision,
+                "model_revision": service.model_revision,
                 "tickers": list(TICKERS),
                 "vector_dimension": len(vectors[0]) if vectors else None,
                 "within_60_seconds": elapsed < 60,

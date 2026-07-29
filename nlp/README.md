@@ -15,10 +15,18 @@ Persistence is intentionally behind the `EmbeddingRepository` protocol. Main
 does not yet contain issue #57's write repository, so this module does not
 create a parallel SQLite layer. The eventual adapter must atomically implement
 `get_embedding()` and `upsert_embedding()` and persist all fields in
-`PersistedEmbedding`.
+`PersistedEmbedding`. Unit tests recreate repository adapters over shared
+in-memory backing state; they do not claim durable SQLite restart coverage.
 
-Run the hardware-sensitive real-model acceptance benchmark separately:
+Run the hardware-sensitive, fixture-derived warm-model benchmark separately:
 
 ```bash
 python -m tools.benchmark_embeddings
+```
+
+Black-compatible Flake8 policy is committed in `.flake8`. Lint the M1 files
+with:
+
+```bash
+python -m flake8 nlp/embeddings.py tests/test_embeddings.py tools/benchmark_embeddings.py
 ```

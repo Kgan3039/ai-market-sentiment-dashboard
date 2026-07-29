@@ -12,6 +12,7 @@ import hashlib
 import math
 import os
 from pathlib import Path
+import re
 import struct
 import threading
 from typing import (
@@ -36,8 +37,7 @@ EMBEDDING_DTYPE = "float32"
 _BLOB_MAGIC = b"TNEMB001"
 _BLOB_HEADER = struct.Struct(">8sIB")
 _FLOAT32_CODE = 1
-_USE_DEFAULT_REVISION = object()
-_USE_DEFAULT_DIMENSION = object()
+_PARAGRAPH_BREAK_PATTERN = re.compile(r"\n(?:[ \t]*\n)+")
 _SHARED_ENCODERS: dict[tuple[str, str | None, str | None], Any] = {}
 _SHARED_ENCODERS_LOCK = threading.Lock()
 
@@ -119,6 +119,26 @@ def _normalize_component(value: str | None, field: str) -> str:
     return " ".join(value.split())
 
 
+def canonicalize_model_input(text: str) -> str:
+    """Normalize text while preserving canonical paragraph separators.
+
+    Runs of two or more newlines become exactly ``"\\n\\n"``. Whitespace
+    inside each paragraph is collapsed to a single space.
+    """
+
+    if not isinstance(text, str):
+        raise EmbeddingInputError("text must be a string")
+    normalized_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = [
+        " ".join(paragraph.split())
+        for paragraph in _PARAGRAPH_BREAK_PATTERN.split(normalized_newlines)
+    ]
+    canonical = "\n\n".join(paragraph for paragraph in paragraphs if paragraph)
+    if not canonical:
+        raise EmbeddingInputError("text must contain usable content")
+    return canonical
+
+
 def compose_embedding_text(title: str | None, description: str | None) -> str:
     """Build deterministic model input from normalized title and description.
 
@@ -132,17 +152,14 @@ def compose_embedding_text(title: str | None, description: str | None) -> str:
     parts = [part for part in (normalized_title, normalized_description) if part]
     if not parts:
         raise EmbeddingInputError("title or description must contain usable text")
-    return "\n\n".join(parts)
+    return canonicalize_model_input("\n\n".join(parts))
 
 
 def input_fingerprint(text: str) -> str:
     """Return a stable SHA-256 fingerprint for normalized model input."""
 
-    if not isinstance(text, str):
-        raise EmbeddingInputError("text must be a string")
-    if not text.strip():
-        raise EmbeddingInputError("text must contain usable content")
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    canonical = canonicalize_model_input(text)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _validated_vector(
@@ -279,10 +296,10 @@ class EmbeddingService:
         self,
         *,
         model_name: str = DEFAULT_MODEL_NAME,
-        model_revision: str | None | object = _USE_DEFAULT_REVISION,
+        model_revision: str | None = None,
         cache_location: str | Path | None = None,
         batch_size: int = 32,
-        expected_dimension: int | None | object = _USE_DEFAULT_DIMENSION,
+        expected_dimension: int | None = None,
         encoder_factory: EncoderFactory | None = None,
     ) -> None:
         normalized_model = str(model_name).strip()
@@ -292,14 +309,12 @@ class EmbeddingService:
             raise EmbeddingInputError("batch_size must be a positive integer")
         if batch_size <= 0:
             raise EmbeddingInputError("batch_size must be a positive integer")
-        if expected_dimension is _USE_DEFAULT_DIMENSION:
+        if expected_dimension is None:
             configured_dimension: int | None = (
                 DEFAULT_VECTOR_DIMENSION
                 if normalized_model == DEFAULT_MODEL_NAME
                 else None
             )
-        elif expected_dimension is None:
-            configured_dimension = None
         elif (
             isinstance(expected_dimension, bool)
             or not isinstance(expected_dimension, int)
@@ -312,22 +327,16 @@ class EmbeddingService:
             configured_dimension = expected_dimension
         configured_cache = cache_location or os.getenv(MODEL_CACHE_ENV)
         self.model_name = normalized_model
-        if model_revision is _USE_DEFAULT_REVISION:
+        if model_revision is None:
             configured_revision: str | None = (
                 DEFAULT_MODEL_REVISION
                 if normalized_model == DEFAULT_MODEL_NAME
                 else None
             )
-        elif model_revision is None:
-            configured_revision = None
         else:
             configured_revision = str(model_revision).strip()
         self.model_revision = configured_revision
-        if (
-            model_revision is not None
-            and model_revision is not _USE_DEFAULT_REVISION
-            and not configured_revision
-        ):
+        if model_revision is not None and not configured_revision:
             raise EmbeddingInputError("model_revision must be non-empty when provided")
         self.cache_location = (
             str(Path(configured_cache).expanduser()) if configured_cache else None
@@ -391,19 +400,19 @@ class EmbeddingService:
             raise EmbeddingInputError("texts must be a sequence of strings")
         if not texts:
             return []
-        normalized_texts = []
+        canonical_texts = []
         for index, text in enumerate(texts):
-            normalized = _normalize_component(text, f"texts[{index}]")
-            if not normalized:
-                raise EmbeddingInputError(f"texts[{index}] must be non-empty")
-            normalized_texts.append(normalized)
+            try:
+                canonical_texts.append(canonicalize_model_input(text))
+            except EmbeddingInputError as exc:
+                raise EmbeddingInputError(f"texts[{index}] is invalid: {exc}") from exc
         try:
             encoder = self._get_encoder()
         except EmbeddingModelLoadError:
             raise
         try:
             encoded = encoder.encode(
-                normalized_texts,
+                canonical_texts,
                 batch_size=self.batch_size,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
@@ -411,13 +420,13 @@ class EmbeddingService:
             )
         except Exception as exc:
             raise EmbeddingEncodingError(
-                f"failed to encode {len(normalized_texts)} text item(s)"
+                f"failed to encode {len(canonical_texts)} text item(s)"
             ) from exc
         try:
             matrix = np.asarray(encoded)
         except (TypeError, ValueError) as exc:
             raise EmbeddingEncodingError("encoder returned non-numeric output") from exc
-        if matrix.ndim != 2 or matrix.shape[0] != len(normalized_texts):
+        if matrix.ndim != 2 or matrix.shape[0] != len(canonical_texts):
             raise EmbeddingEncodingError(
                 "encoder output count does not match input count"
             )
@@ -463,13 +472,22 @@ class EmbeddingService:
         if not isinstance(repository, EmbeddingRepository):
             raise TypeError("repository does not implement EmbeddingRepository")
         normalized: list[tuple[EmbeddingTarget, str, str, str]] = []
+        seen_identities: set[tuple[SourceKind, str]] = set()
+        for target in targets:
+            source_id = target.normalized_source_id()
+            identity = (target.source_kind, source_id)
+            if identity in seen_identities:
+                raise EmbeddingInputError(
+                    "duplicate embedding target identity: "
+                    f"{target.source_kind}:{source_id}"
+                )
+            seen_identities.add(identity)
+            text = compose_embedding_text(target.title, target.description)
+            normalized.append((target, source_id, text, input_fingerprint(text)))
+
         results: list[FloatVector | None] = []
         misses: list[int] = []
-        for index, target in enumerate(targets):
-            source_id = target.normalized_source_id()
-            text = compose_embedding_text(target.title, target.description)
-            fingerprint = input_fingerprint(text)
-            normalized.append((target, source_id, text, fingerprint))
+        for index, (target, source_id, _, fingerprint) in enumerate(normalized):
             stored = repository.get_embedding(target.source_kind, source_id)
             if stored is not None and not isinstance(stored, PersistedEmbedding):
                 raise EmbeddingStorageError(

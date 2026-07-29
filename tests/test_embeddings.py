@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import math
+from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
@@ -19,6 +22,7 @@ from nlp.embeddings import (
     EmbeddingStorageError,
     EmbeddingTarget,
     PersistedEmbedding,
+    canonicalize_model_input,
     compose_embedding_text,
     cosine_similarity,
     deserialize_vector,
@@ -52,11 +56,13 @@ class ContractRepository:
         self, state: dict[tuple[str, str], PersistedEmbedding] | None = None
     ) -> None:
         self.state = state if state is not None else {}
+        self.read_count = 0
         self.write_count = 0
 
     def get_embedding(
         self, source_kind: str, source_id: str
     ) -> PersistedEmbedding | None:
+        self.read_count += 1
         return self.state.get((source_kind, source_id))
 
     def upsert_embedding(self, embedding: PersistedEmbedding) -> None:
@@ -95,6 +101,13 @@ def test_title_and_description_composition_is_deterministic() -> None:
     assert (
         compose_embedding_text("  NVIDIA   unveils GPU ", " New\naccelerator  ")
         == "NVIDIA unveils GPU\n\nNew accelerator"
+    )
+
+
+def test_canonical_model_input_preserves_paragraph_separator() -> None:
+    assert (
+        canonicalize_model_input("  Title \r\n \r\n Description  ")
+        == "Title\n\nDescription"
     )
 
 
@@ -143,6 +156,55 @@ def test_batch_embedding_preserves_order_and_uses_one_model_call() -> None:
         np.allclose(actual, expected) for actual, expected in zip(vectors, singles)
     )
     assert encoder.calls == [["first", "second", "third"]]
+
+
+def test_record_path_encodes_exact_composed_input() -> None:
+    service, encoder, _ = service_with_fake()
+    service.embed_record("  Title  ", " Description ")
+    assert encoder.calls == [["Title\n\nDescription"]]
+
+
+def test_direct_text_and_batch_paths_preserve_canonical_separator() -> None:
+    service, encoder, _ = service_with_fake()
+    service.embed_text("  Title \n\n Description  ")
+    service.embed_batch([" First \n\n Description ", " Second "])
+    assert encoder.calls == [
+        ["Title\n\nDescription"],
+        ["First\n\nDescription", "Second"],
+    ]
+
+
+def test_record_batch_preserves_composition_and_order() -> None:
+    service, encoder, _ = service_with_fake()
+    service.embed_records(
+        [
+            (" First title ", " First description "),
+            (" Second title ", None),
+            (None, " Third description "),
+        ]
+    )
+    assert encoder.calls == [
+        [
+            "First title\n\nFirst description",
+            "Second title",
+            "Third description",
+        ]
+    ]
+
+
+def test_target_fingerprint_hashes_exact_encoder_input() -> None:
+    repository = ContractRepository()
+    service, encoder, _ = service_with_fake()
+    target = EmbeddingTarget("story", "story-1", " Title ", " Description ")
+    service.embed_targets([target], repository)
+    encoded_input = encoder.calls[0][0]
+    stored = repository.get_embedding("story", "story-1")
+    assert stored is not None
+    assert encoded_input == compose_embedding_text(target.title, target.description)
+    assert (
+        stored.input_fingerprint
+        == hashlib.sha256(encoded_input.encode("utf-8")).hexdigest()
+    )
 
 
 def test_model_is_lazy_loaded_once_and_reused() -> None:
@@ -267,7 +329,7 @@ def test_dimension_and_dtype_metadata_mismatch_are_rejected() -> None:
         deserialize_vector(blob, expected_dimension=3, expected_dtype="float64")
 
 
-def test_repository_protocol_and_reconnect_persistence() -> None:
+def test_repository_adapter_recreation_uses_shared_backing_state() -> None:
     state: dict[tuple[str, str], PersistedEmbedding] = {}
     first_repository = ContractRepository(state)
     service, encoder, _ = service_with_fake()
@@ -337,6 +399,51 @@ def test_changed_model_revision_invalidates_stored_embedding() -> None:
     assert stored.model_revision == "revision-2"
     assert len(second_encoder.calls) == 1
     assert repository.write_count == 2
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [
+        [
+            EmbeddingTarget("story", "same", "Title", "Description"),
+            EmbeddingTarget("story", "same", "Title", "Description"),
+        ],
+        [
+            EmbeddingTarget("story", "same", "First", None),
+            EmbeddingTarget("story", "same", "Second", None),
+        ],
+    ],
+)
+def test_duplicate_target_identity_is_rejected_before_side_effects(
+    targets: list[EmbeddingTarget],
+) -> None:
+    repository = ContractRepository()
+    service, encoder, _ = service_with_fake()
+    with pytest.raises(
+        EmbeddingInputError,
+        match="duplicate embedding target identity: story:same",
+    ):
+        service.embed_targets(targets, repository)
+    assert encoder.calls == []
+    assert repository.read_count == 0
+    assert repository.write_count == 0
+
+
+def test_distinct_target_identities_preserve_order() -> None:
+    repository = ContractRepository()
+    service, encoder, _ = service_with_fake()
+    targets = [
+        EmbeddingTarget("story", "story-2", "Second", None),
+        EmbeddingTarget("raw_item", "raw-1", "First", None),
+        EmbeddingTarget("theme", "theme-3", "Third", None),
+    ]
+    vectors = service.embed_targets(targets, repository)
+    assert encoder.calls == [["Second", "First", "Third"]]
+    assert len(vectors) == len(targets)
+    assert [
+        repository.get_embedding(target.source_kind, str(target.source_id)) is not None
+        for target in targets
+    ] == [True, True, True]
 
 
 @pytest.mark.parametrize(
@@ -421,6 +528,20 @@ def test_encoding_failure_is_explicit() -> None:
         service.embed_text("valid input")
 
 
-def test_standard_suite_does_not_import_sentence_transformers() -> None:
-    service, _, _ = service_with_fake()
-    service.embed_text("offline fixture")
+def test_module_import_does_not_import_sentence_transformers() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import nlp.embeddings; "
+                "print('sentence_transformers' in sys.modules)"
+            ),
+        ],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "False"
