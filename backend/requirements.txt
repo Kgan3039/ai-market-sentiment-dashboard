@@ -1,5 +1,5 @@
 # FastAPI framework
-fastapi==0.109.0
+fastapi==0.115.6
 uvicorn[standard]==0.27.0
 
 # Data validation & serialization
@@ -20,6 +20,9 @@ aiohttp==3.9.1
 
 # Development
 pytest==7.4.3
+# This FastAPI/Starlette pair supports TestClient with google-genai's httpx requirement.
+starlette==0.41.3
+httpx==0.28.1
 black==23.12.1
 flake8==6.1.0
 
