@@ -434,6 +434,28 @@ def test_database_rejects_citation_outside_theme_member_stories(tmp_path):
                 """,
                 (theme_id, non_member),
             )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="story member",
+        ):
+            connection.execute(
+                """
+                DELETE FROM story_members
+                WHERE story_id = ? AND raw_item_id = ?
+                """,
+                (story_id, member),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="theme story",
+        ):
+            connection.execute(
+                """
+                DELETE FROM theme_stories
+                WHERE theme_id = ? AND story_id = ?
+                """,
+                (theme_id, story_id),
+            )
 
 
 def test_raw_evidence_and_associations_survive_reconnect(tmp_path):

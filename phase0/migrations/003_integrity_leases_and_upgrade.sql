@@ -53,3 +53,125 @@ BEGIN
         'theme citation must belong to a member story'
     );
 END;
+
+CREATE TRIGGER IF NOT EXISTS trg_story_member_citation_delete
+BEFORE DELETE ON story_members
+WHEN EXISTS (
+    SELECT 1
+    FROM theme_stories
+    JOIN theme_citations
+      ON theme_citations.theme_id = theme_stories.theme_id
+     AND theme_citations.raw_item_id = OLD.raw_item_id
+    WHERE theme_stories.story_id = OLD.story_id
+      AND NOT EXISTS (
+          SELECT 1
+          FROM theme_stories AS alternate_theme_story
+          JOIN story_members AS alternate_member
+            ON alternate_member.story_id = alternate_theme_story.story_id
+          WHERE alternate_theme_story.theme_id = theme_stories.theme_id
+            AND alternate_member.raw_item_id = OLD.raw_item_id
+            AND NOT (
+                alternate_member.story_id = OLD.story_id
+                AND alternate_member.raw_item_id = OLD.raw_item_id
+            )
+      )
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'story member is required by a theme citation'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_story_member_citation_update
+BEFORE UPDATE OF story_id, raw_item_id ON story_members
+WHEN OLD.story_id <> NEW.story_id OR OLD.raw_item_id <> NEW.raw_item_id
+BEGIN
+    SELECT CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM theme_stories
+            JOIN theme_citations
+              ON theme_citations.theme_id = theme_stories.theme_id
+             AND theme_citations.raw_item_id = OLD.raw_item_id
+            WHERE theme_stories.story_id = OLD.story_id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM theme_stories AS alternate_theme_story
+                  JOIN story_members AS alternate_member
+                    ON alternate_member.story_id =
+                        alternate_theme_story.story_id
+                  WHERE alternate_theme_story.theme_id =
+                        theme_stories.theme_id
+                    AND alternate_member.raw_item_id = OLD.raw_item_id
+                    AND NOT (
+                        alternate_member.story_id = OLD.story_id
+                        AND alternate_member.raw_item_id = OLD.raw_item_id
+                    )
+              )
+        )
+        THEN RAISE(
+            ABORT,
+            'story member is required by a theme citation'
+        )
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_theme_story_citation_delete
+BEFORE DELETE ON theme_stories
+WHEN EXISTS (
+    SELECT 1
+    FROM theme_citations
+    JOIN story_members
+      ON story_members.story_id = OLD.story_id
+     AND story_members.raw_item_id = theme_citations.raw_item_id
+    WHERE theme_citations.theme_id = OLD.theme_id
+      AND NOT EXISTS (
+          SELECT 1
+          FROM theme_stories AS alternate_theme_story
+          JOIN story_members AS alternate_member
+            ON alternate_member.story_id = alternate_theme_story.story_id
+          WHERE alternate_theme_story.theme_id = OLD.theme_id
+            AND alternate_theme_story.story_id <> OLD.story_id
+            AND alternate_member.raw_item_id =
+                theme_citations.raw_item_id
+      )
+)
+BEGIN
+    SELECT RAISE(
+        ABORT,
+        'theme story is required by a theme citation'
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_theme_story_citation_update
+BEFORE UPDATE OF theme_id, story_id ON theme_stories
+WHEN OLD.theme_id <> NEW.theme_id OR OLD.story_id <> NEW.story_id
+BEGIN
+    SELECT CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM theme_citations
+            JOIN story_members
+              ON story_members.story_id = OLD.story_id
+             AND story_members.raw_item_id =
+                 theme_citations.raw_item_id
+            WHERE theme_citations.theme_id = OLD.theme_id
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM theme_stories AS alternate_theme_story
+                  JOIN story_members AS alternate_member
+                    ON alternate_member.story_id =
+                        alternate_theme_story.story_id
+                  WHERE alternate_theme_story.theme_id = OLD.theme_id
+                    AND alternate_theme_story.story_id <> OLD.story_id
+                    AND alternate_member.raw_item_id =
+                        theme_citations.raw_item_id
+              )
+        )
+        THEN RAISE(
+            ABORT,
+            'theme story is required by a theme citation'
+        )
+    END;
+END;
