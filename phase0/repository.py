@@ -7,7 +7,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -24,6 +24,7 @@ SECRET_VALUE_PATTERN = re.compile(
     r"(?i)\b(authorization|password|secret|token|api[_-]?key)"
     r"(\s*[:=]\s*)([^\s,;&]+)"
 )
+BEARER_CREDENTIAL_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 
 
 def utc_now() -> str:
@@ -85,7 +86,11 @@ def _redact_secrets(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_redact_secrets(item) for item in value]
     if isinstance(value, str):
-        return SECRET_VALUE_PATTERN.sub(r"\1\2[REDACTED]", value)
+        without_bearer = BEARER_CREDENTIAL_PATTERN.sub(
+            "Bearer [REDACTED]",
+            value,
+        )
+        return SECRET_VALUE_PATTERN.sub(r"\1\2[REDACTED]", without_bearer)
     return value
 
 
@@ -155,6 +160,8 @@ class Phase0Repository:
                 )
                 try:
                     connection.execute("BEGIN IMMEDIATE")
+                    if version == 3 and current == 2:
+                        self._upgrade_legacy_v2(connection)
                     for statement in statements:
                         connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {version}")
@@ -165,6 +172,358 @@ class Phase0Repository:
                 current = version
         finally:
             connection.close()
+
+    def _upgrade_legacy_v2(self, connection: sqlite3.Connection) -> None:
+        """Convert the originally published v2 schema before migration 003."""
+        raw_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(raw_items)")
+        }
+        if "external_id" in raw_columns:
+            return
+
+        legacy_tables = {
+            "raw_items",
+            "stories",
+            "themes",
+            "run_log",
+            "eval_labels",
+            "source_state",
+            "pipeline_stage_keys",
+        }
+        existing_tables = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        missing = legacy_tables - existing_tables
+        if missing:
+            raise RuntimeError(
+                "legacy v2 database is missing required tables: "
+                + ", ".join(sorted(missing))
+            )
+
+        for index in (
+            "idx_raw_items_ticker_published",
+            "idx_stories_ticker_day",
+            "idx_themes_ticker_day",
+            "idx_run_log_stage_started",
+        ):
+            connection.execute(f"DROP INDEX IF EXISTS {index}")
+        for table in legacy_tables:
+            connection.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy_v2")
+
+        for migration_name in (
+            "001_initial.sql",
+            "002_source_state_and_stage_keys.sql",
+        ):
+            sql = (self.migrations_path / migration_name).read_text(encoding="utf-8")
+            for statement in _migration_statements(sql):
+                connection.execute(statement)
+
+        connection.execute(
+            """
+            INSERT INTO raw_items (
+                id, source, ticker, title, description, url, canonical_url,
+                external_id, published_at, fetched_at, ingest_status,
+                validation_errors, raw_json
+            )
+            SELECT
+                id,
+                source,
+                ticker,
+                NULLIF(trim(title), ''),
+                description,
+                NULLIF(trim(url), ''),
+                canonical_url,
+                NULL,
+                CASE
+                    WHEN published_at IS NULL THEN NULL
+                    WHEN datetime(published_at) IS NOT NULL THEN published_at
+                    ELSE NULL
+                END,
+                CASE
+                    WHEN datetime(fetched_at) IS NOT NULL THEN fetched_at
+                    ELSE '1970-01-01T00:00:00+00:00'
+                END,
+                CASE
+                    WHEN length(trim(COALESCE(title, ''))) > 0
+                     AND length(trim(COALESCE(url, ''))) > 0
+                    THEN 'valid'
+                    ELSE 'invalid'
+                END,
+                CASE
+                    WHEN datetime(fetched_at) IS NULL
+                      OR (
+                        published_at IS NOT NULL
+                        AND datetime(published_at) IS NULL
+                      )
+                    THEN json_array(
+                        'legacy timestamps normalized during migration'
+                    )
+                    ELSE '[]'
+                END,
+                CASE
+                    WHEN json_valid(raw_json)
+                     AND json_type(raw_json) = 'object'
+                    THEN raw_json
+                    ELSE json_object('legacy_value', raw_json)
+                END
+            FROM raw_items_legacy_v2
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO raw_item_tickers (
+                raw_item_id, ticker, association_type
+            )
+            SELECT id, trim(upper(ticker)), 'source'
+            FROM raw_items
+            WHERE ticker IS NOT NULL AND length(trim(ticker)) > 0
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO stories (
+                id, ticker, trading_day, canonical_title, embedding,
+                outlet_count, member_ids
+            )
+            SELECT
+                id,
+                ticker,
+                CASE
+                    WHEN date(trading_day) = trading_day
+                    THEN trading_day
+                    ELSE '1970-01-01'
+                END,
+                canonical_title,
+                embedding,
+                CASE WHEN outlet_count > 0 THEN outlet_count ELSE 1 END,
+                CASE
+                    WHEN json_valid(member_ids)
+                     AND json_type(member_ids) = 'array'
+                    THEN member_ids
+                    ELSE '[]'
+                END
+            FROM stories_legacy_v2
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO story_members (
+                story_id, raw_item_id, position
+            )
+            SELECT
+                stories_legacy_v2.id,
+                raw_items.id,
+                CAST(member.key AS INTEGER)
+            FROM stories_legacy_v2
+            JOIN json_each(
+                CASE
+                    WHEN json_valid(stories_legacy_v2.member_ids)
+                     AND json_type(stories_legacy_v2.member_ids) = 'array'
+                    THEN stories_legacy_v2.member_ids
+                    ELSE '[]'
+                END
+            ) AS member
+            JOIN raw_items ON raw_items.id = CAST(member.value AS INTEGER)
+            WHERE member.type = 'integer'
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO themes (
+                id, ticker, trading_day, label, summary, citations,
+                salience_rank, status, centroid, content_hash,
+                pipeline_version
+            )
+            SELECT
+                id,
+                ticker,
+                CASE
+                    WHEN date(trading_day) = trading_day
+                    THEN trading_day
+                    ELSE '1970-01-01'
+                END,
+                label,
+                summary,
+                CASE
+                    WHEN json_valid(citations)
+                     AND json_type(citations) = 'array'
+                    THEN citations
+                    ELSE '[]'
+                END,
+                CASE WHEN salience_rank > 0 THEN salience_rank ELSE 1 END,
+                CASE
+                    WHEN status IN (
+                        'pending', 'ready', 'degraded', 'failed'
+                    )
+                    THEN status
+                    ELSE 'failed'
+                END,
+                centroid,
+                content_hash,
+                pipeline_version
+            FROM themes_legacy_v2
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO theme_stories (theme_id, story_id)
+            SELECT themes.id, stories.id
+            FROM themes
+            JOIN stories
+              ON stories.ticker = themes.ticker
+             AND stories.trading_day = themes.trading_day
+            """
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO theme_citations (
+                theme_id, raw_item_id
+            )
+            SELECT
+                themes_legacy_v2.id,
+                raw_items.id
+            FROM themes_legacy_v2
+            JOIN json_each(
+                CASE
+                    WHEN json_valid(themes_legacy_v2.citations)
+                     AND json_type(themes_legacy_v2.citations) = 'array'
+                    THEN themes_legacy_v2.citations
+                    ELSE '[]'
+                END
+            ) AS citation
+            JOIN raw_items
+              ON raw_items.id = CAST(citation.value AS INTEGER)
+            WHERE citation.type = 'integer'
+              AND EXISTS (
+                SELECT 1
+                FROM theme_stories
+                JOIN story_members
+                  ON story_members.story_id = theme_stories.story_id
+                WHERE theme_stories.theme_id = themes_legacy_v2.id
+                  AND story_members.raw_item_id = raw_items.id
+              )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO run_log (
+                id, run_id, stage, counts, duration_ms, errors,
+                started_at, completed_at, status, trading_day,
+                pipeline_version
+            )
+            SELECT
+                id,
+                run_id,
+                stage,
+                CASE WHEN json_valid(counts) THEN counts ELSE '{}' END,
+                CASE WHEN duration_ms >= 0 THEN duration_ms ELSE 0 END,
+                CASE WHEN json_valid(errors) THEN errors ELSE '[]' END,
+                CASE
+                    WHEN datetime(started_at) IS NOT NULL THEN started_at
+                    ELSE '1970-01-01T00:00:00+00:00'
+                END,
+                CASE
+                    WHEN datetime(completed_at) IS NOT NULL THEN completed_at
+                    ELSE '1970-01-01T00:00:00+00:00'
+                END,
+                CASE
+                    WHEN status IN ('success', 'degraded', 'failed')
+                    THEN status
+                    ELSE 'failed'
+                END,
+                CASE
+                    WHEN date(trading_day) = trading_day
+                    THEN trading_day
+                    ELSE '1970-01-01'
+                END,
+                pipeline_version
+            FROM run_log_legacy_v2
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO eval_labels (
+                id, label_type, item_a_id, item_b_id, reviewer,
+                label, notes, created_at
+            )
+            SELECT
+                eval_labels_legacy_v2.id,
+                label_type,
+                item_a_id,
+                item_b_id,
+                COALESCE(reviewer, 'legacy'),
+                COALESCE(label, 'unlabeled'),
+                notes,
+                CASE
+                    WHEN datetime(created_at) IS NOT NULL THEN created_at
+                    ELSE '1970-01-01T00:00:00+00:00'
+                END
+            FROM eval_labels_legacy_v2
+            JOIN raw_items AS item_a ON item_a.id = item_a_id
+            JOIN raw_items AS item_b ON item_b.id = item_b_id
+            WHERE item_a_id <> item_b_id
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_state (
+                source, etag, last_modified, last_checked_at,
+                last_success_at, metadata
+            )
+            SELECT
+                source,
+                etag,
+                last_modified,
+                CASE
+                    WHEN datetime(last_checked_at) IS NOT NULL
+                    THEN last_checked_at
+                    ELSE '1970-01-01T00:00:00+00:00'
+                END,
+                CASE
+                    WHEN datetime(last_success_at) IS NOT NULL
+                    THEN last_success_at
+                    ELSE NULL
+                END,
+                CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END
+            FROM source_state_legacy_v2
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO pipeline_stage_keys (
+                stage, ticker, trading_day, pipeline_version,
+                status, run_id, updated_at
+            )
+            SELECT
+                stage,
+                ticker,
+                CASE
+                    WHEN date(trading_day) = trading_day
+                    THEN trading_day
+                    ELSE '1970-01-01'
+                END,
+                pipeline_version,
+                CASE
+                    WHEN status IN (
+                        'running', 'success', 'degraded', 'failed'
+                    )
+                    THEN status
+                    ELSE 'failed'
+                END,
+                run_id,
+                CASE
+                    WHEN datetime(updated_at) IS NOT NULL THEN updated_at
+                    ELSE '1970-01-01T00:00:00+00:00'
+                END
+            FROM pipeline_stage_keys_legacy_v2
+            """
+        )
+
+        for table in sorted(legacy_tables, reverse=True):
+            connection.execute(f"DROP TABLE {table}_legacy_v2")
 
     def _prepare_raw_item(self, item: Mapping[str, Any]) -> dict[str, Any]:
         source = str(item.get("source") or "").strip()
@@ -360,7 +719,9 @@ class Phase0Repository:
             "checked_at": checked_at,
             "success_at": checked_at if successful else None,
             "metadata": _serialize_json(
-                dict(state.get("metadata") or {}), "source metadata", dict
+                _redact_secrets(dict(state.get("metadata") or {})),
+                "source metadata",
+                dict,
             ),
         }
 
@@ -576,22 +937,43 @@ class Phase0Repository:
         trading_day: str,
         pipeline_version: str,
         run_id: str,
+        lease_seconds: int = 300,
+        claimed_at: str | datetime | None = None,
     ) -> bool:
-        """Atomically claim an unowned or retryable stage key."""
+        """Atomically claim an unowned, retryable, or expired stage key."""
+        if int(lease_seconds) <= 0:
+            raise ValueError("lease_seconds must be positive")
         day = _normalize_day(trading_day)
+        normalized_claimed_at = _normalize_datetime(
+            claimed_at or utc_now(),
+            "claimed_at",
+        )
+        claimed_datetime = datetime.fromisoformat(normalized_claimed_at)
+        lease_expires_at = (
+            claimed_datetime + timedelta(seconds=int(lease_seconds))
+        ).isoformat()
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO pipeline_stage_keys (
                     stage, ticker, trading_day, pipeline_version,
-                    status, run_id, updated_at
-                ) VALUES (?, ?, ?, ?, 'running', ?, ?)
+                    status, run_id, updated_at, lease_expires_at
+                ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
                 ON CONFLICT(stage, ticker, trading_day, pipeline_version)
                 DO UPDATE SET
                     status = 'running',
                     run_id = excluded.run_id,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    lease_expires_at = excluded.lease_expires_at
                 WHERE pipeline_stage_keys.status IN ('failed', 'degraded')
+                   OR (
+                        pipeline_stage_keys.status = 'running'
+                        AND (
+                            pipeline_stage_keys.lease_expires_at IS NULL
+                            OR pipeline_stage_keys.lease_expires_at
+                                <= excluded.updated_at
+                        )
+                   )
                 """,
                 (
                     stage,
@@ -599,7 +981,8 @@ class Phase0Repository:
                     day,
                     pipeline_version,
                     run_id,
-                    utc_now(),
+                    normalized_claimed_at,
+                    lease_expires_at,
                 ),
             )
             return cursor.rowcount == 1
@@ -621,7 +1004,7 @@ class Phase0Repository:
             cursor = connection.execute(
                 """
                 UPDATE pipeline_stage_keys
-                SET status = ?, updated_at = ?
+                SET status = ?, updated_at = ?, lease_expires_at = NULL
                 WHERE stage = ? AND ticker = ? AND trading_day = ?
                     AND pipeline_version = ? AND run_id = ? AND status = 'running'
                 """,

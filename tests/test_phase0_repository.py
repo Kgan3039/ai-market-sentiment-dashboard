@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -50,7 +51,7 @@ def test_migration_enables_wal_and_creates_expected_tables(tmp_path):
     } <= tables
     assert journal_mode == "wal"
     with repository.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -169,19 +170,86 @@ def test_exactly_one_concurrent_stage_claim_wins(tmp_path):
     repository.migrate()
 
     def claim(index):
-        return repository.claim_stage_key(
-            stage="cluster",
-            ticker="NVDA",
-            trading_day="2026-07-23",
-            pipeline_version="v1",
-            run_id=f"run-{index}",
+        return (
+            index,
+            repository.claim_stage_key(
+                stage="cluster",
+                ticker="NVDA",
+                trading_day="2026-07-23",
+                pipeline_version="v1",
+                run_id=f"run-{index}",
+            ),
         )
 
     with ThreadPoolExecutor(max_workers=8) as executor:
-        claims = list(executor.map(claim, range(8)))
+        attempts = list(executor.map(claim, range(8)))
 
+    claims = [claimed for _, claimed in attempts]
     assert claims.count(True) == 1
     assert claims.count(False) == 7
+    winning_index = next(index for index, claimed in attempts if claimed)
+    with repository.connect() as connection:
+        owner = connection.execute("SELECT run_id FROM pipeline_stage_keys").fetchone()[
+            0
+        ]
+    assert owner == f"run-{winning_index}"
+
+
+def test_running_stage_claim_uses_lease_and_only_expires_at_boundary(tmp_path):
+    repository = Phase0Repository(tmp_path / "phase0.sqlite3")
+    repository.migrate()
+    key = {
+        "stage": "cluster",
+        "ticker": "NVDA",
+        "trading_day": "2026-07-23",
+        "pipeline_version": "v1",
+    }
+
+    assert repository.claim_stage_key(
+        **key,
+        run_id="run-1",
+        lease_seconds=60,
+        claimed_at="2026-07-23T12:00:00Z",
+    )
+    assert not repository.claim_stage_key(
+        **key,
+        run_id="run-2",
+        lease_seconds=60,
+        claimed_at="2026-07-23T12:00:59Z",
+    )
+    with repository.connect() as connection:
+        active = dict(
+            connection.execute(
+                """
+                SELECT run_id, lease_expires_at
+                FROM pipeline_stage_keys
+                """
+            ).fetchone()
+        )
+    assert active == {
+        "run_id": "run-1",
+        "lease_expires_at": "2026-07-23T12:01:00+00:00",
+    }
+
+    assert repository.claim_stage_key(
+        **key,
+        run_id="run-2",
+        lease_seconds=120,
+        claimed_at="2026-07-23T12:01:00Z",
+    )
+    with repository.connect() as connection:
+        reclaimed = dict(
+            connection.execute(
+                """
+                SELECT run_id, lease_expires_at
+                FROM pipeline_stage_keys
+                """
+            ).fetchone()
+        )
+    assert reclaimed == {
+        "run_id": "run-2",
+        "lease_expires_at": "2026-07-23T12:03:00+00:00",
+    }
 
 
 def test_replay_cleanup_removes_stage_keys_but_keeps_raw_evidence(tmp_path):
@@ -327,6 +395,45 @@ def test_invalid_relationships_roll_back_parent_rows(tmp_path):
             pipeline_version="v1",
         )
     assert repository.count("themes") == 0
+
+
+def test_database_rejects_citation_outside_theme_member_stories(tmp_path):
+    repository = Phase0Repository(tmp_path / "phase0.sqlite3")
+    repository.migrate()
+    member = repository.insert_raw_item(sample_item()).item_id
+    other_item = sample_item("https://example.com/other")
+    other_item["canonical_url"] = "https://example.com/other"
+    non_member = repository.insert_raw_item(other_item).item_id
+    story_id = repository.insert_story(
+        ticker="NVDA",
+        trading_day="2026-07-23",
+        canonical_title="Member story",
+        member_ids=[member],
+    )
+    theme_id = repository.insert_theme(
+        ticker="NVDA",
+        trading_day="2026-07-23",
+        label="Coverage",
+        story_ids=[story_id],
+        citation_ids=[member],
+        salience_rank=1,
+        status="ready",
+        content_hash="hash",
+        pipeline_version="v1",
+    )
+
+    with repository.connect() as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="member story",
+        ):
+            connection.execute(
+                """
+                INSERT INTO theme_citations (theme_id, raw_item_id)
+                VALUES (?, ?)
+                """,
+                (theme_id, non_member),
+            )
 
 
 def test_raw_evidence_and_associations_survive_reconnect(tmp_path):
@@ -481,6 +588,9 @@ def test_secret_bearing_error_fields_are_redacted(tmp_path):
             {
                 "api_key": "top-secret",
                 "message": "token=abc123 request failed",
+                "authorization_error": (
+                    "Authorization: Bearer bearer-secret request failed"
+                ),
             }
         ],
         started_at="2026-07-23T12:00:00Z",
@@ -492,3 +602,159 @@ def test_secret_bearing_error_fields_are_redacted(tmp_path):
     error = repository.latest_stage_status()[0]["errors"][0]
     assert error["api_key"] == "[REDACTED]"
     assert "abc123" not in error["message"]
+    assert "bearer-secret" not in error["authorization_error"]
+
+
+def test_nested_source_metadata_is_redacted(tmp_path):
+    repository = Phase0Repository(tmp_path / "phase0.sqlite3")
+    repository.migrate()
+    repository.set_source_state(
+        "rss:test",
+        etag=None,
+        last_modified=None,
+        checked_at="2026-07-23T12:00:00Z",
+        successful=False,
+        metadata={
+            "nested": {
+                "authorization": "Bearer source-secret",
+                "message": "Authorization: Bearer inline-secret failed",
+            }
+        },
+    )
+
+    metadata = repository.source_state("rss:test")["metadata"]
+
+    assert metadata["nested"]["authorization"] == "[REDACTED]"
+    assert "inline-secret" not in metadata["nested"]["message"]
+
+
+def test_actual_legacy_v2_database_upgrades_to_latest_without_data_loss(tmp_path):
+    database = tmp_path / "phase0.sqlite3"
+    legacy_migrations = Path(__file__).parent / "fixtures" / "legacy_v2_migrations"
+    legacy = Phase0Repository(database, migrations_path=legacy_migrations)
+    legacy.migrate()
+    with legacy.connect() as connection:
+        connection.executemany(
+            """
+            INSERT INTO raw_items (
+                id, source, ticker, title, description, url,
+                canonical_url, published_at, fetched_at, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    1,
+                    "rss:test",
+                    "NVDA",
+                    "NVIDIA story",
+                    "Description",
+                    "https://example.com/one",
+                    "https://example.com/one",
+                    "2026-07-23T12:00:00+00:00",
+                    "2026-07-23T12:01:00+00:00",
+                    '{"guid":"one"}',
+                ),
+                (
+                    2,
+                    "rss:test",
+                    "NVDA",
+                    "Second story",
+                    "Description",
+                    "https://example.com/two",
+                    "https://example.com/two",
+                    "2026-07-23T12:02:00+00:00",
+                    "2026-07-23T12:03:00+00:00",
+                    '{"guid":"two"}',
+                ),
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO stories (
+                id, ticker, trading_day, canonical_title,
+                outlet_count, member_ids
+            ) VALUES (1, 'NVDA', '2026-07-23', 'NVIDIA story', 1, '[1]')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO themes (
+                id, ticker, trading_day, label, citations,
+                salience_rank, status, content_hash, pipeline_version
+            ) VALUES (
+                1, 'NVDA', '2026-07-23', 'Coverage', '[1]',
+                1, 'ready', 'hash', 'v1'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO eval_labels (
+                label_type, item_a_id, item_b_id, reviewer,
+                label, created_at
+            ) VALUES (
+                'dedup', 1, 2, 'reviewer', 'different',
+                '2026-07-23T13:00:00+00:00'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO run_log (
+                run_id, stage, counts, duration_ms, errors,
+                started_at, completed_at, status, trading_day,
+                pipeline_version
+            ) VALUES (
+                'run', 'fetch', '{"inserted":2}', 5, '[]',
+                '2026-07-23T12:00:00+00:00',
+                '2026-07-23T12:00:01+00:00',
+                'success', '2026-07-23', 'v1'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_state (
+                source, last_checked_at, last_success_at, metadata
+            ) VALUES (
+                'rss:test', '2026-07-23T12:00:00+00:00',
+                '2026-07-23T12:00:00+00:00', '{"status":"success"}'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO pipeline_stage_keys (
+                stage, ticker, trading_day, pipeline_version,
+                status, run_id, updated_at
+            ) VALUES (
+                'cluster', 'NVDA', '2026-07-23', 'v1',
+                'running', 'abandoned',
+                '2026-07-23T12:00:00+00:00'
+            )
+            """
+        )
+    with legacy.connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+
+    assert upgraded.count("raw_items") == 2
+    assert upgraded.count("story_members") == 1
+    assert upgraded.count("theme_stories") == 1
+    assert upgraded.count("theme_citations") == 1
+    assert upgraded.count("eval_labels") == 1
+    assert upgraded.count("run_log") == 1
+    assert upgraded.count("source_state") == 1
+    with upgraded.connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        lease = connection.execute(
+            """
+            SELECT lease_expires_at FROM pipeline_stage_keys
+            WHERE run_id = 'abandoned'
+            """
+        ).fetchone()[0]
+    assert lease == "2026-07-23T12:00:00+00:00"
