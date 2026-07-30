@@ -31,6 +31,7 @@ pandas==2.2.1
 numpy==1.24.3
 scikit-learn==1.6.1
 yfinance==0.2.65
+sentence-transformers==3.4.1
 
 # LLM provider for theme summarization (ai/summarization.py, issue #65)
 google-genai==2.13.0
