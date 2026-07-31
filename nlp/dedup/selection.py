@@ -20,6 +20,7 @@ import hashlib
 from typing import Sequence
 
 from .config import ALGORITHM_VERSION
+from .errors import DedupInputError
 from .detection import DuplicateGroup
 from .models import (
     DeduplicatedCluster,
@@ -78,8 +79,11 @@ def encode_fields(fields: Sequence[str]) -> bytes:
 def cluster_fingerprint_for(ticker: str, member_ids: Sequence[str]) -> str:
     """Return the change-detection fingerprint of one cluster.
 
-    A full-width SHA-256 digest of the ticker and the *sorted member set*,
-    length-prefix encoded.  It is stable under input permutation and
+    A full-width SHA-256 digest of the ticker and the *sorted unique member
+    set*, length-prefix encoded.  The public path already guarantees
+    well-formed input; the checks here exist so a future caller cannot
+    quietly produce a fingerprint for an empty, blank, or duplicated member
+    set that would collide with a real one.  It is stable under input permutation and
     independent of which member is currently canonical, and it changes when
     membership changes — which is exactly what a reconciler needs to notice
     that a syndicated copy joined.  It is **not** a durable id: the layer
@@ -87,7 +91,19 @@ def cluster_fingerprint_for(ticker: str, member_ids: Sequence[str]) -> str:
     run's clusters to stored rows on ``member_ids``.
     """
 
-    payload = encode_fields((CLUSTER_NAMESPACE, ticker, *sorted(member_ids)))
+    if not isinstance(ticker, str) or not ticker.strip():
+        raise DedupInputError("cluster fingerprint needs a non-blank ticker")
+    identifiers = list(member_ids)
+    if not identifiers:
+        raise DedupInputError("cluster fingerprint needs at least one member")
+    unique = set()
+    for identifier in identifiers:
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise DedupInputError("cluster member ids must be non-blank strings")
+        if identifier in unique:
+            raise DedupInputError(f"duplicate cluster member id: {identifier!r}")
+        unique.add(identifier)
+    payload = encode_fields((CLUSTER_NAMESPACE, ticker, *sorted(unique)))
     return hashlib.sha256(payload).hexdigest()
 
 

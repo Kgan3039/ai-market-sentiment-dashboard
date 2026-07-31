@@ -9,20 +9,24 @@ silently wrong: timestamps and tickers.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import re
 
 from .content import content_identity_key, dedup_content_fingerprint
 from .errors import DedupInputError
 from .models import NormalizedItem, RawItem
 from .structural import analyze_title, tokenize
-from .text import display_text, normalize_source, require_optional_str
+from .text import (
+    TICKER_PATTERN,
+    display_text,
+    normalize_source,
+    provider_namespace,
+    require_optional_str,
+)
 from .urls import clean_url, url_host, url_identity_key
 
-#: Phase 0 symbols are plain equity tickers, optionally with a one-to-three
-#: letter class or exchange suffix ("BRK.B").  Anything else — a
-#: comma-separated list, a sentence, a symbol with whitespace — is an
-#: upstream bug that must not silently become a partition of its own.
-_TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{0,9}(?:[.\-][A-Z]{1,3})?$")
+#: Bumped when the timestamp contract changes.
+TIMESTAMP_POLICY_VERSION = "m2.timestamp.v1"
 
 #: Absolute plausibility bounds for a publication timestamp.  They are
 #: deliberately *not* relative to the current clock: a replay of a stored
@@ -65,7 +69,7 @@ def normalize_ticker(value: str | None) -> str | None:
     if any(character.isspace() for character in stripped):
         raise DedupInputError(f"ticker must be a single symbol: {value!r}")
     symbol = stripped.upper()
-    if not _TICKER_PATTERN.match(symbol):
+    if not TICKER_PATTERN.match(symbol):
         raise DedupInputError(f"ticker is not a valid symbol: {value!r}")
     return symbol
 
@@ -152,10 +156,13 @@ def normalize_item(item: RawItem, universe: frozenset[str]) -> NormalizedItem:
     # million" and "5 million" cannot collapse into one description key.
     normalized_description = " ".join(tokenize(display_text(description)))
     normalized_source = normalize_source(source)
+    # Provider identity uses the conservative namespace, never the outlet
+    # key: "Acme Inc" and "Acme LLC" must not share an authoritative id.
+    namespace = provider_namespace(source)
     provider_item_id = normalize_provider_item_id(item.provider_item_id)
     provider_key = (
-        f"{len(normalized_source)}:{normalized_source}\x1f{provider_item_id}"
-        if normalized_source and provider_item_id
+        f"{len(namespace)}:{namespace}\x1f{provider_item_id}"
+        if namespace and provider_item_id
         else None
     )
     # A canonical URL is preferred, but a value that yields no identity key
@@ -174,7 +181,7 @@ def normalize_item(item: RawItem, universe: frozenset[str]) -> NormalizedItem:
         normalized_description=normalized_description,
         normalized_source=normalized_source,
         outlet=normalized_source or url_host(raw_canonical_url) or url_host(url),
-        provider_namespace=normalized_source or None,
+        provider_namespace=namespace or None,
         provider_item_id=provider_item_id,
         provider_key=provider_key,
         canonical_url=clean_url(raw_canonical_url) or clean_url(url),
@@ -185,3 +192,16 @@ def normalize_item(item: RawItem, universe: frozenset[str]) -> NormalizedItem:
         ),
         published_at=normalize_timestamp(item.published_at),
     )
+
+
+def policy_fingerprint() -> str:
+    """Return a digest of this module's static timestamp policy."""
+
+    payload = "|".join(
+        (
+            TIMESTAMP_POLICY_VERSION,
+            MIN_PLAUSIBLE_PUBLISHED_AT.isoformat(),
+            MAX_PLAUSIBLE_PUBLISHED_AT.isoformat(),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

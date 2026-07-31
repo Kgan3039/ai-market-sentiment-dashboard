@@ -18,6 +18,8 @@ import textwrap
 
 import pytest
 
+from nlp.dedup.config import POLICY_FINGERPRINTS
+from nlp.dedup.selection import cluster_fingerprint_for
 from nlp.dedup import (
     DedupCapacityError,
     DedupConfig,
@@ -284,19 +286,19 @@ def test_the_gate_is_applied_to_exact_content_edges(monkeypatch):
         item("a", published_at=at(0)),
         item("b", source="CNBC", url="https://cnbc.com/b", published_at=at(1)),
     ]
-    seen: list[str] = []
-    real = detection.incompatibility
+    calls: list[int] = []
+    real = detection.combine
 
     def recording(left, right):
-        seen.append(left.item_id)
+        calls.append(1)
         return real(left, right)
 
-    monkeypatch.setattr(detection, "incompatibility", recording)
+    monkeypatch.setattr(detection, "combine", recording)
     merged = run(pair)
     assert merged.clusters[0].match_reasons == (MatchReason.EXACT_CONTENT,)
-    assert seen, "the exact-content edge never reached the gate"
+    assert calls, "the exact-content edge never reached the gate"
 
-    monkeypatch.setattr(detection, "incompatibility", lambda left, right: "forced")
+    monkeypatch.setattr(detection, "combine", lambda left, right: (None, "forced"))
     assert len(run(pair).clusters) == 2
 
 
@@ -461,7 +463,7 @@ def _conflicting(**overrides) -> list[RawItem]:
         ("title", {"title": "Nvidia recalls a product line"}),
         ("description", {"description": "A completely different standfirst."}),
         ("url", {"url": "https://reuters.com/somewhere-else"}),
-        ("text", {"title": None, "description": None}),
+        ("text_presence", {"title": None, "description": None}),
         ("published_at", {"published_at": at(9)}),
         ("ticker", {"ticker": "AMD"}),
     ],
@@ -1055,3 +1057,592 @@ def test_hostile_text_is_normalized_not_executed():
     cluster = result.clusters[0]
     assert "\x00" not in cluster.canonical_title
     assert "Nvidia & AMD" in cluster.canonical_title
+
+
+# --------------------------------------------------------------------------
+# Cluster-wide compatibility: a sparse record cannot bridge contradictions
+# --------------------------------------------------------------------------
+
+
+def _bridge(left_description, right_description, **shared):
+    """A: known value, B: sparse, C: contradicting value — same title."""
+
+    fields: dict[str, object] = {"title": "Quarterly results"}
+    fields.update(shared)
+    return [
+        item("a", description=left_description, published_at=at(0), **fields),
+        item(
+            "b",
+            description=None,
+            source="CNBC",
+            url="https://cnbc.com/b",
+            published_at=at(1),
+            **fields,
+        ),
+        item(
+            "c",
+            description=right_description,
+            source="Financial Times",
+            url="https://ft.com/c",
+            published_at=at(2),
+            **fields,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "left", "right"),
+    [
+        ("opposite claims", "Profit rose sharply.", "Profit fell sharply."),
+        ("numeric", "Revenue rose 5%.", "Revenue rose 8%."),
+        ("direction", "Revenue rose 5%.", "Revenue fell 5%."),
+        ("quarter", "Q1 revenue rose 5%.", "Q2 revenue rose 5%."),
+        ("year", "Guidance for 2025.", "Guidance for 2026."),
+        ("negation", "The deal was approved.", "The deal was not approved."),
+    ],
+)
+def test_a_sparse_record_cannot_bridge_contradictory_records(case, left, right):
+    result = run(_bridge(left, right))
+    by_member = result.cluster_by_member
+    assert (
+        by_member["a"].cluster_fingerprint != by_member["c"].cluster_fingerprint
+    ), case
+    # B may join at most one side, never both.
+    assert len(by_member["b"].member_ids) <= 2
+
+
+def test_the_url_path_cannot_be_bridged_either():
+    url = "https://reuters.com/markets/live-blog"
+    result = run(
+        [
+            item(
+                "a",
+                title="Live blog",
+                description="Stocks rose.",
+                url=url,
+                published_at=at(0),
+            ),
+            item(
+                "b",
+                title="Live blog",
+                description=None,
+                url=url,
+                source="CNBC",
+                published_at=at(1),
+            ),
+            item(
+                "c",
+                title="Live blog",
+                description="Stocks fell.",
+                url=url,
+                source="Financial Times",
+                published_at=at(2),
+            ),
+        ]
+    )
+    by_member = result.cluster_by_member
+    assert by_member["a"].cluster_fingerprint != by_member["c"].cluster_fingerprint
+
+
+def test_multiple_sparse_intermediates_still_cannot_bridge():
+    records = [
+        item(
+            "a",
+            title="Quarterly results",
+            description="Profit rose sharply.",
+            published_at=at(0),
+        ),
+        item(
+            "b1",
+            title="Quarterly results",
+            description=None,
+            source="CNBC",
+            url="https://cnbc.com/b1",
+            published_at=at(1),
+        ),
+        item(
+            "b2",
+            title="Quarterly results",
+            description=None,
+            source="Financial Times",
+            url="https://ft.com/b2",
+            published_at=at(2),
+        ),
+        item(
+            "b3",
+            title="Quarterly results",
+            description=None,
+            source="The Wall Street Journal",
+            url="https://wsj.com/b3",
+            published_at=at(3),
+        ),
+        item(
+            "c",
+            title="Quarterly results",
+            description="Profit fell sharply.",
+            source="Bloomberg",
+            url="https://bloomberg.com/c",
+            published_at=at(4),
+        ),
+    ]
+    by_member = run(records).cluster_by_member
+    assert by_member["a"].cluster_fingerprint != by_member["c"].cluster_fingerprint
+    assert "c" not in by_member["a"].member_ids
+
+
+def test_the_bridge_verdict_is_permutation_invariant():
+    records = _bridge("Profit rose sharply.", "Profit fell sharply.")
+    expected = signature(run(records))
+    for permutation in itertools.permutations(records):
+        assert signature(run(list(permutation))) == expected
+
+
+def test_a_legitimate_sparse_bridge_still_merges_all_three():
+    records = _bridge("Profit rose sharply.", "Profit rose sharply.")
+    result = run(records)
+    assert members(result) == [("a", "b", "c")]
+    assert result.clusters[0].outlet_count == 3
+
+
+def test_a_late_sparse_record_cannot_collapse_two_existing_clusters():
+    # The contradictory pair first: two singleton clusters.
+    contradictory = [
+        item(
+            "a",
+            title="Quarterly results",
+            description="Profit rose sharply.",
+            published_at=at(0),
+        ),
+        item(
+            "c",
+            title="Quarterly results",
+            description="Profit fell sharply.",
+            source="Financial Times",
+            url="https://ft.com/c",
+            published_at=at(2),
+        ),
+    ]
+    assert len(run(contradictory).clusters) == 2
+
+    # Now the sparse record arrives and is processed with them.
+    late = contradictory + [
+        item(
+            "b",
+            title="Quarterly results",
+            description=None,
+            source="CNBC",
+            url="https://cnbc.com/b",
+            published_at=at(3),
+        )
+    ]
+    result = run(late)
+    by_member = result.cluster_by_member
+    assert by_member["a"].cluster_fingerprint != by_member["c"].cluster_fingerprint
+    assert len(result.clusters) == 2
+
+
+# --------------------------------------------------------------------------
+# Candidate generation must not depend on sort adjacency
+# --------------------------------------------------------------------------
+
+
+def test_a_compatible_pair_is_found_despite_an_incompatible_record_between():
+    # A and C agree; B sorts between them in time and contradicts both.
+    # Adjacent-only chaining would propose A-B and B-C, both vetoed, and
+    # never consider A-C.
+    records = [
+        item(
+            "a",
+            title="Quarterly results",
+            description="Profit rose sharply.",
+            published_at=at(0),
+        ),
+        item(
+            "b",
+            title="Quarterly results",
+            description="Profit fell sharply.",
+            source="CNBC",
+            url="https://cnbc.com/b",
+            published_at=at(1),
+        ),
+        item(
+            "c",
+            title="Quarterly results",
+            description="Profit rose sharply.",
+            source="Financial Times",
+            url="https://ft.com/c",
+            published_at=at(2),
+        ),
+    ]
+    result = run(records)
+    assert members(result) == [("a", "c"), ("b",)]
+
+
+def test_the_url_bucket_also_considers_non_adjacent_pairs():
+    url = "https://reuters.com/markets/live-blog"
+    records = [
+        item(
+            "a",
+            title="Live blog",
+            description="Stocks rose.",
+            url=url,
+            published_at=at(0),
+        ),
+        item(
+            "b",
+            title="Live blog",
+            description="Stocks fell.",
+            url=url,
+            source="CNBC",
+            published_at=at(1),
+        ),
+        item(
+            "c",
+            title="Live blog",
+            description="Stocks rose.",
+            url=url,
+            source="Financial Times",
+            published_at=at(2),
+        ),
+    ]
+    result = run(records)
+    assert members(result) == [("a", "c"), ("b",)]
+    # The URL signal is the strongest applicable one, so it is what merged
+    # the non-adjacent pair.
+    assert MatchReason.CANONICAL_URL in result.clusters[0].match_reasons
+
+
+def test_non_adjacent_recovery_is_permutation_invariant():
+    records = [
+        item(
+            "a",
+            title="Quarterly results",
+            description="Profit rose sharply.",
+            published_at=at(0),
+        ),
+        item(
+            "b",
+            title="Quarterly results",
+            description="Profit fell sharply.",
+            source="CNBC",
+            url="https://cnbc.com/b",
+            published_at=at(1),
+        ),
+        item(
+            "c",
+            title="Quarterly results",
+            description="Profit rose sharply.",
+            source="Financial Times",
+            url="https://ft.com/c",
+            published_at=at(2),
+        ),
+    ]
+    expected = signature(run(records))
+    for permutation in itertools.permutations(records):
+        assert signature(run(list(permutation))) == expected
+
+
+# --------------------------------------------------------------------------
+# Provider identity: unified policy and conservative namespaces
+# --------------------------------------------------------------------------
+
+
+def test_uncertain_numeric_titles_under_one_provider_id_are_quarantined():
+    # Neither title yields an ordinary key; that is not permission to merge.
+    result = run(
+        [
+            item(
+                "a",
+                title="Profit ½ higher",
+                description=None,
+                url="https://reuters.com/a",
+                published_at=at(0),
+                provider_item_id="rtrs-1",
+            ),
+            item(
+                "b",
+                title="Revenue ⅓ lower",
+                description=None,
+                url="https://reuters.com/a",
+                published_at=at(0.25),
+                provider_item_id="rtrs-1",
+            ),
+        ]
+    )
+    assert result.stats.provider_conflict_count == 1
+    assert "uncertain_numeric_notation" in result.provider_conflicts[0].fields
+    assert result.quarantined_item_ids == ("a", "b")
+    assert len(result.clusters) == 2
+
+
+def test_legal_suffixes_do_not_collapse_distinct_providers():
+    # "Acme Inc" and "Acme LLC" are different companies; sharing an item id
+    # must not merge them, and must not be reported as a conflict either.
+    result = run(
+        [
+            item(
+                "a",
+                source="Acme Inc",
+                url="https://acme-inc.example/a",
+                published_at=at(0),
+                provider_item_id="1",
+            ),
+            item(
+                "b",
+                source="Acme LLC",
+                title="A completely different story",
+                description="Unrelated.",
+                url="https://acme-llc.example/b",
+                published_at=at(1),
+                provider_item_id="1",
+            ),
+        ]
+    )
+    assert result.stats.provider_conflict_count == 0
+    assert len(result.clusters) == 2
+    assert result.stats.reason_count(MatchReason.PROVIDER_ITEM) == 0
+
+
+def test_a_three_record_group_is_quarantined_when_only_one_pair_conflicts():
+    records = [
+        item(
+            "a",
+            url="https://reuters.com/one",
+            published_at=at(0),
+            provider_item_id="rtrs-1",
+        ),
+        item(
+            "b",
+            url="https://reuters.com/one",
+            published_at=at(0.25),
+            provider_item_id="rtrs-1",
+        ),
+        item(
+            "c",
+            url="https://reuters.com/one",
+            published_at=at(0.5),
+            provider_item_id="rtrs-1",
+            description="A contradicting standfirst.",
+        ),
+    ]
+    result = run(records)
+    assert result.stats.provider_conflict_count == 1
+    assert result.provider_conflicts[0].item_ids == ("a", "b", "c")
+    assert result.quarantined_item_ids == ("a", "b", "c")
+    assert members(result) == [("a",), ("b",), ("c",)]
+
+
+def test_provider_conflict_detection_is_permutation_invariant():
+    records = [
+        item(
+            "a",
+            url="https://reuters.com/one",
+            published_at=at(0),
+            provider_item_id="rtrs-1",
+        ),
+        item(
+            "b",
+            url="https://reuters.com/one",
+            published_at=at(0.25),
+            provider_item_id="rtrs-1",
+        ),
+        item(
+            "c",
+            url="https://reuters.com/one",
+            published_at=at(0.5),
+            provider_item_id="rtrs-1",
+            description="A contradicting standfirst.",
+        ),
+    ]
+    expected = signature(run(records))
+    for permutation in itertools.permutations(records):
+        assert signature(run(list(permutation))) == expected
+
+
+# --------------------------------------------------------------------------
+# The configured URL window is enforced
+# --------------------------------------------------------------------------
+
+_REUSED_URL = "https://reuters.com/markets/quarterly-results"
+
+
+def _untitled_pair(gap: timedelta) -> list[RawItem]:
+    return [
+        item("a", title=None, description=None, url=_REUSED_URL, published_at=at(0)),
+        item(
+            "b",
+            title=None,
+            description=None,
+            url=_REUSED_URL,
+            source="CNBC",
+            published_at=BASE + gap,
+        ),
+    ]
+
+
+def test_a_reused_url_does_not_merge_across_one_hundred_and_eighty_days():
+    result = run(
+        [
+            item("a", url=_REUSED_URL, published_at=at(0)),
+            item("b", url=_REUSED_URL, source="CNBC", published_at=at(24 * 180)),
+        ]
+    )
+    assert len(result.clusters) == 2
+
+
+@pytest.mark.parametrize(
+    ("gap", "expected"),
+    [
+        (timedelta(hours=71, minutes=59), 1),
+        (timedelta(hours=72), 1),
+        (timedelta(hours=72, microseconds=1), 2),
+        (timedelta(hours=73), 2),
+    ],
+)
+def test_the_url_window_boundary_is_exact(gap, expected):
+    assert len(run(_untitled_pair(gap)).clusters) == expected
+
+
+def test_undated_records_do_not_qualify_for_a_url_match():
+    result = run(
+        [
+            item("a", url=_REUSED_URL, published_at=None),
+            item("b", url=_REUSED_URL, source="CNBC", published_at=None),
+        ]
+    )
+    assert len(result.clusters) == 2
+
+
+def test_undated_records_at_one_url_still_merge_on_provider_identity():
+    result = run(
+        [
+            item("a", url=_REUSED_URL, published_at=None, provider_item_id="rtrs-1"),
+            item("b", url=_REUSED_URL, published_at=None, provider_item_id="rtrs-1"),
+        ]
+    )
+    assert members(result) == [("a", "b")]
+    assert result.clusters[0].match_reasons == (MatchReason.PROVIDER_ITEM,)
+
+
+def test_url_plus_compatible_text_still_obeys_the_window():
+    # Identical headline and body: agreement is total, and the window still
+    # decides.
+    result = run(
+        [
+            item("a", url=_REUSED_URL, published_at=at(0)),
+            item("b", url=_REUSED_URL, source="CNBC", published_at=at(73)),
+        ]
+    )
+    assert len(result.clusters) == 2
+
+
+def test_a_mixed_provider_and_url_cluster_keeps_full_span_behaviour():
+    # Provider identity merges a and b unconditionally; c shares a's URL but
+    # would stretch the cluster past the URL window.
+    result = run(
+        [
+            item("a", url=_REUSED_URL, published_at=at(0), provider_item_id="rtrs-1"),
+            item("b", url=_REUSED_URL, published_at=at(0.5), provider_item_id="rtrs-1"),
+            item("c", url=_REUSED_URL, source="CNBC", published_at=at(80)),
+        ]
+    )
+    assert members(result) == [("a", "b"), ("c",)]
+
+
+# --------------------------------------------------------------------------
+# Ticker universes and policy fingerprinting
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "universe",
+    [["NVDA"], ["NVDA", "AMD"], ["BRK.B"], ["RDS-A"], ("nvda", "amd"), {"NVDA"}],
+)
+def test_valid_ticker_universes_are_accepted(universe):
+    assert DedupConfig(supported_tickers=universe).ticker_universe
+
+
+@pytest.mark.parametrize(
+    "universe",
+    [
+        ["NVDA", "NVDA"],
+        ["NVDA", "nvda"],
+        ["NVDA", " NVDA "],
+        ["$AAPL"],
+        ["A@B"],
+        ["A..B"],
+        ["1NVDA"],
+        [""],
+        ["   "],
+        ["TOOLONGSYMBOL"],
+        ["NVDA,AMD"],
+        ["NVDA AMD"],
+    ],
+)
+def test_invalid_ticker_universes_are_rejected(universe):
+    with pytest.raises(DedupConfigError):
+        DedupConfig(supported_tickers=universe)
+
+
+def test_a_configured_symbol_is_always_one_a_record_could_satisfy():
+    from nlp.dedup.normalization import normalize_ticker
+
+    for symbol in DedupConfig(supported_tickers=["BRK.B", "RDS-A"]).ticker_universe:
+        assert normalize_ticker(symbol) == symbol
+
+
+@pytest.mark.parametrize("policy", sorted(POLICY_FINGERPRINTS))
+def test_every_static_policy_contributes_to_the_fingerprint(policy, monkeypatch):
+    # Assembly is tested directly rather than by mutating the policy lists,
+    # which would leak into other tests through module state.
+    baseline = config().fingerprint()
+    monkeypatch.setitem(POLICY_FINGERPRINTS, policy, lambda: f"changed-{policy}")
+    assert config().fingerprint() != baseline
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"content_window_hours": 80},
+        {"exact_title_window_hours": 71},
+        {"near_exact_window_hours": 35},
+        {"url_window_hours": 71},
+        {"provider_timestamp_tolerance_hours": 2},
+        {"minhash_permutations": 64},
+        {"minhash_shingle_size": 4},
+        {"minhash_seed": "other"},
+        {"candidate_min_similarity": 0.5},
+        {"max_partition_items": 249},
+        {"supported_tickers": ["NVDA"]},
+    ],
+)
+def test_every_setting_contributes_to_the_fingerprint(overrides):
+    assert config(**overrides).fingerprint() != config().fingerprint()
+
+
+# --------------------------------------------------------------------------
+# Internal helper hardening
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ticker", "member_ids"),
+    [
+        ("NVDA", []),
+        ("NVDA", ["a", "a"]),
+        ("NVDA", [""]),
+        ("NVDA", ["  "]),
+        ("NVDA", [None]),
+        ("", ["a"]),
+        ("   ", ["a"]),
+    ],
+)
+def test_cluster_fingerprint_rejects_unusable_input(ticker, member_ids):
+    with pytest.raises(DedupInputError):
+        cluster_fingerprint_for(ticker, member_ids)
+
+
+def test_cluster_fingerprint_is_stable_and_full_width():
+    digest = cluster_fingerprint_for("NVDA", ["b", "a"])
+    assert digest == cluster_fingerprint_for("NVDA", ["a", "b"])
+    assert len(digest) == 64

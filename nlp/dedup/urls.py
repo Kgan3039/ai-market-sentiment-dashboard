@@ -25,10 +25,14 @@ plus an extremely narrow allowlist of click/analytics parameters.
 from __future__ import annotations
 
 import encodings.idna
+import hashlib
 import re
 from urllib.parse import urlsplit, urlunsplit
 
 from .text import display_text
+
+#: Bumped when the tracking allowlist or the identity rules change.
+URL_POLICY_VERSION = "m2.url.v1"
 
 _HTTP_SCHEMES = frozenset({"http", "https"})
 _DEFAULT_PORTS = {"http": "80", "https": "443"}
@@ -206,3 +210,18 @@ def url_host(value: str | None) -> str:
 
     parsed = _parts(value)
     return "" if parsed is None else parsed[1]
+
+
+def policy_fingerprint() -> str:
+    """Return a digest of this module's static URL-identity policy."""
+
+    payload = "|".join(
+        (
+            URL_POLICY_VERSION,
+            ",".join(sorted(TRACKING_PARAMS)),
+            ",".join(TRACKING_PARAM_PREFIXES),
+            _ASCII_HOST_PATTERN.pattern,
+            str(_MAX_PORT),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

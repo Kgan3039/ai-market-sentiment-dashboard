@@ -3,8 +3,8 @@
 There is no default construction.  ``supported_tickers`` must be supplied
 by the caller, because the core has no business reading files to discover
 which symbols Phase 0 covers: that belongs to whatever orchestrates it.
-Every setting, plus the static policies in :mod:`nlp.dedup.structural` and
-:mod:`nlp.dedup.minhash`, is folded into :meth:`DedupConfig.fingerprint`,
+Every setting, plus every behaviour-affecting static policy listed in
+:data:`POLICY_FINGERPRINTS`, is folded into :meth:`DedupConfig.fingerprint`,
 so editing a policy invalidates cached output without anyone remembering to
 bump a version constant.
 """
@@ -18,6 +18,8 @@ import json
 import math
 from typing import Collection
 
+from .compatibility import policy_fingerprint as compatibility_policy_fingerprint
+from .compatibility import provider_policy_fingerprint
 from .content import DEDUP_CONTENT_VERSION
 from .errors import DedupConfigError
 from .minhash import (
@@ -27,8 +29,25 @@ from .minhash import (
     DEFAULT_SHINGLE_SIZE,
 )
 from .minhash import policy_fingerprint as minhash_policy_fingerprint
+from .normalization import policy_fingerprint as timestamp_policy_fingerprint
 from .structural import STRUCTURE_VERSION
 from .structural import policy_fingerprint as structural_policy_fingerprint
+from .text import TICKER_PATTERN
+from .text import policy_fingerprint as text_policy_fingerprint
+from .urls import policy_fingerprint as url_policy_fingerprint
+
+#: Every behaviour-affecting static policy, named once.  ``fingerprint()``
+#: walks this map, so adding a policy module here is all it takes for its
+#: version to invalidate cached output — no manual ALGORITHM_VERSION bump.
+POLICY_FINGERPRINTS = {
+    "compatibility_policy": compatibility_policy_fingerprint,
+    "minhash_policy": minhash_policy_fingerprint,
+    "provider_policy": provider_policy_fingerprint,
+    "structural_policy": structural_policy_fingerprint,
+    "text_policy": text_policy_fingerprint,
+    "timestamp_policy": timestamp_policy_fingerprint,
+    "url_policy": url_policy_fingerprint,
+}
 
 #: Bumped whenever a change to normalization, identity, detection, or
 #: selection can change the clusters produced from identical input.
@@ -43,8 +62,6 @@ MAX_WINDOW_HOURS = 336.0
 #: quadratic, and 2,000 items in one window measured ~54 s on the dev box
 #: against a Phase 0 reality of a few dozen headlines per ticker per run.
 DEFAULT_MAX_PARTITION_ITEMS = 250
-
-_SYMBOL_SEPARATORS = frozenset(" ,;/\t\n")
 
 
 def _validate_window(value: object, field_name: str) -> float:
@@ -61,6 +78,16 @@ def _validate_window(value: object, field_name: str) -> float:
 
 
 def _validate_universe(value: Collection[str]) -> frozenset[str]:
+    """Validate a ticker universe against the record ticker contract.
+
+    The same :data:`~nlp.dedup.text.TICKER_PATTERN` that validates a
+    record's ticker validates the configured universe, so a configuration
+    can never contain a symbol no record could ever satisfy.  Duplicates —
+    exact, or differing only in case — are rejected rather than silently
+    collapsed: they mean the caller assembled the universe from two sources
+    and does not know it.
+    """
+
     if isinstance(value, (str, bytes)) or not isinstance(value, Collection):
         raise DedupConfigError("supported_tickers must be a collection of symbols")
     symbols: set[str] = set()
@@ -68,13 +95,18 @@ def _validate_universe(value: Collection[str]) -> frozenset[str]:
         if not isinstance(symbol, str):
             raise DedupConfigError("supported_tickers must contain strings")
         stripped = symbol.strip()
-        if not stripped or any(
-            character in _SYMBOL_SEPARATORS for character in stripped
-        ):
+        if not stripped:
+            raise DedupConfigError("supported_tickers must not contain blank symbols")
+        normalized = stripped.upper()
+        if not TICKER_PATTERN.match(normalized):
             raise DedupConfigError(
                 f"supported_tickers has an invalid symbol: {symbol!r}"
             )
-        symbols.add(stripped.upper())
+        if normalized in symbols:
+            raise DedupConfigError(
+                f"supported_tickers contains a duplicate symbol: {symbol!r}"
+            )
+        symbols.add(normalized)
     if not symbols:
         raise DedupConfigError("supported_tickers must not be empty")
     return frozenset(symbols)
@@ -204,14 +236,23 @@ class DedupConfig:
         return timedelta(hours=float(self.provider_timestamp_tolerance_hours))
 
     def fingerprint(self) -> str:
-        """Return a stable digest of the settings and every static policy."""
+        """Return a stable digest of the settings and every static policy.
+
+        Covers every behaviour-affecting input: the merge windows, the
+        capacity limit, the MinHash configuration, the supported ticker
+        universe, and each module's policy version in
+        :data:`POLICY_FINGERPRINTS` — compatibility and negation rules,
+        provider-conflict rules, URL tracking-parameter rules, source and
+        ticker syntax rules, timestamp plausibility bounds, structural title
+        and protected-expression rules.  Editing any of them changes this
+        digest without anyone bumping :data:`ALGORITHM_VERSION` by hand.
+        """
 
         payload = {
             "algorithm_version": ALGORITHM_VERSION,
             "content_version": DEDUP_CONTENT_VERSION,
             "structure_version": STRUCTURE_VERSION,
-            "structural_policy": structural_policy_fingerprint(),
-            "minhash_policy": minhash_policy_fingerprint(),
+            **{name: digest() for name, digest in POLICY_FINGERPRINTS.items()},
             "content_window_hours": float(self.content_window_hours),
             "exact_title_window_hours": float(self.exact_title_window_hours),
             "near_exact_window_hours": float(self.near_exact_window_hours),

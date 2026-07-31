@@ -11,7 +11,20 @@ from __future__ import annotations
 import html
 import unicodedata
 
+import hashlib
+import re
+
 from .errors import DedupInputError
+
+#: Bumped when source/provider normalization or the ticker syntax changes.
+#: Folded into the configuration fingerprint by :mod:`nlp.dedup.config`.
+TEXT_POLICY_VERSION = "m2.text.v2"
+
+#: Phase 0 symbols are plain equity tickers, optionally with a one-to-three
+#: letter class or exchange suffix ("BRK.B").  One definition, used both to
+#: validate a configured universe and to validate a record's ticker, so a
+#: configuration can never hold a symbol no record could satisfy.
+TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{0,9}(?:[.\-][A-Z]{1,3})?$")
 
 #: Typographic variants folded before matching so a curly apostrophe or an em
 #: dash never splits one story into two.
@@ -117,8 +130,33 @@ def text_key(value: str | None) -> str:
     return " ".join(spaced.split())
 
 
+def provider_namespace(value: str | None) -> str:
+    """Return the conservative namespace for a provider item id.
+
+    Deliberately *not* :func:`normalize_source`: that folds away legal and
+    domain suffixes, which would make ``Acme Inc`` and ``Acme LLC`` share an
+    authoritative identity and let one feed's item id silently merge another
+    company's article.  Only formatting is cleaned here — case, accents,
+    punctuation, and whitespace — so two spellings share a namespace only
+    when they really are the same string modulo formatting.  Being too
+    strict costs at most a tier-1 merge, which the weaker signals can still
+    make; being too loose merges unrelated records on a stranger's id.
+    """
+
+    text = display_text(value)
+    if not text:
+        return ""
+    folded = strip_accents(text.casefold())
+    spaced = "".join(character if character.isalnum() else " " for character in folded)
+    return " ".join(spaced.split())
+
+
 def normalize_source(value: str | None) -> str:
-    """Return the publisher key (``"Reuters.com"`` becomes ``"reuters"``)."""
+    """Return the display/outlet key (``"Reuters.com"`` becomes ``"reuters"``).
+
+    Used for outlet counting and title-attribution stripping, never for
+    provider identity — see :func:`provider_namespace`.
+    """
 
     key = text_key(value)
     if not key:
@@ -129,3 +167,17 @@ def normalize_source(value: str | None) -> str:
     while len(tokens) > 1 and tokens[-1] in _SOURCE_NOISE_SUFFIXES:
         tokens = tokens[:-1]
     return " ".join(tokens)
+
+
+def policy_fingerprint() -> str:
+    """Return a digest of this module's static text policy."""
+
+    payload = "|".join(
+        (
+            TEXT_POLICY_VERSION,
+            TICKER_PATTERN.pattern,
+            "".join(sorted(_SOURCE_NOISE_SUFFIXES)),
+            repr(sorted(_TYPOGRAPHIC_MAP.items())),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

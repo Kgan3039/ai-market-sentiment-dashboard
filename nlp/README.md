@@ -62,7 +62,7 @@ M3's job — false negatives here are expected, false positives are not.
 | Signal | Window | Gated |
 |---|---|---|
 | provider namespace + provider item id | none | no — authoritative |
-| URL identity key, corroborated | 72 h | yes |
+| URL identity key, corroborated, both records dated | 72 h | yes |
 | identical normalized title **and** description | 72 h | yes |
 | identical normalized title | 72 h | yes |
 | MinHash candidate verified structurally identical | 36 h | yes |
@@ -72,14 +72,23 @@ two records are its same item. It is not time-bounded and not gated — but
 only while the identity is consistent (see quarantine below).
 
 Every other signal is circumstantial, so every other edge passes **one**
-compatibility gate before it is unioned. Earlier revisions checked
-contradictions per tier and each tier checked something slightly different,
-so the same false merge kept reappearing through whichever check was
-weakest. There is now a single `compatibility.incompatibility()`, applied
-centrally in `detection._accept_edges`, covering: unparseable numeric
-notation, text-free versus text-bearing, protected-expression disagreement
-(numbers, currencies, units, ranges, signs, percentages, quarters, years,
-dates), negation disagreement, differing titles, differing descriptions.
+compatibility gate before it is unioned, and the gate is applied to the
+**whole prospective cluster**, not to the edge's two endpoints. Checking
+endpoints alone let a sparse record bridge contradictory ones — A "profit
+rose", B with no description, C "profit fell" — since A–B and B–C are each
+individually fine. Each component now carries an `EvidenceSummary` of every
+value its members assert, and a union is admissible only when the combined
+summary still holds at most one known value per field. That is exactly
+equivalent to comparing every member on one side against every member on
+the other, at constant cost.
+
+The gate covers: unparseable numeric notation, text-free versus
+text-bearing, protected-expression disagreement (numbers, currencies,
+units, ranges, signs, percentages, quarters, years, dates), negation
+disagreement, differing titles, differing descriptions. The same primitive
+backs provider-conflict quarantine, which adds URL, ticker, and timestamp
+checks on top — provider quarantine may be stricter than ordinary
+compatibility, never weaker.
 
 The rule is asymmetric on purpose — **explicit disagreement vetoes, missing
 information does not.** So this pair stays apart even though the headlines
@@ -98,10 +107,12 @@ chaining cannot widen a merge. Merges never cross a ticker.
 
 ### Provider-conflict quarantine
 
-For each `(source, provider_item_id)` the core compares title, description,
-URL, text-bearing versus text-free, ticker, and timestamps (beyond a 1-hour
-tolerance). On any disagreement **every item under that identity is
-quarantined**: it merges through no signal at all, and is emitted as its own
+For each `(provider namespace, provider_item_id)` the core compares every
+pair with the shared evidence primitive, then adds URL, ticker, and
+timestamp checks (beyond a 1-hour tolerance). Two titles the core could not
+parse — "Profit ½ higher" and "Revenue ⅓ lower" — conflict rather than
+merging on the accident that neither yields an ordinary title key. On any
+disagreement **every item under that identity is quarantined**: it merges through no signal at all, and is emitted as its own
 cluster so no coverage is lost. `result.provider_conflicts` reports the
 namespace, id, affected item ids, and the fields that disagreed.
 
@@ -132,6 +143,12 @@ carrying the ticker, the item count, and the limit. The core never returns
 a result that looks complete while having skipped work; splitting the batch
 or raising the limit is the caller's deliberate choice.
 
+The provider namespace is deliberately *not* the outlet key: it applies
+case, accent, punctuation, and whitespace folding only. Stripping legal or
+domain suffixes would give `Acme Inc` and `Acme LLC` one authoritative
+identity, letting one feed's item id merge another company's article. Being
+too strict costs at most a tier-1 merge the weaker signals can still make.
+
 ### Contracts the core insists on
 
 - **`supported_tickers` is required.** There is no default, no fallback, and
@@ -147,7 +164,13 @@ or raising the limit is the caller's deliberate choice.
   Timestamps outside 1990–2100 are rejected as corrupt, on absolute bounds
   so replay does not depend on today's date.
 - Windows must be positive, at most two weeks, and ordered
-  `near_exact ≤ exact_title ≤ content`, `url ≤ content`.
+  `near_exact ≤ exact_title ≤ content`, `url ≤ content`. **Every** signal
+  except authoritative provider identity is windowed, URL included: the
+  same reusable slug 180 days apart does not merge, and a URL pair with no
+  usable timestamps is not a URL match at all.
+- `supported_tickers` is validated against the same syntax a record's
+  ticker must satisfy, and rejects duplicates that differ only in case, so
+  a configuration cannot hold a symbol no record could ever match.
 
 ### URL identity
 
@@ -168,7 +191,8 @@ values yield `None`, meaning "no URL evidence".
 The core assigns **no** durable identifier. Each cluster carries
 `cluster_fingerprint`: a full-width SHA-256 digest of the ticker and the
 sorted **unique** member set, length-prefix encoded so no item id can forge
-a separator boundary. It is order-independent and independent of which
+a separator boundary. The helper rejects blank tickers, blank member ids,
+duplicates, and empty member sets outright. It is order-independent and independent of which
 member is canonical, and it **changes when membership changes** — that is
 the change-detection signal a reconciler needs. Durable `stories.id`
 belongs to issue #57, and joining a run's clusters to stored rows is done

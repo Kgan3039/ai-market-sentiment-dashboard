@@ -7,7 +7,7 @@ match) and stage 2 (MinHash over title shingles).  Both are here.
 Signal                                                Window       Gated
 ====================================================  ===========  ========
 provider namespace + provider item id (unconflicted)  none         no
-URL identity key, corroborated                        url          yes
+URL identity key, corroborated, both dated            url          yes
 identical normalized title *and* description          content      yes
 identical normalized title                            exact_title  yes
 MinHash candidate verified structurally identical     near_exact   yes
@@ -19,10 +19,13 @@ but it applies only while the identity is consistent.  A provider item id
 that carried conflicting payloads quarantines every item under it, and
 those items then merge through no signal at all.
 
-Every other signal is circumstantial, so every other edge passes
-:func:`nlp.dedup.compatibility.incompatibility` before it is unioned.  The
-gate is applied once, centrally, in :func:`_accept_edges` — never inside an
-individual signal — so no tier can drift into a weaker check of its own.
+Every other signal is circumstantial, so every other edge passes the shared
+compatibility gate before it is unioned.  The gate is applied once,
+centrally, inside :meth:`_ConstrainedDisjointSet.union` — never inside an
+individual signal — so no tier can drift into a weaker check of its own,
+and it is applied to the **whole prospective cluster** rather than the two
+endpoints of the edge.  Endpoint-only checking let a record carrying no
+description bridge two records whose descriptions contradicted each other.
 
 Merges never cross a ticker partition, and every window is applied to the
 *span of the resulting cluster*, so transitive chaining cannot widen a
@@ -33,16 +36,24 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import itertools
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Sequence
 
-from .compatibility import incompatibility
+from .compatibility import (
+    PROVIDER_EXTRA_CHECKS,
+    VETO_REASONS,
+    EvidenceSummary,
+    combine,
+    summarize,
+)
 from .config import DedupConfig
 from .errors import DedupCapacityError
 from .minhash import estimate_similarity, shingles, signature
 from .models import MatchReason, NormalizedItem, ProviderConflict, REASON_RANK
 
 _EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
+
 
 KeyGetter = Callable[[NormalizedItem], str | None]
 
@@ -90,27 +101,31 @@ class DetectionReport:
 def _conflicting_fields(
     members: Sequence[NormalizedItem], config: DedupConfig
 ) -> tuple[str, ...]:
-    """Return the sorted field names that disagree within one provider id."""
+    """Return the sorted reasons the records under one provider id disagree.
+
+    Text evidence is compared with the *same* primitive the compatibility
+    gate uses, so provider quarantine can never be the weaker of the two.
+    Every pair is compared, so a three-record group where only one pair
+    conflicts is still quarantined as a whole.  On top of that, provider
+    identity applies three checks ordinary compatibility does not: an item
+    id must not move between URLs, between tickers, or across time.
+    """
 
     fields: set[str] = set()
-    titles = {item.title_key for item in members if item.title_key is not None}
-    if len(titles) > 1:
-        fields.add("title")
-    descriptions = {
-        item.normalized_description for item in members if item.normalized_description
-    }
-    if len(descriptions) > 1:
-        fields.add("description")
+    for left, right in itertools.combinations(members, 2):
+        reason = combine(summarize(left), summarize(right))[1]
+        if reason is not None:
+            fields.add(reason)
+    # The stricter-than-compatibility checks, named in PROVIDER_EXTRA_CHECKS.
     urls = {item.url_key for item in members if item.url_key is not None}
     if len(urls) > 1:
         fields.add("url")
-    if len({item.content_fingerprint is not None for item in members}) > 1:
-        fields.add("text")
     if len({item.ticker for item in members}) > 1:
         fields.add("ticker")
     stamps = sorted(item.published_at for item in members if item.published_at)
     if stamps and stamps[-1] - stamps[0] > config.provider_timestamp_tolerance:
         fields.add("published_at")
+    assert fields <= set(PROVIDER_EXTRA_CHECKS) | set(VETO_REASONS)
     return tuple(sorted(fields))
 
 
@@ -166,13 +181,25 @@ def _order_key(item: NormalizedItem) -> tuple[bool, datetime, str]:
 
 
 class _ConstrainedDisjointSet:
-    """Union-find that refuses merges widening a cluster past a window."""
+    """Union-find that enforces the window *and* cluster-wide compatibility.
 
-    def __init__(self, timestamps: Sequence[datetime | None]) -> None:
+    Each component carries the evidence summary of everything in it, so a
+    union is checked against the whole prospective cluster rather than the
+    two endpoints of one edge.  Without that, a record carrying no
+    description could bridge two records whose descriptions flatly
+    contradict each other.
+    """
+
+    def __init__(
+        self,
+        timestamps: Sequence[datetime | None],
+        summaries: Sequence[EvidenceSummary],
+    ) -> None:
         self._parent = list(range(len(timestamps)))
         self._size = [1] * len(timestamps)
         self._earliest: list[datetime | None] = list(timestamps)
         self._latest: list[datetime | None] = list(timestamps)
+        self._summary: list[EvidenceSummary] = list(summaries)
 
     def find(self, index: int) -> int:
         root = index
@@ -182,12 +209,24 @@ class _ConstrainedDisjointSet:
             self._parent[index], index = root, self._parent[index]
         return root
 
-    def union(self, left: int, right: int, window: timedelta | None) -> bool:
-        """Merge the two clusters, or return ``False`` if the window forbids it."""
+    def union(
+        self, left: int, right: int, window: timedelta | None, *, gated: bool
+    ) -> tuple[bool, str | None]:
+        """Merge the two components.
+
+        Returns ``(merged, veto_reason)``.  ``gated`` is False only for the
+        authoritative provider signal, whose groups have already survived
+        conflict quarantine.
+        """
 
         left_root, right_root = self.find(left), self.find(right)
         if left_root == right_root:
-            return False
+            return False, None
+        merged_summary, veto = combine(
+            self._summary[left_root], self._summary[right_root]
+        )
+        if gated and veto is not None:
+            return False, veto
         earliest = _minimum(self._earliest[left_root], self._earliest[right_root])
         latest = _maximum(self._latest[left_root], self._latest[right_root])
         if (
@@ -196,7 +235,7 @@ class _ConstrainedDisjointSet:
             and latest is not None
             and latest - earliest > window
         ):
-            return False
+            return False, None
         # Merge the smaller cluster into the larger one; the lower root index
         # wins ties so the structure never depends on input order.
         if self._size[left_root] < self._size[right_root] or (
@@ -207,7 +246,9 @@ class _ConstrainedDisjointSet:
         self._size[left_root] += self._size[right_root]
         self._earliest[left_root] = earliest
         self._latest[left_root] = latest
-        return True
+        if merged_summary is not None:
+            self._summary[left_root] = merged_summary
+        return True, None
 
 
 def _minimum(left: datetime | None, right: datetime | None) -> datetime | None:
@@ -227,7 +268,7 @@ def _maximum(left: datetime | None, right: datetime | None) -> datetime | None:
 # --------------------------------------------------------------------------
 
 
-def _chain_edges(
+def _bucket_edges(
     items: Sequence[NormalizedItem],
     ordered: Sequence[int],
     key: KeyGetter,
@@ -235,12 +276,15 @@ def _chain_edges(
     *,
     requires_timestamp: bool,
 ) -> list[CandidateEdge]:
-    """Chain time-adjacent members of each key group.
+    """Propose every unique pair inside each exact-key bucket.
 
-    Chaining consecutive members rather than every pair keeps edge
-    generation linear while producing the same clusters: the window check
-    applies to the cluster span, so any pair the chain skips is a pair whose
-    span has already been evaluated.
+    An earlier version chained only time-adjacent members, on the argument
+    that the window applies to the cluster span so skipped pairs were
+    already covered.  That reasoning fails once an edge can be *vetoed*: if
+    A and C share a key and are compatible, but an incompatible B sorts
+    between them, chaining proposes only A-B and B-C and never considers
+    A-C.  Buckets are bounded by the per-ticker capacity contract, so all
+    unique pairs is affordable and complete.
     """
 
     groups: dict[str, list[int]] = {}
@@ -254,7 +298,7 @@ def _chain_edges(
     return [
         CandidateEdge(left, right, reason)
         for group_key in sorted(groups)
-        for left, right in zip(groups[group_key], groups[group_key][1:])
+        for left, right in itertools.combinations(groups[group_key], 2)
     ]
 
 
@@ -375,14 +419,15 @@ def _accept_edges(
 
     windows = {
         MatchReason.PROVIDER_ITEM: None,
-        MatchReason.CANONICAL_URL: None,
+        MatchReason.CANONICAL_URL: config.url_window,
         MatchReason.EXACT_CONTENT: config.content_window,
         MatchReason.EXACT_TITLE: config.exact_title_window,
         MatchReason.NEAR_EXACT_TITLE: config.near_exact_window,
     }
     position = {index: offset for offset, index in enumerate(ordered)}
     disjoint_set = _ConstrainedDisjointSet(
-        [items[index].published_at for index in ordered]
+        [items[index].published_at for index in ordered],
+        [summarize(items[index]) for index in ordered],
     )
     ordered_edges = sorted(
         edges,
@@ -396,16 +441,19 @@ def _accept_edges(
     reason_counts: Counter = Counter()
     veto_counts: Counter = Counter()
     for edge in ordered_edges:
-        if edge.reason is not MatchReason.PROVIDER_ITEM:
-            # One gate, one place. Provider identity is authoritative and
-            # is the only signal that bypasses it.
-            veto = incompatibility(items[edge.left], items[edge.right])
-            if veto is not None:
-                veto_counts[veto] += 1
-                continue
-        if disjoint_set.union(
-            position[edge.left], position[edge.right], windows[edge.reason]
-        ):
+        # One gate, one place, applied to the whole prospective cluster.
+        # Provider identity is authoritative and is the only signal that
+        # bypasses it, having already survived conflict quarantine.
+        merged, veto = disjoint_set.union(
+            position[edge.left],
+            position[edge.right],
+            windows[edge.reason],
+            gated=edge.reason is not MatchReason.PROVIDER_ITEM,
+        )
+        if veto is not None:
+            veto_counts[veto] += 1
+            continue
+        if merged:
             accepted.append(edge)
             reason_counts[edge.reason.value] += 1
     return _Acceptance(
@@ -426,7 +474,7 @@ def _detect_partition(
 ) -> tuple[list[DuplicateGroup], Counter, Counter, int, int]:
     edges: list[CandidateEdge] = []
     edges.extend(
-        _chain_edges(
+        _bucket_edges(
             items,
             mergeable,
             lambda item: item.provider_key,
@@ -434,12 +482,16 @@ def _detect_partition(
             requires_timestamp=False,
         )
     )
-    url_edges = _chain_edges(
+    # A repeated URL only counts as evidence between records that can be
+    # placed in time: without both timestamps the configured window cannot
+    # be enforced, and an unbounded URL merge is exactly what a recycled
+    # slug exploits.  An undated pair may still merge on provider identity.
+    url_edges = _bucket_edges(
         items,
         mergeable,
         lambda item: item.url_key,
         MatchReason.CANONICAL_URL,
-        requires_timestamp=False,
+        requires_timestamp=True,
     )
     edges.extend(
         edge
@@ -447,7 +499,7 @@ def _detect_partition(
         if url_corroborated(items[edge.left], items[edge.right], config)
     )
     edges.extend(
-        _chain_edges(
+        _bucket_edges(
             items,
             mergeable,
             lambda item: item.content_key,
@@ -456,7 +508,7 @@ def _detect_partition(
         )
     )
     edges.extend(
-        _chain_edges(
+        _bucket_edges(
             items,
             mergeable,
             lambda item: item.title_key,
