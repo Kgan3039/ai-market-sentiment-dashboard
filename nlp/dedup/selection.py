@@ -91,6 +91,8 @@ def cluster_fingerprint_for(ticker: str, member_ids: Sequence[str]) -> str:
     run's clusters to stored rows on ``member_ids``.
     """
 
+    if not isinstance(CLUSTER_NAMESPACE, str) or not CLUSTER_NAMESPACE.strip():
+        raise DedupInputError("cluster fingerprint needs a non-blank namespace")
     if not isinstance(ticker, str) or not ticker.strip():
         raise DedupInputError("cluster fingerprint needs a non-blank ticker")
     identifiers = list(member_ids)

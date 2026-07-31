@@ -1646,3 +1646,24 @@ def test_cluster_fingerprint_is_stable_and_full_width():
     digest = cluster_fingerprint_for("NVDA", ["b", "a"])
     assert digest == cluster_fingerprint_for("NVDA", ["a", "b"])
     assert len(digest) == 64
+
+
+def test_the_committed_namespace_produces_a_stable_fingerprint():
+    from nlp.dedup import selection
+
+    assert selection.CLUSTER_NAMESPACE == "m2.cluster.v1"
+    assert cluster_fingerprint_for("NVDA", ["a", "b"]) == (
+        "10a6a32a27473343a03a06b638f530eb8d7db8b3148dd77ef105fc8af90a3295"
+    )
+
+
+@pytest.mark.parametrize("namespace", ["", "   ", "\t\n", None, 7, b"m2"])
+def test_cluster_fingerprint_rejects_a_blank_namespace(namespace, monkeypatch):
+    # The committed constant is non-blank; the guard exists so a future
+    # edit that blanks it fails loudly instead of silently hashing a
+    # namespace-less payload that could collide with a real cluster.
+    from nlp.dedup import selection
+
+    monkeypatch.setattr(selection, "CLUSTER_NAMESPACE", namespace)
+    with pytest.raises(DedupInputError, match="non-blank namespace"):
+        cluster_fingerprint_for("NVDA", ["a", "b"])
