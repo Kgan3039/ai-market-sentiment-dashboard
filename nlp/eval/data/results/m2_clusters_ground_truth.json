@@ -1,39 +1,46 @@
 {
+  "accounting": {
+    "duplicated_item_ids": [],
+    "failed_case_ids": [],
+    "missing_item_ids": [],
+    "unexpected_item_ids": [],
+    "violations": []
+  },
   "cases": [
     {
       "case_id": "C001",
       "category": "sparse_bridge_contradictory",
-      "duplicated_items": [],
       "exact_match": true,
       "expected_partition": [
         [
-          "C001-3"
+          "C001-1"
         ],
         [
-          "C001-1",
-          "C001-2"
+          "C001-3"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [
+        "C001-2"
+      ],
       "over_merged_pairs": [],
+      "permutation_count": 6,
       "permutation_stable": true,
       "predicted_partition": [
         [
-          "C001-3"
+          "C001-1"
         ],
         [
-          "C001-1",
-          "C001-2"
+          "C001-3"
         ]
       ],
       "resolvable_by": "m2",
       "status": "decidable",
-      "under_merged_pairs": []
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C002",
       "category": "sparse_bridge_compatible",
-      "duplicated_items": [],
       "exact_match": true,
       "expected_partition": [
         [
@@ -42,8 +49,9 @@
           "C002-3"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 6,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -54,26 +62,25 @@
       ],
       "resolvable_by": "m2",
       "status": "decidable",
-      "under_merged_pairs": []
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C003",
       "category": "provider_conflict_group",
-      "duplicated_items": [],
-      "exact_match": true,
+      "exact_match": false,
       "expected_partition": [
-        [
-          "C003-1"
-        ],
         [
           "C003-2"
         ],
         [
+          "C003-1",
           "C003-3"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 6,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -88,12 +95,17 @@
       ],
       "resolvable_by": "m2",
       "status": "decidable",
-      "under_merged_pairs": []
+      "under_merged_pairs": [
+        [
+          "C003-1",
+          "C003-3"
+        ]
+      ],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C004",
       "category": "url_reuse_group",
-      "duplicated_items": [],
       "exact_match": true,
       "expected_partition": [
         [
@@ -104,8 +116,9 @@
           "C004-2"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 6,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -118,12 +131,12 @@
       ],
       "resolvable_by": "m2",
       "status": "decidable",
-      "under_merged_pairs": []
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C005",
       "category": "repeated_quarterly_group",
-      "duplicated_items": [],
       "exact_match": true,
       "expected_partition": [
         [
@@ -136,8 +149,9 @@
           "C005-3"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 6,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -152,12 +166,12 @@
       ],
       "resolvable_by": "m2",
       "status": "decidable",
-      "under_merged_pairs": []
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C006",
       "category": "semantic_transitivity",
-      "duplicated_items": [],
       "exact_match": false,
       "expected_partition": [
         [
@@ -166,8 +180,9 @@
           "C006-3"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 6,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -195,12 +210,12 @@
           "C006-2",
           "C006-3"
         ]
-      ]
+      ],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C007",
       "category": "mixed_stage_group",
-      "duplicated_items": [],
       "exact_match": false,
       "expected_partition": [
         [
@@ -210,8 +225,9 @@
           "C007-4"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 24,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -238,12 +254,12 @@
           "C007-3",
           "C007-4"
         ]
-      ]
+      ],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C008",
       "category": "permutation_equivalence",
-      "duplicated_items": [],
       "exact_match": true,
       "expected_partition": [
         [
@@ -258,8 +274,9 @@
           "C008-5"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 120,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -276,12 +293,12 @@
       ],
       "resolvable_by": "m2",
       "status": "decidable",
-      "under_merged_pairs": []
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
     },
     {
       "case_id": "C009",
-      "category": "mixed_stage_group",
-      "duplicated_items": [],
+      "category": "same_event_different_article",
       "exact_match": true,
       "expected_partition": [
         [
@@ -292,8 +309,9 @@
           "C009-2"
         ]
       ],
-      "missing_items": [],
+      "indeterminate_item_ids": [],
       "over_merged_pairs": [],
+      "permutation_count": 6,
       "permutation_stable": true,
       "predicted_partition": [
         [
@@ -304,9 +322,10 @@
           "C009-2"
         ]
       ],
-      "resolvable_by": "m3",
-      "status": "ambiguous",
-      "under_merged_pairs": []
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
     }
   ],
   "completeness": {
@@ -319,22 +338,22 @@
   "dataset_id": "phase0-dedup-cluster-cases-v1",
   "limitation": "Multi-item cluster metrics run each case as one batch, so they do observe cluster-wide compatibility, transitivity, quarantine, and window-on-span behaviour that isolated-pair metrics cannot. They are still nine authored cases, not a sample of production traffic, and they are not evidence of production acceptance.",
   "multi_item_cluster_metrics": {
-    "accounting_failures": [],
-    "ambiguous_case_count": 1,
+    "ambiguous_case_count": 0,
     "exact_partition_matches": 6,
-    "exact_partition_rate": 0.75,
+    "exact_partition_rate": 0.6666666666666666,
     "over_merge_case_ids": [],
     "pairwise_co_clustering": {
-      "accuracy": 0.8235294117647058,
+      "accuracy": 0.8,
       "counts": {
-        "false_negative": 6,
+        "false_negative": 7,
         "false_positive": 0,
         "true_negative": 18,
         "true_positive": 10
       },
-      "f1": 0.7692307692307693,
+      "f1": 0.7407407407407407,
       "pair_ids": {
         "false_negative": [
+          "C003:C003-1|C003-3",
           "C006:C006-1|C006-2",
           "C006:C006-1|C006-3",
           "C006:C006-2|C006-3",
@@ -345,9 +364,7 @@
         "false_positive": [],
         "true_negative": [
           "C001:C001-1|C001-3",
-          "C001:C001-2|C001-3",
           "C003:C003-1|C003-2",
-          "C003:C003-1|C003-3",
           "C003:C003-2|C003-3",
           "C004:C004-1|C004-3",
           "C004:C004-2|C004-3",
@@ -361,10 +378,11 @@
           "C008:C008-2|C008-4",
           "C008:C008-3|C008-4",
           "C008:C008-3|C008-5",
-          "C008:C008-4|C008-5"
+          "C008:C008-4|C008-5",
+          "C009:C009-1|C009-3",
+          "C009:C009-2|C009-3"
         ],
         "true_positive": [
-          "C001:C001-1|C001-2",
           "C002:C002-1|C002-2",
           "C002:C002-1|C002-3",
           "C002:C002-2|C002-3",
@@ -373,20 +391,23 @@
           "C007:C007-1|C007-3",
           "C007:C007-2|C007-3",
           "C008:C008-1|C008-4",
-          "C008:C008-2|C008-5"
+          "C008:C008-2|C008-5",
+          "C009:C009-1|C009-2"
         ]
       },
       "precision": 1.0,
-      "recall": 0.625
+      "recall": 0.5882352941176471
     },
     "permutation_failures": [],
-    "scored_case_count": 8,
+    "scored_case_count": 9,
     "under_merge_case_ids": [
+      "C003",
       "C006",
       "C007"
     ]
   },
   "predictor": "m2",
+  "schema_version": "phase0.eval_report.clusters.v2",
   "scope": "multi_item_clusters",
   "target": "expected_partition",
   "trust_contract": {

@@ -19,6 +19,12 @@ from .clusters import ClusterEvaluationReport
 from .metrics import CategoryBreakdown, EvaluationReport, Metrics, ThresholdPoint
 
 
+#: Payload shapes, versioned so a consumer can tell which contract it has.
+ISOLATED_PAIR_PAYLOAD_VERSION = "phase0.eval_report.isolated_pairs.v2"
+CLUSTER_PAYLOAD_VERSION = "phase0.eval_report.clusters.v2"
+SWEEP_PAYLOAD_VERSION = "phase0.eval_report.sweep.v2"
+
+
 def _number(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.4f}"
 
@@ -74,6 +80,7 @@ def to_payload(report: EvaluationReport) -> dict[str, Any]:
     return {
         "trust_contract": report.trust.as_dict(),
         "dataset_id": report.dataset_id,
+        "schema_version": ISOLATED_PAIR_PAYLOAD_VERSION,
         "predictor": report.predictor,
         "scope": report.scope,
         "limitation": report.limitation,
@@ -100,6 +107,7 @@ def cluster_payload(report: ClusterEvaluationReport) -> dict[str, Any]:
     return {
         "trust_contract": report.trust.as_dict(),
         "dataset_id": report.dataset_id,
+        "schema_version": CLUSTER_PAYLOAD_VERSION,
         "predictor": report.predictor,
         "scope": report.scope,
         "limitation": report.limitation,
@@ -112,8 +120,24 @@ def cluster_payload(report: ClusterEvaluationReport) -> dict[str, Any]:
             "over_merge_case_ids": list(report.over_merge_case_ids),
             "under_merge_case_ids": list(report.under_merge_case_ids),
             "permutation_failures": list(report.permutation_failures),
-            "accounting_failures": list(report.accounting_failures),
             "ambiguous_case_count": report.ambiguous_case_count,
+        },
+        "accounting": {
+            "failed_case_ids": list(report.accounting_failure_ids),
+            "missing_item_ids": list(report.missing_item_ids),
+            "duplicated_item_ids": list(report.duplicated_item_ids),
+            "unexpected_item_ids": list(report.unexpected_item_ids),
+            "violations": [
+                {
+                    "case_id": entry.case_id,
+                    "missing_item_ids": list(entry.missing_item_ids),
+                    "duplicated_item_ids": list(entry.duplicated_item_ids),
+                    "unexpected_item_ids": list(entry.unexpected_item_ids),
+                    "empty_cluster_count": entry.empty_cluster_count,
+                    "message": entry.message,
+                }
+                for entry in report.accounting_violations
+            ],
         },
         "cases": [
             {
@@ -128,9 +152,10 @@ def cluster_payload(report: ClusterEvaluationReport) -> dict[str, Any]:
                 "under_merged_pairs": [
                     list(pair) for pair in outcome.under_merged_pairs
                 ],
-                "missing_items": list(outcome.missing_items),
-                "duplicated_items": list(outcome.duplicated_items),
+                "indeterminate_item_ids": list(outcome.indeterminate_item_ids),
+                "permutation_count": outcome.permutation_count,
                 "permutation_stable": outcome.permutation_stable,
+                "unstable_permutation_count": outcome.unstable_permutation_count,
             }
             for outcome in report.outcomes
         ],
@@ -138,29 +163,54 @@ def cluster_payload(report: ClusterEvaluationReport) -> dict[str, Any]:
     }
 
 
-def sweep_payload(points: Sequence[ThresholdPoint]) -> list[dict[str, Any]]:
-    """Return the JSON-serializable form of a threshold sweep."""
+def sweep_payload(points: Sequence[ThresholdPoint]) -> dict[str, Any]:
+    """Return the JSON-serializable form of a threshold sweep.
 
-    return [
-        {
-            "threshold": point.threshold,
-            "scope": point.report.scope,
-            "precision": point.precision,
-            "recall": point.recall,
-            "f1": point.f1,
-            "candidate_recall": point.report.candidate_recall,
-            "counts": {
-                "true_positive": point.report.isolated_pair_metrics.confusion.tp,
-                "false_positive": point.report.isolated_pair_metrics.confusion.fp,
-                "false_negative": point.report.isolated_pair_metrics.confusion.fn,
-            },
-            "false_positives": list(
-                point.report.isolated_pair_metrics.confusion.false_positives
-            ),
-            "complete": point.report.complete,
-        }
-        for point in points
-    ]
+    A full document, not a bare list of rows.  The rows are the part
+    somebody quotes, so the trust contract, the dataset identity, the scope
+    and the completeness of each point have to be in the same object; a
+    caller that wrapped the list itself could forget, and one did.
+    """
+
+    if not points:
+        raise ValueError("a sweep report needs at least one point")
+    first = points[0].report
+    return {
+        "trust_contract": first.trust.as_dict(),
+        "dataset_id": first.dataset_id,
+        "schema_version": SWEEP_PAYLOAD_VERSION,
+        "scope": first.scope,
+        "limitation": first.limitation,
+        "complete": all(point.report.complete for point in points),
+        "evaluated_case_count": first.evaluated_case_count,
+        "failed_case_count": sum(point.report.failed_case_count for point in points),
+        "failed_case_ids": sorted(
+            {case_id for point in points for case_id in point.report.failed_case_ids}
+        ),
+        "points": [
+            {
+                "threshold": point.threshold,
+                "scope": point.report.scope,
+                "precision": point.precision,
+                "recall": point.recall,
+                "f1": point.f1,
+                "candidate_recall": point.report.candidate_recall,
+                "counts": {
+                    "true_positive": point.report.isolated_pair_metrics.confusion.tp,
+                    "false_positive": point.report.isolated_pair_metrics.confusion.fp,
+                    "false_negative": point.report.isolated_pair_metrics.confusion.fn,
+                },
+                "false_positives": list(
+                    point.report.isolated_pair_metrics.confusion.false_positives
+                ),
+                "complete": point.report.complete,
+                "evaluated_case_count": point.report.evaluated_case_count,
+                "failed_case_count": point.report.failed_case_count,
+                "failed_case_ids": list(point.report.failed_case_ids),
+            }
+            for point in points
+        ],
+    }
 
 
 def _table(rows: Sequence[Sequence[str]]) -> list[str]:
@@ -337,7 +387,12 @@ def render_clusters(
         f"  permutation failures   "
         f"{', '.join(report.permutation_failures) or 'none'}",
         f"  accounting failures    "
-        f"{', '.join(report.accounting_failures) or 'none'}",
+        f"{', '.join(report.accounting_failure_ids) or 'none'}",
+        f"  missing item ids       {', '.join(report.missing_item_ids) or 'none'}",
+        f"  duplicated item ids    "
+        f"{', '.join(report.duplicated_item_ids) or 'none'}",
+        f"  unexpected item ids    "
+        f"{', '.join(report.unexpected_item_ids) or 'none'}",
         f"  ambiguous cases        {report.ambiguous_case_count} (excluded)",
         "",
         "cases",
@@ -366,6 +421,15 @@ def render_clusters(
                 "         under-merged "
                 + ", ".join("+".join(pair) for pair in outcome.under_merged_pairs)
             )
+        if outcome.indeterminate_item_ids:
+            lines.append(
+                "         indeterminate (unscored) "
+                + ", ".join(outcome.indeterminate_item_ids)
+            )
+        lines.append(
+            f"         permutations {outcome.permutation_count} checked, "
+            f"{outcome.unstable_permutation_count} disagreed"
+        )
         if not outcome.permutation_stable:
             lines.append("         PERMUTATION UNSTABLE")
         if rationales and outcome.case_id in rationales:

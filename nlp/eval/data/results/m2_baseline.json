@@ -1381,6 +1381,7 @@
   "limitation": "Isolated-pair metrics measure whether a two-item invocation of the stage merges a pair. Production clustering can differ on the same two records in a multi-item batch, because cluster-wide compatibility, transitivity, provider-conflict quarantine, and capacity behaviour all depend on the companion items in the batch. These numbers therefore cannot on their own validate production clustering; see multi_item_cluster_metrics.",
   "merge_recall": 0.6153846153846154,
   "predictor": "m2",
+  "schema_version": "phase0.eval_report.isolated_pairs.v2",
   "scope": "isolated_pairs",
   "scores": {},
   "threshold": null,

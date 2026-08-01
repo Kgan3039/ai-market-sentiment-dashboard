@@ -32,6 +32,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 from .dataset import LabeledPair, PairSet
 from .trust import TrustContract
+from .validation import validate_optional_unit_interval, validate_thresholds
 
 #: What an :class:`EvaluationReport` measures.  Present in every payload so
 #: a report can never be read as something it is not.
@@ -303,6 +304,7 @@ def evaluate_isolated_pairs(
     ``complete`` False.
     """
 
+    threshold = validate_optional_unit_interval(threshold, "threshold")
     predictions: list[tuple[LabeledPair, PairPrediction]] = []
     failures: list[EvaluationFailure] = []
     for pair in pair_set.pairs:
@@ -379,34 +381,6 @@ class ThresholdPoint:
     @property
     def f1(self) -> float | None:
         return self.report.isolated_pair_metrics.f1
-
-
-def validate_thresholds(thresholds: Sequence[float]) -> tuple[float, ...]:
-    """Return the sorted, validated sweep points.
-
-    Rejects an empty sweep, repeats, non-numbers, non-finite values, and
-    anything outside ``[0, 1]``: a cosine threshold above 1 merges nothing
-    and below 0 merges everything, and either would put a meaningless row
-    in a tuning table that somebody later reads as evidence.
-    """
-
-    import math
-
-    values: list[float] = []
-    for entry in thresholds:
-        if isinstance(entry, bool) or not isinstance(entry, (int, float)):
-            raise ValueError(f"sweep thresholds must be numbers, got {entry!r}")
-        number = float(entry)
-        if not math.isfinite(number):
-            raise ValueError(f"sweep thresholds must be finite, got {entry!r}")
-        if not 0.0 <= number <= 1.0:
-            raise ValueError(f"sweep thresholds must lie in [0.0, 1.0], got {entry!r}")
-        values.append(number)
-    if not values:
-        raise ValueError("a sweep needs at least one threshold")
-    if len(set(values)) != len(values):
-        raise ValueError("sweep thresholds must be distinct")
-    return tuple(sorted(values))
 
 
 def sweep_thresholds(

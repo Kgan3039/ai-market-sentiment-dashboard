@@ -243,15 +243,28 @@ Metrics are not valid for K3/G4 or final AC-3 acceptance.**
 | `gate_eligible` | `false` |
 | `metrics_purpose` | `development_regression_only` |
 
-This block is **enforced, not documented**. Both manifests must declare all
-seven fields; the loader refuses a set that omits one, that is synthetic and
-claims real ingested evidence, that is synthetic and claims gate
-eligibility, that claims adjudication with one reviewer, or whose `labeling`
-block contradicts its `trust_contract`. Every loaded pair, item, and case is
-stamped `synthetic=True` from the manifest. The block and the warning are
-printed **above and below** every text report, and appear in every JSON
-payload and every committed result file — because somebody will read
-`m2_baseline.json`, or a CLI transcript in a ticket, with no README nearby.
+This block is **enforced, not documented**, and validation is *relational*
+rather than per-field: `dataset_kind`, `labeling_status` and
+`metrics_purpose` are enums with no unknown values accepted, and the
+combinations are checked against each other in `nlp/eval/trust.py`.
+
+A `synthetic_development` set may not claim real ingested evidence, may not
+claim gate eligibility, and must declare
+`metrics_purpose=development_regression_only` — so it cannot claim
+`gate_acceptance` or `final_acceptance`. A `single_author_unadjudicated` set
+must have exactly one reviewer, must not be adjudicated, and must not be
+gate eligible. `adjudicated=true` requires at least two reviewers *and* an
+adjudicated labeling status. `gate_eligible=true` requires real ingested
+evidence, adjudication, at least two reviewers, a gate-or-acceptance
+purpose, and a non-synthetic dataset kind; and a gate purpose declared
+without `gate_eligible` is refused too. The `labeling` block must agree with
+the contract on all four shared fields.
+
+Every loaded pair, item, and case is stamped `synthetic=True` from the
+manifest. The block and the warning are printed **above and below** every
+text report, and appear in every JSON payload and every committed result
+file — because somebody will read `m2_baseline.json`, or a CLI transcript in
+a ticket, with no README nearby.
 
 Issue #67 asks for ~150 pairs **sampled from real ingested data**,
 co-labelled with Kartik under the K3 (#60) guidelines. None of that is
@@ -332,32 +345,80 @@ without touching a numerator. M2 was not tuned.
 Nine authored cases, 30 records, covering a sparse bridge between
 contradictory endpoints, a legitimate sparse bridge, a provider-conflict
 group, a recycled-URL group, a repeated quarterly group, three-item semantic
-transitivity, two mixed-stage groups, and a permutation-equivalence batch.
+transitivity, a mixed-stage group, a permutation-equivalence batch, and a
+release-plus-interview group.
 
-Against `exact_stage_partition` — what the exact stage alone should produce
-(`m2_clusters_exact_stage.json`):
+**Three expectations per case, kept apart on purpose:**
+
+| field | what it is |
+|---|---|
+| `expected_partition` | ground truth — how a reader groups the *articles* |
+| `indeterminate_item_ids` | items the records do not place; never scored |
+| `exact_stage_partition` | what the exact stage alone should produce |
+
+Recording an implementation's traversal order as human truth would make the
+fixture agree with the code by construction. Three cases were corrected for
+exactly that:
+
+- **C001** previously asserted `[[1,2],[3]]` as ground truth. Item 2 carries
+  the same headline and no standfirst — nothing in the records says which of
+  the two contradicting articles it is a copy of. It is now
+  `indeterminate`, ground truth asserts only the decidable part (1 and 3
+  stay apart), and no pair involving item 2 is scored. M2's answer is kept
+  in `exact_stage_partition`, where it belongs.
+- **C003** previously made ground truth all-singleton because M2 quarantines
+  a provider conflict. As articles, records 1 and 3 are one story and record
+  2 is a different recall. Ground truth now says so, quarantine stays in
+  `exact_stage_partition`, and the gap shows up as an under-merge — the
+  honest cost of the policy rather than a definition that hides it.
+- **C009** was `ambiguous` on the same question P152 answers. P152 is
+  `distinct`; C009 now takes the same decision and declares the link, so the
+  two fixtures cannot disagree silently.
+
+**Cross-fixture claims.** A case may declare that a relationship it contains
+is the same one a pair records. The loader checks the claim against the
+pair's label *and* against the case's own partition, refuses a claim that
+borrows authority from an `ambiguous` pair, and refuses a contradiction
+unless the case states a `divergence_reason`. Eleven claims are committed.
+
+Against `exact_stage_partition` (`m2_clusters_exact_stage.json`):
 
 | metric | value |
 |---|---|
-| exact partition match | **8/8** (1.0000) |
+| exact partition match | **9/9** (1.0000) |
 | co-clustering precision / recall / F1 | 1.0000 / 1.0000 / 1.0000 |
 | over-merged / under-merged cases | none / none |
 | permutation failures | none |
-| missing or duplicated items | none |
+| accounting violations | none |
 
-Against `expected_partition` — ground truth (`m2_clusters_ground_truth.json`):
+Against `expected_partition` (`m2_clusters_ground_truth.json`):
 
 | metric | value |
 |---|---|
-| exact partition match | 6/8 (0.7500) |
-| co-clustering precision / recall / F1 | 1.0000 / 0.6250 / 0.7692 |
+| exact partition match | 6/9 (0.6667) |
+| co-clustering precision / recall / F1 | 1.0000 / 0.5882 / 0.7407 |
 | over-merged cases | **none** |
-| under-merged cases | `C006`, `C007` |
+| under-merged cases | `C003` (quarantine), `C006`, `C007` (semantic) |
 
-Both under-merges are the semantic cases M3 exists for, and reporting the
-two targets separately is what keeps that legible as correct M2 behaviour
-rather than a defect. Every case is re-run reversed and rotated; a partition
-that changed would be named in `permutation_failures`.
+### Cluster-member accounting is checked before any metric
+
+A predicted partition must contain exactly the case's item ids. Missing ids,
+duplicate ids across groups, invented ids, empty groups, blank ids and
+non-collection groups all raise `PartitionAccountingError`, and the case is
+**failed** — excluded from every denominator, with `missing_item_ids`,
+`duplicated_item_ids` and `unexpected_item_ids` reported per case and in
+aggregate. A clusterer that returns the right answer plus one invented id
+scores `exact_partition_matches=0` and undefined precision, not a perfect
+run.
+
+### Permutation coverage
+
+Every case is re-run under **every ordering** while the factorial stays at or
+below 120 — which covers all nine fixtures (6, 6, 6, 6, 6, 6, 24, 120, 6
+orderings). Above that the set is the original, the reverse, every cyclic
+rotation, and eight shuffles seeded on the case id, so it is documented,
+deterministic and reproducible from the case alone. Each case reports
+`permutation_count` and `unstable_permutation_count`.
 
 ### Dataset integrity, enforced at load
 
@@ -378,6 +439,32 @@ with its id, exception type and message, left out of **every** denominator,
 and the report exposes `evaluated_case_count`, `failed_case_count`,
 `failed_case_ids` and `complete`. The text renderer prints the failures and
 states that they were excluded; the CLI exits 1 on an incomplete run.
+
+### One validator for every gate value
+
+`nlp/eval/validation.py` is the only place a threshold or floor becomes a
+number. It rejects NaN, `inf`, `-inf`, values outside `[0, 1]`,
+non-numbers, and booleans — `True` would otherwise be read as `1.0`. It is
+used by the CLI's `--precision-floor`, `--recall-floor` and `--threshold`,
+by the sweep, and by the report constructor.
+
+This matters because **NaN loses every comparison silently**: a gate checked
+against it does not fail loudly, it passes or fails depending on which way
+the comparison happens to be written. `argparse`'s `type=float` accepts
+`nan`, `inf` and `-inf` without complaint, so the check happens after
+parsing and before any comparison. All six of `--precision-floor nan`,
+`--recall-floor nan`, `--precision-floor inf`, `--recall-floor -inf`,
+`--precision-floor -0.1` and `--recall-floor 1.1` exit 2 with a message
+naming the field and the reason.
+
+### The trust block reaches the raw rows, not only the rendering
+
+Every public payload-producing function — `to_payload`, `cluster_payload`
+and `sweep_payload` — returns a document carrying the trust contract, the
+dataset id, a versioned `schema_version`, the scope, the limitation, and the
+completeness counts. `sweep_payload` used to return a bare list of rows,
+which is exactly the object somebody quotes; it now returns the document and
+the rows live under `points`, each carrying its own scope and completeness.
 
 ### Evaluator conventions
 

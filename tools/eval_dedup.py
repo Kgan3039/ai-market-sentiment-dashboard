@@ -49,6 +49,7 @@ from nlp.eval.metrics import (
     evaluate_isolated_pairs,
     sweep_thresholds,
 )
+from nlp.eval.validation import validate_thresholds
 from nlp.eval.report import (
     cluster_payload,
     render_clusters,
@@ -58,6 +59,7 @@ from nlp.eval.report import (
     to_payload,
 )
 from nlp.eval.trust import TrustContractError
+from nlp.eval.validation import GateValueError, validate_optional_unit_interval
 
 
 def config_for_cluster_set(case_set: ClusterCaseSet) -> Any:
@@ -178,6 +180,21 @@ def _predictor_for(
     return SWEEPABLE[stage](pair_set, threshold)
 
 
+def _validated_floors(args: argparse.Namespace) -> tuple[float | None, float | None]:
+    """Validate the gate floors before any comparison is made against them.
+
+    ``argparse``'s ``type=float`` accepts ``nan``, ``inf`` and ``-inf``.
+    NaN then loses every ``<`` and ``>=`` silently, so a gate checked
+    against it never fails for the reason the operator thinks. The floors
+    go through the shared validator first, and a bad one ends the run.
+    """
+
+    return (
+        validate_optional_unit_interval(args.precision_floor, "--precision-floor"),
+        validate_optional_unit_interval(args.recall_floor, "--recall-floor"),
+    )
+
+
 def _gate(report: EvaluationReport, args: argparse.Namespace) -> int:
     failures: list[str] = []
     if args.precision_floor is not None:
@@ -267,6 +284,15 @@ def _run_clusters(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    try:
+        _validated_floors(args)
+        if args.threshold is not None:
+            validate_optional_unit_interval(args.threshold, "--threshold")
+        if args.sweep:
+            validate_thresholds(args.sweep)
+    except GateValueError as exc:
+        print(f"invalid gate value: {exc}", file=sys.stderr)
+        return 2
     if args.scope == "clusters":
         return _run_clusters(args)
 

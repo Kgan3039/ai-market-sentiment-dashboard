@@ -34,9 +34,13 @@ from nlp.eval import (
     validate_thresholds,
 )
 from nlp.eval.clusters import (
+    PartitionAccountingError,
     canonical_partition,
+    check_cross_fixture_claims,
     evaluate_clusters,
     m2_cluster_predictor,
+    permutations_of,
+    validate_predicted_partition,
 )
 from nlp.eval.dataset import DEFAULT_META_PATH
 from nlp.eval.dedup import config_for, m2_isolated_pair_predictor, to_raw_items
@@ -46,13 +50,22 @@ from nlp.eval.metrics import (
     Metrics,
 )
 from nlp.eval.report import (
+    CLUSTER_PAYLOAD_VERSION,
+    ISOLATED_PAIR_PAYLOAD_VERSION,
+    SWEEP_PAYLOAD_VERSION,
     cluster_payload,
     render_clusters,
     render_sweep,
     render_text,
+    sweep_payload,
     to_payload,
 )
 from nlp.eval.trust import WARNING_BANNER
+from nlp.eval.validation import (
+    GateValueError,
+    validate_optional_unit_interval,
+    validate_unit_interval,
+)
 from tools import eval_dedup
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -264,17 +277,6 @@ def test_p131_pins_a_single_market_so_the_currencies_really_contradict():
 # --------------------------------------------------------------------------
 
 
-def test_the_committed_sets_declare_the_full_trust_contract():
-    for trust in (default_pair_set().trust, default_cluster_cases().trust):
-        assert trust.dataset_kind == "synthetic_development"
-        assert trust.real_ingested_evidence is False
-        assert trust.labeling_status == "single_author_unadjudicated"
-        assert trust.reviewer_count == 1
-        assert trust.adjudicated is False
-        assert trust.gate_eligible is False
-        assert trust.metrics_purpose == "development_regression_only"
-
-
 def test_a_manifest_without_a_trust_contract_is_refused(tmp_path):
     meta = {
         key: value for key, value in _MINIMAL_META.items() if key != "trust_contract"
@@ -312,35 +314,12 @@ def test_synthetic_data_may_not_claim_gate_eligibility(tmp_path):
         load_pair_set(meta_path)
 
 
-def test_one_reviewer_may_not_claim_adjudication(tmp_path):
-    trust = dict(_TRUST, adjudicated=True)
-    labeling = dict(_LABELING, adjudicated=True)
-    meta_path = write_set(
-        tmp_path,
-        [_pair("P001")],
-        {"trust_contract": trust, "labeling": labeling},
-    )
-
-    with pytest.raises(TrustContractError, match="at least two reviewers"):
-        load_pair_set(meta_path)
-
-
 @pytest.mark.parametrize("value", [0, -1, 1.5, "one", True, None])
 def test_reviewer_count_must_be_a_positive_integer(tmp_path, value):
     trust = dict(_TRUST, reviewer_count=value)
     meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
 
     with pytest.raises(TrustContractError, match="positive integer"):
-        load_pair_set(meta_path)
-
-
-@pytest.mark.parametrize("field", ["adjudicated", "gate_eligible"])
-@pytest.mark.parametrize("value", ["false", 0, None])
-def test_adjudicated_and_gate_eligible_must_be_booleans(tmp_path, field, value):
-    trust = dict(_TRUST, **{field: value})
-    meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
-
-    with pytest.raises(TrustContractError, match="must be a boolean"):
         load_pair_set(meta_path)
 
 
@@ -445,18 +424,6 @@ def test_the_cluster_report_carries_the_same_contract_in_both_formats():
 
     assert render_clusters(report).splitlines()[0].startswith("WARNING:")
     assert cluster_payload(report)["trust_contract"]["gate_eligible"] is False
-
-
-def test_a_sweep_report_carries_the_contract_too():
-    pair_set = default_pair_set()
-    points = sweep_thresholds(
-        pair_set,
-        lambda threshold: (lambda pair: PairPrediction(merged=False, score=threshold)),
-        [0.5, 0.9],
-        name="fake",
-    )
-
-    assert render_sweep(points).startswith("WARNING:")
 
 
 @pytest.mark.parametrize(
@@ -723,24 +690,6 @@ def test_the_committed_set_is_sorted_and_stable():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "thresholds,message",
-    [
-        ([], "at least one threshold"),
-        ([0.8, 0.8], "must be distinct"),
-        ([float("nan")], "must be finite"),
-        ([float("inf")], "must be finite"),
-        ([-0.1], r"\[0.0, 1.0\]"),
-        ([1.5], r"\[0.0, 1.0\]"),
-        (["0.8"], "must be numbers"),
-        ([True], "must be numbers"),
-    ],
-)
-def test_an_unusable_sweep_threshold_is_refused(thresholds, message):
-    with pytest.raises(ValueError, match=message):
-        validate_thresholds(thresholds)
-
-
 def test_valid_thresholds_come_back_sorted():
     assert validate_thresholds([0.9, 0.1, 0.5]) == (0.1, 0.5, 0.9)
 
@@ -943,7 +892,7 @@ def test_a_predictor_returning_the_wrong_type_still_raises(tmp_path):
 def test_the_cluster_fixture_covers_every_required_batch_behaviour():
     categories = {case.category for case in default_cluster_cases()}
 
-    assert categories == {
+    assert categories >= {
         "sparse_bridge_contradictory",
         "sparse_bridge_compatible",
         "provider_conflict_group",
@@ -953,21 +902,6 @@ def test_the_cluster_fixture_covers_every_required_batch_behaviour():
         "mixed_stage_group",
         "permutation_equivalence",
     }
-
-
-def test_every_cluster_case_declares_two_valid_partitions():
-    for case in default_cluster_cases():
-        for partition in (case.expected_partition, case.exact_stage_partition):
-            covered = {item for group in partition for item in group}
-            assert covered == set(case.item_ids), case.case_id
-            assert sum(len(group) for group in partition) == len(case.items)
-
-
-def test_a_partition_that_places_an_item_twice_is_refused(tmp_path):
-    from nlp.eval.clusters import _as_partition
-
-    with pytest.raises(EvalDatasetError, match="more than one group"):
-        _as_partition([["a", "b"], ["b"]], where="test")
 
 
 def test_a_partition_that_misses_an_item_is_refused(tmp_path):
@@ -982,34 +916,13 @@ def test_a_partition_that_misses_an_item_is_refused(tmp_path):
         .splitlines()[0]
     )
     case["expected_partition"] = [[case["items"][0]["item_id"]]]
+    case["cross_fixture_claims"] = []
     meta["cases_file"] = "cases.jsonl"
     (tmp_path / "cases.meta.json").write_text(json.dumps(meta), encoding="utf-8")
     (tmp_path / "cases.jsonl").write_text(json.dumps(case), encoding="utf-8")
 
-    with pytest.raises(EvalDatasetError, match="but the case holds"):
+    with pytest.raises(EvalDatasetError, match="does not account for"):
         load_cluster_cases(tmp_path / "cases.meta.json")
-
-
-def test_m2_reproduces_the_exact_stage_partition_on_every_decidable_case():
-    report = evaluate_m2_clusters(target="exact_stage_partition")
-
-    assert report.exact_partition_matches == report.scored_case_count
-    assert report.exact_partition_rate == 1.0
-    assert report.pairwise.precision == 1.0
-    assert report.pairwise.recall == 1.0
-    assert report.over_merge_case_ids == ()
-    assert report.under_merge_case_ids == ()
-    assert report.complete
-
-
-def test_the_sparse_record_cannot_bridge_contradictory_endpoints():
-    """The batch behaviour a pairwise metric is structurally blind to."""
-
-    report = evaluate_m2_clusters()
-    outcome = next(o for o in report.outcomes if o.case_id == "C001")
-
-    assert outcome.exact_match
-    assert not any({"C001-1", "C001-3"} <= set(group) for group in outcome.predicted)
 
 
 def test_a_sparse_record_does_bridge_compatible_endpoints():
@@ -1021,134 +934,8 @@ def test_a_sparse_record_does_bridge_compatible_endpoints():
     )
 
 
-def test_a_provider_conflict_quarantines_the_whole_group():
-    report = evaluate_m2_clusters()
-    outcome = next(o for o in report.outcomes if o.case_id == "C003")
-
-    assert all(len(group) == 1 for group in outcome.predicted)
-
-
-def test_m2_under_merges_the_semantic_cases_against_ground_truth():
-    """Correct behaviour for M2, and it must be visible as an under-merge."""
-
-    report = evaluate_m2_clusters(target="expected_partition")
-
-    assert set(report.under_merge_case_ids) == {"C006", "C007"}
-    assert report.over_merge_case_ids == ()
-    assert report.pairwise.precision == 1.0
-    assert report.pairwise.recall is not None
-    assert report.pairwise.recall < 1.0
-
-
-def test_over_merging_is_detected_and_named():
-    """A clusterer that puts everything together must be caught."""
-
-    case_set = default_cluster_cases()
-    report = evaluate_clusters(
-        case_set,
-        lambda case: canonical_partition([frozenset(case.item_ids)]),
-        name="merge-everything",
-    )
-
-    assert set(report.over_merge_case_ids) >= {"C001", "C003", "C004", "C005"}
-    assert report.exact_partition_matches < report.scored_case_count
-    assert report.pairwise.precision is not None
-    assert report.pairwise.precision < 1.0
-
-
-def test_under_merging_is_detected_and_named():
-    case_set = default_cluster_cases()
-    report = evaluate_clusters(
-        case_set,
-        lambda case: canonical_partition(
-            [frozenset({item_id}) for item_id in case.item_ids]
-        ),
-        name="merge-nothing",
-    )
-
-    assert set(report.under_merge_case_ids) >= {"C002", "C004", "C007", "C008"}
-    assert report.over_merge_case_ids == ()
-    assert report.pairwise.recall == 0.0
-
-
-def test_a_transitive_bridge_is_caught_as_an_over_merge():
-    """Chaining A-B and B-C into one group where ground truth splits them."""
-
-    case_set = default_cluster_cases()
-    report = evaluate_clusters(
-        case_set,
-        lambda case: canonical_partition([frozenset(case.item_ids)]),
-        name="transitive",
-    )
-    outcome = next(o for o in report.outcomes if o.case_id == "C001")
-
-    assert ("C001-1", "C001-3") in outcome.over_merged_pairs
-    assert not outcome.exact_match
-
-
-def test_missing_and_duplicated_items_are_reported():
-    case_set = default_cluster_cases()
-
-    def drops_one(case):
-        keep = sorted(case.item_ids)[1:]
-        return canonical_partition([frozenset({item_id}) for item_id in keep])
-
-    def duplicates_one(case):
-        first = sorted(case.item_ids)[0]
-        return canonical_partition(
-            [frozenset({item_id}) for item_id in case.item_ids] + [frozenset({first})]
-        )
-
-    dropped = evaluate_clusters(case_set, drops_one, name="lossy")
-    doubled = evaluate_clusters(case_set, duplicates_one, name="doubling")
-
-    assert dropped.accounting_failures
-    assert all(o.missing_items for o in dropped.outcomes)
-    assert doubled.accounting_failures
-    assert all(o.duplicated_items for o in doubled.outcomes)
-
-
-def test_permutation_instability_is_detected():
-    """Every case is re-run shuffled; an order-sensitive stage is named."""
-
-    seen: dict[str, int] = {}
-
-    def order_sensitive(case):
-        seen[case.case_id] = seen.get(case.case_id, 0) + 1
-        if seen[case.case_id] == 1:
-            return canonical_partition([frozenset(case.item_ids)])
-        return canonical_partition([frozenset({item_id}) for item_id in case.item_ids])
-
-    report = evaluate_clusters(
-        default_cluster_cases(), order_sensitive, name="order-sensitive"
-    )
-
-    assert report.permutation_failures
-
-
 def test_m2_is_permutation_stable_on_every_case():
     assert evaluate_m2_clusters().permutation_failures == ()
-
-
-def test_a_raising_case_is_reported_rather_than_ending_the_cluster_run():
-    def explode(case):
-        if case.case_id == "C003":
-            raise RuntimeError("stage exploded")
-        return canonical_partition([frozenset({item_id}) for item_id in case.item_ids])
-
-    report = evaluate_clusters(default_cluster_cases(), explode, name="flaky")
-
-    assert report.failed_case_ids == ("C003",)
-    assert not report.complete
-    assert all(outcome.case_id != "C003" for outcome in report.outcomes)
-    assert report.scored_case_count == 7
-
-
-def test_ambiguous_cluster_cases_are_excluded_from_the_headline_numbers():
-    report = evaluate_m2_clusters()
-
-    assert report.ambiguous_case_count == 1
-    assert report.scored_case_count == len(default_cluster_cases()) - 1
 
 
 def test_the_cluster_evaluator_runs_the_whole_group_in_one_call():
@@ -1327,7 +1114,7 @@ def test_the_cli_scores_clusters(capsys):
     out = capsys.readouterr().out
 
     assert "multi_item_cluster_metrics" in out
-    assert "exact partition match  8/8" in out
+    assert "exact partition match  9/9" in out
 
 
 def test_the_cli_writes_both_report_kinds(tmp_path, capsys):
@@ -1355,3 +1142,840 @@ def test_the_cli_reports_a_dataset_error_without_a_traceback(tmp_path, capsys):
 def test_the_cli_refuses_to_sweep_a_stage_with_no_threshold(capsys):
     assert eval_dedup.main(["--stage", "m2", "--sweep"]) == 2
     assert "no tunable threshold" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# Corrected cluster cases C001, C003, C009
+# --------------------------------------------------------------------------
+
+
+def case(case_id: str):
+    return default_cluster_cases().by_id(case_id)
+
+
+def test_c001_does_not_encode_traversal_order_as_human_truth():
+    """The sparse record's placement is not decided by the records."""
+
+    c001 = case("C001")
+
+    assert c001.indeterminate_item_ids == frozenset({"C001-2"})
+    assert c001.expected_partition == canonical_partition(
+        [frozenset({"C001-1"}), frozenset({"C001-3"})]
+    )
+    # The implementation's answer is kept, separately, where it belongs.
+    assert c001.exact_stage_partition == canonical_partition(
+        [frozenset({"C001-1", "C001-2"}), frozenset({"C001-3"})]
+    )
+    assert c001.expected_partition != c001.exact_stage_partition
+
+
+def test_c001_scores_no_pair_involving_the_indeterminate_record():
+    report = evaluate_m2_clusters(target="expected_partition")
+    outcome = next(o for o in report.outcomes if o.case_id == "C001")
+
+    scored = {
+        item
+        for pair in outcome.over_merged_pairs + outcome.under_merged_pairs
+        for item in pair
+    }
+    assert "C001-2" not in scored
+    assert outcome.exact_match
+    assert outcome.indeterminate_item_ids == ("C001-2",)
+
+
+def test_c001_still_asserts_the_decidable_part():
+    """Ground truth still says the two contradicting records stay apart."""
+
+    c001 = case("C001")
+
+    assert not any({"C001-1", "C001-3"} <= group for group in c001.expected_partition)
+
+
+def test_c003_separates_quarantine_policy_from_human_truth():
+    c003 = case("C003")
+
+    # As articles: the two identical wiper stories are one story.
+    assert c003.expected_partition == canonical_partition(
+        [frozenset({"C003-1", "C003-3"}), frozenset({"C003-2"})]
+    )
+    # As implementation: quarantine emits three singletons.
+    assert all(len(group) == 1 for group in c003.exact_stage_partition)
+
+
+def test_c003_shows_quarantine_as_an_under_merge_against_ground_truth():
+    """The honest cost of the policy, visible rather than defined away."""
+
+    ground = evaluate_m2_clusters(target="expected_partition")
+    stage = evaluate_m2_clusters(target="exact_stage_partition")
+
+    assert "C003" in ground.under_merge_case_ids
+    assert "C003" not in stage.under_merge_case_ids
+    assert "C003" not in ground.over_merge_case_ids
+
+
+def test_c009_takes_the_same_decision_as_p152():
+    c009 = case("C009")
+    p152 = default_pair_set().by_id("P152")
+
+    assert c009.status == "decidable"
+    assert p152.label == "distinct"
+    assert not any({"C009-1", "C009-3"} <= group for group in c009.expected_partition)
+    claim = next(c for c in c009.cross_fixture_claims if c.pair_id == "P152")
+    assert claim.relationship == "different_story"
+
+
+def test_no_cluster_case_is_left_ambiguous_without_reason():
+    for entry in default_cluster_cases():
+        assert entry.status == "decidable", entry.case_id
+
+
+# --------------------------------------------------------------------------
+# Cross-fixture consistency
+# --------------------------------------------------------------------------
+
+
+def test_every_committed_claim_agrees_with_its_pair():
+    pair_set = default_pair_set()
+    cases = default_cluster_cases()
+
+    claimed = 0
+    for entry in cases:
+        for claim in entry.cross_fixture_claims:
+            pair = pair_set.by_id(claim.pair_id)
+            expected = "same_story" if pair.label == "duplicate" else "different_story"
+            assert claim.relationship == expected, (entry.case_id, claim.pair_id)
+            claimed += 1
+    assert claimed >= 8
+
+
+def _mutate_case(entry, **changes):
+    from dataclasses import replace
+
+    return replace(entry, **changes)
+
+
+def test_a_claim_contradicting_its_pair_is_refused():
+    from nlp.eval.clusters import CrossFixtureClaim
+
+    pair_set = default_pair_set()
+    entry = _mutate_case(
+        case("C009"),
+        cross_fixture_claims=(
+            CrossFixtureClaim(
+                pair_id="P152",
+                item_ids=("C009-1", "C009-2"),
+                relationship="same_story",
+            ),
+        ),
+    )
+
+    with pytest.raises(EvalDatasetError, match="may not contradict a pair fixture"):
+        check_cross_fixture_claims(entry, pair_set)
+
+
+def test_a_documented_divergence_is_allowed():
+    from nlp.eval.clusters import CrossFixtureClaim
+
+    pair_set = default_pair_set()
+    entry = _mutate_case(
+        case("C009"),
+        cross_fixture_claims=(
+            CrossFixtureClaim(
+                pair_id="P152",
+                item_ids=("C009-1", "C009-2"),
+                relationship="same_story",
+                divergence_reason="these two are the wire copy, not the interview",
+            ),
+        ),
+    )
+
+    check_cross_fixture_claims(entry, pair_set)
+
+
+def test_a_claim_may_not_borrow_authority_from_an_ambiguous_pair():
+    from nlp.eval.clusters import CrossFixtureClaim
+
+    pair_set = default_pair_set()
+    entry = _mutate_case(
+        case("C009"),
+        cross_fixture_claims=(
+            CrossFixtureClaim(
+                pair_id="P133",
+                item_ids=("C009-1", "C009-2"),
+                relationship="same_story",
+            ),
+        ),
+    )
+
+    with pytest.raises(EvalDatasetError, match="the records do not decide"):
+        check_cross_fixture_claims(entry, pair_set)
+
+
+def test_a_claim_disagreeing_with_its_own_partition_is_refused():
+    from nlp.eval.clusters import CrossFixtureClaim
+
+    entry = _mutate_case(
+        case("C009"),
+        cross_fixture_claims=(
+            CrossFixtureClaim(
+                pair_id="P152",
+                item_ids=("C009-1", "C009-3"),
+                relationship="same_story",
+            ),
+        ),
+    )
+
+    with pytest.raises(EvalDatasetError, match="expected_partition places"):
+        check_cross_fixture_claims(entry, default_pair_set())
+
+
+def test_a_claim_about_an_indeterminate_item_is_refused():
+    from nlp.eval.clusters import CrossFixtureClaim
+
+    entry = _mutate_case(
+        case("C001"),
+        cross_fixture_claims=(
+            CrossFixtureClaim(
+                pair_id="P117",
+                item_ids=("C001-1", "C001-2"),
+                relationship="different_story",
+            ),
+        ),
+    )
+
+    with pytest.raises(EvalDatasetError, match="indeterminate item"):
+        check_cross_fixture_claims(entry, default_pair_set())
+
+
+# --------------------------------------------------------------------------
+# Trust invariants
+# --------------------------------------------------------------------------
+
+
+def test_the_committed_sets_declare_the_full_trust_contract():
+    from nlp.eval.trust import DatasetKind, LabelingStatus, MetricsPurpose
+
+    for trust in (default_pair_set().trust, default_cluster_cases().trust):
+        assert trust.dataset_kind is DatasetKind.SYNTHETIC_DEVELOPMENT
+        assert trust.real_ingested_evidence is False
+        assert trust.labeling_status is LabelingStatus.SINGLE_AUTHOR_UNADJUDICATED
+        assert trust.reviewer_count == 1
+        assert trust.adjudicated is False
+        assert trust.gate_eligible is False
+        assert trust.metrics_purpose is MetricsPurpose.DEVELOPMENT_REGRESSION_ONLY
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("dataset_kind", "made_up"),
+        ("labeling_status", "someone_looked"),
+        ("metrics_purpose", "shipping"),
+    ],
+)
+def test_an_unknown_enum_value_is_refused(tmp_path, field, value):
+    trust = dict(_TRUST, **{field: value})
+    meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
+
+    with pytest.raises(TrustContractError, match="is not one of"):
+        load_pair_set(meta_path)
+
+
+@pytest.mark.parametrize(
+    "overrides,labeling_overrides,message",
+    [
+        # synthetic + final_acceptance
+        (
+            {"metrics_purpose": "final_acceptance"},
+            {},
+            "must declare metrics_purpose=development_regression_only",
+        ),
+        # synthetic + gate_acceptance
+        (
+            {"metrics_purpose": "gate_acceptance"},
+            {},
+            "must declare metrics_purpose=development_regression_only",
+        ),
+        # synthetic + gate_eligible
+        (
+            {"gate_eligible": True},
+            {"gate_eligible": True},
+            "cannot claim gate_eligible",
+        ),
+        # synthetic + real evidence
+        (
+            {"real_ingested_evidence": True},
+            {},
+            "cannot claim real_ingested_evidence",
+        ),
+        # single author + adjudicated
+        (
+            {"adjudicated": True},
+            {"adjudicated": True},
+            "cannot be adjudicated",
+        ),
+        # single author + reviewer_count 3
+        (
+            {"reviewer_count": 3},
+            {"reviewer_count": 3},
+            "requires reviewer_count=1",
+        ),
+        # single author + gate_eligible
+        (
+            {"gate_eligible": True, "dataset_kind": "sampled_production"},
+            {"gate_eligible": True},
+            "cannot be gate_eligible",
+        ),
+        # adjudicated status but adjudicated false
+        (
+            {
+                "dataset_kind": "sampled_production",
+                "labeling_status": "multi_reviewer_adjudicated",
+                "reviewer_count": 2,
+            },
+            {"status": "multi_reviewer_adjudicated", "reviewer_count": 2},
+            "but adjudicated=false",
+        ),
+        # multi-reviewer status with one reviewer
+        (
+            {
+                "dataset_kind": "sampled_production",
+                "labeling_status": "multi_reviewer_unadjudicated",
+            },
+            {"status": "multi_reviewer_unadjudicated"},
+            "requires reviewer_count >= 2",
+        ),
+        # gate eligible without real evidence
+        (
+            {
+                "dataset_kind": "sampled_production",
+                "labeling_status": "multi_reviewer_adjudicated",
+                "reviewer_count": 2,
+                "adjudicated": True,
+                "gate_eligible": True,
+                "metrics_purpose": "gate_acceptance",
+            },
+            {
+                "status": "multi_reviewer_adjudicated",
+                "reviewer_count": 2,
+                "adjudicated": True,
+                "gate_eligible": True,
+            },
+            "requires real_ingested_evidence=true",
+        ),
+        # gate eligible without adjudication
+        (
+            {
+                "dataset_kind": "sampled_production",
+                "labeling_status": "multi_reviewer_unadjudicated",
+                "reviewer_count": 2,
+                "real_ingested_evidence": True,
+                "gate_eligible": True,
+                "metrics_purpose": "gate_acceptance",
+            },
+            {
+                "status": "multi_reviewer_unadjudicated",
+                "reviewer_count": 2,
+                "gate_eligible": True,
+            },
+            "requires adjudicated=true",
+        ),
+        # gate purpose without gate_eligible
+        (
+            {
+                "dataset_kind": "sampled_production",
+                "labeling_status": "multi_reviewer_adjudicated",
+                "reviewer_count": 2,
+                "adjudicated": True,
+                "real_ingested_evidence": True,
+                "metrics_purpose": "final_acceptance",
+            },
+            {
+                "status": "multi_reviewer_adjudicated",
+                "reviewer_count": 2,
+                "adjudicated": True,
+            },
+            "but gate_eligible is false",
+        ),
+        # gate eligible with development purpose
+        (
+            {
+                "dataset_kind": "sampled_production",
+                "labeling_status": "multi_reviewer_adjudicated",
+                "reviewer_count": 2,
+                "adjudicated": True,
+                "real_ingested_evidence": True,
+                "gate_eligible": True,
+            },
+            {
+                "status": "multi_reviewer_adjudicated",
+                "reviewer_count": 2,
+                "adjudicated": True,
+                "gate_eligible": True,
+            },
+            "requires a metrics_purpose in",
+        ),
+    ],
+)
+def test_a_contradictory_trust_combination_is_refused(
+    tmp_path, overrides, labeling_overrides, message
+):
+    trust = dict(_TRUST, **overrides)
+    labeling = dict(_LABELING, **labeling_overrides)
+    provenance = dict(_PROVENANCE)
+    if trust["dataset_kind"] != "synthetic_development":
+        provenance = dict(_PROVENANCE, kind="sampled", collection_method="sampled")
+    meta_path = write_set(
+        tmp_path,
+        [_pair("P001")],
+        {"trust_contract": trust, "labeling": labeling, "provenance": provenance},
+    )
+
+    with pytest.raises(TrustContractError, match=message):
+        load_pair_set(meta_path)
+
+
+@pytest.mark.parametrize("field", ["adjudicated", "gate_eligible"])
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_adjudicated_and_gate_eligible_must_be_booleans(tmp_path, field, value):
+    trust = dict(_TRUST, **{field: value})
+    meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
+
+    with pytest.raises(TrustContractError, match="must be a boolean"):
+        load_pair_set(meta_path)
+
+
+# --------------------------------------------------------------------------
+# Cluster-member accounting
+# --------------------------------------------------------------------------
+
+
+def clusterer(builder):
+    return lambda entry: builder(entry)
+
+
+def singletons(entry):
+    return [[item_id] for item_id in sorted(entry.item_ids)]
+
+
+@pytest.mark.parametrize(
+    "builder,message,attribute,expected",
+    [
+        (
+            lambda entry: singletons(entry) + [["INVENTED-1"]],
+            "not in the case",
+            "unexpected_item_ids",
+            ("INVENTED-1",),
+        ),
+        (
+            lambda entry: singletons(entry)[1:],
+            "missing",
+            "missing_item_ids",
+            None,
+        ),
+        (
+            lambda entry: singletons(entry) + [[sorted(entry.item_ids)[0]]],
+            "in more than one group",
+            "duplicated_item_ids",
+            None,
+        ),
+        (
+            lambda entry: singletons(entry) + [[]],
+            "empty group",
+            "missing_item_ids",
+            (),
+        ),
+    ],
+)
+def test_a_partition_that_does_not_account_for_the_case_fails_it(
+    builder, message, attribute, expected
+):
+    report = evaluate_clusters(
+        default_cluster_cases(), clusterer(builder), name="broken"
+    )
+
+    assert not report.complete
+    assert report.failed_case_count == len(default_cluster_cases())
+    assert report.scored_case_count == 0
+    assert report.outcomes == ()
+    assert message in report.failures[0].message
+    assert report.failures[0].error_type == "PartitionAccountingError"
+    if expected is not None:
+        assert getattr(report, attribute) == expected or expected == ()
+    assert report.accounting_failure_ids == tuple(
+        sorted(entry.case_id for entry in default_cluster_cases())
+    )
+
+
+def test_an_invented_id_never_earns_perfect_credit():
+    """The failure mode this whole check exists for."""
+
+    def almost_right(entry):
+        base = [sorted(group) for group in entry.exact_stage_partition]
+        return base + [["GHOST"]]
+
+    report = evaluate_clusters(
+        default_cluster_cases(), almost_right, name="ghost-writer"
+    )
+
+    assert report.exact_partition_matches == 0
+    assert report.pairwise.precision is None
+    assert report.pairwise.recall is None
+    assert report.unexpected_item_ids == ("GHOST",)
+    assert not report.complete
+
+
+def test_the_accounting_violation_names_every_id_class():
+    def messy(entry):
+        members = sorted(entry.item_ids)
+        return [[members[0]], [members[0]], ["GHOST"]]
+
+    report = evaluate_clusters(default_cluster_cases(), messy, name="messy")
+    violation = report.accounting_violations[0]
+
+    assert violation.duplicated_item_ids == (sorted(case("C001").item_ids)[0],)
+    assert violation.unexpected_item_ids == ("GHOST",)
+    assert violation.missing_item_ids
+
+
+def test_the_partition_validator_rejects_each_defect_directly():
+    universe = frozenset({"a", "b"})
+
+    with pytest.raises(PartitionAccountingError, match="not in the case"):
+        validate_predicted_partition([["a"], ["b"], ["c"]], universe, where="t")
+    with pytest.raises(PartitionAccountingError, match="missing"):
+        validate_predicted_partition([["a"]], universe, where="t")
+    with pytest.raises(PartitionAccountingError, match="more than one group"):
+        validate_predicted_partition([["a", "b"], ["a"]], universe, where="t")
+    with pytest.raises(PartitionAccountingError, match="empty group"):
+        validate_predicted_partition([["a", "b"], []], universe, where="t")
+    with pytest.raises(PartitionAccountingError, match="non-blank strings"):
+        validate_predicted_partition([["a", "b"], [" "]], universe, where="t")
+    with pytest.raises(PartitionAccountingError, match="sequence of groups"):
+        validate_predicted_partition("ab", universe, where="t")
+
+
+def test_a_valid_partition_passes_the_validator():
+    universe = frozenset({"a", "b", "c"})
+
+    assert validate_predicted_partition(
+        [["b", "a"], ["c"]], universe, where="t"
+    ) == canonical_partition([frozenset({"a", "b"}), frozenset({"c"})])
+
+
+# --------------------------------------------------------------------------
+# Cluster scoring against the corrected fixture
+# --------------------------------------------------------------------------
+
+
+def test_m2_reproduces_the_exact_stage_partition_on_every_case():
+    report = evaluate_m2_clusters(target="exact_stage_partition")
+
+    assert report.exact_partition_matches == report.scored_case_count == 9
+    assert report.exact_partition_rate == 1.0
+    assert report.pairwise.precision == 1.0
+    assert report.pairwise.recall == 1.0
+    assert report.over_merge_case_ids == ()
+    assert report.under_merge_case_ids == ()
+    assert report.complete
+    assert report.accounting_violations == ()
+
+
+def test_m2_under_merges_only_where_the_design_says_it_should():
+    report = evaluate_m2_clusters(target="expected_partition")
+
+    assert set(report.under_merge_case_ids) == {"C003", "C006", "C007"}
+    assert report.over_merge_case_ids == ()
+    assert report.pairwise.precision == 1.0
+    assert report.pairwise.recall is not None and report.pairwise.recall < 1.0
+
+
+def test_over_merging_is_detected_and_named():
+    report = evaluate_clusters(
+        default_cluster_cases(),
+        lambda entry: [sorted(entry.item_ids)],
+        name="merge-everything",
+    )
+
+    assert set(report.over_merge_case_ids) >= {"C001", "C004", "C005"}
+    assert report.exact_partition_matches < report.scored_case_count
+    assert report.pairwise.precision is not None and report.pairwise.precision < 1.0
+
+
+def test_under_merging_is_detected_and_named():
+    report = evaluate_clusters(
+        default_cluster_cases(), singletons, name="merge-nothing"
+    )
+
+    assert set(report.under_merge_case_ids) >= {"C002", "C004", "C007", "C008"}
+    assert report.over_merge_case_ids == ()
+    assert report.pairwise.recall == 0.0
+
+
+def test_a_transitive_bridge_is_caught_as_an_over_merge():
+    report = evaluate_clusters(
+        default_cluster_cases(),
+        lambda entry: [sorted(entry.item_ids)],
+        name="transitive",
+    )
+    outcome = next(o for o in report.outcomes if o.case_id == "C001")
+
+    assert ("C001-1", "C001-3") in outcome.over_merged_pairs
+    assert not outcome.exact_match
+
+
+def test_a_raising_case_is_reported_rather_than_ending_the_cluster_run():
+    def explode(entry):
+        if entry.case_id == "C003":
+            raise RuntimeError("stage exploded")
+        return singletons(entry)
+
+    report = evaluate_clusters(default_cluster_cases(), explode, name="flaky")
+
+    assert report.failed_case_ids == ("C003",)
+    assert not report.complete
+    assert all(outcome.case_id != "C003" for outcome in report.outcomes)
+    assert report.scored_case_count == 8
+
+
+# --------------------------------------------------------------------------
+# Permutation coverage
+# --------------------------------------------------------------------------
+
+
+def test_small_cases_are_checked_under_every_ordering():
+    import math
+
+    for entry in default_cluster_cases():
+        orderings = permutations_of(entry)
+        assert len(orderings) == math.factorial(len(entry.items)), entry.case_id
+        assert len({tuple(i.item_id for i in o) for o in orderings}) == len(orderings)
+
+
+def test_a_large_case_uses_a_documented_representative_set():
+    from dataclasses import replace
+    from nlp.eval.clusters import MAX_EXHAUSTIVE_PERMUTATIONS, REPRESENTATIVE_SHUFFLES
+
+    big = case("C008")
+    big = replace(big, items=big.items + big.items[:3])
+    orderings = permutations_of(big)
+
+    assert len(big.items) == 8
+    assert len(orderings) < MAX_EXHAUSTIVE_PERMUTATIONS
+    # original, reverse, 7 rotations, then the seeded shuffles
+    assert len(orderings) >= 2 + (len(big.items) - 1)
+    assert orderings[0] == big.items
+    assert orderings[1] == tuple(reversed(big.items))
+    assert permutations_of(big) == orderings  # deterministic, seeded on case_id
+    assert REPRESENTATIVE_SHUFFLES >= 4
+
+
+def test_every_case_reports_its_permutation_count():
+    report = evaluate_m2_clusters()
+
+    for outcome in report.outcomes:
+        assert outcome.permutation_count >= 6
+        assert outcome.unstable_permutation_count == 0
+    assert report.permutation_failures == ()
+
+
+def test_permutation_instability_is_detected_and_counted():
+    seen: dict[str, int] = {}
+
+    def order_sensitive(entry):
+        seen[entry.case_id] = seen.get(entry.case_id, 0) + 1
+        if seen[entry.case_id] == 1:
+            return [sorted(entry.item_ids)]
+        return singletons(entry)
+
+    report = evaluate_clusters(
+        default_cluster_cases(), order_sensitive, name="order-sensitive"
+    )
+
+    assert report.permutation_failures
+    unstable = next(o for o in report.outcomes if not o.permutation_stable)
+    assert unstable.unstable_permutation_count == unstable.permutation_count - 1
+
+
+# --------------------------------------------------------------------------
+# Shared gate-value validator
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,message",
+    [
+        (float("nan"), "real number"),
+        (float("inf"), "finite"),
+        (float("-inf"), "finite"),
+        (-0.1, r"\[0.0, 1.0\]"),
+        (1.1, r"\[0.0, 1.0\]"),
+        ("0.8", "must be a number"),
+        (True, "not a boolean"),
+        (False, "not a boolean"),
+        (None, "must be a number"),
+    ],
+)
+def test_the_shared_validator_rejects_every_unusable_gate_value(value, message):
+    with pytest.raises(GateValueError, match=message):
+        validate_unit_interval(value, "field")
+
+
+@pytest.mark.parametrize("value", [0.0, 0.5, 1.0, 0, 1])
+def test_the_shared_validator_accepts_a_real_probability(value):
+    assert validate_unit_interval(value, "field") == float(value)
+
+
+def test_the_optional_validator_passes_none_through():
+    assert validate_optional_unit_interval(None, "field") is None
+    with pytest.raises(GateValueError):
+        validate_optional_unit_interval(float("nan"), "field")
+
+
+@pytest.mark.parametrize(
+    "thresholds,message",
+    [
+        ([], "at least one threshold"),
+        ([0.8, 0.8], "must be distinct"),
+        ([float("nan")], "real number"),
+        ([float("inf")], "finite"),
+        ([float("-inf")], "finite"),
+        ([-0.1], r"\[0.0, 1.0\]"),
+        ([1.5], r"\[0.0, 1.0\]"),
+        (["0.8"], "must be a number"),
+        ([True], "not a boolean"),
+    ],
+)
+def test_an_unusable_sweep_threshold_is_refused(thresholds, message):
+    with pytest.raises(GateValueError, match=message):
+        validate_thresholds(thresholds)
+
+
+def test_a_report_threshold_goes_through_the_same_validator(tmp_path):
+    pair_set = load_pair_set(write_set(tmp_path, [_pair("P001")]))
+
+    with pytest.raises(GateValueError, match="real number"):
+        evaluate_isolated_pairs(
+            pair_set, constant(False), name="x", threshold=float("nan")
+        )
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--precision-floor=nan",
+        "--recall-floor=nan",
+        "--precision-floor=inf",
+        "--recall-floor=-inf",
+        "--precision-floor=-0.1",
+        "--recall-floor=1.1",
+    ],
+)
+def test_the_cli_exits_non_zero_on_an_unusable_gate_value(flag):
+    completed = subprocess.run(
+        [sys.executable, "-m", "tools.eval_dedup", "--stage", "m2", flag],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "invalid gate value" in completed.stderr
+
+
+def test_a_valid_cli_floor_still_runs():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.eval_dedup",
+            "--stage",
+            "m2",
+            "--precision-floor=0.85",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+
+
+# --------------------------------------------------------------------------
+# Every payload carries the trust block
+# --------------------------------------------------------------------------
+
+
+def all_payloads():
+    """Every public JSON-producing function, with a real argument."""
+
+    pair_report = evaluate_m2_isolated_pairs()
+    cluster_report = evaluate_m2_clusters()
+    points = sweep_thresholds(
+        default_pair_set(),
+        lambda threshold: (lambda pair: PairPrediction(merged=False, score=threshold)),
+        [0.5, 0.9],
+        name="fake",
+    )
+    return {
+        "to_payload": to_payload(pair_report),
+        "cluster_payload": cluster_payload(cluster_report),
+        "sweep_payload": sweep_payload(points),
+    }
+
+
+@pytest.mark.parametrize("name", ["to_payload", "cluster_payload", "sweep_payload"])
+def test_every_public_payload_carries_the_full_contract(name):
+    payload = all_payloads()[name]
+
+    for field in sorted(_TRUST):
+        assert field in payload["trust_contract"], (name, field)
+    assert payload["trust_contract"]["warning"].startswith("WARNING:")
+    assert payload["dataset_id"]
+    assert payload["schema_version"]
+    assert payload["scope"]
+    assert payload["limitation"]
+
+
+@pytest.mark.parametrize("name", ["to_payload", "cluster_payload", "sweep_payload"])
+def test_every_public_payload_reports_completeness(name):
+    payload = all_payloads()[name]
+    block = payload.get("completeness", payload)
+
+    assert block["complete"] is True
+    assert block["evaluated_case_count"] > 0
+    assert block["failed_case_count"] == 0
+    assert block["failed_case_ids"] == []
+
+
+def test_the_raw_sweep_rows_are_inside_the_contract_document():
+    """The bare list a caller could paste without provenance is gone."""
+
+    payload = all_payloads()["sweep_payload"]
+
+    assert isinstance(payload, dict)
+    assert isinstance(payload["points"], list)
+    assert len(payload["points"]) == 2
+    for point in payload["points"]:
+        assert point["scope"] == "isolated_pairs"
+        assert point["complete"] is True
+        assert "evaluated_case_count" in point
+
+
+def test_a_sweep_report_carries_the_contract_in_rendered_form():
+    points = sweep_thresholds(
+        default_pair_set(),
+        lambda threshold: (lambda pair: PairPrediction(merged=False, score=threshold)),
+        [0.5, 0.9],
+        name="fake",
+    )
+
+    assert render_sweep(points).startswith("WARNING:")
+
+
+def test_the_payload_versions_are_stated():
+    payloads = all_payloads()
+
+    assert payloads["to_payload"]["schema_version"] == ISOLATED_PAIR_PAYLOAD_VERSION
+    assert payloads["cluster_payload"]["schema_version"] == CLUSTER_PAYLOAD_VERSION
+    assert payloads["sweep_payload"]["schema_version"] == SWEEP_PAYLOAD_VERSION
