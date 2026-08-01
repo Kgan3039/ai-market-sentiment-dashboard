@@ -528,3 +528,183 @@ python -m black --check nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
 python -m flake8 nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
 python -m pytest tests/test_dedup_eval.py
 ```
+
+## Phase 0 semantic dedup (M3, issue #70)
+
+`nlp.semdedup` merges canonical stories that describe one event in different
+words, using M1 embeddings and a threshold selected on M4's labelled set. It
+runs **after** M2 and never changes it.
+
+```python
+from nlp.dedup import DedupConfig, deduplicate
+from nlp.embeddings import EmbeddingService
+from nlp.semdedup import (
+    SemanticDedupConfig, merge_semantic_duplicates, stories_from_dedup,
+)
+
+exact = deduplicate(raw_items, config=DedupConfig(supported_tickers=TICKERS))
+result = merge_semantic_duplicates(
+    stories_from_dedup(exact, raw_items),
+    config=SemanticDedupConfig(supported_tickers=TICKERS),
+    encoder=EmbeddingService(),
+)
+```
+
+**This does not close issue #70.** The DoD requires the stage to be
+"integrated in pipeline"; `pipeline.py` is issue #68 (open, blocked by
+#61/#62). The AC-3 half of the DoD is met *on the committed labelled set* —
+which is synthetic, so it is a design measurement, not the G4 gate result.
+
+### The finding that shaped the design
+
+Sweeping the labelled set with the Phase 0 encoder, cosine similarity alone
+**cannot separate the classes at any threshold**:
+
+| | cosine range |
+|---|---|
+| genuine same-story rewrites | 0.42 – 0.73 |
+| hard negatives (date, magnitude, role, sign changes) | 0.97 – 0.996 |
+
+The classes are *inverted* with respect to similarity, and for a structural
+reason: a real rewrite shares almost no wording with its twin, while a
+template negative that swaps one date or one number shares almost all of it.
+A stage that merged on similarity would merge exactly the pairs it must not.
+
+So M3 is not a threshold with guards bolted on. It is a set of guards with a
+threshold behind them.
+
+### The guards (`nlp/semdedup/evidence.py`)
+
+Each is a static, versioned policy over M2's tokenizer, tried in this order
+so a recorded veto names the most specific true objection:
+
+| guard | refuses |
+|---|---|
+| `temporal_disagreement` | different quarters, fiscal years, months, dates |
+| `numeric_disagreement` | different magnitudes, currencies, units, ranges, signs |
+| `role_disagreement` | different named roles (CFO vs COO) |
+| `subject_shift` | one story is about a supplier, reseller, or agency |
+| `contrast_polarity` | opposing claims: raised/cut, approved/rejected, beat/missed, profit/loss, maintained/withdrawn |
+| `negation` | one explicitly negates where the other does not |
+| `same_frame_different_event` | heavy lexical overlap with a substituted content slot |
+
+The last is the load-bearing one for "same template, different event": when
+two headlines overlap heavily, the tokens they do *not* share are the story.
+A rewrite has the opposite shape — low overlap, high similarity — so it never
+triggers. A strict elaboration ("Apple opens a store" / "…a store in
+Riyadh") adds detail rather than substituting an event and is not caught.
+
+M2's asymmetry is preserved: **explicit disagreement vetoes, missing
+information does not.** A story with no numbers does not contradict one that
+has them. Numbers bind only to neighbours that change their meaning, so
+"1,000 roles" and "1,000 under the plan" agree while "5 million" and
+"5 billion" do not.
+
+### Threshold selection, from evidence
+
+Committed sweep: `nlp/eval/data/results/m3_threshold_sweep.json`.
+
+| threshold | P | R | F1 | fp |
+|---|---|---|---|---|
+| 0.60 | 0.9861 | 0.9103 | **0.9467** | 1 |
+| 0.67 | 0.9848 | 0.8333 | 0.9028 | 1 |
+| 0.68 | 1.0000 | 0.8333 | 0.9091 | 0 |
+| **0.70** | **1.0000** | **0.8077** | 0.8936 | **0** |
+| 0.75 | 1.0000 | 0.7692 | 0.8696 | 0 |
+| 0.85 | 1.0000 | 0.6667 | 0.8000 | 0 |
+
+The highest-scoring false merge is 0.6753 — P079, two different
+partnerships announced under one headline template — and precision reaches
+1.0000 from 0.68 upward. **0.70 is the committed default.** 0.68 would sit
+0.005 above a single observation; 0.70 keeps a real margin over the worst
+false merge while recall still clears AC-3's floor with room. F1 peaks at
+0.60 and that threshold is *not* used: it buys 0.05 of F1 with a false
+merge, and a false merge is the failure the whole design exists to prevent.
+
+### Result at the committed threshold
+
+`nlp/eval/data/results/m2_m3_pipeline.json`, M2 then M3, 148 scored pairs:
+
+| metric | value | AC-3 |
+|---|---|---|
+| precision | **1.0000** | ≥ 0.85 ✓ |
+| recall | **0.8077** | ≥ 0.75 ✓ |
+| F1 | 0.8936 | |
+| tp / fp / tn / fn | 63 / 0 / 70 / 15 | |
+| candidate recall | 1.0000 | |
+
+**False positives: none.** Every one of the 70 hard negatives was refused,
+including all 7 different-company pairs, all 10 same-template pairs, and all
+20 magnitude/date/unit/sign pairs.
+
+**False negatives: 15**, every one a semantic rewrite scoring below 0.70 —
+0.42 (`P075`, "trims Reality Labs hiring plans" / "slows recruitment inside
+its metaverse division") through 0.6957 (`P051`). No guard rejected a true
+positive: all 15 are `below_threshold`. That is the price of the precision
+margin and it is visible in the sweep — 0.60 would recover 8 of them and
+cost one false merge.
+
+**Ambiguous pairs:** 3 of 5 merged (`P150`, `P151`, `P153`). They are
+excluded from the metrics by design, and which way they should go is exactly
+the question K3 adjudication exists to settle.
+
+### Cluster semantics
+
+A story is a **clique**: every pair inside it independently cleared the
+threshold, every guard, and the ±36 h window. Single-link chaining would let
+A–B and B–C place A and C together without anything ever comparing them.
+On top of that, each prospective story carries a combined evidence summary,
+so a vague story cannot bridge two that contradict each other — the same
+constant-cost trick M2 uses for its compatibility gate.
+
+Canonical member is the earliest published, outlet then story key breaking
+ties. Every member id, outlet, and source link is carried through, and
+`outlet_count` unions the declared outlets with the retained links so it can
+never undercount them. Merges never cross a ticker. Undated stories do not
+merge by default — without a timestamp the window cannot be enforced.
+
+No durable story id is invented: `story_fingerprint` is a change-detection
+digest over the ticker and the sorted member set, exactly as M2 does.
+
+### Boundaries
+
+- **The encoder is injected**, never constructed. `EmbeddingService`
+  satisfies `StoryEncoder` as-is. No test in this package loads a model or
+  touches the network, and one asserts `sentence_transformers` is not in
+  `sys.modules` after a run.
+- **The embedded text is M1's composition** (`title + "\n\n" + description`),
+  deliberately unlike M2, which owns its content rules: M2's identity keys
+  must not move when the encoder's input changes, whereas M3's whole job is
+  to ask the encoder a question and it must ask it the way everyone else
+  does.
+- **Encoder identity is in the fingerprint.** Same stories, same settings,
+  different model is a different result.
+- **`nlp/semdedup/bridge.py` is the only place M3 knows what an M2 cluster
+  looks like.** Everything else takes `StoryInput`.
+- An encoder failure, wrong vector count, ragged dimension, non-finite or
+  zero vector raises rather than falling back to a lexical comparison.
+  Silently changing which algorithm produced a merge would make the run
+  unexplainable.
+
+### Honest limitations
+
+- **The dataset and the guards share an author.** The reported precision is
+  optimistic for that reason alone: the guard families were written from the
+  same failure taxonomy the negatives were written from. Real-sample
+  numbers (blocked on #61/#62) should be expected to be worse, and the
+  guards will need cases they have not seen.
+- **The guard lexicons are English and finite.** An opposing claim phrased
+  outside them ("greenlights"/"nixes") is invisible to `contrast_polarity`,
+  and the threshold is the only thing left.
+- **Recall is the sacrifice.** Half the semantic rewrites in the set are
+  missed at the committed threshold. That is the deliberate trade, not an
+  accident, and the sweep documents its price exactly.
+
+Lint and test with:
+
+```bash
+python -m black --check nlp/semdedup tests/test_semantic_dedup.py
+python -m flake8 nlp/semdedup tests/test_semantic_dedup.py
+python -m pytest tests/test_semantic_dedup.py
+python -m tools.eval_dedup --stage m2+m3 --precision-floor 0.85 --recall-floor 0.75
+```
