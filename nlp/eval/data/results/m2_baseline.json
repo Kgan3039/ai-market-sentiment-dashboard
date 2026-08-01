@@ -1,6 +1,6 @@
 {
   "ambiguous": {
-    "count": 5,
+    "count": 2,
     "merged": []
   },
   "by_category": {
@@ -57,7 +57,7 @@
       "counts": {
         "false_negative": 0,
         "false_positive": 0,
-        "true_negative": 3,
+        "true_negative": 2,
         "true_positive": 0
       },
       "f1": null,
@@ -66,8 +66,7 @@
         "false_positive": [],
         "true_negative": [
           "P131",
-          "P132",
-          "P133"
+          "P132"
         ],
         "true_positive": []
       },
@@ -128,7 +127,7 @@
         "false_negative": 0,
         "false_positive": 0,
         "true_negative": 0,
-        "true_positive": 10
+        "true_positive": 11
       },
       "f1": 1.0,
       "pair_ids": {
@@ -145,7 +144,8 @@
           "P007",
           "P008",
           "P009",
-          "P010"
+          "P010",
+          "P031"
         ]
       },
       "precision": 1.0,
@@ -273,7 +273,7 @@
       "counts": {
         "false_negative": 0,
         "false_positive": 0,
-        "true_negative": 2,
+        "true_negative": 1,
         "true_positive": 0
       },
       "f1": null,
@@ -281,8 +281,7 @@
         "false_negative": [],
         "false_positive": [],
         "true_negative": [
-          "P137",
-          "P138"
+          "P137"
         ],
         "true_positive": []
       },
@@ -333,6 +332,30 @@
           "P098",
           "P099",
           "P100"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "same_event_different_article": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 5,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P149",
+          "P150",
+          "P151",
+          "P152",
+          "P153"
         ],
         "true_positive": []
       },
@@ -478,7 +501,7 @@
         "false_negative": 0,
         "false_positive": 0,
         "true_negative": 0,
-        "true_positive": 14
+        "true_positive": 13
       },
       "f1": 1.0,
       "pair_ids": {
@@ -492,7 +515,6 @@
           "P028",
           "P029",
           "P030",
-          "P031",
           "P032",
           "P033",
           "P034",
@@ -674,7 +696,7 @@
       "counts": {
         "false_negative": 0,
         "false_positive": 0,
-        "true_negative": 70,
+        "true_negative": 73,
         "true_positive": 0
       },
       "f1": null,
@@ -736,12 +758,10 @@
           "P130",
           "P131",
           "P132",
-          "P133",
           "P134",
           "P135",
           "P136",
           "P137",
-          "P138",
           "P139",
           "P140",
           "P141",
@@ -751,7 +771,12 @@
           "P145",
           "P146",
           "P147",
-          "P148"
+          "P148",
+          "P149",
+          "P150",
+          "P151",
+          "P152",
+          "P153"
         ],
         "true_positive": []
       },
@@ -761,11 +786,11 @@
   },
   "by_ticker": {
     "AAPL": {
-      "accuracy": 0.8064516129032258,
+      "accuracy": 0.8125,
       "counts": {
         "false_negative": 6,
         "false_positive": 0,
-        "true_negative": 15,
+        "true_negative": 16,
         "true_positive": 10
       },
       "f1": 0.7692307692307693,
@@ -794,7 +819,8 @@
           "P132",
           "P141",
           "P143",
-          "P148"
+          "P148",
+          "P151"
         ],
         "true_positive": [
           "P004",
@@ -813,11 +839,11 @@
       "recall": 0.625
     },
     "AMD": {
-      "accuracy": 0.8076923076923077,
+      "accuracy": 0.8148148148148148,
       "counts": {
         "false_negative": 5,
         "false_positive": 0,
-        "true_negative": 13,
+        "true_negative": 14,
         "true_positive": 8
       },
       "f1": 0.761904761904762,
@@ -843,7 +869,8 @@
           "P129",
           "P134",
           "P137",
-          "P147"
+          "P147",
+          "P153"
         ],
         "true_positive": [
           "P003",
@@ -860,11 +887,11 @@
       "recall": 0.6153846153846154
     },
     "META": {
-      "accuracy": 0.8214285714285714,
+      "accuracy": 0.8148148148148148,
       "counts": {
         "false_negative": 5,
         "false_positive": 0,
-        "true_negative": 13,
+        "true_negative": 12,
         "true_positive": 10
       },
       "f1": 0.8,
@@ -888,9 +915,8 @@
           "P117",
           "P122",
           "P127",
-          "P133",
-          "P138",
-          "P146"
+          "P146",
+          "P152"
         ],
         "true_positive": [
           "P005",
@@ -909,11 +935,11 @@
       "recall": 0.6666666666666666
     },
     "NVDA": {
-      "accuracy": 0.7741935483870968,
+      "accuracy": 0.78125,
       "counts": {
         "false_negative": 7,
         "false_positive": 0,
-        "true_negative": 14,
+        "true_negative": 15,
         "true_positive": 10
       },
       "f1": 0.7407407407407407,
@@ -942,7 +968,8 @@
           "P135",
           "P139",
           "P142",
-          "P145"
+          "P145",
+          "P149"
         ],
         "true_positive": [
           "P001",
@@ -961,11 +988,11 @@
       "recall": 0.5882352941176471
     },
     "TSLA": {
-      "accuracy": 0.78125,
+      "accuracy": 0.7878787878787878,
       "counts": {
         "false_negative": 7,
         "false_positive": 0,
-        "true_negative": 15,
+        "true_negative": 16,
         "true_positive": 10
       },
       "f1": 0.7407407407407407,
@@ -995,7 +1022,8 @@
           "P131",
           "P136",
           "P140",
-          "P144"
+          "P144",
+          "P150"
         ],
         "true_positive": [
           "P002",
@@ -1015,7 +1043,14 @@
     }
   },
   "candidate_recall": 0.6153846153846154,
-  "dataset_id": "phase0-dedup-pairs-v1",
+  "completeness": {
+    "complete": true,
+    "evaluated_case_count": 153,
+    "failed_case_count": 0,
+    "failed_case_ids": [],
+    "failures": []
+  },
+  "dataset_id": "phase0-dedup-pairs-v2",
   "details": {
     "P001": "merged: exact_content",
     "P002": "merged: exact_content",
@@ -1105,9 +1140,9 @@
     "P086": "not merged: no signal",
     "P087": "not merged: no signal",
     "P088": "not merged: no signal",
-    "P089": "not merged: descriptionx2",
+    "P089": "not merged: descriptionx1",
     "P090": "not merged: no signal",
-    "P091": "not merged: protected_expressionx2",
+    "P091": "not merged: protected_expressionx1",
     "P092": "not merged: no signal",
     "P093": "not merged: no signal",
     "P094": "not merged: descriptionx1",
@@ -1160,7 +1195,7 @@
     "P141": "not merged: protected_expressionx2",
     "P142": "not merged: no signal",
     "P143": "not merged: no signal",
-    "P144": "not merged: no signal",
+    "P144": "not merged: descriptionx2",
     "P145": "not merged: no signal",
     "P146": "not merged: no signal",
     "P147": "not merged: no signal",
@@ -1171,13 +1206,12 @@
     "P152": "not merged: no signal",
     "P153": "not merged: no signal"
   },
-  "merge_recall": 0.6153846153846154,
-  "overall": {
-    "accuracy": 0.7972972972972973,
+  "isolated_pair_metrics": {
+    "accuracy": 0.8013245033112583,
     "counts": {
       "false_negative": 30,
       "false_positive": 0,
-      "true_negative": 70,
+      "true_negative": 73,
       "true_positive": 48
     },
     "f1": 0.761904761904762,
@@ -1270,12 +1304,10 @@
         "P130",
         "P131",
         "P132",
-        "P133",
         "P134",
         "P135",
         "P136",
         "P137",
-        "P138",
         "P139",
         "P140",
         "P141",
@@ -1285,7 +1317,12 @@
         "P145",
         "P146",
         "P147",
-        "P148"
+        "P148",
+        "P149",
+        "P150",
+        "P151",
+        "P152",
+        "P153"
       ],
       "true_positive": [
         "P001",
@@ -1341,7 +1378,20 @@
     "precision": 1.0,
     "recall": 0.6153846153846154
   },
+  "limitation": "Isolated-pair metrics measure whether a two-item invocation of the stage merges a pair. Production clustering can differ on the same two records in a multi-item batch, because cluster-wide compatibility, transitivity, provider-conflict quarantine, and capacity behaviour all depend on the companion items in the batch. These numbers therefore cannot on their own validate production clustering; see multi_item_cluster_metrics.",
+  "merge_recall": 0.6153846153846154,
   "predictor": "m2",
+  "scope": "isolated_pairs",
   "scores": {},
-  "threshold": null
+  "threshold": null,
+  "trust_contract": {
+    "adjudicated": false,
+    "dataset_kind": "synthetic_development",
+    "gate_eligible": false,
+    "labeling_status": "single_author_unadjudicated",
+    "metrics_purpose": "development_regression_only",
+    "real_ingested_evidence": false,
+    "reviewer_count": 1,
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset. Metrics are not valid for K3/G4 or final AC-3 acceptance."
+  }
 }

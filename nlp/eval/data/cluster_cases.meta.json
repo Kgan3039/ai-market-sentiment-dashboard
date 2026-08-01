@@ -1,0 +1,65 @@
+{
+  "schema_version": "phase0.cluster_eval.v1",
+  "dataset_id": "phase0-dedup-cluster-cases-v1",
+  "issue": "#67",
+  "cases_file": "cluster_cases.jsonl",
+  "purpose": "Isolated-pair metrics cannot see the behaviour that only exists in a batch: cluster-wide compatibility, transitivity, provider quarantine, and the window applied to a cluster's span. Each case here is run as one group, in one call, and scored on the partition that comes back.",
+  "trust_contract": {
+    "dataset_kind": "synthetic_development",
+    "real_ingested_evidence": false,
+    "labeling_status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "adjudicated": false,
+    "gate_eligible": false,
+    "metrics_purpose": "development_regression_only",
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset. Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "why": "These cases are constructed to exercise specific batch behaviours. They are not a sample of anything, so they measure regression against the author's expectations and nothing else."
+  },
+  "tickers": [
+    "AAPL",
+    "AMD",
+    "META",
+    "NVDA",
+    "TSLA"
+  ],
+  "statuses": [
+    "decidable",
+    "ambiguous"
+  ],
+  "categories": [
+    "sparse_bridge_contradictory",
+    "sparse_bridge_compatible",
+    "provider_conflict_group",
+    "url_reuse_group",
+    "repeated_quarterly_group",
+    "semantic_transitivity",
+    "mixed_stage_group",
+    "permutation_equivalence"
+  ],
+  "partition_contract": {
+    "expected_partition": "Ground truth: how a reader would group the items by event, regardless of which stage can get there.",
+    "exact_stage_partition": "What the exact stage (M2) alone should produce. Identical to expected_partition except where the grouping needs semantics, in which case M2 is expected to under-merge and that under-merge is correct behaviour rather than a defect.",
+    "both": "Both must be partitions of exactly the case's item ids: every item exactly once, no extras."
+  },
+  "provenance": {
+    "kind": "synthetic",
+    "collection_method": "authored",
+    "statement": "Every record is authored. No URL resolves and nothing here was published. Real outlet names are used so the wire-attribution policy is exercised; invented names are used for any third-party company a case needs.",
+    "urls_are_synthetic": true,
+    "uses_real_outlet_names": true,
+    "why_synthetic": "Same blockers as the pair set: I2 (#61) and I3 (#62) are open, so there is no ingested batch to sample a real multi-item group from.",
+    "blocked_by": {
+      "#61": "I2 Yahoo ingestion - open",
+      "#62": "I3 RSS ingestion - open",
+      "#60": "K3 reviewer guidelines - open"
+    }
+  },
+  "labeling": {
+    "status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "reviewers": [],
+    "adjudicated": false,
+    "gate_eligible": false,
+    "protocol": "One author, no adjudication. A case marked 'ambiguous' is excluded from the headline partition metrics."
+  }
+}

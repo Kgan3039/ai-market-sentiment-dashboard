@@ -1,15 +1,21 @@
 """Deterministic rendering of an evaluation report.
 
-Both renderers are pure functions of the report: no clock, no host name, no
+Every renderer is a pure function of the report: no clock, no host name, no
 run identifier, no dictionary iteration order.  That is what lets the JSON
 form be committed to the repository and diffed — a re-run that changes a
 byte means a stage changed, not that the file was regenerated.
+
+Every renderer also emits the dataset's trust contract **before** any
+number, in both formats.  Somebody will read ``m2_baseline.json``, or a CLI
+transcript pasted into a ticket, without the README anywhere nearby; the
+provenance has to be in the artefact itself or it is not stated at all.
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from .clusters import ClusterEvaluationReport
 from .metrics import CategoryBreakdown, EvaluationReport, Metrics, ThresholdPoint
 
 
@@ -45,14 +51,34 @@ def _breakdown_payload(
     return {entry.key: _metrics_payload(entry.metrics) for entry in breakdown}
 
 
+def _completeness(report: Any) -> dict[str, Any]:
+    return {
+        "evaluated_case_count": report.evaluated_case_count,
+        "failed_case_count": report.failed_case_count,
+        "failed_case_ids": list(report.failed_case_ids),
+        "complete": report.complete,
+        "failures": [
+            {
+                "case_id": failure.case_id,
+                "error_type": failure.error_type,
+                "message": failure.message,
+            }
+            for failure in report.failures
+        ],
+    }
+
+
 def to_payload(report: EvaluationReport) -> dict[str, Any]:
-    """Return the JSON-serializable form of a report."""
+    """Return the JSON-serializable form of an isolated-pair report."""
 
     return {
+        "trust_contract": report.trust.as_dict(),
         "dataset_id": report.dataset_id,
         "predictor": report.predictor,
+        "scope": report.scope,
+        "limitation": report.limitation,
         "threshold": report.threshold,
-        "overall": _metrics_payload(report.overall),
+        "isolated_pair_metrics": _metrics_payload(report.isolated_pair_metrics),
         "candidate_recall": report.candidate_recall,
         "merge_recall": report.merge_recall,
         "by_expected_stage": _breakdown_payload(report.by_expected_stage),
@@ -62,8 +88,53 @@ def to_payload(report: EvaluationReport) -> dict[str, Any]:
             "count": report.ambiguous_count,
             "merged": list(report.ambiguous_merged),
         },
+        "completeness": _completeness(report),
         "details": dict(sorted(report.details.items())),
         "scores": dict(sorted(report.scores.items())),
+    }
+
+
+def cluster_payload(report: ClusterEvaluationReport) -> dict[str, Any]:
+    """Return the JSON-serializable form of a multi-item cluster report."""
+
+    return {
+        "trust_contract": report.trust.as_dict(),
+        "dataset_id": report.dataset_id,
+        "predictor": report.predictor,
+        "scope": report.scope,
+        "limitation": report.limitation,
+        "target": report.target,
+        "multi_item_cluster_metrics": {
+            "exact_partition_matches": report.exact_partition_matches,
+            "scored_case_count": report.scored_case_count,
+            "exact_partition_rate": report.exact_partition_rate,
+            "pairwise_co_clustering": _metrics_payload(report.pairwise),
+            "over_merge_case_ids": list(report.over_merge_case_ids),
+            "under_merge_case_ids": list(report.under_merge_case_ids),
+            "permutation_failures": list(report.permutation_failures),
+            "accounting_failures": list(report.accounting_failures),
+            "ambiguous_case_count": report.ambiguous_case_count,
+        },
+        "cases": [
+            {
+                "case_id": outcome.case_id,
+                "category": outcome.category,
+                "status": outcome.status,
+                "resolvable_by": outcome.resolvable_by,
+                "expected_partition": [sorted(group) for group in outcome.expected],
+                "predicted_partition": [sorted(group) for group in outcome.predicted],
+                "exact_match": outcome.exact_match,
+                "over_merged_pairs": [list(pair) for pair in outcome.over_merged_pairs],
+                "under_merged_pairs": [
+                    list(pair) for pair in outcome.under_merged_pairs
+                ],
+                "missing_items": list(outcome.missing_items),
+                "duplicated_items": list(outcome.duplicated_items),
+                "permutation_stable": outcome.permutation_stable,
+            }
+            for outcome in report.outcomes
+        ],
+        "completeness": _completeness(report),
     }
 
 
@@ -73,16 +144,20 @@ def sweep_payload(points: Sequence[ThresholdPoint]) -> list[dict[str, Any]]:
     return [
         {
             "threshold": point.threshold,
+            "scope": point.report.scope,
             "precision": point.precision,
             "recall": point.recall,
             "f1": point.f1,
             "candidate_recall": point.report.candidate_recall,
             "counts": {
-                "true_positive": point.report.overall.confusion.tp,
-                "false_positive": point.report.overall.confusion.fp,
-                "false_negative": point.report.overall.confusion.fn,
+                "true_positive": point.report.isolated_pair_metrics.confusion.tp,
+                "false_positive": point.report.isolated_pair_metrics.confusion.fp,
+                "false_negative": point.report.isolated_pair_metrics.confusion.fn,
             },
-            "false_positives": list(point.report.overall.confusion.false_positives),
+            "false_positives": list(
+                point.report.isolated_pair_metrics.confusion.false_positives
+            ),
+            "complete": point.report.complete,
         }
         for point in points
     ]
@@ -98,12 +173,51 @@ def _table(rows: Sequence[Sequence[str]]) -> list[str]:
     ]
 
 
+def _wrap(text: str, width: int = 74, indent: str = "  ") -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if current and len(current) + len(word) + 1 > width:
+            lines.append(indent + current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(indent + current)
+    return lines
+
+
+def render_banner(report: Any) -> str:
+    """The provenance block printed above every metric, in every renderer."""
+
+    return report.trust.banner() + "\n"
+
+
+def _completeness_lines(report: Any) -> list[str]:
+    lines = [
+        "",
+        "completeness",
+        f"  evaluated_case_count  {report.evaluated_case_count}",
+        f"  failed_case_count     {report.failed_case_count}",
+        f"  complete              {str(report.complete).lower()}",
+    ]
+    if report.failures:
+        lines.append(f"  failed_case_ids       {', '.join(report.failed_case_ids)}")
+        for failure in report.failures:
+            lines.append(
+                f"    {failure.case_id}  {failure.error_type}: {failure.message}"
+            )
+        lines.append("  NOTE: failed cases are excluded from every denominator above.")
+    return lines
+
+
 def render_text(
     report: EvaluationReport,
     *,
     rationales: Mapping[str, str] | None = None,
 ) -> str:
-    """Render a human-readable report.
+    """Render a human-readable isolated-pair report.
 
     ``rationales`` maps pair id to its labelling rationale; when supplied,
     every confusion entry is printed with the reason a human gave for the
@@ -111,21 +225,24 @@ def render_text(
     the dataset.
     """
 
-    lines: list[str] = [
+    lines: list[str] = [render_banner(report).rstrip(), ""]
+    lines += [
         f"dataset:   {report.dataset_id}",
         f"predictor: {report.predictor}",
+        f"scope:     {report.scope}",
     ]
     if report.threshold is not None:
         lines.append(f"threshold: {report.threshold:g}")
-    overall = report.overall
-    confusion = overall.confusion
+    lines += ["", "limitation"] + _wrap(report.limitation)
+    metrics = report.isolated_pair_metrics
+    confusion = metrics.confusion
     lines += [
         "",
-        "overall (ambiguous pairs excluded)",
-        f"  precision        {_number(overall.precision)}",
-        f"  recall           {_number(overall.recall)}",
-        f"  f1               {_number(overall.f1)}",
-        f"  accuracy         {_number(overall.accuracy)}",
+        "isolated_pair_metrics (ambiguous pairs excluded)",
+        f"  precision        {_number(metrics.precision)}",
+        f"  recall           {_number(metrics.recall)}",
+        f"  f1               {_number(metrics.f1)}",
+        f"  accuracy         {_number(metrics.accuracy)}",
         f"  candidate recall {_number(report.candidate_recall)}",
         f"  tp/fp/tn/fn      {confusion.tp}/{confusion.fp}/"
         f"{confusion.tn}/{confusion.fn}",
@@ -184,6 +301,77 @@ def render_text(
         f"(excluded); merged by this stage: "
         f"{', '.join(report.ambiguous_merged) or 'none'}",
     ]
+    lines += _completeness_lines(report)
+    lines += ["", render_banner(report).rstrip()]
+    return "\n".join(lines) + "\n"
+
+
+def render_clusters(
+    report: ClusterEvaluationReport,
+    *,
+    rationales: Mapping[str, str] | None = None,
+) -> str:
+    """Render a human-readable multi-item cluster report."""
+
+    lines: list[str] = [render_banner(report).rstrip(), ""]
+    lines += [
+        f"dataset:   {report.dataset_id}",
+        f"predictor: {report.predictor}",
+        f"scope:     {report.scope}",
+        f"target:    {report.target}",
+        "",
+        "limitation",
+    ]
+    lines += _wrap(report.limitation)
+    lines += [
+        "",
+        "multi_item_cluster_metrics (ambiguous cases excluded)",
+        f"  exact partition match  {report.exact_partition_matches}"
+        f"/{report.scored_case_count}"
+        f"  ({_number(report.exact_partition_rate)})",
+        f"  co-clustering P/R/F1   {_number(report.pairwise.precision)}"
+        f" / {_number(report.pairwise.recall)}"
+        f" / {_number(report.pairwise.f1)}",
+        f"  over-merged cases      {', '.join(report.over_merge_case_ids) or 'none'}",
+        f"  under-merged cases     {', '.join(report.under_merge_case_ids) or 'none'}",
+        f"  permutation failures   "
+        f"{', '.join(report.permutation_failures) or 'none'}",
+        f"  accounting failures    "
+        f"{', '.join(report.accounting_failures) or 'none'}",
+        f"  ambiguous cases        {report.ambiguous_case_count} (excluded)",
+        "",
+        "cases",
+    ]
+    for outcome in report.outcomes:
+        mark = "ok " if outcome.exact_match else "DIFF"
+        lines.append(
+            f"  [{mark}] {outcome.case_id}  {outcome.category}"
+            f"  ({outcome.status}, resolvable_by {outcome.resolvable_by})"
+        )
+        lines.append(
+            "         expected  "
+            + " | ".join("+".join(sorted(group)) for group in outcome.expected)
+        )
+        lines.append(
+            "         predicted "
+            + " | ".join("+".join(sorted(group)) for group in outcome.predicted)
+        )
+        if outcome.over_merged_pairs:
+            lines.append(
+                "         over-merged  "
+                + ", ".join("+".join(pair) for pair in outcome.over_merged_pairs)
+            )
+        if outcome.under_merged_pairs:
+            lines.append(
+                "         under-merged "
+                + ", ".join("+".join(pair) for pair in outcome.under_merged_pairs)
+            )
+        if not outcome.permutation_stable:
+            lines.append("         PERMUTATION UNSTABLE")
+        if rationales and outcome.case_id in rationales:
+            lines += _wrap(rationales[outcome.case_id], indent="         ")
+    lines += _completeness_lines(report)
+    lines += ["", render_banner(report).rstrip()]
     return "\n".join(lines) + "\n"
 
 
@@ -198,10 +386,13 @@ def render_sweep(points: Sequence[ThresholdPoint]) -> str:
             _number(point.recall),
             _number(point.f1),
             _number(point.report.candidate_recall),
-            str(point.report.overall.confusion.tp),
-            str(point.report.overall.confusion.fp),
-            str(point.report.overall.confusion.fn),
+            str(point.report.isolated_pair_metrics.confusion.tp),
+            str(point.report.isolated_pair_metrics.confusion.fp),
+            str(point.report.isolated_pair_metrics.confusion.fn),
         ]
         for point in points
     ]
-    return "\n".join(_table(rows)) + "\n"
+    header = points[0].report.trust.banner() if points else ""
+    body = "\n".join(_table(rows))
+    scope = "scope: isolated_pairs"
+    return f"{header}\n\n{scope}\n{body}\n\n{header}\n" if header else body + "\n"

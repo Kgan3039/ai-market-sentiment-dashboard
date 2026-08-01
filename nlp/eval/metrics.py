@@ -4,16 +4,25 @@ This module counts; it never decides.  A predictor hands back one
 :class:`PairPrediction` per pair and everything here is arithmetic over
 those, so a metric cannot disagree with the behaviour it claims to measure.
 
-Two deliberate choices:
+**What these metrics are.**  Every number here comes from invoking a stage
+on *two records at a time*.  It answers "does a two-item call merge this
+pair", which is not the same question as "does the production pipeline put
+these two in one story" — see :class:`EvaluationReport` and
+:mod:`nlp.eval.clusters`.  The report calls them ``isolated_pair_metrics``
+for that reason and nothing here calls them anything else.
+
+Three deliberate choices:
 
 * **Undefined is ``None``, not zero.**  Precision over zero predicted
   merges is not "0% precise", it is unmeasured.  Returning 0.0 would let a
   stage that merges nothing look like a failing stage rather than an
-  unevaluated one, and would silently satisfy a "recall is low" narrative
-  with a number nobody computed.
+  unevaluated one.
 * **Ambiguous pairs are excluded from the headline numbers** and reported
-  separately.  Scoring against a label the author already marked arguable
-  measures the coin flip.
+  separately.  Scoring against a label the records do not settle measures
+  the coin flip.
+* **A pair that raised is reported, never silently dropped.**  It leaves
+  the denominators, the report is marked incomplete, and the pair id and
+  the exception are carried out with the numbers.
 """
 
 from __future__ import annotations
@@ -22,6 +31,22 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Protocol, Sequence
 
 from .dataset import LabeledPair, PairSet
+from .trust import TrustContract
+
+#: What an :class:`EvaluationReport` measures.  Present in every payload so
+#: a report can never be read as something it is not.
+ISOLATED_PAIR_SCOPE = "isolated_pairs"
+
+#: Stated in every report, in the same words, next to the numbers.
+ISOLATED_PAIR_LIMITATION = (
+    "Isolated-pair metrics measure whether a two-item invocation of the "
+    "stage merges a pair. Production clustering can differ on the same two "
+    "records in a multi-item batch, because cluster-wide compatibility, "
+    "transitivity, provider-conflict quarantine, and capacity behaviour all "
+    "depend on the companion items in the batch. These numbers therefore "
+    "cannot on their own validate production clustering; see "
+    "multi_item_cluster_metrics."
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +76,29 @@ class PairPredictor(Protocol):
 
     def __call__(self, pair: LabeledPair) -> PairPrediction:
         ...
+
+
+@dataclass(frozen=True)
+class EvaluationFailure:
+    """One case the evaluator could not score, and why.
+
+    A stage can raise on an input — a capacity refusal, a rejected record,
+    a model failure — and an evaluation that swallowed it would report a
+    precision computed over a denominator nobody could see. So the case
+    leaves the denominators, lands here, and marks the run incomplete.
+    """
+
+    case_id: str
+    error_type: str
+    message: str
+
+    @classmethod
+    def of(cls, case_id: str, error: BaseException) -> "EvaluationFailure":
+        return cls(
+            case_id=case_id,
+            error_type=type(error).__name__,
+            message=str(error) or repr(error),
+        )
 
 
 @dataclass(frozen=True)
@@ -140,32 +188,64 @@ class CategoryBreakdown:
 
 @dataclass(frozen=True)
 class EvaluationReport:
-    """The full result of scoring one predictor against one pair set."""
+    """Isolated-pair scoring of one predictor against one pair set.
+
+    ``isolated_pair_metrics`` is deliberately not called "overall": it is
+    the total over the pairs that were *scored two at a time*, which is a
+    different measurement from what the pipeline does to the same records
+    in a batch.  :data:`ISOLATED_PAIR_LIMITATION` states the difference and
+    travels with every rendering of this report.
+    """
 
     dataset_id: str
     predictor: str
-    overall: Metrics
+    trust: TrustContract
+    isolated_pair_metrics: Metrics
     by_category: tuple[CategoryBreakdown, ...]
     by_expected_stage: tuple[CategoryBreakdown, ...]
     by_ticker: tuple[CategoryBreakdown, ...]
     #: Recall computed over pairs the stage even considered, versus recall
-    #: over every positive.  ``candidate_recall`` bounds ``recall``.
+    #: over every positive.  ``candidate_recall`` bounds ``merge_recall``.
     candidate_recall: float | None
     #: Ambiguous pairs the stage merged, by pair id.  Not scored.
     ambiguous_merged: tuple[str, ...]
     ambiguous_count: int
+    #: Pairs the stage raised on.  Excluded from every denominator above.
+    failures: tuple[EvaluationFailure, ...] = ()
     #: Per-pair detail keyed by pair id, for the confusion listing.
     details: Mapping[str, str] = field(default_factory=dict)
     #: The threshold this run used, when the predictor has one.
     threshold: float | None = None
     #: Predicted scores keyed by pair id, when the predictor emits them.
     scores: Mapping[str, float] = field(default_factory=dict)
+    scope: str = ISOLATED_PAIR_SCOPE
+    limitation: str = ISOLATED_PAIR_LIMITATION
 
     @property
     def merge_recall(self) -> float | None:
-        """Alias for ``overall.recall``, named for the candidate contrast."""
+        """Alias for the isolated-pair recall, named for the candidate contrast."""
 
-        return self.overall.recall
+        return self.isolated_pair_metrics.recall
+
+    @property
+    def evaluated_case_count(self) -> int:
+        """Pairs that produced a prediction, scored or ambiguous."""
+
+        return self.isolated_pair_metrics.confusion.total + self.ambiguous_count
+
+    @property
+    def failed_case_count(self) -> int:
+        return len(self.failures)
+
+    @property
+    def failed_case_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(failure.case_id for failure in self.failures))
+
+    @property
+    def complete(self) -> bool:
+        """False when any pair raised; the numbers cover less than the set."""
+
+        return not self.failures
 
 
 def _score_slice(pairs: Sequence[tuple[LabeledPair, PairPrediction]]) -> Metrics:
@@ -205,36 +285,50 @@ def _breakdown(
     )
 
 
-def evaluate(
+def evaluate_isolated_pairs(
     pair_set: PairSet,
     predictor: PairPredictor,
     *,
     name: str,
     threshold: float | None = None,
 ) -> EvaluationReport:
-    """Run ``predictor`` over every pair and score the scored ones.
+    """Run ``predictor`` over every pair, two records at a time, and score it.
 
     The predictor is called once per pair, in dataset order, and the
     dataset is ordered by ``pair_id``, so two runs of the same predictor
     over the same set produce identical reports in any process.
+
+    A predictor that raises does not abort the run: the pair is recorded in
+    ``failures``, left out of every denominator, and the returned report has
+    ``complete`` False.
     """
 
-    predictions = [(pair, predictor(pair)) for pair in pair_set.pairs]
-    for pair, prediction in predictions:
+    predictions: list[tuple[LabeledPair, PairPrediction]] = []
+    failures: list[EvaluationFailure] = []
+    for pair in pair_set.pairs:
+        try:
+            prediction = predictor(pair)
+        except Exception as error:  # noqa: BLE001 - reported, never swallowed
+            failures.append(EvaluationFailure.of(pair.pair_id, error))
+            continue
         if not isinstance(prediction, PairPrediction):
             raise TypeError(
                 f"{name}: predictor returned {type(prediction).__name__} "
                 f"for {pair.pair_id}, expected PairPrediction"
             )
+        predictions.append((pair, prediction))
+
     scored = [(pair, prediction) for pair, prediction in predictions if pair.is_scored]
     positives = [(pair, prediction) for pair, prediction in scored if pair.is_positive]
     considered = sum(
         1 for _, prediction in positives if prediction.candidate or prediction.merged
     )
+    ambiguous = [pair for pair, _ in predictions if pair.label == "ambiguous"]
     return EvaluationReport(
         dataset_id=pair_set.dataset_id,
         predictor=name,
-        overall=_score_slice(scored),
+        trust=pair_set.trust,
+        isolated_pair_metrics=_score_slice(scored),
         by_category=_breakdown(scored, lambda pair: pair.category),
         by_expected_stage=_breakdown(scored, lambda pair: pair.expected_stage),
         by_ticker=_breakdown(scored, lambda pair: pair.ticker),
@@ -246,7 +340,8 @@ def evaluate(
                 if pair.label == "ambiguous" and prediction.merged
             )
         ),
-        ambiguous_count=len(pair_set.ambiguous),
+        ambiguous_count=len(ambiguous),
+        failures=tuple(failures),
         details={
             pair.pair_id: prediction.detail
             for pair, prediction in predictions
@@ -261,6 +356,11 @@ def evaluate(
     )
 
 
+#: Historical name.  Kept because it reads correctly — it evaluates a
+#: predictor over a pair set — while the *report* is what needed renaming.
+evaluate = evaluate_isolated_pairs
+
+
 @dataclass(frozen=True)
 class ThresholdPoint:
     """One point of a threshold sweep."""
@@ -270,15 +370,43 @@ class ThresholdPoint:
 
     @property
     def precision(self) -> float | None:
-        return self.report.overall.precision
+        return self.report.isolated_pair_metrics.precision
 
     @property
     def recall(self) -> float | None:
-        return self.report.overall.recall
+        return self.report.isolated_pair_metrics.recall
 
     @property
     def f1(self) -> float | None:
-        return self.report.overall.f1
+        return self.report.isolated_pair_metrics.f1
+
+
+def validate_thresholds(thresholds: Sequence[float]) -> tuple[float, ...]:
+    """Return the sorted, validated sweep points.
+
+    Rejects an empty sweep, repeats, non-numbers, non-finite values, and
+    anything outside ``[0, 1]``: a cosine threshold above 1 merges nothing
+    and below 0 merges everything, and either would put a meaningless row
+    in a tuning table that somebody later reads as evidence.
+    """
+
+    import math
+
+    values: list[float] = []
+    for entry in thresholds:
+        if isinstance(entry, bool) or not isinstance(entry, (int, float)):
+            raise ValueError(f"sweep thresholds must be numbers, got {entry!r}")
+        number = float(entry)
+        if not math.isfinite(number):
+            raise ValueError(f"sweep thresholds must be finite, got {entry!r}")
+        if not 0.0 <= number <= 1.0:
+            raise ValueError(f"sweep thresholds must lie in [0.0, 1.0], got {entry!r}")
+        values.append(number)
+    if not values:
+        raise ValueError("a sweep needs at least one threshold")
+    if len(set(values)) != len(values):
+        raise ValueError("sweep thresholds must be distinct")
+    return tuple(sorted(values))
 
 
 def sweep_thresholds(
@@ -292,24 +420,17 @@ def sweep_thresholds(
 
     Points are returned in ascending threshold order regardless of the
     order supplied, so a sweep reads the same way however it was requested.
-    Repeated thresholds are rejected: silently scoring one twice would put
-    two different-looking rows with identical numbers in a tuning table.
     """
 
-    values = [float(threshold) for threshold in thresholds]
-    if not values:
-        raise ValueError("a sweep needs at least one threshold")
-    if len(set(values)) != len(values):
-        raise ValueError("sweep thresholds must be distinct")
     return tuple(
         ThresholdPoint(
             threshold=threshold,
-            report=evaluate(
+            report=evaluate_isolated_pairs(
                 pair_set,
                 predictor_factory(threshold),
                 name=f"{name}@{threshold:g}",
                 threshold=threshold,
             ),
         )
-        for threshold in sorted(values)
+        for threshold in validate_thresholds(thresholds)
     )

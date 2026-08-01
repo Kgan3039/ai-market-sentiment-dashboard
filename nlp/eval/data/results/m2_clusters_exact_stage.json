@@ -1,0 +1,378 @@
+{
+  "cases": [
+    {
+      "case_id": "C001",
+      "category": "sparse_bridge_contradictory",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C001-3"
+        ],
+        [
+          "C001-1",
+          "C001-2"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C001-3"
+        ],
+        [
+          "C001-1",
+          "C001-2"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C002",
+      "category": "sparse_bridge_compatible",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C002-1",
+          "C002-2",
+          "C002-3"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C002-1",
+          "C002-2",
+          "C002-3"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C003",
+      "category": "provider_conflict_group",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C003-1"
+        ],
+        [
+          "C003-2"
+        ],
+        [
+          "C003-3"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C003-1"
+        ],
+        [
+          "C003-2"
+        ],
+        [
+          "C003-3"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C004",
+      "category": "url_reuse_group",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C004-3"
+        ],
+        [
+          "C004-1",
+          "C004-2"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C004-3"
+        ],
+        [
+          "C004-1",
+          "C004-2"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C005",
+      "category": "repeated_quarterly_group",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C005-1"
+        ],
+        [
+          "C005-2"
+        ],
+        [
+          "C005-3"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C005-1"
+        ],
+        [
+          "C005-2"
+        ],
+        [
+          "C005-3"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C006",
+      "category": "semantic_transitivity",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C006-1"
+        ],
+        [
+          "C006-2"
+        ],
+        [
+          "C006-3"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C006-1"
+        ],
+        [
+          "C006-2"
+        ],
+        [
+          "C006-3"
+        ]
+      ],
+      "resolvable_by": "m3",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C007",
+      "category": "mixed_stage_group",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C007-4"
+        ],
+        [
+          "C007-1",
+          "C007-2",
+          "C007-3"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C007-4"
+        ],
+        [
+          "C007-1",
+          "C007-2",
+          "C007-3"
+        ]
+      ],
+      "resolvable_by": "m3",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C008",
+      "category": "permutation_equivalence",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C008-3"
+        ],
+        [
+          "C008-1",
+          "C008-4"
+        ],
+        [
+          "C008-2",
+          "C008-5"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C008-3"
+        ],
+        [
+          "C008-1",
+          "C008-4"
+        ],
+        [
+          "C008-2",
+          "C008-5"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": []
+    },
+    {
+      "case_id": "C009",
+      "category": "mixed_stage_group",
+      "duplicated_items": [],
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C009-3"
+        ],
+        [
+          "C009-1",
+          "C009-2"
+        ]
+      ],
+      "missing_items": [],
+      "over_merged_pairs": [],
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C009-3"
+        ],
+        [
+          "C009-1",
+          "C009-2"
+        ]
+      ],
+      "resolvable_by": "m3",
+      "status": "ambiguous",
+      "under_merged_pairs": []
+    }
+  ],
+  "completeness": {
+    "complete": true,
+    "evaluated_case_count": 9,
+    "failed_case_count": 0,
+    "failed_case_ids": [],
+    "failures": []
+  },
+  "dataset_id": "phase0-dedup-cluster-cases-v1",
+  "limitation": "Multi-item cluster metrics run each case as one batch, so they do observe cluster-wide compatibility, transitivity, quarantine, and window-on-span behaviour that isolated-pair metrics cannot. They are still nine authored cases, not a sample of production traffic, and they are not evidence of production acceptance.",
+  "multi_item_cluster_metrics": {
+    "accounting_failures": [],
+    "ambiguous_case_count": 1,
+    "exact_partition_matches": 8,
+    "exact_partition_rate": 1.0,
+    "over_merge_case_ids": [],
+    "pairwise_co_clustering": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 24,
+        "true_positive": 10
+      },
+      "f1": 1.0,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "C001:C001-1|C001-3",
+          "C001:C001-2|C001-3",
+          "C003:C003-1|C003-2",
+          "C003:C003-1|C003-3",
+          "C003:C003-2|C003-3",
+          "C004:C004-1|C004-3",
+          "C004:C004-2|C004-3",
+          "C005:C005-1|C005-2",
+          "C005:C005-1|C005-3",
+          "C005:C005-2|C005-3",
+          "C006:C006-1|C006-2",
+          "C006:C006-1|C006-3",
+          "C006:C006-2|C006-3",
+          "C007:C007-1|C007-4",
+          "C007:C007-2|C007-4",
+          "C007:C007-3|C007-4",
+          "C008:C008-1|C008-2",
+          "C008:C008-1|C008-3",
+          "C008:C008-1|C008-5",
+          "C008:C008-2|C008-3",
+          "C008:C008-2|C008-4",
+          "C008:C008-3|C008-4",
+          "C008:C008-3|C008-5",
+          "C008:C008-4|C008-5"
+        ],
+        "true_positive": [
+          "C001:C001-1|C001-2",
+          "C002:C002-1|C002-2",
+          "C002:C002-1|C002-3",
+          "C002:C002-2|C002-3",
+          "C004:C004-1|C004-2",
+          "C007:C007-1|C007-2",
+          "C007:C007-1|C007-3",
+          "C007:C007-2|C007-3",
+          "C008:C008-1|C008-4",
+          "C008:C008-2|C008-5"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "permutation_failures": [],
+    "scored_case_count": 8,
+    "under_merge_case_ids": []
+  },
+  "predictor": "m2",
+  "scope": "multi_item_clusters",
+  "target": "exact_stage_partition",
+  "trust_contract": {
+    "adjudicated": false,
+    "dataset_kind": "synthetic_development",
+    "gate_eligible": false,
+    "labeling_status": "single_author_unadjudicated",
+    "metrics_purpose": "development_regression_only",
+    "real_ingested_evidence": false,
+    "reviewer_count": 1,
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset. Metrics are not valid for K3/G4 or final AC-3 acceptance."
+  }
+}

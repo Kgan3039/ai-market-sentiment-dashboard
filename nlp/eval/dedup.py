@@ -1,14 +1,30 @@
-"""Scoring the deduplication stages against the labeled set.
+"""Scoring the deduplication stages one pair at a time.
 
 The predictor here calls :func:`nlp.dedup.deduplicate` and reads its result.
 It reimplements no identity rule, no window, and no threshold, so the
 measured precision is the precision of the shipped stage rather than of a
 parallel model of it.
 
-Each pair is scored on its own two records.  That is faithful because M2
-guarantees a record's clusters do not depend on which other records share
-the batch (``nlp/dedup/service.py``), and it keeps a false merge attributable
-to exactly one labeled pair.
+**What this does not measure.**  Each pair is scored on its own two
+records, in a two-item invocation.  That is *not* what the pipeline does,
+and the difference is not cosmetic:
+
+* the compatibility gate is applied to the whole prospective cluster, so a
+  third record present in a real batch can change whether these two merge;
+* merges are transitive, so a batch can place two records together that no
+  single edge would have joined;
+* provider-conflict quarantine considers every record sharing a provider
+  item id, so a third record under that id can suppress a merge this pair
+  makes on its own;
+* the merge window is applied to the span of the resulting cluster, not to
+  a pair;
+* capacity is a property of a partition.
+
+None of that is visible two records at a time.  So the numbers this module
+produces answer "does a two-item call merge this pair" and nothing wider;
+they are reported as ``isolated_pair_metrics`` and they cannot on their own
+validate production clustering.  :mod:`nlp.eval.clusters` runs whole groups
+in one call and is where batch behaviour is measured.
 """
 
 from __future__ import annotations
@@ -18,7 +34,12 @@ from typing import Sequence
 from nlp.dedup import DedupConfig, MatchReason, RawItem, deduplicate
 
 from .dataset import LabeledItem, LabeledPair, PairSet, default_pair_set
-from .metrics import EvaluationReport, PairPrediction, PairPredictor, evaluate
+from .metrics import (
+    EvaluationReport,
+    PairPrediction,
+    PairPredictor,
+    evaluate_isolated_pairs,
+)
 
 #: Every accepted reason that means "these two are one story".  ``CANONICAL``
 #: is excluded: it names the representative member, not a merge signal.
@@ -60,8 +81,12 @@ def config_for(pair_set: PairSet) -> DedupConfig:
     return DedupConfig(supported_tickers=tuple(pair_set.metadata["tickers"]))
 
 
-def m2_predictor(config: DedupConfig) -> PairPredictor:
-    """Return a predictor that runs the M2 core over one pair at a time."""
+def m2_isolated_pair_predictor(config: DedupConfig) -> PairPredictor:
+    """Return a predictor that runs the M2 core over one pair at a time.
+
+    Two records in, one two-item invocation out.  See the module docstring
+    for what a two-item invocation cannot tell you.
+    """
 
     def predict(pair: LabeledPair) -> PairPrediction:
         left, right = to_raw_items(pair)
@@ -101,16 +126,26 @@ def m2_predictor(config: DedupConfig) -> PairPredictor:
     return predict
 
 
-def evaluate_m2(
+#: Historical name for the same factory.
+m2_predictor = m2_isolated_pair_predictor
+
+
+def evaluate_m2_isolated_pairs(
     pair_set: PairSet | None = None,
     *,
     config: DedupConfig | None = None,
 ) -> EvaluationReport:
-    """Score the merged M2 core against the labeled set."""
+    """Score the merged M2 core against the labeled set, two records at a time."""
 
     pairs = pair_set if pair_set is not None else default_pair_set()
     settings = config if config is not None else config_for(pairs)
-    return evaluate(pairs, m2_predictor(settings), name="m2")
+    return evaluate_isolated_pairs(
+        pairs, m2_isolated_pair_predictor(settings), name="m2"
+    )
+
+
+#: Historical name.  The report it returns is labelled ``isolated_pairs``.
+evaluate_m2 = evaluate_m2_isolated_pairs
 
 
 def merged_pair_ids(reports: Sequence[EvaluationReport]) -> tuple[str, ...]:
@@ -118,7 +153,7 @@ def merged_pair_ids(reports: Sequence[EvaluationReport]) -> tuple[str, ...]:
 
     merged: set[str] = set()
     for report in reports:
-        merged.update(report.overall.confusion.true_positives)
-        merged.update(report.overall.confusion.false_positives)
+        merged.update(report.isolated_pair_metrics.confusion.true_positives)
+        merged.update(report.isolated_pair_metrics.confusion.false_positives)
         merged.update(report.ambiguous_merged)
     return tuple(sorted(merged))

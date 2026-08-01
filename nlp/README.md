@@ -214,101 +214,188 @@ python -m flake8 nlp/dedup tests/test_dedup_core*.py
 python -m pytest tests/test_dedup_core.py tests/test_dedup_core_signals.py
 ```
 
-## Phase 0 dedup evaluation set and evaluator (M4, issue #67)
+## Phase 0 dedup evaluation sets and evaluators (M4, issue #67)
 
-`nlp.eval` holds the labelled deduplication pair set and the deterministic
-evaluator that measures a stage against it. The evaluator calls the public
-stage APIs and only counts what they return, so a reported number cannot
+`nlp.eval` holds the labelled deduplication datasets and the deterministic
+evaluators that measure a stage against them. The evaluators call the public
+stage APIs and only count what they return, so a reported number cannot
 drift away from shipped behaviour.
 
 ```bash
-python -m tools.eval_dedup --stage m2                     # text report
-python -m tools.eval_dedup --stage m2 --json              # committed form
-python -m tools.eval_dedup --composition                  # dataset makeup
-python -m tools.eval_dedup --stage m2 \
-    --precision-floor 0.85 --recall-floor 0.75            # AC-3 as a gate
+python -m tools.eval_dedup --stage m2                    # isolated pairs
+python -m tools.eval_dedup --stage m2 --scope clusters   # whole batches
+python -m tools.eval_dedup --composition                 # dataset makeup
+python -m tools.eval_dedup --stage m2 --json             # committed form
 ```
 
-### The dataset is synthetic, and that is a blocker, not a detail
+### Read this before reading any number below
 
-Issue #67 asks for ~150 pairs **sampled from real ingested data**, co-labelled
-with Kartik under the K3 (#60) reviewer guidelines. None of that is possible
-on `main`: I2 (#61) and I3 (#62) are open, so there is no ingestion path and
-no populated `raw_items`; K3 is open, so the co-labelling protocol is not
-written. Rather than block M4 entirely or invent provenance for articles
-nobody fetched, `nlp/eval/data/dedup_pairs.jsonl` is **authored** and marked
-synthetic in its manifest, in the loader, and here.
+**WARNING: Synthetic, single-author, unadjudicated development dataset.
+Metrics are not valid for K3/G4 or final AC-3 acceptance.**
 
-Every headline, URL, outlet, and timestamp in it is invented. Company names
-and tickers are real because the set has to exercise the five Phase 0
-symbols; the events are not, and nothing in the file should be quoted or
-cited as a claim about any company. **The AC-3 numbers this set produces are
-a design measurement, not the G4 gate result.** G4 needs the real sample.
+| | |
+|---|---|
+| `dataset_kind` | `synthetic_development` |
+| `real_ingested_evidence` | `false` |
+| `labeling_status` | `single_author_unadjudicated` |
+| `reviewer_count` | 1 |
+| `adjudicated` | `false` |
+| `gate_eligible` | `false` |
+| `metrics_purpose` | `development_regression_only` |
 
-Cases were written from the failure modes a reviewer has to catch, not by
-running M2's normalizer over a corpus and keeping what it collapsed — the
-labels are independent of the implementation.
+This block is **enforced, not documented**. Both manifests must declare all
+seven fields; the loader refuses a set that omits one, that is synthetic and
+claims real ingested evidence, that is synthetic and claims gate
+eligibility, that claims adjudication with one reviewer, or whose `labeling`
+block contradicts its `trust_contract`. Every loaded pair, item, and case is
+stamped `synthetic=True` from the manifest. The block and the warning are
+printed **above and below** every text report, and appear in every JSON
+payload and every committed result file — because somebody will read
+`m2_baseline.json`, or a CLI transcript in a ticket, with no README nearby.
+
+Issue #67 asks for ~150 pairs **sampled from real ingested data**,
+co-labelled with Kartik under the K3 (#60) guidelines. None of that is
+possible on `main`: I2 (#61) and I3 (#62) are open, so there is no ingestion
+and no populated `raw_items`; K3 is open, so the co-labelling protocol is
+not written. Every headline, URL, outlet and timestamp is authored. Real
+outlet names are used so the syndication and attribution cases exercise the
+real publisher policy; invented names (`Wolfsberg Motors`, `Pacific Advanced
+Packaging`, `Harbourline Media`, `Northfield Securities`, `Calder Bank
+Markets`) are used wherever a label needs to name a third party.
+
+### The two measurements are not interchangeable
+
+| scope | what it does | what it can see |
+|---|---|---|
+| `isolated_pair_metrics` | one pair per invocation, two records | whether a **two-item call** merges a pair |
+| `multi_item_cluster_metrics` | one whole group per invocation | cluster-wide compatibility, transitivity, provider quarantine, window-on-span |
+
+The pairwise evaluator previously claimed its results were faithful to
+production clustering because M2 guarantees a record's clusters do not
+depend on batch companions. **That claim was wrong and has been removed.**
+M2 makes the opposite guarantee explicitly: the compatibility gate is
+applied to the whole prospective cluster, merges are transitive, quarantine
+looks at every record under a provider id, and the window applies to a
+cluster's span. All four mean a third record *can* change what happens to
+two others. Isolated-pair metrics therefore cannot on their own validate
+production clustering, the report is scoped `isolated_pairs`, the field is
+named `isolated_pair_metrics` rather than `overall`, and
+`ISOLATED_PAIR_LIMITATION` travels with every rendering.
 
 ### Composition (153 pairs)
 
 | | count |
 |---|---|
-| duplicate / distinct / ambiguous | 78 / 70 / 5 |
+| duplicate / distinct / ambiguous | 78 / 73 / **2** |
 | expected stage m2 / m3 / none | 48 / 30 / 75 |
 | tickers AAPL / AMD / META / NVDA / TSLA | 32 / 27 / 29 / 32 / 33 |
 
-Positives: exact duplicates, syndicated copies, trivial title variants (wire
-prefixes, attribution suffixes, typography, entities, thousands separators),
-provider-id repeats, URL repeats, and 30 semantic rewrites deliberately left
-for M3. Negatives: same-template different events, repeated quarterly
-stories, role changes, guidance direction, approval/rejection, beat/miss,
-profit/loss, and changed numbers, dates, quarters, currencies, units, ranges
-and signs, plus similar headlines about different companies. Five ambiguous
-pairs are labelled as such and **excluded from the headline metrics** —
-scoring against a label the author already flagged as arguable measures the
-coin flip, not the stage.
+`ambiguous` now means **the records do not contain enough to decide it**,
+not "the author expects disagreement". Two pairs qualify: `P133`, one EU
+fine reported in euros by one outlet and dollars by another, where a rounded
+conversion explains the pair as well as two decisions do; and `P138`, a point
+estimate of 62 billion inside a published 60-65 billion range, which is
+exactly how a second outlet summarizes one disclosure. Both were confident
+hard negatives and should not have been.
 
-### M2 baseline (committed, `nlp/eval/data/results/m2_baseline.json`)
+Five pairs went the other way. `P149`-`P153` (a live blog beside an article
+about one announcement in it, a report beside a follow-up analysis, a rumour
+beside its confirmation, a release beside an executive interview, an
+announcement beside a hands-on) were labelled ambiguous. The article-level
+contract settles all five: a canonical story is one event reported by
+multiple outlets, and none of these is a copy of the other. Labelling them
+ambiguous was class balancing. They are now `distinct`, in a new
+`same_event_different_article` category.
+
+### M2 isolated-pair baseline
+
+`nlp/eval/data/results/m2_baseline.json`, 151 scored pairs:
 
 | metric | value |
 |---|---|
 | precision | **1.0000** (48 merges, 0 false) |
 | recall | 0.6154 |
 | F1 | 0.7619 |
-| tp / fp / tn / fn | 48 / 0 / 70 / 30 |
+| tp / fp / tn / fn | 48 / 0 / **73** / 30 |
 | recall on `expected_stage=m2` | **1.0000** (48/48) |
 | recall on `expected_stage=m3` | 0.0000 (0/30) |
 | ambiguous pairs merged | 0 |
+| complete | true (0 failures) |
 
-M2 clears AC-3's precision floor (≥0.85) with room to spare and **fails its
-recall floor** (≥0.75). It merges every positive it is responsible for and
-none of the 30 semantic rewrites, because none of them share an exact key.
-That gap is the measured case for M3 (#70) existing at all, and it is the
-reason M4 lands first: the threshold M3 picks has to come from this set, not
-from intuition.
+The true-negative count moved 70 → 73 because three pairs joined the scored
+set. Precision, recall and F1 are unchanged: the relabelled pairs were all
+ones M2 correctly refused, so they moved from "excluded" to "true negative"
+without touching a numerator. M2 was not tuned.
 
-M2 was not loosened to improve these numbers, and must not be.
+### M2 multi-item cluster results
+
+Nine authored cases, 30 records, covering a sparse bridge between
+contradictory endpoints, a legitimate sparse bridge, a provider-conflict
+group, a recycled-URL group, a repeated quarterly group, three-item semantic
+transitivity, two mixed-stage groups, and a permutation-equivalence batch.
+
+Against `exact_stage_partition` — what the exact stage alone should produce
+(`m2_clusters_exact_stage.json`):
+
+| metric | value |
+|---|---|
+| exact partition match | **8/8** (1.0000) |
+| co-clustering precision / recall / F1 | 1.0000 / 1.0000 / 1.0000 |
+| over-merged / under-merged cases | none / none |
+| permutation failures | none |
+| missing or duplicated items | none |
+
+Against `expected_partition` — ground truth (`m2_clusters_ground_truth.json`):
+
+| metric | value |
+|---|---|
+| exact partition match | 6/8 (0.7500) |
+| co-clustering precision / recall / F1 | 1.0000 / 0.6250 / 0.7692 |
+| over-merged cases | **none** |
+| under-merged cases | `C006`, `C007` |
+
+Both under-merges are the semantic cases M3 exists for, and reporting the
+two targets separately is what keeps that legible as correct M2 behaviour
+rather than a defect. Every case is re-run reversed and rotated; a partition
+that changed would be named in `permutation_failures`.
+
+### Dataset integrity, enforced at load
+
+Refused: unknown vocabulary values; duplicate `pair_id` or `item_id`; a pair
+that repeats another pair's **content**, including with the two sides
+swapped; a non-duplicate pair whose two records are byte-identical; a
+missing `canonical_url` key (it must be present even when null); a URL that
+is not parseable http(s) with a host; a naive timestamp; a timestamp outside
+the range `nlp.dedup` itself accepts, imported rather than restated; a label
+contradicting its expected stage; rows out of `pair_id` order; and any
+malformed trust, provenance, or labeling block. Sweep thresholds must be
+finite numbers inside `[0, 1]` and distinct.
+
+### Failures are reported, never swallowed
+
+A stage that raises on one case does not end the run. The case is recorded
+with its id, exception type and message, left out of **every** denominator,
+and the report exposes `evaluated_case_count`, `failed_case_count`,
+`failed_case_ids` and `complete`. The text renderer prints the failures and
+states that they were excluded; the CLI exits 1 on an incomplete run.
 
 ### Evaluator conventions
 
 - **Undefined is `None`, not zero.** Precision over zero predicted merges is
-  unmeasured, not 0%. Returning 0.0 would let a stage that merges nothing
-  look like a failing stage rather than an unevaluated one. An undefined
-  metric never clears a gate.
-- **Pairs are scored two records at a time.** M2 guarantees a record's
-  clusters do not depend on batch companions, so this is faithful and it
-  keeps every false merge attributable to exactly one pair id.
-- **Candidate recall is reported next to merge recall.** The gap separates
-  "the generator never proposed it" from "the predicate refused it", which is
-  what a threshold sweep needs to mean anything.
-- **Loading is strict.** Unknown category, duplicate pair or item id, naive
-  timestamp, empty-string optional field, label contradicting its expected
-  stage, or rows out of `pair_id` order all raise `EvalDatasetError` rather
-  than being scored around.
-- **Everything is deterministic.** Reports are pure functions of the dataset
-  and the stage: no clock, no run id, no hash-order. The committed baseline
-  is byte-compared against a fresh run in the test suite, under three
-  different `PYTHONHASHSEED` values.
+  unmeasured, not 0%. An undefined metric never clears a gate.
+- **Ambiguous pairs and cases are excluded** from the headline numbers and
+  reported separately.
+- **Candidate recall is reported beside merge recall**, so a sweep can tell
+  a missing candidate from a refused one.
+- **Everything is deterministic.** Both committed baselines are byte-compared
+  against a fresh run in the test suite, under three `PYTHONHASHSEED` values.
+
+### This does not close issue #67
+
+The DoD's "sampled from real ingested data" and "co-label with Kartik per
+K3" halves remain blocked on #61, #62 and #60. The numbers here are
+development regression signals. G4 needs the real sample, a second reviewer,
+and adjudication.
 
 Lint and test with:
 
