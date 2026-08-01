@@ -853,3 +853,155 @@ python -m flake8 nlp/semdedup tests/test_semantic_dedup.py
 python -m pytest tests/test_semantic_dedup.py
 python -m tools.eval_dedup --stage m2+m3 --precision-floor 0.85 --recall-floor 0.75
 ```
+
+## Phase 0 theme clustering (M5, issue #72)
+
+`nlp.themes` groups one ticker-day's canonical stories into 2-6
+salience-ranked themes plus "Other coverage".
+
+```python
+from datetime import date
+from nlp.embeddings import EmbeddingService
+from nlp.themes import ThemeConfig, cluster_themes
+
+themes = cluster_themes(
+    stories,                       # canonical stories, after M2 and M3
+    ticker="NVDA",
+    trading_day=date(2026, 3, 5),
+    config=ThemeConfig(supported_tickers=TICKERS),
+    encoder=EmbeddingService(),
+    previous_themes=last_run,      # optional; keeps unchanged themes' identity
+)
+```
+
+**This does not close issue #72.** The DoD asks for AC-4 demonstrated on
+three *real* ticker-days. Real days need I2 (#61), I3 (#62) and I1 (#57),
+none of which are on main. The three committed days are authored to the same
+shape and marked synthetic; they demonstrate the behaviour, not the DoD.
+
+### No story disappears
+
+Every input comes back in exactly one of three places — a theme,
+`other_coverage`, or `excluded` with a stated reason — and
+`cluster_themes` asserts that partition before returning. `excluded` is
+currently only ever "no encodable text". A story that is in none of the
+three is a bug the function raises on rather than ships.
+
+### Algorithm, and when it gives way
+
+HDBSCAN over story embeddings on a **precomputed cosine-distance matrix**,
+with the agglomerative fallback issue #72 allows. "Unstable" is given a
+checkable meaning rather than left to judgement — HDBSCAN gives way when:
+
+1. it finds a number of clusters outside AC-4's 2-6 band, which at Phase 0
+   volumes it often does; or
+2. one of its clusters is looser than `min_theme_cohesion` (0.40).
+
+The second case is the one that bites. On the committed TSLA day HDBSCAN
+under-split 18 stories into a seven-story grab-bag at cohesion 0.351 holding
+the robotaxi permit, the Berlin factory restart, the Nevada battery line and
+the investor-day notice together. That is the "one giant catch-all cluster"
+a reader must never be shown as a theme. The fallback picks a cluster count
+in the band by silhouette (ties to the smaller count) and produced five
+themes at 0.42-0.58.
+
+Below four stories the day is not clustered at all (AC-4): stories are
+listed individually under "Other coverage". A group of fewer than
+`min_theme_stories` (2) is coverage, not a theme, and goes the same way — so
+a day never shows a "theme" of one story.
+
+### Coherence: exactly one contradiction transfers from M3
+
+A theme is coarser than a story. Different quarters, different magnitudes
+and different people legitimately share an earnings theme, so applying M3's
+full guard set here would shred every theme into singletons. Exactly one
+family transfers: **opposing claims**. A theme holding both "raised
+guidance" and "cut guidance" cannot be summarized in 2-4 faithful sentences.
+The minority side moves to "Other coverage" — majority by story count, ties
+to the side holding the theme's leading story — and every move is reported
+in `method_reason`.
+
+### Salience and stability
+
+`salience = f(story count, outlet diversity, recency)`, each component
+normalized within the ticker-day so a quiet day's top theme is not penalised
+against a busy one's. Recency decays with a 6-hour half-life measured
+against **the day's own most recent story, never a clock** — replaying a
+stored day (AC-8) must rank it the same way next year. Ranking ties break on
+the earliest story, then the fingerprint, so equal-salience themes never
+swap places between runs. `SalienceFeatures` reports every input, because
+"why is this theme first" is a question a reviewer asks about a ranked list.
+
+Theme identity survives across runs by centroid matching: one-to-one, greedy
+from the most similar pair, at cosine ≥ 0.90. A theme that gained a story
+keeps its `theme_key` while its `fingerprint` moves — which is exactly the
+signal a reconciler needs. A genuinely new theme gets a new key.
+
+### Measured on the three committed days
+
+`nlp/themes/data/results/theme_quality.json`, real encoder:
+
+| | AAPL 03-04 | NVDA 03-05 | TSLA 03-06 |
+|---|---|---|---|
+| stories | 3 | 9 | 18 |
+| method | small-n fallback | hdbscan | agglomerative |
+| themes | 0 | 3 | 5 |
+| other coverage | 3 | 3 | 1 |
+| excluded | 0 | 0 | 0 |
+| theme coverage | n/a | 0.667 | 0.944 |
+| mean cohesion | n/a | 0.729 | 0.479 |
+| max inter-theme similarity | n/a | 0.583 | 0.617 |
+| AC-4 shape | yes | yes | yes |
+| no story lost | yes | yes | yes |
+| permutation stable | yes | yes | yes |
+| re-run keeps identities | yes | yes | yes |
+
+### Honest limitations
+
+- **Unsupervised clustering has no objective truth, and these numbers do not
+  claim any.** They measure what is mechanically checkable: coverage, shape,
+  cohesion versus separation, stability. A day can score perfectly here and
+  still group two stories a reader would separate — which is what the K3
+  (#60) human review exists for, and it is not written yet.
+- **Two of the five TSLA themes are imperfect.** The top one puts the
+  battery line and the supercharger corridor with the delivery report; the
+  fourth puts the investor-day notice with the Berlin factory. Both are
+  above the cohesion floor and both would survive to a reader. Tuning the
+  parameters until this particular fixture looked clean would be fitting to
+  a fixture I wrote, so it has not been done.
+- **Membership is fragile under perturbation; identity is not.** Dropping
+  one story from the TSLA day re-runs the silhouette choice and retains only
+  20% of the exact memberships — but centroid matching retained 100% of the
+  theme identities, which is the property AC-4 actually asks for. On the
+  HDBSCAN days membership retention was 0.67-1.00.
+- **`min_theme_cohesion` was calibrated on these three days.** Real days
+  will need it re-measured.
+- **The fixture, the guards, and the thresholds share an author**, exactly
+  as in M4, so the results are optimistic.
+
+### Boundaries
+
+- **M5 calls no LLM and adds no retrieval framework.** No RAG, no LangChain,
+  no LangGraph, no MCP. It prepares the closed evidence set the citation-safe
+  summarizer (#65/#80) consumes and stops. A test asserts none of those
+  modules is importable into the stage.
+- `ThemeEvidence` is a projection carrying only what the citation contract
+  resolves. `Theme.citable_item_ids` is what a citation may resolve to, and
+  a test asserts the sets are disjoint across themes — a citation cannot
+  reach outside its own theme.
+- **`trading_day` is an argument, not a derivation.** Which trading day a
+  story belongs to is a calendar question owned by #57/#68; guessing it here
+  would file a story under the wrong day silently.
+- No durable theme id is invented. `fingerprint` is a content digest;
+  `themes.id` belongs to issue #57.
+- The encoder is injected. No test in this package loads a model or touches
+  the network.
+
+Lint and test with:
+
+```bash
+python -m black --check nlp/themes tools/eval_themes.py tests/test_theme_clustering.py
+python -m flake8 nlp/themes tools/eval_themes.py tests/test_theme_clustering.py
+python -m pytest tests/test_theme_clustering.py
+python -m tools.eval_themes
+```

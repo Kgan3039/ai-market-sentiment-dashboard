@@ -1,0 +1,156 @@
+{
+  "dataset_id": "phase0-theme-ticker-days-v1",
+  "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+  "ticker_days": [
+    {
+      "excluded_count": 0,
+      "max_inter_theme_similarity": null,
+      "mean_cohesion": null,
+      "meets_ac4_shape": true,
+      "method": "small_n_fallback",
+      "method_reason": "3 stories, below the clustering floor of 4; listed individually",
+      "no_story_lost": true,
+      "other_coverage": [
+        "aapl-1",
+        "aapl-3",
+        "aapl-2"
+      ],
+      "other_coverage_count": 3,
+      "permutation_stable": true,
+      "perturbation": {
+        "identity_retained": 1.0,
+        "membership_retained": 1.0,
+        "theme_count_after": 0,
+        "theme_count_before": 0
+      },
+      "rerun_keeps_identity": true,
+      "singleton_theme_count": 0,
+      "story_count": 3,
+      "theme_count": 0,
+      "theme_coverage": 0.0,
+      "themes": [],
+      "ticker": "AAPL",
+      "trading_day": "2026-03-04",
+      "volume": "low"
+    },
+    {
+      "excluded_count": 0,
+      "max_inter_theme_similarity": 0.5824737467655388,
+      "mean_cohesion": 0.7287741369137682,
+      "meets_ac4_shape": true,
+      "method": "hdbscan",
+      "method_reason": "hdbscan found 3 clusters inside the allowed band, loosest cohesion 0.6897",
+      "no_story_lost": true,
+      "other_coverage": [
+        "nvda-9",
+        "nvda-8",
+        "nvda-3"
+      ],
+      "other_coverage_count": 3,
+      "permutation_stable": true,
+      "perturbation": {
+        "identity_retained": 1.0,
+        "membership_retained": 0.6666666666666666,
+        "theme_count_after": 2,
+        "theme_count_before": 3
+      },
+      "rerun_keeps_identity": true,
+      "singleton_theme_count": 0,
+      "story_count": 9,
+      "theme_count": 3,
+      "theme_coverage": 0.6666666666666666,
+      "themes": [
+        [
+          1,
+          "Nvidia reports record data centre revenue",
+          2,
+          5,
+          0.9832
+        ],
+        [
+          2,
+          "Nvidia unveils its next accelerator generation at GTC",
+          2,
+          2,
+          0.7108
+        ],
+        [
+          3,
+          "Washington clears Nvidia to ship a reduced-performance chip to China",
+          2,
+          3,
+          0.7037
+        ]
+      ],
+      "ticker": "NVDA",
+      "trading_day": "2026-03-05",
+      "volume": "medium"
+    },
+    {
+      "excluded_count": 0,
+      "max_inter_theme_similarity": 0.6167591575864638,
+      "mean_cohesion": 0.4792599700127025,
+      "meets_ac4_shape": true,
+      "method": "agglomerative",
+      "method_reason": "hdbscan's loosest cluster has cohesion 0.3508, below 0.4; best silhouette 0.1767 at k=6; moved a 1-story cluster to other coverage, below the 2-story theme floor",
+      "no_story_lost": true,
+      "other_coverage": [
+        "tsla-16"
+      ],
+      "other_coverage_count": 1,
+      "permutation_stable": true,
+      "perturbation": {
+        "identity_retained": 1.0,
+        "membership_retained": 0.2,
+        "theme_count_after": 1,
+        "theme_count_before": 5
+      },
+      "rerun_keeps_identity": true,
+      "singleton_theme_count": 0,
+      "story_count": 18,
+      "theme_count": 5,
+      "theme_coverage": 0.9444444444444444,
+      "themes": [
+        [
+          1,
+          "Tesla delivers 495,000 vehicles in the first quarter",
+          6,
+          4,
+          1.0
+        ],
+        [
+          2,
+          "Tesla applies for a robotaxi permit in Arizona",
+          3,
+          4,
+          0.6559
+        ],
+        [
+          3,
+          "Tesla recalls 12,000 Cybertrucks over a wiper fault",
+          3,
+          3,
+          0.6252
+        ],
+        [
+          4,
+          "Tesla's Berlin plant resumes output after a grid fault",
+          3,
+          4,
+          0.5875
+        ],
+        [
+          5,
+          "Tesla cuts Model 3 prices across Europe",
+          2,
+          3,
+          0.4833
+        ]
+      ],
+      "ticker": "TSLA",
+      "trading_day": "2026-03-06",
+      "volume": "high"
+    }
+  ]
+}
