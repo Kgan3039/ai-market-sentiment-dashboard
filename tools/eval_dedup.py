@@ -11,10 +11,10 @@ There are two measurements and ``--scope`` chooses between them:
     python -m tools.eval_dedup --stage m2 --scope clusters   # whole batches
     python -m tools.eval_dedup --stage m2 --json
 
-Every output, in both formats, carries the dataset's trust contract and the
-warning above and below the numbers.  These datasets are synthetic,
-single-author and unadjudicated; their metrics are development regression
-signals and cannot clear K3/G4 or final AC-3.
+Every output, in both formats, carries the loaded dataset's trust contract
+and the summary derived from it, above and below the numbers.  The banner is
+a function of the validated metadata, never text a manifest supplied, so it
+cannot describe a dataset as something the fields say it is not.
 
 Exit status is 0 when the run completed, 1 when a supplied floor was not
 cleared or the run was incomplete, and 2 for a usage or dataset error.
@@ -96,10 +96,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="eval_dedup",
         description=(
-            "Measure a deduplication stage against the labeled sets. The "
-            "datasets are synthetic, single-author and unadjudicated; the "
-            "metrics are development regression signals only and are not "
-            "valid for K3/G4 or final AC-3 acceptance."
+            "Measure a deduplication stage against the labeled sets. Every "
+            "report states the loaded dataset's trust contract and a "
+            "summary derived from it, above and below the numbers; read "
+            "that before quoting any figure."
         ),
     )
     parser.add_argument(
@@ -214,12 +214,13 @@ def _gate(report: EvaluationReport, args: argparse.Namespace) -> int:
     for failure in failures:
         print(f"GATE FAILED: {failure}", file=sys.stderr)
     if failures:
-        print(
-            "NOTE: this dataset is synthetic and single-author; a floor "
-            "checked here is a development regression guard, not AC-3 "
-            "acceptance.",
-            file=sys.stderr,
-        )
+        if not report.trust.gate_eligible:
+            print(
+                f"NOTE: {report.trust.summary.headline} A floor checked "
+                "against this dataset is a development regression guard, "
+                "not acceptance.",
+                file=sys.stderr,
+            )
     return 1 if failures else 0
 
 

@@ -244,27 +244,64 @@ Metrics are not valid for K3/G4 or final AC-3 acceptance.**
 | `metrics_purpose` | `development_regression_only` |
 
 This block is **enforced, not documented**, and validation is *relational*
-rather than per-field: `dataset_kind`, `labeling_status` and
-`metrics_purpose` are enums with no unknown values accepted, and the
-combinations are checked against each other in `nlp/eval/trust.py`.
+rather than per-field. `dataset_kind`, `labeling_status` and
+`metrics_purpose` are enums with no unknown values accepted, and each
+dataset kind's invariants live in one table, `DATASET_KIND_RULES`, which the
+validator asserts covers every enum member — so a new kind cannot silently
+inherit permissive behaviour.
 
-A `synthetic_development` set may not claim real ingested evidence, may not
-claim gate eligibility, and must declare
-`metrics_purpose=development_regression_only` — so it cannot claim
-`gate_acceptance` or `final_acceptance`. A `single_author_unadjudicated` set
-must have exactly one reviewer, must not be adjudicated, and must not be
-gate eligible. `adjudicated=true` requires at least two reviewers *and* an
-adjudicated labeling status. `gate_eligible=true` requires real ingested
-evidence, adjudication, at least two reviewers, a gate-or-acceptance
-purpose, and a non-synthetic dataset kind; and a gate purpose declared
-without `gate_eligible` is refused too. The `labeling` block must agree with
-the contract on all four shared fields.
+| | `synthetic_development` | `sampled_production` |
+|---|---|---|
+| `real_ingested_evidence` | must be `false` | must be **`true`** |
+| `metrics_purpose` | only `development_regression_only` | any |
+| may be gate eligible | no | yes, subject to the rules below |
+| `provenance.kind` | `synthetic` | `sampled` |
+| `provenance.collection_method` | `authored` | `sampled` or `ingested` |
+| `provenance.urls_are_synthetic` | `true` | `false` |
+| extra provenance required | `why_synthetic`, `blocked_by` | `ingestion_source`, `sample_selection` |
+
+A production sample must name what it was sampled *from*, and cannot
+describe itself as authored — the combination `sampled_production` with
+`real_ingested_evidence=false` used to load and no longer does.
+
+On top of the per-kind table, kind-independent rules: a
+`single_author_unadjudicated` set has exactly one reviewer, is not
+adjudicated, and is not gate eligible; `adjudicated=true` needs at least two
+reviewers *and* an adjudicated status; `gate_eligible=true` needs real
+ingested evidence, adjudication, two or more reviewers, a
+gate-or-acceptance purpose, and a kind that permits it; and a gate purpose
+declared without `gate_eligible` is refused. The `labeling` block must agree
+with the contract on all four shared fields.
+
+### The banner is derived, never supplied
+
+There is no `warning` field on a trust contract and a manifest that supplies
+one is **rejected** — a banner a caller could write is a banner that could
+contradict the fields beside it. `derive_trust_summary()` computes it from
+`dataset_kind`, evidence status, `labeling_status`, `reviewer_count`,
+`adjudicated`, `gate_eligible` and `metrics_purpose`:
+
+| state | banner |
+|---|---|
+| synthetic | `WARNING: Synthetic, {labelling} development dataset.` / `Metrics are not valid for K3/G4 or final AC-3 acceptance.` |
+| production, unadjudicated | `WARNING: Production-sampled evidence has not completed independent adjudication.` / `Metrics are development-only and not gate eligible.` |
+| production, adjudicated, not gated | `NOTICE: Production-sampled, independently adjudicated evaluation dataset.` / `Metrics are not configured as a release gate.` |
+| production, adjudicated, gated | `NOTICE: Production-sampled, independently adjudicated gate-eligible dataset.` |
+
+The labelling phrase is derived too — `single-author, unadjudicated`,
+`3-reviewer, unadjudicated`, `2-reviewer, independently adjudicated` — so
+the wording tracks the fields rather than a constant. Branching on
+`dataset_kind` first means **no production dataset can receive synthetic
+wording and no synthetic dataset can receive a production or adjudicated
+notice**; both directions are tested.
+
+Every text renderer prints the derived summary above and below the numbers,
+and every JSON payload carries **both** the structured `trust_contract`
+block and the derived `trust_summary` (`level`, `headline`, `detail`,
+`text`) — including the low-level sweep document.
 
 Every loaded pair, item, and case is stamped `synthetic=True` from the
-manifest. The block and the warning are printed **above and below** every
-text report, and appear in every JSON payload and every committed result
-file — because somebody will read `m2_baseline.json`, or a CLI transcript in
-a ticket, with no README nearby.
+manifest.
 
 Issue #67 asks for ~150 pairs **sampled from real ingested data**,
 co-labelled with Kartik under the K3 (#60) guidelines. None of that is

@@ -60,7 +60,6 @@ from nlp.eval.report import (
     sweep_payload,
     to_payload,
 )
-from nlp.eval.trust import WARNING_BANNER
 from nlp.eval.validation import (
     GateValueError,
     validate_optional_unit_interval,
@@ -302,7 +301,9 @@ def test_synthetic_data_may_not_claim_real_ingestion(tmp_path):
     trust = dict(_TRUST, real_ingested_evidence=True)
     meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
 
-    with pytest.raises(TrustContractError, match="cannot claim real_ingested_evidence"):
+    with pytest.raises(
+        TrustContractError, match="requires real_ingested_evidence=false"
+    ):
         load_pair_set(meta_path)
 
 
@@ -343,7 +344,7 @@ def test_a_synthetic_set_may_not_claim_its_urls_are_real(tmp_path):
     provenance = dict(_PROVENANCE, urls_are_synthetic=False)
     meta_path = write_set(tmp_path, [_pair("P001")], {"provenance": provenance})
 
-    with pytest.raises(TrustContractError, match="cannot claim its URLs are real"):
+    with pytest.raises(TrustContractError, match="urls_are_synthetic=true"):
         load_pair_set(meta_path)
 
 
@@ -351,7 +352,7 @@ def test_a_synthetic_set_may_not_claim_it_was_collected(tmp_path):
     provenance = dict(_PROVENANCE, collection_method="sampled")
     meta_path = write_set(tmp_path, [_pair("P001")], {"provenance": provenance})
 
-    with pytest.raises(TrustContractError, match="nothing here was collected"):
+    with pytest.raises(TrustContractError, match="provenance.collection_method"):
         load_pair_set(meta_path)
 
 
@@ -464,8 +465,11 @@ def test_the_cli_composition_output_carries_the_contract(capsys):
     assert json.loads(capsys.readouterr().out)["trust_contract"]["reviewer_count"] == 1
 
 
-def test_the_default_banner_matches_the_committed_warning():
-    assert default_pair_set().trust.warning.startswith(WARNING_BANNER.split("\n")[0])
+def test_the_committed_banner_is_derived_not_supplied():
+    trust = default_pair_set().trust
+
+    assert trust.warning == trust.summary.text
+    assert trust.summary.level == "WARNING"
 
 
 # --------------------------------------------------------------------------
@@ -1106,7 +1110,7 @@ def test_the_cli_fails_the_ac3_recall_gate_for_m2(capsys):
 
     assert exit_code == 1
     assert "GATE FAILED: recall" in captured.err
-    assert "not AC-3 acceptance" in captured.err
+    assert "not acceptance" in captured.err
 
 
 def test_the_cli_scores_clusters(capsys):
@@ -1388,13 +1392,13 @@ def test_an_unknown_enum_value_is_refused(tmp_path, field, value):
         (
             {"metrics_purpose": "final_acceptance"},
             {},
-            "must declare metrics_purpose=development_regression_only",
+            "must declare a metrics_purpose in",
         ),
         # synthetic + gate_acceptance
         (
             {"metrics_purpose": "gate_acceptance"},
             {},
-            "must declare metrics_purpose=development_regression_only",
+            "must declare a metrics_purpose in",
         ),
         # synthetic + gate_eligible
         (
@@ -1406,7 +1410,7 @@ def test_an_unknown_enum_value_is_refused(tmp_path, field, value):
         (
             {"real_ingested_evidence": True},
             {},
-            "cannot claim real_ingested_evidence",
+            "requires real_ingested_evidence=false",
         ),
         # single author + adjudicated
         (
@@ -1422,7 +1426,12 @@ def test_an_unknown_enum_value_is_refused(tmp_path, field, value):
         ),
         # single author + gate_eligible
         (
-            {"gate_eligible": True, "dataset_kind": "sampled_production"},
+            {
+                "gate_eligible": True,
+                "dataset_kind": "sampled_production",
+                "real_ingested_evidence": True,
+                "metrics_purpose": "gate_acceptance",
+            },
             {"gate_eligible": True},
             "cannot be gate_eligible",
         ),
@@ -1430,6 +1439,7 @@ def test_an_unknown_enum_value_is_refused(tmp_path, field, value):
         (
             {
                 "dataset_kind": "sampled_production",
+                "real_ingested_evidence": True,
                 "labeling_status": "multi_reviewer_adjudicated",
                 "reviewer_count": 2,
             },
@@ -1440,6 +1450,7 @@ def test_an_unknown_enum_value_is_refused(tmp_path, field, value):
         (
             {
                 "dataset_kind": "sampled_production",
+                "real_ingested_evidence": True,
                 "labeling_status": "multi_reviewer_unadjudicated",
             },
             {"status": "multi_reviewer_unadjudicated"},
@@ -1524,7 +1535,15 @@ def test_a_contradictory_trust_combination_is_refused(
     labeling = dict(_LABELING, **labeling_overrides)
     provenance = dict(_PROVENANCE)
     if trust["dataset_kind"] != "synthetic_development":
-        provenance = dict(_PROVENANCE, kind="sampled", collection_method="sampled")
+        provenance = {
+            "kind": "sampled",
+            "collection_method": "sampled",
+            "statement": "sampled from stored raw_items",
+            "urls_are_synthetic": False,
+            "uses_real_outlet_names": True,
+            "ingestion_source": "I2 Yahoo fetcher, raw_items",
+            "sample_selection": "stratified, seeded",
+        }
     meta_path = write_set(
         tmp_path,
         [_pair("P001")],
@@ -1979,3 +1998,446 @@ def test_the_payload_versions_are_stated():
     assert payloads["to_payload"]["schema_version"] == ISOLATED_PAIR_PAYLOAD_VERSION
     assert payloads["cluster_payload"]["schema_version"] == CLUSTER_PAYLOAD_VERSION
     assert payloads["sweep_payload"]["schema_version"] == SWEEP_PAYLOAD_VERSION
+
+
+# --------------------------------------------------------------------------
+# The dataset-kind invariant matrix
+# --------------------------------------------------------------------------
+
+from nlp.eval.trust import (  # noqa: E402
+    DATASET_KIND_RULES,
+    DatasetKind,
+    LabelingStatus,
+    MetricsPurpose,
+    TrustContract,
+    derive_trust_summary,
+    rules_for,
+)
+
+_PRODUCTION_PROVENANCE = {
+    "kind": "sampled",
+    "collection_method": "sampled",
+    "statement": "sampled from stored raw_items",
+    "urls_are_synthetic": False,
+    "uses_real_outlet_names": True,
+    "ingestion_source": "I2 Yahoo fetcher, raw_items table, 2026-03-02..06",
+    "sample_selection": "stratified by similarity band, seeded",
+}
+
+
+def production_trust(**overrides) -> dict:
+    base = {
+        "dataset_kind": "sampled_production",
+        "real_ingested_evidence": True,
+        "labeling_status": "multi_reviewer_adjudicated",
+        "reviewer_count": 2,
+        "adjudicated": True,
+        "gate_eligible": False,
+        "metrics_purpose": "development_regression_only",
+    }
+    base.update(overrides)
+    return base
+
+
+def production_labeling(trust: dict, **overrides) -> dict:
+    base = {
+        "status": trust["labeling_status"],
+        "reviewer_count": trust["reviewer_count"],
+        "reviewers": [],
+        "adjudicated": trust["adjudicated"],
+        "gate_eligible": trust["gate_eligible"],
+        "protocol": "co-labelled and adjudicated under K3",
+    }
+    base.update(overrides)
+    return base
+
+
+def write_production_set(tmp_path, trust: dict, provenance: dict | None = None):
+    return write_set(
+        tmp_path,
+        [_pair("P001")],
+        {
+            "trust_contract": trust,
+            "labeling": production_labeling(trust),
+            "provenance": provenance or dict(_PRODUCTION_PROVENANCE),
+        },
+    )
+
+
+def test_the_matrix_covers_every_dataset_kind():
+    """A new kind cannot silently inherit permissive behaviour."""
+
+    assert set(DATASET_KIND_RULES) == set(DatasetKind)
+    for kind in DatasetKind:
+        assert rules_for(kind).kind is kind
+
+
+def test_sampled_production_without_real_evidence_is_refused(tmp_path):
+    """The defect this correction exists for."""
+
+    meta_path = write_production_set(
+        tmp_path, production_trust(real_ingested_evidence=False)
+    )
+
+    with pytest.raises(
+        TrustContractError, match="requires real_ingested_evidence=true"
+    ):
+        load_pair_set(meta_path)
+
+
+def test_synthetic_claiming_real_evidence_is_still_refused(tmp_path):
+    trust = dict(_TRUST, real_ingested_evidence=True)
+    meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
+
+    with pytest.raises(
+        TrustContractError, match="requires real_ingested_evidence=false"
+    ):
+        load_pair_set(meta_path)
+
+
+@pytest.mark.parametrize(
+    "provenance_overrides,message",
+    [
+        ({"kind": "synthetic"}, "requires a provenance.kind in"),
+        ({"collection_method": "authored"}, "requires a provenance.collection_method"),
+        ({"urls_are_synthetic": True}, "urls_are_synthetic=false"),
+    ],
+)
+def test_sampled_production_may_not_claim_synthetic_provenance(
+    tmp_path, provenance_overrides, message
+):
+    provenance = dict(_PRODUCTION_PROVENANCE, **provenance_overrides)
+    meta_path = write_production_set(tmp_path, production_trust(), provenance)
+
+    with pytest.raises(TrustContractError, match=message):
+        load_pair_set(meta_path)
+
+
+@pytest.mark.parametrize("field", ["ingestion_source", "sample_selection"])
+def test_sampled_production_must_identify_its_source(tmp_path, field):
+    provenance = {
+        key: value for key, value in _PRODUCTION_PROVENANCE.items() if key != field
+    }
+    meta_path = write_production_set(tmp_path, production_trust(), provenance)
+
+    with pytest.raises(TrustContractError, match="provenance is missing"):
+        load_pair_set(meta_path)
+
+
+@pytest.mark.parametrize("field", ["ingestion_source", "sample_selection"])
+def test_a_blank_source_identification_is_refused(tmp_path, field):
+    provenance = dict(_PRODUCTION_PROVENANCE, **{field: "   "})
+    meta_path = write_production_set(tmp_path, production_trust(), provenance)
+
+    with pytest.raises(TrustContractError, match=f"provenance.{field}"):
+        load_pair_set(meta_path)
+
+
+def test_a_synthetic_set_need_not_name_an_ingestion_source():
+    """The extra fields are per kind, not universal."""
+
+    assert (
+        "ingestion_source"
+        not in rules_for(DatasetKind.SYNTHETIC_DEVELOPMENT).extra_provenance_fields
+    )
+    assert (
+        "why_synthetic"
+        in rules_for(DatasetKind.SYNTHETIC_DEVELOPMENT).extra_provenance_fields
+    )
+
+
+def test_valid_unadjudicated_production_evidence_loads(tmp_path):
+    trust = production_trust(
+        labeling_status="multi_reviewer_unadjudicated", adjudicated=False
+    )
+    pair_set = load_pair_set(write_production_set(tmp_path, trust))
+
+    assert pair_set.trust.dataset_kind is DatasetKind.SAMPLED_PRODUCTION
+    assert pair_set.trust.real_ingested_evidence is True
+    assert pair_set.trust.gate_eligible is False
+
+
+def test_valid_adjudicated_non_gate_production_evaluation_loads(tmp_path):
+    pair_set = load_pair_set(write_production_set(tmp_path, production_trust()))
+
+    assert pair_set.trust.adjudicated is True
+    assert pair_set.trust.gate_eligible is False
+    assert pair_set.trust.metrics_purpose is MetricsPurpose.DEVELOPMENT_REGRESSION_ONLY
+
+
+def test_a_valid_gate_eligible_production_contract_loads(tmp_path):
+    trust = production_trust(gate_eligible=True, metrics_purpose="final_acceptance")
+    pair_set = load_pair_set(write_production_set(tmp_path, trust))
+
+    assert pair_set.trust.gate_eligible is True
+    assert pair_set.trust.metrics_purpose is MetricsPurpose.FINAL_ACCEPTANCE
+    assert pair_set.trust.reviewer_count == 2
+
+
+def test_gate_eligible_production_without_adjudication_is_refused(tmp_path):
+    trust = production_trust(
+        labeling_status="multi_reviewer_unadjudicated",
+        adjudicated=False,
+        gate_eligible=True,
+        metrics_purpose="gate_acceptance",
+    )
+    meta_path = write_production_set(tmp_path, trust)
+
+    with pytest.raises(TrustContractError, match="requires adjudicated=true"):
+        load_pair_set(meta_path)
+
+
+def test_gate_eligible_production_with_one_reviewer_is_refused(tmp_path):
+    trust = production_trust(
+        labeling_status="single_author_unadjudicated",
+        reviewer_count=1,
+        adjudicated=False,
+        gate_eligible=True,
+        metrics_purpose="gate_acceptance",
+    )
+    meta_path = write_production_set(tmp_path, trust)
+
+    with pytest.raises(TrustContractError, match="cannot be gate_eligible"):
+        load_pair_set(meta_path)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("dataset_kind", "warehouse_dump", "is not one of"),
+        ("metrics_purpose", "looks_fine", "is not one of"),
+        ("labeling_status", "somebody_checked", "is not one of"),
+    ],
+)
+def test_an_unknown_enum_value_is_refused_for_production_too(
+    tmp_path, field, value, message
+):
+    meta_path = write_production_set(tmp_path, production_trust(**{field: value}))
+
+    with pytest.raises(TrustContractError, match=message):
+        load_pair_set(meta_path)
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"reviewer_count": 1}, "requires reviewer_count >= 2"),
+        (
+            {"labeling_status": "multi_reviewer_unadjudicated"},
+            "requires an adjudicated labeling_status",
+        ),
+        (
+            {"adjudicated": False},
+            "but adjudicated=false",
+        ),
+    ],
+)
+def test_inconsistent_reviewer_and_adjudication_fields_are_refused(
+    tmp_path, overrides, message
+):
+    trust = production_trust(**overrides)
+    meta_path = write_set(
+        tmp_path,
+        [_pair("P001")],
+        {
+            "trust_contract": trust,
+            "labeling": production_labeling(trust),
+            "provenance": dict(_PRODUCTION_PROVENANCE),
+        },
+    )
+
+    with pytest.raises(TrustContractError, match=message):
+        load_pair_set(meta_path)
+
+
+# --------------------------------------------------------------------------
+# The derived banner
+# --------------------------------------------------------------------------
+
+
+def contract_of(**overrides) -> TrustContract:
+    base = {
+        "dataset_kind": DatasetKind.SAMPLED_PRODUCTION,
+        "real_ingested_evidence": True,
+        "labeling_status": LabelingStatus.MULTI_REVIEWER_ADJUDICATED,
+        "reviewer_count": 2,
+        "adjudicated": True,
+        "gate_eligible": False,
+        "metrics_purpose": MetricsPurpose.DEVELOPMENT_REGRESSION_ONLY,
+    }
+    base.update(overrides)
+    return TrustContract(**base)
+
+
+def test_the_current_synthetic_state_produces_the_expected_warning():
+    summary = default_pair_set().trust.summary
+
+    assert summary.level == "WARNING"
+    assert summary.text == (
+        "WARNING: Synthetic, single-author, unadjudicated development dataset.\n"
+        "Metrics are not valid for K3/G4 or final AC-3 acceptance."
+    )
+
+
+def test_unadjudicated_production_evidence_produces_the_expected_warning():
+    summary = derive_trust_summary(
+        contract_of(
+            labeling_status=LabelingStatus.MULTI_REVIEWER_UNADJUDICATED,
+            adjudicated=False,
+        )
+    )
+
+    assert summary.text == (
+        "WARNING: Production-sampled evidence has not completed independent "
+        "adjudication.\n"
+        "Metrics are development-only and not gate eligible."
+    )
+
+
+def test_adjudicated_non_gate_production_produces_the_expected_notice():
+    summary = derive_trust_summary(contract_of())
+
+    assert summary.text == (
+        "NOTICE: Production-sampled, independently adjudicated evaluation "
+        "dataset.\n"
+        "Metrics are not configured as a release gate."
+    )
+
+
+def test_a_gate_eligible_dataset_produces_the_expected_notice():
+    summary = derive_trust_summary(
+        contract_of(gate_eligible=True, metrics_purpose=MetricsPurpose.FINAL_ACCEPTANCE)
+    )
+
+    assert summary.text == (
+        "NOTICE: Production-sampled, independently adjudicated gate-eligible "
+        "dataset."
+    )
+    assert summary.level == "NOTICE"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "labeling_status": LabelingStatus.MULTI_REVIEWER_UNADJUDICATED,
+            "adjudicated": False,
+        },
+        {},
+        {"gate_eligible": True, "metrics_purpose": MetricsPurpose.FINAL_ACCEPTANCE},
+    ],
+)
+def test_no_production_state_ever_receives_synthetic_wording(overrides):
+    summary = derive_trust_summary(contract_of(**overrides))
+
+    assert "ynthetic" not in summary.text
+    assert "Production-sampled" in summary.headline
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {
+            "labeling_status": LabelingStatus.MULTI_REVIEWER_UNADJUDICATED,
+            "reviewer_count": 3,
+        },
+        {
+            "labeling_status": LabelingStatus.MULTI_REVIEWER_ADJUDICATED,
+            "reviewer_count": 4,
+            "adjudicated": True,
+        },
+    ],
+)
+def test_no_synthetic_state_ever_receives_a_production_notice(overrides):
+    settings = {
+        "dataset_kind": DatasetKind.SYNTHETIC_DEVELOPMENT,
+        "real_ingested_evidence": False,
+        "labeling_status": LabelingStatus.SINGLE_AUTHOR_UNADJUDICATED,
+        "reviewer_count": 1,
+        "adjudicated": False,
+    }
+    settings.update(overrides)
+    summary = derive_trust_summary(contract_of(**settings))
+
+    assert summary.level == "WARNING"
+    assert summary.headline.startswith("Synthetic,")
+    assert "Production-sampled" not in summary.text
+    assert "adjudicated" in summary.headline or "unadjudicated" in summary.headline
+
+
+def test_the_labeling_phrase_is_derived_from_the_reviewer_fields():
+    single = derive_trust_summary(
+        contract_of(
+            dataset_kind=DatasetKind.SYNTHETIC_DEVELOPMENT,
+            real_ingested_evidence=False,
+            labeling_status=LabelingStatus.SINGLE_AUTHOR_UNADJUDICATED,
+            reviewer_count=1,
+            adjudicated=False,
+        )
+    )
+    several = derive_trust_summary(
+        contract_of(
+            dataset_kind=DatasetKind.SYNTHETIC_DEVELOPMENT,
+            real_ingested_evidence=False,
+            labeling_status=LabelingStatus.MULTI_REVIEWER_ADJUDICATED,
+            reviewer_count=3,
+            adjudicated=True,
+        )
+    )
+
+    assert "single-author, unadjudicated" in single.headline
+    assert "3-reviewer, independently adjudicated" in several.headline
+
+
+def test_a_manifest_may_not_supply_its_own_banner(tmp_path):
+    trust = dict(_TRUST, warning="NOTICE: everything is fine, ship it")
+    meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
+
+    with pytest.raises(TrustContractError, match="may not supply a warning"):
+        load_pair_set(meta_path)
+
+
+def test_an_unknown_trust_field_is_refused(tmp_path):
+    trust = dict(_TRUST, banner_override="anything")
+    meta_path = write_set(tmp_path, [_pair("P001")], {"trust_contract": trust})
+
+    with pytest.raises(TrustContractError, match="unknown field"):
+        load_pair_set(meta_path)
+
+
+def test_the_committed_manifests_supply_no_banner():
+    for name in ("dedup_pairs.meta.json", "cluster_cases.meta.json"):
+        payload = json.loads(
+            (REPO_ROOT / "nlp" / "eval" / "data" / name).read_text("utf-8")
+        )
+        assert "warning" not in payload["trust_contract"], name
+
+
+@pytest.mark.parametrize("name", ["to_payload", "cluster_payload", "sweep_payload"])
+def test_every_payload_carries_both_the_block_and_the_derived_summary(name):
+    payload = all_payloads()[name]
+
+    assert set(payload["trust_summary"]) == {"level", "headline", "detail", "text"}
+    assert payload["trust_summary"]["text"] == payload["trust_contract"]["warning"]
+    assert payload["trust_summary"]["level"] == "WARNING"
+    assert payload["trust_contract"]["dataset_kind"] == "synthetic_development"
+
+
+def test_both_renderers_use_the_derived_summary():
+    pair_report = evaluate_m2_isolated_pairs()
+    cluster_report = evaluate_m2_clusters()
+
+    for rendered, report in (
+        (render_text(pair_report), pair_report),
+        (render_clusters(cluster_report), cluster_report),
+    ):
+        assert rendered.splitlines()[0] == report.trust.summary.text.splitlines()[0]
+
+
+def test_no_renderer_hardcodes_a_dataset_judgement():
+    """The wording lives in one derivation, not in the renderers."""
+
+    for name in ("report.py", "metrics.py", "clusters.py", "dataset.py"):
+        source = (REPO_ROOT / "nlp" / "eval" / name).read_text("utf-8")
+        assert "Synthetic, single-author" not in source, name

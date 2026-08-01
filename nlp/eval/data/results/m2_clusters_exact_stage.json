@@ -394,6 +394,12 @@
     "metrics_purpose": "development_regression_only",
     "real_ingested_evidence": false,
     "reviewer_count": 1,
-    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset. Metrics are not valid for K3/G4 or final AC-3 acceptance."
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  },
+  "trust_summary": {
+    "detail": "Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "headline": "Synthetic, single-author, unadjudicated development dataset.",
+    "level": "WARNING",
+    "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
   }
 }

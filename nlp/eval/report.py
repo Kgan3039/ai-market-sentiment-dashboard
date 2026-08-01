@@ -79,6 +79,7 @@ def to_payload(report: EvaluationReport) -> dict[str, Any]:
 
     return {
         "trust_contract": report.trust.as_dict(),
+        "trust_summary": report.trust.summary.as_dict(),
         "dataset_id": report.dataset_id,
         "schema_version": ISOLATED_PAIR_PAYLOAD_VERSION,
         "predictor": report.predictor,
@@ -106,6 +107,7 @@ def cluster_payload(report: ClusterEvaluationReport) -> dict[str, Any]:
 
     return {
         "trust_contract": report.trust.as_dict(),
+        "trust_summary": report.trust.summary.as_dict(),
         "dataset_id": report.dataset_id,
         "schema_version": CLUSTER_PAYLOAD_VERSION,
         "predictor": report.predictor,
@@ -177,6 +179,7 @@ def sweep_payload(points: Sequence[ThresholdPoint]) -> dict[str, Any]:
     first = points[0].report
     return {
         "trust_contract": first.trust.as_dict(),
+        "trust_summary": first.trust.summary.as_dict(),
         "dataset_id": first.dataset_id,
         "schema_version": SWEEP_PAYLOAD_VERSION,
         "scope": first.scope,
@@ -239,7 +242,12 @@ def _wrap(text: str, width: int = 74, indent: str = "  ") -> list[str]:
 
 
 def render_banner(report: Any) -> str:
-    """The provenance block printed above every metric, in every renderer."""
+    """The provenance block printed above every metric, in every renderer.
+
+    The heading is :meth:`~nlp.eval.trust.TrustContract.banner`, derived
+    from the validated fields. No renderer composes wording of its own, so
+    a production dataset can never be described as synthetic here.
+    """
 
     return report.trust.banner() + "\n"
 

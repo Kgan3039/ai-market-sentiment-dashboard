@@ -12,7 +12,6 @@
     "adjudicated": false,
     "gate_eligible": false,
     "metrics_purpose": "development_regression_only",
-    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset. Metrics are not valid for K3/G4 or final AC-3 acceptance.",
     "why": "Every metric derived from this set measures whether a stage still behaves the way its author expected. It measures nothing about real coverage, and it cannot clear a go/no-go gate: the labels have one author, no second reviewer, and no adjudication, and the records were written rather than sampled."
   },
   "tickers": [

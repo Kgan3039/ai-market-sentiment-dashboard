@@ -12,7 +12,6 @@
     "adjudicated": false,
     "gate_eligible": false,
     "metrics_purpose": "development_regression_only",
-    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset. Metrics are not valid for K3/G4 or final AC-3 acceptance.",
     "why": "These cases are constructed to exercise specific batch behaviours. They are not a sample of anything, so they measure regression against the author's expectations and nothing else."
   },
   "tickers": [
