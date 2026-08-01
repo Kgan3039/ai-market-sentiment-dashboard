@@ -22,6 +22,9 @@ reader would ask:
 ``negation``         does one explicitly negate where the other does not?
 ``subject_shift``    is one about a supplier, reseller, or agency rather
                      than the company itself?
+``article_type``     is one a live blog, an analysis, a rumour, a
+                     confirmation, an interview, or a hands-on where the
+                     other is a plain report?
 ``same_frame``       do they share most of their wording and differ only in
                      the slot that carries the event?
 
@@ -50,7 +53,7 @@ from nlp.dedup.structural import tokenize
 from nlp.dedup.text import display_text
 
 #: Bumped whenever a guard, a lexicon, or the comparison changes.
-EVIDENCE_POLICY_VERSION = "m3.evidence.v1"
+EVIDENCE_POLICY_VERSION = "m3.evidence.v2"
 
 #: A numeric token as M2's tokenizer emits it: optional sign, optional
 #: currency symbol, then a digit.  Deliberately stricter than "contains a
@@ -104,6 +107,45 @@ _UNIT_WORDS = frozenset(
     }
 )
 _BOUND_WORDS = _MAGNITUDE_WORDS | _UNIT_WORDS
+
+#: Counts a newsroom spells out rather than digitising.  "eleven European
+#: markets" and "nine European markets" are the same disagreement as
+#: "11" and "9", and a magnitude guard that only read digits could not see
+#: it.  The multipliers (million, billion) stay out: they already bind to a
+#: preceding number, and treating a bare one as a count would double-count
+#: "5 million".
+_CARDINAL_WORDS = frozenset(
+    {
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
+        "thirty",
+        "forty",
+        "fifty",
+        "sixty",
+        "seventy",
+        "eighty",
+        "ninety",
+        "dozen",
+    }
+)
 
 _QUARTER_WORDS = {
     "first": "q1",
@@ -310,6 +352,94 @@ _CONTRAST_GROUPS: tuple[tuple[str, frozenset[str], frozenset[str]], ...] = (
     ),
 )
 
+#: What *kind* of article a record is.  Two records can cover one event
+#: and still be different stories: a rolling live blog is not the article
+#: about one announcement inside it, a follow-up analysis is not the report
+#: it analyses, a confirmation is not the rumour it confirms, an interview
+#: is not the release it discusses, and a hands-on is not the launch it
+#: follows.  Merging across those loses reporting that exists in only one
+#: of them, and lets a citation to one resolve to the other.
+#:
+#: Every record has a type; the default is a plain ``report``.  A veto
+#: therefore fires on a marker present on one side and absent on the other,
+#: not only on two different markers, because "plain report" is itself a
+#: type.  Markers are narrow phrases rather than single common verbs: "says"
+#: and "tells" appear in ordinary wire copy and would split legitimate
+#: rewrites.
+DEFAULT_ARTICLE_TYPE = "report"
+
+ARTICLE_TYPE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("live_blog", ("live updates", "live blog", "liveblog", "as it happened")),
+    (
+        "analysis",
+        (
+            "means for",
+            "what it means",
+            "analysis:",
+            "explainer",
+            "what to know",
+            "takeaways",
+            "deep dive",
+            "breaking down",
+        ),
+    ),
+    (
+        "interview",
+        (
+            "interview",
+            "q&a",
+            "in conversation with",
+            "speaks to",
+            "sits down with",
+            "explains the",
+            "explains how",
+            "explains why",
+        ),
+    ),
+    (
+        "hands_on",
+        ("hands on", "hands-on", "first look", "we tried", "road test", "reviewed:"),
+    ),
+    (
+        "rumour",
+        (
+            "is said to",
+            "are said to",
+            "reportedly",
+            "rumoured",
+            "rumored",
+            "sources say",
+            "people familiar",
+            "is expected to",
+        ),
+    ),
+    ("confirmation", ("confirms", "confirmed", "officially")),
+    ("opinion", ("opinion:", "column:", "commentary")),
+    ("preview", ("preview", "what to expect")),
+    ("recap", ("recap", "wrap-up", "round-up")),
+)
+
+
+def article_types(text: str) -> tuple[str, ...]:
+    """Return the sorted article-type markers a text carries.
+
+    Empty means the default :data:`DEFAULT_ARTICLE_TYPE`; the comparison in
+    :func:`combine` treats the empty set as its own value, so a marked
+    record never merges with an unmarked one.
+    """
+
+    lowered = text.casefold()
+    return tuple(
+        sorted(
+            {
+                name
+                for name, markers in ARTICLE_TYPE_MARKERS
+                if any(marker in lowered for marker in markers)
+            }
+        )
+    )
+
+
 #: Nouns that make a headline about somebody other than the company the
 #: ticker names.  Deliberately narrow: "partner", "rival", and "customer"
 #: are modifiers far more often than they are subjects, and including them
@@ -396,12 +526,14 @@ def numeric_signature(tokens: tuple[str, ...]) -> tuple[str, ...]:
     Each numeric token is bound to the following token only when that token
     changes what the number means (a magnitude or a unit).  Order is
     preserved and never sorted, so "up 5% to $10" cannot equal "up 10% to
-    $5".
+    $5".  Counts spelled out in words count too: a newsroom writes "eleven
+    European markets" as readily as "11", and the disagreement is the same
+    one either way.
     """
 
     claims: list[str] = []
     for index, token in enumerate(tokens):
-        if not _NUMERIC_TOKEN.match(token):
+        if not _NUMERIC_TOKEN.match(token) and token not in _CARDINAL_WORDS:
             continue
         following = tokens[index + 1] if index + 1 < len(tokens) else ""
         claims.append(f"{token} {following}" if following in _BOUND_WORDS else token)
@@ -476,6 +608,7 @@ class StoryEvidence:
     contrasts: frozenset[tuple[str, str]]
     negations: frozenset[bool]
     subjects: frozenset[tuple[str, ...]]
+    article_types: frozenset[tuple[str, ...]]
     #: Token sets of each member, kept for the ``same_frame`` guard, which
     #: is pairwise by nature: it asks whether *these two* share a frame.
     token_sets: frozenset[frozenset[str]]
@@ -494,6 +627,7 @@ def summarize(title: str, description: str | None = None) -> StoryEvidence:
             contrasts=frozenset(),
             negations=frozenset(),
             subjects=frozenset(),
+            article_types=frozenset({()}),
             token_sets=frozenset(),
         )
     numeric = numeric_signature(tokens)
@@ -507,6 +641,7 @@ def summarize(title: str, description: str | None = None) -> StoryEvidence:
         contrasts=frozenset(contrasts(tokens)),
         negations=frozenset({bool(set(tokens) & NEGATION_TOKENS)}),
         subjects=frozenset({subjects}),
+        article_types=frozenset({article_types(text)}),
         token_sets=frozenset({frozenset(tokens)}),
     )
 
@@ -522,6 +657,7 @@ def summarize(title: str, description: str | None = None) -> StoryEvidence:
 #: opposing verbs ("rejects", "denies", "refused") are negation tokens too,
 #: and "these take opposite positions" is the better answer.
 _BEFORE_POLARITY: tuple[tuple[str, str], ...] = (
+    ("article_type", "article_types"),
     ("temporal_disagreement", "temporal"),
     ("numeric_disagreement", "numeric"),
     ("role_disagreement", "roles"),
@@ -570,6 +706,7 @@ def combine(
         contrasts=left.contrasts | right.contrasts,
         negations=left.negations | right.negations,
         subjects=left.subjects | right.subjects,
+        article_types=left.article_types | right.article_types,
         token_sets=left.token_sets | right.token_sets,
     )
     for reason, field in _BEFORE_POLARITY:
@@ -616,6 +753,10 @@ def policy_fingerprint() -> str:
             ";".join(
                 f"{family}:{','.join(sorted(positive))}|{','.join(sorted(negative))}"
                 for family, positive, negative in _CONTRAST_GROUPS
+            ),
+            ",".join(sorted(_CARDINAL_WORDS)),
+            ";".join(
+                f"{name}:{','.join(markers)}" for name, markers in ARTICLE_TYPE_MARKERS
             ),
             ",".join(sorted(_SUBJECT_SHIFT_TOKENS)),
             ",".join(sorted(_FUNCTION_WORDS)),

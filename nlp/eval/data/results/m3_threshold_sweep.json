@@ -1,217 +1,309 @@
 {
-  "dataset_id": "phase0-dedup-pairs-v1",
-  "stage": "m2+m3",
-  "sweep": [
+  "complete": true,
+  "dataset_id": "phase0-dedup-pairs-v2",
+  "evaluated_case_count": 153,
+  "failed_case_count": 0,
+  "failed_case_ids": [],
+  "limitation": "Isolated-pair metrics measure whether a two-item invocation of the stage merges a pair. Production clustering can differ on the same two records in a multi-item batch, because cluster-wide compatibility, transitivity, provider-conflict quarantine, and capacity behaviour all depend on the companion items in the batch. These numbers therefore cannot on their own validate production clustering; see multi_item_cluster_metrics.",
+  "points": [
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 3,
         "false_positive": 2,
         "true_positive": 75
       },
+      "evaluated_case_count": 153,
       "f1": 0.967741935483871,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [
         "P079",
         "P080"
       ],
       "precision": 0.974025974025974,
       "recall": 0.9615384615384616,
+      "scope": "isolated_pairs",
       "threshold": 0.5
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 5,
         "false_positive": 2,
         "true_positive": 73
       },
+      "evaluated_case_count": 153,
       "f1": 0.954248366013072,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [
         "P079",
         "P080"
       ],
       "precision": 0.9733333333333334,
       "recall": 0.9358974358974359,
+      "scope": "isolated_pairs",
       "threshold": 0.55
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
+      "counts": {
+        "false_negative": 6,
+        "false_positive": 1,
+        "true_positive": 72
+      },
+      "evaluated_case_count": 153,
+      "f1": 0.9536423841059603,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
+      "false_positives": [
+        "P079"
+      ],
+      "precision": 0.9863013698630136,
+      "recall": 0.9230769230769231,
+      "scope": "isolated_pairs",
+      "threshold": 0.58
+    },
+    {
+      "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 7,
         "false_positive": 1,
         "true_positive": 71
       },
+      "evaluated_case_count": 153,
       "f1": 0.9466666666666667,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [
         "P079"
       ],
       "precision": 0.9861111111111112,
       "recall": 0.9102564102564102,
+      "scope": "isolated_pairs",
       "threshold": 0.6
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 9,
         "false_positive": 1,
         "true_positive": 69
       },
+      "evaluated_case_count": 153,
       "f1": 0.9324324324324325,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [
         "P079"
       ],
       "precision": 0.9857142857142858,
       "recall": 0.8846153846153846,
+      "scope": "isolated_pairs",
       "threshold": 0.62
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 10,
         "false_positive": 1,
         "true_positive": 68
       },
+      "evaluated_case_count": 153,
       "f1": 0.9251700680272109,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [
         "P079"
       ],
       "precision": 0.9855072463768116,
       "recall": 0.8717948717948718,
+      "scope": "isolated_pairs",
       "threshold": 0.65
     },
     {
       "candidate_recall": 1.0,
-      "counts": {
-        "false_negative": 11,
-        "false_positive": 1,
-        "true_positive": 67
-      },
-      "f1": 0.9178082191780821,
-      "false_positives": [
-        "P079"
-      ],
-      "precision": 0.9852941176470589,
-      "recall": 0.8589743589743589,
-      "threshold": 0.66
-    },
-    {
-      "candidate_recall": 1.0,
-      "counts": {
-        "false_negative": 13,
-        "false_positive": 1,
-        "true_positive": 65
-      },
-      "f1": 0.9027777777777777,
-      "false_positives": [
-        "P079"
-      ],
-      "precision": 0.9848484848484849,
-      "recall": 0.8333333333333334,
-      "threshold": 0.67
-    },
-    {
-      "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 13,
         "false_positive": 0,
         "true_positive": 65
       },
+      "evaluated_case_count": 153,
       "f1": 0.9090909090909091,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [],
       "precision": 1.0,
       "recall": 0.8333333333333334,
+      "scope": "isolated_pairs",
       "threshold": 0.68
     },
     {
       "candidate_recall": 1.0,
-      "counts": {
-        "false_negative": 13,
-        "false_positive": 0,
-        "true_positive": 65
-      },
-      "f1": 0.9090909090909091,
-      "false_positives": [],
-      "precision": 1.0,
-      "recall": 0.8333333333333334,
-      "threshold": 0.69
-    },
-    {
-      "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 15,
         "false_positive": 0,
         "true_positive": 63
       },
+      "evaluated_case_count": 153,
       "f1": 0.8936170212765957,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [],
       "precision": 1.0,
       "recall": 0.8076923076923077,
+      "scope": "isolated_pairs",
       "threshold": 0.7
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
+      "counts": {
+        "false_negative": 15,
+        "false_positive": 0,
+        "true_positive": 63
+      },
+      "evaluated_case_count": 153,
+      "f1": 0.8936170212765957,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
+      "false_positives": [],
+      "precision": 1.0,
+      "recall": 0.8076923076923077,
+      "scope": "isolated_pairs",
+      "threshold": 0.72
+    },
+    {
+      "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 18,
         "false_positive": 0,
         "true_positive": 60
       },
+      "evaluated_case_count": 153,
       "f1": 0.8695652173913044,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [],
       "precision": 1.0,
       "recall": 0.7692307692307693,
+      "scope": "isolated_pairs",
       "threshold": 0.75
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 23,
         "false_positive": 0,
         "true_positive": 55
       },
+      "evaluated_case_count": 153,
       "f1": 0.8270676691729323,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [],
       "precision": 1.0,
       "recall": 0.7051282051282052,
+      "scope": "isolated_pairs",
       "threshold": 0.8
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 26,
         "false_positive": 0,
         "true_positive": 52
       },
+      "evaluated_case_count": 153,
       "f1": 0.8,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [],
       "precision": 1.0,
       "recall": 0.6666666666666666,
+      "scope": "isolated_pairs",
       "threshold": 0.85
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 29,
         "false_positive": 0,
         "true_positive": 49
       },
+      "evaluated_case_count": 153,
       "f1": 0.7716535433070866,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [],
       "precision": 1.0,
       "recall": 0.6282051282051282,
+      "scope": "isolated_pairs",
       "threshold": 0.9
     },
     {
       "candidate_recall": 1.0,
+      "complete": true,
       "counts": {
         "false_negative": 30,
         "false_positive": 0,
         "true_positive": 48
       },
+      "evaluated_case_count": 153,
       "f1": 0.761904761904762,
+      "failed_case_count": 0,
+      "failed_case_ids": [],
       "false_positives": [],
       "precision": 1.0,
       "recall": 0.6153846153846154,
+      "scope": "isolated_pairs",
       "threshold": 0.95
     }
-  ]
+  ],
+  "schema_version": "phase0.eval_report.sweep.v2",
+  "scope": "isolated_pairs",
+  "selection": {
+    "basis": "precision_first",
+    "caveat": "Provisional and development-only. Selected on a synthetic, single-author, unadjudicated dataset that is not gate eligible; these numbers cannot clear K3/G4 or final AC-3.",
+    "f1_at_selected": 0.8936170212765957,
+    "false_positives_at_selected": [],
+    "highest_threshold_still_producing_a_false_merge": 0.65,
+    "lowest_threshold_with_zero_false_merges": 0.68,
+    "max_f1_threshold": 0.5,
+    "precision_at_selected": 1.0,
+    "rationale": "Precision-first. The selected point is the lowest threshold that produces no false merge, taken with a margin over the highest threshold that still produces one rather than sitting on it. The F1 maximum is deliberately not used: it buys F1 with false merges, and a false merge is the failure this stage exists to prevent.",
+    "recall_at_selected": 0.8076923076923077,
+    "selected_threshold": 0.7,
+    "status": "provisional"
+  },
+  "stage": "m2+m3",
+  "trust_contract": {
+    "adjudicated": false,
+    "dataset_kind": "synthetic_development",
+    "gate_eligible": false,
+    "labeling_status": "single_author_unadjudicated",
+    "metrics_purpose": "development_regression_only",
+    "real_ingested_evidence": false,
+    "reviewer_count": 1,
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  },
+  "trust_summary": {
+    "detail": "Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "headline": "Synthetic, single-author, unadjudicated development dataset.",
+    "level": "WARNING",
+    "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  }
 }

@@ -602,51 +602,124 @@ has them. Numbers bind only to neighbours that change their meaning, so
 
 ### Threshold selection, from evidence
 
-Committed sweep: `nlp/eval/data/results/m3_threshold_sweep.json`.
+Committed sweep: `nlp/eval/data/results/m3_threshold_sweep.json`, recomputed
+from source against the **corrected 153-pair set** (78 duplicate / 73
+distinct / 2 ambiguous, 151 scored). The old sweep was recorded against
+labels in which five of these pairs were `ambiguous` and therefore excluded
+from scoring; they are now scored negatives, and the numbers below are the
+honest ones.
 
-| threshold | P | R | F1 | fp |
-|---|---|---|---|---|
-| 0.60 | 0.9861 | 0.9103 | **0.9467** | 1 |
-| 0.67 | 0.9848 | 0.8333 | 0.9028 | 1 |
-| 0.68 | 1.0000 | 0.8333 | 0.9091 | 0 |
-| **0.70** | **1.0000** | **0.8077** | 0.8936 | **0** |
-| 0.75 | 1.0000 | 0.7692 | 0.8696 | 0 |
-| 0.85 | 1.0000 | 0.6667 | 0.8000 | 0 |
+| threshold | P | R | F1 | fp | false positives |
+|---|---|---|---|---|---|
+| 0.50 | 0.9740 | 0.9615 | **0.9677** | 2 | P079, P080 |
+| 0.58 | 0.9863 | 0.9231 | 0.9536 | 1 | P079 |
+| 0.65 | 0.9855 | 0.8718 | 0.9252 | 1 | P079 |
+| 0.68 | 1.0000 | 0.8333 | 0.9091 | 0 | — |
+| **0.70** | **1.0000** | **0.8077** | 0.8936 | **0** | — |
+| 0.75 | 1.0000 | 0.7692 | 0.8696 | 0 | — |
+| 0.90 | 1.0000 | 0.6282 | 0.7717 | 0 | — |
 
-The highest-scoring false merge is 0.6753 — P079, two different
-partnerships announced under one headline template — and precision reaches
-1.0000 from 0.68 upward. **0.70 is the committed default.** 0.68 would sit
-0.005 above a single observation; 0.70 keeps a real margin over the worst
-false merge while recall still clears AC-3's floor with room. F1 peaks at
-0.60 and that threshold is *not* used: it buys 0.05 of F1 with a false
-merge, and a false merge is the failure the whole design exists to prevent.
+**0.70 remains the committed default, but for a different reason.** Under the
+old labels it produced zero *apparent* false merges; under the corrected ones
+the same threshold produced **four** (P144, P150, P151, P153). Those are now
+refused by guards, not by the number. Precision reaches 1.0000 at 0.68; 0.70
+is taken for margin over the highest-scoring false merge that survives (P079
+at 0.6753) while recall still clears AC-3's 0.75 floor. F1 peaks at 0.50 and
+is not used: it buys F1 with two false merges.
+
+The threshold is **provisional** — selected on a synthetic, single-author,
+unadjudicated development dataset that is not gate eligible. The committed
+sweep carries that caveat in a `selection` block generated from the rows
+rather than typed in.
+
+### The article-type guard
+
+The corrected labels exposed a guard family M3 did not have. Five
+`same_event_different_article` negatives and one `different_company` negative
+merged on cosine alone, with **no guard firing at all**:
+
+| pair | cosine | what it is |
+|---|---|---|
+| P151 | 0.9282 | rumour vs confirmation |
+| P144 | 0.8889 | two automakers, identical headline |
+| P153 | 0.8410 | announcement vs hands-on |
+| P150 | 0.7083 | report vs follow-up analysis |
+| P152 | 0.5243 | release vs executive interview |
+| P149 | 0.4639 | live blog vs standalone article |
+
+Two general, versioned evidence categories close it (`m3.evidence.v2`):
+
+- **`article_type`** — every record has a type, defaulting to `report`, and
+  two records of different types never merge. Markers cover live blog,
+  analysis/explainer, interview, hands-on/first-look, rumour, confirmation,
+  opinion, preview and recap. Because `report` is itself a type, a marker on
+  one side and none on the other is a difference. Markers are narrow phrases,
+  never bare verbs: "says" and "tells" appear in ordinary wire copy and
+  treating them as types would split legitimate rewrites — a test asserts
+  they do not.
+- **spelled-out cardinals** folded into the existing magnitude signature, so
+  "eleven European markets" and "nine European markets" disagree exactly as
+  "11" and "9" would. The multipliers stay out; they already bind to a
+  preceding digit.
+
+Neither guard rejects a single semantic rewrite in the set. Two M2-handled
+pairs (P025, P042) trip the magnitude guard on an asymmetric count — the
+ordered numeric signature is compared as one value, which is stricter than
+"missing information does not veto". Both are collapsed by M2 before M3 sees
+them, so the pipeline is unaffected; it is recorded here as a known
+conservatism rather than papered over.
+
+P079 (0.6753) and P080 (0.5708) remain false positives *below* the threshold.
+Both are `same_template_different_event` at genuinely low similarity, where
+the threshold is the right instrument; lowering the frame-overlap guard to
+catch them would split real rewrites sitting at 0.42–0.45 overlap.
 
 ### Result at the committed threshold
 
-`nlp/eval/data/results/m2_m3_pipeline.json`, M2 then M3, 148 scored pairs:
+`nlp/eval/data/results/m2_m3_pipeline.json`, M2 then M3, 151 scored pairs:
 
 | metric | value | AC-3 |
 |---|---|---|
 | precision | **1.0000** | ≥ 0.85 ✓ |
 | recall | **0.8077** | ≥ 0.75 ✓ |
 | F1 | 0.8936 | |
-| tp / fp / tn / fn | 63 / 0 / 70 / 15 | |
+| tp / fp / tn / fn | 63 / 0 / 73 / 15 | |
 | candidate recall | 1.0000 | |
+| complete / failed | true / 0 | |
 
-**False positives: none.** Every one of the 70 hard negatives was refused,
-including all 7 different-company pairs, all 10 same-template pairs, and all
-20 magnitude/date/unit/sign pairs.
+**False positives: none.** All 73 hard negatives refused, including the six
+that merged before the guards existed.
 
-**False negatives: 15**, every one a semantic rewrite scoring below 0.70 —
-0.42 (`P075`, "trims Reality Labs hiring plans" / "slows recruitment inside
-its metaverse division") through 0.6957 (`P051`). No guard rejected a true
-positive: all 15 are `below_threshold`. That is the price of the precision
-margin and it is visible in the sweep — 0.60 would recover 8 of them and
-cost one false merge.
+**False negatives: 15**, every one a semantic rewrite below 0.70 — 0.4205
+(`P075`) through 0.6957 (`P051`). No guard rejects a true positive.
 
-**Ambiguous pairs:** 3 of 5 merged (`P150`, `P151`, `P153`). They are
-excluded from the metrics by design, and which way they should go is exactly
-the question K3 adjudication exists to settle.
+These are `isolated_pair_metrics`: two records per invocation. They cannot on
+their own validate production clustering — see below.
+
+### Multi-item cluster results
+
+`nlp/eval/data/results/m2_m3_clusters_ground_truth.json`, the nine committed
+cases scored against ground truth:
+
+| | M2 alone | M2 + M3 |
+|---|---|---|
+| exact partition match | 6/9 | **8/9** |
+| co-clustering P / R / F1 | 1.0000 / 0.5882 / 0.7407 | **1.0000 / 0.8235 / 0.9032** |
+| over-merged cases | none | **none** |
+| under-merged cases | C003, C006, C007 | **C006** |
+| permutation failures | none | none |
+| missing / duplicated members | none | none |
+
+M3 recovers **C003** — the provider-conflict group, where M2's quarantine
+correctly refused two byte-identical wire stories and M3 rejoins them at
+cosine 1.0000 while keeping the different recall apart at 0.4988 — and
+**C007**, the mixed-stage group, at 0.8137. **C006** stays split: its three
+pairs score 0.6064, 0.6860 and 0.6990, all below the floor, one of them by
+0.001. That is the recall cost of the margin, visible rather than argued
+away.
+
+Nine authored cases are a regression fixture, not a sample of production
+traffic; they are not evidence of production cluster quality.
 
 ### Cluster semantics
 

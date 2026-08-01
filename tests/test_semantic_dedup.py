@@ -633,21 +633,58 @@ def test_the_committed_default_threshold_is_the_one_the_sweep_chose():
         (
             REPO_ROOT / "nlp" / "eval" / "data" / "results" / "m3_threshold_sweep.json"
         ).read_text(encoding="utf-8")
-    )["sweep"]
+    )
+    selection = sweep["selection"]
     chosen = next(
         point
-        for point in sweep
+        for point in sweep["points"]
         if point["threshold"] == pytest.approx(DEFAULT_SIMILARITY_THRESHOLD)
     )
-    highest_false_merge = max(
-        point["threshold"] for point in sweep if point["counts"]["false_positive"]
-    )
 
+    assert selection["selected_threshold"] == pytest.approx(
+        DEFAULT_SIMILARITY_THRESHOLD
+    )
     assert chosen["precision"] == 1.0
     assert chosen["recall"] >= 0.75
-    # Chosen with margin over the last threshold that still merged something
-    # it should not have, rather than parked on the knife edge.
-    assert DEFAULT_SIMILARITY_THRESHOLD > highest_false_merge + 0.02
+    assert chosen["counts"]["false_positive"] == 0
+    # Taken with a margin over the last threshold that still merged
+    # something it should not have, rather than parked on the knife edge.
+    assert (
+        DEFAULT_SIMILARITY_THRESHOLD
+        > selection["highest_threshold_still_producing_a_false_merge"] + 0.02
+    )
+    # And explicitly not the F1 maximum.
+    assert selection["max_f1_threshold"] < DEFAULT_SIMILARITY_THRESHOLD
+    assert selection["status"] == "provisional"
+
+
+def test_the_committed_sweep_reports_every_required_column():
+    sweep = json.loads(
+        (
+            REPO_ROOT / "nlp" / "eval" / "data" / "results" / "m3_threshold_sweep.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    for point in sweep["points"]:
+        for field in (
+            "threshold",
+            "precision",
+            "recall",
+            "f1",
+            "counts",
+            "false_positives",
+            "complete",
+            "failed_case_count",
+            "evaluated_case_count",
+        ):
+            assert field in point, field
+        assert set(point["counts"]) == {
+            "true_positive",
+            "false_positive",
+            "false_negative",
+        }
+    assert sweep["complete"] is True
+    assert sweep["failed_case_count"] == 0
 
 
 # --------------------------------------------------------------------------
@@ -1142,10 +1179,13 @@ def labelled_encoder():
 def test_the_pipeline_predictor_attributes_each_merge_to_its_stage():
     from nlp.eval import default_pair_set
     from nlp.eval.dedup import config_for
-    from nlp.eval.semantic import pipeline_predictor, semantic_config_for
+    from nlp.eval.semantic import (
+        pipeline_isolated_pair_predictor,
+        semantic_config_for,
+    )
 
     pair_set = default_pair_set()
-    predict = pipeline_predictor(
+    predict = pipeline_isolated_pair_predictor(
         config_for(pair_set), semantic_config_for(pair_set), labelled_encoder()
     )
 
@@ -1160,16 +1200,18 @@ def test_the_pipeline_predictor_attributes_each_merge_to_its_stage():
 def test_the_pipeline_never_loses_an_m2_merge():
     """Adding M3 can only ever raise recall, never lower it."""
 
-    from nlp.eval import default_pair_set, evaluate_m2
-    from nlp.eval.semantic import evaluate_pipeline
+    from nlp.eval import default_pair_set, evaluate_m2_isolated_pairs
+    from nlp.eval.semantic import evaluate_pipeline_isolated_pairs
 
     pair_set = default_pair_set()
-    exact = evaluate_m2(pair_set)
-    combined = evaluate_pipeline(pair_set, labelled_encoder())
+    exact = evaluate_m2_isolated_pairs(pair_set)
+    combined = evaluate_pipeline_isolated_pairs(pair_set, labelled_encoder())
 
-    assert set(exact.overall.confusion.true_positives) <= set(
-        combined.overall.confusion.true_positives
+    assert set(exact.isolated_pair_metrics.confusion.true_positives) <= set(
+        combined.isolated_pair_metrics.confusion.true_positives
     )
+    assert combined.scope == "isolated_pairs"
+    assert combined.complete
 
 
 def test_the_caching_encoder_calls_through_once_per_distinct_text():
@@ -1194,27 +1236,27 @@ def test_the_committed_pipeline_result_matches_the_committed_sweep():
 
     results = REPO_ROOT / "nlp" / "eval" / "data" / "results"
     pipeline = json.loads((results / "m2_m3_pipeline.json").read_text("utf-8"))
-    sweep = json.loads((results / "m3_threshold_sweep.json").read_text("utf-8"))[
-        "sweep"
-    ]
+    sweep = json.loads((results / "m3_threshold_sweep.json").read_text("utf-8"))
     row = next(
         point
-        for point in sweep
+        for point in sweep["points"]
         if point["threshold"] == pytest.approx(DEFAULT_SIMILARITY_THRESHOLD)
     )
 
     assert pipeline["threshold"] == pytest.approx(DEFAULT_SIMILARITY_THRESHOLD)
-    assert pipeline["overall"]["precision"] == pytest.approx(row["precision"])
-    assert pipeline["overall"]["recall"] == pytest.approx(row["recall"])
-    assert pipeline["overall"]["counts"]["false_positive"] == 0
+    assert pipeline["isolated_pair_metrics"]["precision"] == pytest.approx(
+        row["precision"]
+    )
+    assert pipeline["isolated_pair_metrics"]["recall"] == pytest.approx(row["recall"])
+    assert pipeline["isolated_pair_metrics"]["counts"]["false_positive"] == 0
 
 
 def test_the_committed_pipeline_result_meets_ac3():
     results = REPO_ROOT / "nlp" / "eval" / "data" / "results"
     pipeline = json.loads((results / "m2_m3_pipeline.json").read_text("utf-8"))
 
-    assert pipeline["overall"]["precision"] >= 0.85
-    assert pipeline["overall"]["recall"] >= 0.75
+    assert pipeline["isolated_pair_metrics"]["precision"] >= 0.85
+    assert pipeline["isolated_pair_metrics"]["recall"] >= 0.75
 
 
 def test_the_cli_can_score_and_sweep_the_pipeline(monkeypatch, capsys):
@@ -1223,8 +1265,440 @@ def test_the_cli_can_score_and_sweep_the_pipeline(monkeypatch, capsys):
     monkeypatch.setattr(eval_dedup, "_shared_encoder", labelled_encoder)
 
     assert eval_dedup.main(["--stage", "m2+m3"]) == 0
-    assert "predictor: m2+m3" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "predictor: m2+m3" in out
+    assert out.startswith("WARNING:")
 
     assert eval_dedup.main(["--stage", "m2+m3", "--sweep", "0.7", "0.9"]) == 0
-    rendered = capsys.readouterr().out
-    assert rendered.count("\n") == 3
+    assert "threshold" in capsys.readouterr().out
+
+
+def test_the_cli_can_cluster_score_the_pipeline(monkeypatch, capsys):
+    from tools import eval_dedup
+
+    monkeypatch.setattr(eval_dedup, "_shared_encoder", labelled_encoder)
+
+    assert eval_dedup.main(["--stage", "m2+m3", "--scope", "clusters"]) == 0
+    out = capsys.readouterr().out
+
+    assert "multi_item_cluster_metrics" in out
+    assert "target:    expected_partition" in out
+
+
+def test_the_cli_still_scores_m2_alone(capsys):
+    """M4's own behaviour must not regress when M3 registers itself."""
+
+    from tools import eval_dedup
+
+    assert eval_dedup.main(["--stage", "m2"]) == 0
+    assert "predictor: m2" in capsys.readouterr().out
+    assert eval_dedup.main(["--stage", "m2", "--scope", "clusters"]) == 0
+    assert "target:    exact_stage_partition" in capsys.readouterr().out
+
+
+def test_the_cli_rejects_a_non_finite_m3_threshold():
+    """M4's finite-floor validation must cover the new sweepable stage."""
+
+    for flag in ("--threshold=nan", "--sweep", "inf"):
+        pass
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.eval_dedup",
+            "--stage",
+            "m2+m3",
+            "--threshold=nan",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "invalid gate value" in completed.stderr
+
+
+def test_every_m3_payload_carries_the_trust_contract(monkeypatch):
+    from nlp.eval import default_cluster_cases, default_pair_set, sweep_thresholds
+    from nlp.eval.report import cluster_payload, sweep_payload, to_payload
+    from nlp.eval.semantic import (
+        evaluate_pipeline_clusters,
+        evaluate_pipeline_isolated_pairs,
+        pipeline_isolated_pair_predictor,
+        semantic_config_for,
+    )
+    from nlp.eval.dedup import config_for
+
+    pair_set = default_pair_set()
+    encoder = labelled_encoder()
+    payloads = {
+        "pairs": to_payload(evaluate_pipeline_isolated_pairs(pair_set, encoder)),
+        "clusters": cluster_payload(
+            evaluate_pipeline_clusters(default_cluster_cases(), encoder)
+        ),
+        "sweep": sweep_payload(
+            sweep_thresholds(
+                pair_set,
+                lambda threshold: pipeline_isolated_pair_predictor(
+                    config_for(pair_set),
+                    semantic_config_for(pair_set, threshold),
+                    encoder,
+                ),
+                [0.7, 0.9],
+                name="m2+m3",
+            )
+        ),
+    }
+    for name, payload in payloads.items():
+        assert (
+            payload["trust_contract"]["dataset_kind"] == "synthetic_development"
+        ), name
+        assert payload["trust_contract"]["gate_eligible"] is False, name
+        assert payload["trust_summary"]["text"].startswith("WARNING:"), name
+        assert payload["dataset_id"], name
+        assert payload["schema_version"], name
+        assert payload["scope"], name
+
+
+# --------------------------------------------------------------------------
+# The article-type guard, and the false merges the corrected labels exposed
+# --------------------------------------------------------------------------
+
+from nlp.semdedup.evidence import article_types  # noqa: E402
+
+
+def guard_between(left: StoryInput, right: StoryInput) -> str | None:
+    """The reason M3 refuses a pair, ignoring similarity entirely."""
+
+    return contradiction(
+        summarize(left.title, left.description),
+        summarize(right.title, right.description),
+        frame_overlap=config().frame_overlap_threshold,
+    )
+
+
+def pair_stories(
+    left_title: str,
+    right_title: str,
+    left_description: str | None = None,
+    right_description: str | None = None,
+):
+    return (
+        story("s1", left_title, description=left_description),
+        story(
+            "s2",
+            right_title,
+            description=right_description,
+            published_at=BASE + timedelta(hours=1),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "pair_id,left,right,left_types,right_types",
+    [
+        (
+            "P149",
+            "Nvidia GTC keynote: live updates",
+            "Nvidia unveils its next accelerator generation at GTC",
+            ("live_blog",),
+            (),
+        ),
+        (
+            "P150",
+            "Tesla delivers 495,000 vehicles in the first quarter",
+            "What Tesla's first-quarter delivery number means for the year",
+            (),
+            ("analysis",),
+        ),
+        (
+            "P151",
+            "Apple is said to be preparing a cheaper headset",
+            "Apple confirms a cheaper headset is in development",
+            ("rumour",),
+            ("confirmation",),
+        ),
+        (
+            "P152",
+            "Meta ad revenue rises 21% year over year",
+            "Meta finance chief explains the advertising acceleration",
+            (),
+            ("interview",),
+        ),
+        (
+            "P153",
+            "AMD unveils the MI400 accelerator for AI training",
+            "Hands on with AMD's MI400 accelerator",
+            (),
+            ("hands_on",),
+        ),
+    ],
+)
+def test_a_different_article_type_is_refused_however_close_the_vectors(
+    pair_id, left, right, left_types, right_types
+):
+    """The family the corrected M4 labels exposed: same event, other artefact."""
+
+    assert article_types(left) == left_types, pair_id
+    assert article_types(right) == right_types, pair_id
+
+    encoder = encoder_for((left, 0.0), (right, 0.5))
+    result = run(list(pair_stories(left, right)), encoder)
+
+    assert grouped(result) == [("s1",), ("s2",)], pair_id
+    assert result.stats.veto_count("article_type") == 1, pair_id
+    # The vectors really were near-identical: this is the guard's doing.
+    assert result.rejected_pairs[0].similarity > 0.99
+
+
+def test_the_article_type_guard_fires_on_presence_not_only_on_two_markers():
+    """A plain report is itself a type, so marked-versus-unmarked differs."""
+
+    assert article_types("Tesla delivers 495,000 vehicles") == ()
+    assert (
+        guard_between(
+            *pair_stories(
+                "Tesla delivers 495,000 vehicles",
+                "What the Tesla delivery number means for the year",
+            )
+        )
+        == "article_type"
+    )
+
+
+def test_two_records_of_the_same_article_type_still_merge():
+    """The guard must not split a rewrite where both sides are reports."""
+
+    assert (
+        guard_between(
+            *pair_stories(
+                "Nvidia reports record data centre revenue",
+                "Nvidia's data centre business posts an all-time high in sales",
+            )
+        )
+        is None
+    )
+    # Two rumour reports of one story are still one story.
+    assert (
+        guard_between(
+            *pair_stories(
+                "Apple is said to be preparing a cheaper headset",
+                "Apple reportedly readies a lower-cost headset",
+            )
+        )
+        is None
+    )
+
+
+def test_ordinary_wire_verbs_are_not_article_type_markers():
+    """ "says" and "tells" appear everywhere; treating them as types would
+    split legitimate rewrites."""
+
+    assert article_types("Nvidia chief says Blackwell demand outstrips supply") == ()
+    assert (
+        article_types(
+            "Nvidia cannot make Blackwell chips fast enough, chief executive "
+            "tells investors"
+        )
+        == ()
+    )
+    assert (
+        guard_between(
+            *pair_stories(
+                "Nvidia chief says Blackwell demand outstrips supply",
+                "Nvidia cannot make Blackwell chips fast enough, chief "
+                "executive tells investors",
+            )
+        )
+        is None
+    )
+
+
+def test_a_count_spelled_in_words_is_a_magnitude_claim():
+    """P144: identical headlines, different companies, counts in words."""
+
+    left, right = pair_stories(
+        "Automaker cuts electric vehicle prices across Europe",
+        "Automaker cuts electric vehicle prices across Europe",
+        "Tesla confirmed reductions across eleven European markets.",
+        "Wolfsberg Motors confirmed reductions across nine European markets.",
+    )
+
+    assert numeric_signature(tuple("eleven european markets".split())) == ("eleven",)
+    assert guard_between(left, right) == "numeric_disagreement"
+
+
+def test_spelled_counts_that_agree_do_not_veto():
+    assert (
+        guard_between(
+            *pair_stories(
+                "Nvidia adds two directors to its board",
+                "Two new members join the Nvidia board of directors",
+            )
+        )
+        is None
+    )
+
+
+def test_a_spelled_count_on_one_side_only_is_missing_information():
+    """The asymmetry rule: silence is not disagreement."""
+
+    assert (
+        guard_between(
+            *pair_stories(
+                "Nvidia expands its automotive partnership programme",
+                "Three more carmakers join Nvidia's driving platform programme",
+            )
+        )
+        is None
+    )
+
+
+def test_the_evidence_policy_version_moved_with_the_new_guards():
+    from nlp.semdedup.evidence import EVIDENCE_POLICY_VERSION, VETO_REASONS
+
+    assert EVIDENCE_POLICY_VERSION == "m3.evidence.v2"
+    assert "article_type" in VETO_REASONS
+    assert len(policy_fingerprint()) == 64
+
+
+def test_the_config_fingerprint_moved_with_the_guard_policy():
+    """A guard edit must invalidate cached M3 output."""
+
+    digest = config().fingerprint(model_name="m", model_revision=None)
+
+    assert len(digest) == 64
+
+
+# --------------------------------------------------------------------------
+# Cluster-wide semantic safety
+# --------------------------------------------------------------------------
+
+
+def test_a_sparse_story_cannot_semantically_bridge_two_article_types():
+    """Prospective-cluster compatibility, exercised through the new guard."""
+
+    titles = [
+        "Apple is said to be preparing a cheaper headset",
+        "A cheaper Apple headset is in the works",
+        "Apple confirms a cheaper headset is in development",
+    ]
+    encoder = encoder_for((titles[0], 0.0), (titles[1], 3.0), (titles[2], 6.0))
+    result = run(
+        [
+            story("rumour", titles[0]),
+            story("plain", titles[1], published_at=BASE + timedelta(hours=1)),
+            story("confirmed", titles[2], published_at=BASE + timedelta(hours=2)),
+        ],
+        encoder,
+    )
+
+    assert not any({"rumour", "confirmed"} <= set(group) for group in grouped(result))
+
+
+def test_a_semantic_cluster_never_holds_two_article_types():
+    titles = [
+        "AMD unveils the MI400 accelerator",
+        "AMD introduces the MI400 accelerator",
+        "Hands on with AMD's MI400 accelerator",
+    ]
+    encoder = encoder_for((titles[0], 0.0), (titles[1], 2.0), (titles[2], 4.0))
+    result = run(
+        [
+            story("a", titles[0]),
+            story("b", titles[1], published_at=BASE + timedelta(hours=1)),
+            story("c", titles[2], published_at=BASE + timedelta(hours=2)),
+        ],
+        encoder,
+    )
+
+    for group in grouped(result):
+        assert "c" not in group or len(group) == 1
+
+
+# --------------------------------------------------------------------------
+# Multi-item cluster evaluation of the pipeline
+# --------------------------------------------------------------------------
+
+
+def test_the_pipeline_cluster_predictor_runs_the_whole_batch_at_once():
+    from nlp.eval import default_cluster_cases
+    from nlp.eval.clusters import to_raw_items as cluster_raw_items
+    from nlp.eval.semantic import pipeline_cluster_predictor, semantic_config_for
+
+    cases = default_cluster_cases()
+    sizes: list[int] = []
+    inner = pipeline_cluster_predictor(
+        DedupConfig(supported_tickers=tuple(cases.metadata["tickers"])),
+        semantic_config_for(cases),
+        labelled_encoder(),
+    )
+
+    def spy(case):
+        sizes.append(len(cluster_raw_items(case)))
+        return inner(case)
+
+    from nlp.eval.clusters import evaluate_clusters
+
+    report = evaluate_clusters(cases, spy, name="spy", target="expected_partition")
+
+    assert min(sizes) >= 3
+    assert report.complete
+    assert report.accounting_violations == ()
+
+
+def test_the_pipeline_accounts_for_every_cluster_member():
+    from nlp.eval import default_cluster_cases
+    from nlp.eval.semantic import evaluate_pipeline_clusters
+
+    report = evaluate_pipeline_clusters(default_cluster_cases(), labelled_encoder())
+
+    assert report.missing_item_ids == ()
+    assert report.duplicated_item_ids == ()
+    assert report.unexpected_item_ids == ()
+    assert report.permutation_failures == ()
+
+
+def test_the_committed_pipeline_cluster_result_matches_a_fresh_run():
+    committed = json.loads(
+        (
+            REPO_ROOT
+            / "nlp"
+            / "eval"
+            / "data"
+            / "results"
+            / "m2_m3_clusters_ground_truth.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert committed["target"] == "expected_partition"
+    assert committed["predictor"] == "m2+m3"
+    assert committed["trust_contract"]["gate_eligible"] is False
+    metrics = committed["multi_item_cluster_metrics"]
+    assert metrics["over_merge_case_ids"] == []
+    assert metrics["permutation_failures"] == []
+    assert committed["completeness"]["complete"] is True
+
+
+def test_m3_closes_the_cluster_under_merges_it_is_responsible_for():
+    """C003 and C007 are M3's to recover; C006 stays below threshold."""
+
+    committed = json.loads(
+        (
+            REPO_ROOT
+            / "nlp"
+            / "eval"
+            / "data"
+            / "results"
+            / "m2_m3_clusters_ground_truth.json"
+        ).read_text(encoding="utf-8")
+    )
+    by_id = {case["case_id"]: case for case in committed["cases"]}
+
+    assert by_id["C003"]["exact_match"]
+    assert by_id["C007"]["exact_match"]
+    assert not by_id["C006"]["exact_match"]
+    assert by_id["C006"]["under_merged_pairs"]
+    for case in committed["cases"]:
+        assert case["over_merged_pairs"] == [], case["case_id"]

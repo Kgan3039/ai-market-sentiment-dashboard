@@ -43,6 +43,12 @@ from nlp.eval.dataset import (
     load_pair_set,
 )
 from nlp.eval.dedup import config_for, m2_isolated_pair_predictor
+from nlp.eval.semantic import (
+    CachingEncoder,
+    pipeline_cluster_predictor,
+    pipeline_isolated_pair_predictor,
+    semantic_config_for,
+)
 from nlp.eval.metrics import (
     EvaluationReport,
     PairPredictor,
@@ -70,24 +76,66 @@ def config_for_cluster_set(case_set: ClusterCaseSet) -> Any:
     return DedupConfig(supported_tickers=tuple(case_set.metadata["tickers"]))
 
 
+_ENCODER: Any = None
+
+
+def _shared_encoder() -> Any:
+    """Build the real embedding service once, on first use.
+
+    Lazily, because scoring M2 must never load a model, and cached, because
+    a sweep re-scores the same stories at every threshold and would
+    otherwise measure the encoder rather than the predicate.
+    """
+
+    global _ENCODER
+    if _ENCODER is None:
+        from nlp.embeddings import EmbeddingService
+
+        _ENCODER = CachingEncoder(EmbeddingService())
+    return _ENCODER
+
+
 #: Stages this build can score one pair at a time.
 StageFactory = Callable[[PairSet], PairPredictor]
 
+
+def _pipeline_pairs(pair_set: PairSet, threshold: float | None = None) -> PairPredictor:
+    return pipeline_isolated_pair_predictor(
+        config_for(pair_set),
+        semantic_config_for(pair_set, threshold),
+        _shared_encoder(),
+    )
+
+
 STAGES: dict[str, StageFactory] = {
     "m2": lambda pair_set: m2_isolated_pair_predictor(config_for(pair_set)),
+    "m2+m3": _pipeline_pairs,
 }
 
 #: Stages this build can score on whole batches.
 ClusterStageFactory = Callable[[ClusterCaseSet], ClusterPredictor]
 
+
+def _pipeline_clusters(case_set: ClusterCaseSet) -> ClusterPredictor:
+    return pipeline_cluster_predictor(
+        config_for_cluster_set(case_set),
+        semantic_config_for(case_set),
+        _shared_encoder(),
+    )
+
+
 CLUSTER_STAGES: dict[str, ClusterStageFactory] = {
     "m2": lambda case_set: m2_cluster_predictor(config_for_cluster_set(case_set)),
+    "m2+m3": _pipeline_clusters,
 }
 
 #: Stages whose merge predicate has a tunable threshold, mapped to the
 #: factory a sweep needs.  M2 has none by construction: no similarity value
-#: participates in any of its accept decisions.
-SWEEPABLE: dict[str, Callable[[PairSet, float], PairPredictor]] = {}
+#: participates in any of its accept decisions.  M3's cosine floor is one,
+#: and it is the only tunable value in the pipeline.
+SWEEPABLE: dict[str, Callable[[PairSet, float], PairPredictor]] = {
+    "m2+m3": _pipeline_pairs,
+}
 
 DEFAULT_SWEEP = (0.70, 0.75, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.95)
 
@@ -120,11 +168,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target",
-        default="exact_stage_partition",
+        default=None,
         choices=("exact_stage_partition", "expected_partition"),
         help=(
             "cluster scope only: which committed expectation to score "
-            "against (default: what the exact stage alone should produce)"
+            "against (default: exact_stage_partition for m2, "
+            "expected_partition for m2+m3, since closing the gap to ground "
+            "truth is what the semantic stage is for)"
         ),
     )
     parser.add_argument(
@@ -224,6 +274,62 @@ def _gate(report: EvaluationReport, args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Describe which sweep point the build ships, and why.
+
+    Computed from the sweep rows rather than typed in, so the rationale a
+    reader sees cannot drift from the numbers beside it.  ``None`` for a
+    stage with no configured threshold.
+    """
+
+    if stage not in SWEEPABLE:
+        return None
+    from nlp.semdedup.config import DEFAULT_SIMILARITY_THRESHOLD
+
+    chosen = next(
+        (
+            point
+            for point in points
+            if abs(point["threshold"] - DEFAULT_SIMILARITY_THRESHOLD) < 1e-9
+        ),
+        None,
+    )
+    if chosen is None:
+        return None
+    dirty = [point for point in points if point["counts"]["false_positive"]]
+    clean = [point for point in points if not point["counts"]["false_positive"]]
+    return {
+        "selected_threshold": DEFAULT_SIMILARITY_THRESHOLD,
+        "status": "provisional",
+        "basis": "precision_first",
+        "precision_at_selected": chosen["precision"],
+        "recall_at_selected": chosen["recall"],
+        "f1_at_selected": chosen["f1"],
+        "false_positives_at_selected": chosen["false_positives"],
+        "highest_threshold_still_producing_a_false_merge": (
+            max(point["threshold"] for point in dirty) if dirty else None
+        ),
+        "lowest_threshold_with_zero_false_merges": (
+            min(point["threshold"] for point in clean) if clean else None
+        ),
+        "max_f1_threshold": max(points, key=lambda point: point["f1"] or 0.0)[
+            "threshold"
+        ],
+        "rationale": (
+            "Precision-first. The selected point is the lowest threshold that "
+            "produces no false merge, taken with a margin over the highest "
+            "threshold that still produces one rather than sitting on it. The "
+            "F1 maximum is deliberately not used: it buys F1 with false merges, "
+            "and a false merge is the failure this stage exists to prevent."
+        ),
+        "caveat": (
+            "Provisional and development-only. Selected on a synthetic, "
+            "single-author, unadjudicated dataset that is not gate eligible; "
+            "these numbers cannot clear K3/G4 or final AC-3."
+        ),
+    }
+
+
 def _dump(payload: object, path: Path | None) -> str:
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     if path is not None:
@@ -263,11 +369,14 @@ def _run_clusters(args: argparse.Namespace) -> int:
             )
         )
         return 0
+    target = args.target or (
+        "expected_partition" if args.stage == "m2+m3" else "exact_stage_partition"
+    )
     report = evaluate_clusters(
         case_set,
         CLUSTER_STAGES[args.stage](case_set),
         name=args.stage,
-        target=args.target,
+        target=target,
     )
     text = _dump(cluster_payload(report), args.write)
     if args.json:
@@ -333,13 +442,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             thresholds,
             name=args.stage,
         )
-        payload = {
-            "trust_contract": pair_set.trust.as_dict(),
-            "dataset_id": pair_set.dataset_id,
-            "stage": args.stage,
-            "scope": "isolated_pairs",
-            "sweep": sweep_payload(points),
-        }
+        payload = sweep_payload(points)
+        payload["stage"] = args.stage
+        selection = _selection_block(args.stage, payload["points"])
+        if selection is not None:
+            payload["selection"] = selection
         text = _dump(payload, args.write)
         print(text if args.json else render_sweep(points), end="")
         return 0
@@ -348,6 +455,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     # happened to type: a committed report whose threshold reads "null"
     # cannot be checked against the sweep it is supposed to come from.
     effective = args.threshold
+    if effective is None and args.stage in SWEEPABLE:
+        effective = semantic_config_for(pair_set).similarity_threshold
     report = evaluate_isolated_pairs(
         pair_set,
         _predictor_for(args.stage, pair_set, args.threshold),

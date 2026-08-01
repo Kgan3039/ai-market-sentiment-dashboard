@@ -32,15 +32,28 @@ ALGORITHM_VERSION = "m3.semantic.v1"
 DEFAULT_WINDOW_HOURS = 36.0
 MAX_WINDOW_HOURS = 168.0
 
-#: Selected on the M4 labelled set, not chosen by intuition.  Sweeping
-#: 0.50-0.95 there, the highest-scoring false merge is 0.6753 (P079, two
-#: different partnerships announced under one headline template) and
-#: precision reaches 1.0000 from 0.68 upward.  0.68 would sit 0.005 above a
-#: single observation; 0.70 keeps a real margin over the worst false merge
-#: while recall (0.8077) still clears AC-3's 0.75 floor with room.  F1 is
-#: higher at 0.60 (0.9467) and that threshold is *not* used: it buys 0.05 of
-#: F1 with a false merge, and a false merge is the failure the whole
-#: trust-first design exists to prevent.
+#: Selected on the M4 labelled set, not chosen by intuition, and
+#: re-derived from scratch after M4's trust-contract correction relabelled
+#: five pairs into the scored set.
+#:
+#: Sweeping 0.50-0.95 there, precision reaches 1.0000 from 0.68 upward and
+#: the highest-scoring false merge is 0.6753 (P079, two different
+#: partnerships announced under one headline template).  0.68 would sit
+#: 0.005 above a single observation; 0.70 keeps a real margin over the
+#: worst false merge while recall (0.8077) still clears AC-3's 0.75 floor
+#: with room.  F1 peaks at 0.50 (0.9677) and that threshold is *not* used:
+#: it buys F1 with two false merges, and a false merge is the failure the
+#: whole trust-first design exists to prevent.
+#:
+#: The value is unchanged from the pre-correction run, but the reason is
+#: not.  Before the relabelling, 0.70 hid four false merges that the old
+#: labels scored as ambiguous or positive; those are now refused by the
+#: ``article_type`` and magnitude guards, so the threshold no longer
+#: carries work a guard should be doing.
+#:
+#: **Provisional.**  It was selected on a synthetic, single-author,
+#: unadjudicated development dataset that is not gate eligible.  It is a
+#: development default, not an accepted operating point.
 #:
 #: It is the *floor* under a merge that has already survived every
 #: contradiction guard, never a merge rule on its own.
