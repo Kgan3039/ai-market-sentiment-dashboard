@@ -1,0 +1,68 @@
+{
+  "schema_version": "phase0.cluster_eval.v1",
+  "dataset_id": "phase0-dedup-cluster-cases-v1",
+  "issue": "#67",
+  "cases_file": "cluster_cases.jsonl",
+  "purpose": "Isolated-pair metrics cannot see the behaviour that only exists in a batch: cluster-wide compatibility, transitivity, provider quarantine, and the window applied to a cluster's span. Each case here is run as one group, in one call, and scored on the partition that comes back.",
+  "trust_contract": {
+    "dataset_kind": "synthetic_development",
+    "real_ingested_evidence": false,
+    "labeling_status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "adjudicated": false,
+    "gate_eligible": false,
+    "metrics_purpose": "development_regression_only",
+    "why": "These cases are constructed to exercise specific batch behaviours. They are not a sample of anything, so they measure regression against the author's expectations and nothing else."
+  },
+  "tickers": [
+    "AAPL",
+    "AMD",
+    "META",
+    "NVDA",
+    "TSLA"
+  ],
+  "statuses": [
+    "decidable",
+    "ambiguous"
+  ],
+  "categories": [
+    "sparse_bridge_contradictory",
+    "sparse_bridge_compatible",
+    "provider_conflict_group",
+    "url_reuse_group",
+    "repeated_quarterly_group",
+    "semantic_transitivity",
+    "mixed_stage_group",
+    "permutation_equivalence",
+    "same_event_different_article"
+  ],
+  "partition_contract": {
+    "expected_partition": "Ground truth: how a reader would group the items by event, regardless of which stage can get there, and regardless of what any implementation policy does with them. It covers exactly the determinate items - that is, every item not listed in indeterminate_item_ids.",
+    "indeterminate_item_ids": "Items whose placement the records present do not decide. They are excluded from expected_partition and from every pair scored against it, rather than being assigned to whichever group an implementation happens to reach first. exact_stage_partition still covers them, because an implementation must put them somewhere.",
+    "exact_stage_partition": "What the exact stage (M2) alone should produce, covering every item. It differs from expected_partition where the grouping needs semantics (M2 is expected to under-merge), where an implementation policy such as provider-conflict quarantine deliberately trades recall for safety, and where an indeterminate item has to be placed.",
+    "cross_fixture_claims": "Relationships this case shares with a pair in the pair set. Each names the pair id, the two items, and whether they are the same story. The loader checks the claim against the pair's label and against expected_partition, so a cluster fixture cannot silently contradict a pair fixture about the same relationship. A deliberate divergence needs an explicit divergence_reason.",
+    "both": "expected_partition covers the determinate items exactly; exact_stage_partition covers every item exactly."
+  },
+  "provenance": {
+    "kind": "synthetic",
+    "collection_method": "authored",
+    "statement": "Every record is authored. No URL resolves and nothing here was published. Real outlet names are used so the wire-attribution policy is exercised; invented names are used for any third-party company a case needs.",
+    "urls_are_synthetic": true,
+    "uses_real_outlet_names": true,
+    "why_synthetic": "Same blockers as the pair set: I2 (#61) and I3 (#62) are open, so there is no ingested batch to sample a real multi-item group from.",
+    "blocked_by": {
+      "#61": "I2 Yahoo ingestion - open",
+      "#62": "I3 RSS ingestion - open",
+      "#60": "K3 reviewer guidelines - open"
+    }
+  },
+  "labeling": {
+    "status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "reviewers": [],
+    "adjudicated": false,
+    "gate_eligible": false,
+    "protocol": "One author, no adjudication. A case marked 'ambiguous' is excluded from the headline partition metrics."
+  },
+  "cross_fixture_contract": "Every relationship a cluster case shares with a pair must be declared and must agree: duplicate maps to same_story, distinct maps to different_story, and an ambiguous pair may not be claimed either way. A case that must diverge from its pair has to say so in divergence_reason, which makes the disagreement reviewable instead of invisible."
+}

@@ -1,0 +1,103 @@
+{
+  "schema_version": "phase0.dedup_eval.v2",
+  "dataset_id": "phase0-dedup-pairs-v2",
+  "issue": "#67",
+  "acceptance_criteria": "AC-3 (precision >= 0.85, recall >= 0.75); gate G4",
+  "pairs_file": "dedup_pairs.jsonl",
+  "trust_contract": {
+    "dataset_kind": "synthetic_development",
+    "real_ingested_evidence": false,
+    "labeling_status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "adjudicated": false,
+    "gate_eligible": false,
+    "metrics_purpose": "development_regression_only",
+    "why": "Every metric derived from this set measures whether a stage still behaves the way its author expected. It measures nothing about real coverage, and it cannot clear a go/no-go gate: the labels have one author, no second reviewer, and no adjudication, and the records were written rather than sampled."
+  },
+  "tickers": [
+    "AAPL",
+    "AMD",
+    "META",
+    "NVDA",
+    "TSLA"
+  ],
+  "labels": [
+    "duplicate",
+    "distinct",
+    "ambiguous"
+  ],
+  "expected_stages": [
+    "m2",
+    "m3",
+    "none"
+  ],
+  "confidences": [
+    "high",
+    "medium",
+    "low"
+  ],
+  "categories": [
+    "exact_duplicate",
+    "syndicated_copy",
+    "trivial_title_variant",
+    "provider_repeat",
+    "url_repeat",
+    "semantic_rewrite",
+    "same_template_different_event",
+    "same_event_different_article",
+    "repeated_quarterly",
+    "role_change",
+    "guidance_direction",
+    "approval_decision",
+    "beat_miss",
+    "profit_loss",
+    "number_change",
+    "date_change",
+    "quarter_change",
+    "currency_change",
+    "unit_change",
+    "range_change",
+    "sign_change",
+    "different_company"
+  ],
+  "provenance": {
+    "kind": "synthetic",
+    "collection_method": "authored",
+    "statement": "Every headline, description, URL, outlet, and timestamp in this dataset is authored, not scraped. No pair asserts anything about a real published article, and no URL in this file resolves. Company names and tickers are real because the dataset has to exercise the five Phase 0 symbols, but the events are invented and must not be quoted, cited, or used as evidence about any company. Third parties that the labels need to name - a packaging supplier, an advertising agency, a rival automaker, two banks - are given invented names for the same reason.",
+    "urls_are_synthetic": true,
+    "uses_real_outlet_names": true,
+    "real_outlet_name_note": "Outlet names are real so that the wire-attribution and syndication cases exercise the same publisher policy production will. Nothing attributed to an outlet here was published by it.",
+    "why_synthetic": "Issue #67 asks for ~150 pairs sampled from real ingested data. Sampling requires I2 (#61) and I3 (#62), which are not on main: there is no ingestion path and no populated raw_items table in this repository. Rather than block M4 entirely or invent provenance for articles nobody fetched, the set is authored against the same raw_items field contract (docs/PHASE_0_SPEC.md section 5) and marked synthetic in the manifest, in the loader, in every CLI report, and in every committed result file.",
+    "authoring_method": "Cases were written from the failure modes the reviewer guidelines are meant to catch (syndication, wire decoration, attribution suffixes, recycled URLs, repeated quarterly events, opposing claims, changed magnitudes and units, similar headlines about different companies), not by running M2's normalizer over a seed corpus and keeping whatever it collapsed. The labels are therefore independent of the implementation: a pair is labelled 'duplicate' when a reader would say the two records describe one event, whatever any stage happens to do with it.",
+    "blocked_by": {
+      "#61": "I2 Yahoo ingestion - open; no real items to sample",
+      "#62": "I3 RSS ingestion - open; no real items to sample",
+      "#60": "K3 reviewer guidelines - open; the co-labelling protocol this set is supposed to follow is not written yet"
+    }
+  },
+  "labeling": {
+    "status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "reviewers": [],
+    "adjudicated": false,
+    "gate_eligible": false,
+    "protocol": "Issue #67 requires co-labelling with Kartik under the K3 (#60) guidelines and adjudication of disagreements. Neither the guidelines nor a second reviewer exist on main, so every label here carries exactly one author and has not been adjudicated. Per-pair 'confidence' records how the author expects a second reviewer to land: 'high' means the label should be uncontroversial, 'low' marks pairs the author could not decide.",
+    "ambiguous_policy": "A pair is labelled 'ambiguous' only when the records themselves do not contain enough to decide it - not when the author simply expects disagreement about a judgement the Phase 0 contract already settles. Ambiguous pairs are excluded from precision and recall and reported separately."
+  },
+  "revision_log": [
+    {
+      "version": "v2",
+      "change": "Trust-contract correction pass. Twenty pairs reviewed for internal contradictions. P133 (one EU fine reported in two currencies) and P138 (a point estimate inside a published range) were downgraded from hard negatives to ambiguous, because a rounded conversion and a summarizing estimate explain them as well as two events do. P149-P153 were promoted from ambiguous to distinct: whether a live blog, a follow-up analysis, a confirmation, an interview, or a hands-on is the same story as the original article is settled by the article-level contract, not left to the reviewer, and labelling them ambiguous was class balancing rather than honest uncertainty. P002, P055, P089, P090, P091 and P150 had timestamps that contradicted the reporting cadence their own links carried. P031's rationale claimed a typographic difference between two byte-identical headlines. P100's rationale described a chief-executive appointment that neither record mentions. P054, P068, P084, P144, P145 and P146 asserted an identity or a distinction the records did not contain, and now name the briefing, the disclosure, the two banks, the rival automaker, the supplier and the agency that make them decidable. Every item now carries canonical_url explicitly."
+    }
+  ],
+  "field_contract": {
+    "pair_id": "Unique within the set; stable across revisions; used in every confusion report.",
+    "ticker": "The Phase 0 symbol the pair is evaluated under. Both items normally carry it; different_company pairs may override one side.",
+    "label": "duplicate = one event, the two records should end up in one canonical story. distinct = two events, they must never merge. ambiguous = the records do not contain enough to decide; excluded from the headline precision/recall numbers and reported separately.",
+    "category": "Which failure mode the pair exercises.",
+    "expected_stage": "Which stage's documented responsibility covers this pair. m2 = collapsible by exact identity after M2's normalization. m3 = same event, different wording, needs embeddings. none = must not merge at any stage, or cannot be decided. It is a statement about design intent, not a prediction: a positive M2 misses is a false negative and is reported as one.",
+    "rationale": "Why the label is what it is, in reviewer language, citing the evidence present in the two records.",
+    "confidence": "Author's expected agreement level with a second reviewer.",
+    "item_a/item_b": "raw_items projections: item_id, ticker (optional override), title, description, url, canonical_url, source, published_at (ISO-8601 with offset), provider_item_id. canonical_url is always present and may be null. Absent optional fields are null and mean 'this feed did not supply it', never 'empty'."
+  }
+}

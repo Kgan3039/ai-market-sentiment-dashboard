@@ -1,0 +1,1404 @@
+{
+  "ambiguous": {
+    "count": 2,
+    "merged": []
+  },
+  "by_category": {
+    "approval_decision": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 5,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P106",
+          "P107",
+          "P108",
+          "P109",
+          "P110"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "beat_miss": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 5,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P111",
+          "P112",
+          "P113",
+          "P114",
+          "P115"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "currency_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 2,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P131",
+          "P132"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "date_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 3,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P125",
+          "P126",
+          "P127"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "different_company": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 7,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P142",
+          "P143",
+          "P144",
+          "P145",
+          "P146",
+          "P147",
+          "P148"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "exact_duplicate": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 11
+      },
+      "f1": 1.0,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": [
+          "P001",
+          "P002",
+          "P003",
+          "P004",
+          "P005",
+          "P006",
+          "P007",
+          "P008",
+          "P009",
+          "P010",
+          "P031"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "guidance_direction": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 5,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P101",
+          "P102",
+          "P103",
+          "P104",
+          "P105"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "number_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 5,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P120",
+          "P121",
+          "P122",
+          "P123",
+          "P124"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "profit_loss": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 4,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P116",
+          "P117",
+          "P118",
+          "P119"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "provider_repeat": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 5
+      },
+      "f1": 1.0,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": [
+          "P039",
+          "P040",
+          "P041",
+          "P042",
+          "P043"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "quarter_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 3,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P128",
+          "P129",
+          "P130"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "range_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 1,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P137"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "repeated_quarterly": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 7,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P089",
+          "P090",
+          "P091",
+          "P092",
+          "P093",
+          "P094",
+          "P095"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "role_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 5,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P096",
+          "P097",
+          "P098",
+          "P099",
+          "P100"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "same_event_different_article": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 5,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P149",
+          "P150",
+          "P151",
+          "P152",
+          "P153"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "same_template_different_event": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 10,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P079",
+          "P080",
+          "P081",
+          "P082",
+          "P083",
+          "P084",
+          "P085",
+          "P086",
+          "P087",
+          "P088"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "semantic_rewrite": {
+      "accuracy": 0.0,
+      "counts": {
+        "false_negative": 30,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [
+          "P049",
+          "P050",
+          "P051",
+          "P052",
+          "P053",
+          "P054",
+          "P055",
+          "P056",
+          "P057",
+          "P058",
+          "P059",
+          "P060",
+          "P061",
+          "P062",
+          "P063",
+          "P064",
+          "P065",
+          "P066",
+          "P067",
+          "P068",
+          "P069",
+          "P070",
+          "P071",
+          "P072",
+          "P073",
+          "P074",
+          "P075",
+          "P076",
+          "P077",
+          "P078"
+        ],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": 0.0
+    },
+    "sign_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 3,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P139",
+          "P140",
+          "P141"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "syndicated_copy": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 14
+      },
+      "f1": 1.0,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": [
+          "P011",
+          "P012",
+          "P013",
+          "P014",
+          "P015",
+          "P016",
+          "P017",
+          "P018",
+          "P019",
+          "P020",
+          "P021",
+          "P022",
+          "P023",
+          "P024"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "trivial_title_variant": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 13
+      },
+      "f1": 1.0,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": [
+          "P025",
+          "P026",
+          "P027",
+          "P028",
+          "P029",
+          "P030",
+          "P032",
+          "P033",
+          "P034",
+          "P035",
+          "P036",
+          "P037",
+          "P038"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "unit_change": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 3,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P134",
+          "P135",
+          "P136"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    },
+    "url_repeat": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 5
+      },
+      "f1": 1.0,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": [
+          "P044",
+          "P045",
+          "P046",
+          "P047",
+          "P048"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 1.0
+    }
+  },
+  "by_expected_stage": {
+    "m2": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 48
+      },
+      "f1": 1.0,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": [
+          "P001",
+          "P002",
+          "P003",
+          "P004",
+          "P005",
+          "P006",
+          "P007",
+          "P008",
+          "P009",
+          "P010",
+          "P011",
+          "P012",
+          "P013",
+          "P014",
+          "P015",
+          "P016",
+          "P017",
+          "P018",
+          "P019",
+          "P020",
+          "P021",
+          "P022",
+          "P023",
+          "P024",
+          "P025",
+          "P026",
+          "P027",
+          "P028",
+          "P029",
+          "P030",
+          "P031",
+          "P032",
+          "P033",
+          "P034",
+          "P035",
+          "P036",
+          "P037",
+          "P038",
+          "P039",
+          "P040",
+          "P041",
+          "P042",
+          "P043",
+          "P044",
+          "P045",
+          "P046",
+          "P047",
+          "P048"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 1.0
+    },
+    "m3": {
+      "accuracy": 0.0,
+      "counts": {
+        "false_negative": 30,
+        "false_positive": 0,
+        "true_negative": 0,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [
+          "P049",
+          "P050",
+          "P051",
+          "P052",
+          "P053",
+          "P054",
+          "P055",
+          "P056",
+          "P057",
+          "P058",
+          "P059",
+          "P060",
+          "P061",
+          "P062",
+          "P063",
+          "P064",
+          "P065",
+          "P066",
+          "P067",
+          "P068",
+          "P069",
+          "P070",
+          "P071",
+          "P072",
+          "P073",
+          "P074",
+          "P075",
+          "P076",
+          "P077",
+          "P078"
+        ],
+        "false_positive": [],
+        "true_negative": [],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": 0.0
+    },
+    "none": {
+      "accuracy": 1.0,
+      "counts": {
+        "false_negative": 0,
+        "false_positive": 0,
+        "true_negative": 73,
+        "true_positive": 0
+      },
+      "f1": null,
+      "pair_ids": {
+        "false_negative": [],
+        "false_positive": [],
+        "true_negative": [
+          "P079",
+          "P080",
+          "P081",
+          "P082",
+          "P083",
+          "P084",
+          "P085",
+          "P086",
+          "P087",
+          "P088",
+          "P089",
+          "P090",
+          "P091",
+          "P092",
+          "P093",
+          "P094",
+          "P095",
+          "P096",
+          "P097",
+          "P098",
+          "P099",
+          "P100",
+          "P101",
+          "P102",
+          "P103",
+          "P104",
+          "P105",
+          "P106",
+          "P107",
+          "P108",
+          "P109",
+          "P110",
+          "P111",
+          "P112",
+          "P113",
+          "P114",
+          "P115",
+          "P116",
+          "P117",
+          "P118",
+          "P119",
+          "P120",
+          "P121",
+          "P122",
+          "P123",
+          "P124",
+          "P125",
+          "P126",
+          "P127",
+          "P128",
+          "P129",
+          "P130",
+          "P131",
+          "P132",
+          "P134",
+          "P135",
+          "P136",
+          "P137",
+          "P139",
+          "P140",
+          "P141",
+          "P142",
+          "P143",
+          "P144",
+          "P145",
+          "P146",
+          "P147",
+          "P148",
+          "P149",
+          "P150",
+          "P151",
+          "P152",
+          "P153"
+        ],
+        "true_positive": []
+      },
+      "precision": null,
+      "recall": null
+    }
+  },
+  "by_ticker": {
+    "AAPL": {
+      "accuracy": 0.8125,
+      "counts": {
+        "false_negative": 6,
+        "false_positive": 0,
+        "true_negative": 16,
+        "true_positive": 10
+      },
+      "f1": 0.7692307692307693,
+      "pair_ids": {
+        "false_negative": [
+          "P066",
+          "P067",
+          "P068",
+          "P069",
+          "P070",
+          "P078"
+        ],
+        "false_positive": [],
+        "true_negative": [
+          "P081",
+          "P086",
+          "P091",
+          "P096",
+          "P105",
+          "P107",
+          "P112",
+          "P119",
+          "P121",
+          "P125",
+          "P130",
+          "P132",
+          "P141",
+          "P143",
+          "P148",
+          "P151"
+        ],
+        "true_positive": [
+          "P004",
+          "P008",
+          "P014",
+          "P018",
+          "P023",
+          "P028",
+          "P032",
+          "P037",
+          "P042",
+          "P046"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 0.625
+    },
+    "AMD": {
+      "accuracy": 0.8148148148148148,
+      "counts": {
+        "false_negative": 5,
+        "false_positive": 0,
+        "true_negative": 14,
+        "true_positive": 8
+      },
+      "f1": 0.761904761904762,
+      "pair_ids": {
+        "false_negative": [
+          "P061",
+          "P062",
+          "P063",
+          "P064",
+          "P065"
+        ],
+        "false_positive": [],
+        "true_negative": [
+          "P083",
+          "P088",
+          "P093",
+          "P097",
+          "P101",
+          "P110",
+          "P113",
+          "P118",
+          "P124",
+          "P129",
+          "P134",
+          "P137",
+          "P147",
+          "P153"
+        ],
+        "true_positive": [
+          "P003",
+          "P010",
+          "P013",
+          "P020",
+          "P027",
+          "P034",
+          "P041",
+          "P048"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 0.6153846153846154
+    },
+    "META": {
+      "accuracy": 0.8148148148148148,
+      "counts": {
+        "false_negative": 5,
+        "false_positive": 0,
+        "true_negative": 12,
+        "true_positive": 10
+      },
+      "f1": 0.8,
+      "pair_ids": {
+        "false_negative": [
+          "P071",
+          "P072",
+          "P073",
+          "P074",
+          "P075"
+        ],
+        "false_positive": [],
+        "true_negative": [
+          "P082",
+          "P087",
+          "P092",
+          "P099",
+          "P104",
+          "P109",
+          "P115",
+          "P117",
+          "P122",
+          "P127",
+          "P146",
+          "P152"
+        ],
+        "true_positive": [
+          "P005",
+          "P009",
+          "P015",
+          "P019",
+          "P024",
+          "P029",
+          "P033",
+          "P038",
+          "P043",
+          "P047"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 0.6666666666666666
+    },
+    "NVDA": {
+      "accuracy": 0.78125,
+      "counts": {
+        "false_negative": 7,
+        "false_positive": 0,
+        "true_negative": 15,
+        "true_positive": 10
+      },
+      "f1": 0.7407407407407407,
+      "pair_ids": {
+        "false_negative": [
+          "P049",
+          "P050",
+          "P051",
+          "P052",
+          "P053",
+          "P054",
+          "P076"
+        ],
+        "false_positive": [],
+        "true_negative": [
+          "P079",
+          "P084",
+          "P089",
+          "P094",
+          "P100",
+          "P102",
+          "P108",
+          "P111",
+          "P123",
+          "P128",
+          "P135",
+          "P139",
+          "P142",
+          "P145",
+          "P149"
+        ],
+        "true_positive": [
+          "P001",
+          "P006",
+          "P011",
+          "P016",
+          "P021",
+          "P025",
+          "P030",
+          "P035",
+          "P039",
+          "P044"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 0.5882352941176471
+    },
+    "TSLA": {
+      "accuracy": 0.7878787878787878,
+      "counts": {
+        "false_negative": 7,
+        "false_positive": 0,
+        "true_negative": 16,
+        "true_positive": 10
+      },
+      "f1": 0.7407407407407407,
+      "pair_ids": {
+        "false_negative": [
+          "P055",
+          "P056",
+          "P057",
+          "P058",
+          "P059",
+          "P060",
+          "P077"
+        ],
+        "false_positive": [],
+        "true_negative": [
+          "P080",
+          "P085",
+          "P090",
+          "P095",
+          "P098",
+          "P103",
+          "P106",
+          "P114",
+          "P116",
+          "P120",
+          "P126",
+          "P131",
+          "P136",
+          "P140",
+          "P144",
+          "P150"
+        ],
+        "true_positive": [
+          "P002",
+          "P007",
+          "P012",
+          "P017",
+          "P022",
+          "P026",
+          "P031",
+          "P036",
+          "P040",
+          "P045"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 0.5882352941176471
+    }
+  },
+  "candidate_recall": 0.6153846153846154,
+  "completeness": {
+    "complete": true,
+    "evaluated_case_count": 153,
+    "failed_case_count": 0,
+    "failed_case_ids": [],
+    "failures": []
+  },
+  "dataset_id": "phase0-dedup-pairs-v2",
+  "details": {
+    "P001": "merged: exact_content",
+    "P002": "merged: exact_content",
+    "P003": "merged: exact_content",
+    "P004": "merged: exact_content",
+    "P005": "merged: exact_content",
+    "P006": "merged: provider_item",
+    "P007": "merged: exact_title",
+    "P008": "merged: exact_content",
+    "P009": "merged: exact_content",
+    "P010": "merged: exact_content",
+    "P011": "merged: exact_content",
+    "P012": "merged: exact_title",
+    "P013": "merged: exact_content",
+    "P014": "merged: exact_title",
+    "P015": "merged: exact_content",
+    "P016": "merged: exact_title",
+    "P017": "merged: exact_content",
+    "P018": "merged: exact_title",
+    "P019": "merged: exact_content",
+    "P020": "merged: exact_title",
+    "P021": "merged: exact_content",
+    "P022": "merged: exact_title",
+    "P023": "merged: exact_content",
+    "P024": "merged: exact_title",
+    "P025": "merged: exact_content",
+    "P026": "merged: exact_content",
+    "P027": "merged: exact_content",
+    "P028": "merged: exact_title",
+    "P029": "merged: exact_title",
+    "P030": "merged: exact_title",
+    "P031": "merged: exact_title",
+    "P032": "merged: exact_title",
+    "P033": "merged: exact_title",
+    "P034": "merged: exact_title",
+    "P035": "merged: exact_title",
+    "P036": "merged: exact_title",
+    "P037": "merged: exact_title",
+    "P038": "merged: exact_content",
+    "P039": "merged: provider_item",
+    "P040": "merged: provider_item",
+    "P041": "merged: provider_item",
+    "P042": "merged: provider_item",
+    "P043": "merged: provider_item",
+    "P044": "merged: canonical_url",
+    "P045": "merged: canonical_url",
+    "P046": "merged: canonical_url",
+    "P047": "merged: canonical_url",
+    "P048": "merged: canonical_url",
+    "P049": "not merged: no signal",
+    "P050": "not merged: no signal",
+    "P051": "not merged: no signal",
+    "P052": "not merged: no signal",
+    "P053": "not merged: no signal",
+    "P054": "not merged: no signal",
+    "P055": "not merged: no signal",
+    "P056": "not merged: no signal",
+    "P057": "not merged: no signal",
+    "P058": "not merged: no signal",
+    "P059": "not merged: no signal",
+    "P060": "not merged: no signal",
+    "P061": "not merged: no signal",
+    "P062": "not merged: no signal",
+    "P063": "not merged: no signal",
+    "P064": "not merged: no signal",
+    "P065": "not merged: no signal",
+    "P066": "not merged: no signal",
+    "P067": "not merged: no signal",
+    "P068": "not merged: no signal",
+    "P069": "not merged: no signal",
+    "P070": "not merged: no signal",
+    "P071": "not merged: no signal",
+    "P072": "not merged: no signal",
+    "P073": "not merged: no signal",
+    "P074": "not merged: no signal",
+    "P075": "not merged: no signal",
+    "P076": "not merged: no signal",
+    "P077": "not merged: no signal",
+    "P078": "not merged: no signal",
+    "P079": "not merged: no signal",
+    "P080": "not merged: no signal",
+    "P081": "not merged: no signal",
+    "P082": "not merged: no signal",
+    "P083": "not merged: no signal",
+    "P084": "not merged: no signal",
+    "P085": "not merged: no signal",
+    "P086": "not merged: no signal",
+    "P087": "not merged: no signal",
+    "P088": "not merged: no signal",
+    "P089": "not merged: descriptionx1",
+    "P090": "not merged: no signal",
+    "P091": "not merged: protected_expressionx1",
+    "P092": "not merged: no signal",
+    "P093": "not merged: no signal",
+    "P094": "not merged: descriptionx1",
+    "P095": "not merged: no signal",
+    "P096": "not merged: no signal",
+    "P097": "not merged: no signal",
+    "P098": "not merged: no signal",
+    "P099": "not merged: no signal",
+    "P100": "not merged: no signal",
+    "P101": "not merged: no signal",
+    "P102": "not merged: no signal",
+    "P103": "not merged: descriptionx2",
+    "P104": "not merged: no signal",
+    "P105": "not merged: no signal",
+    "P106": "not merged: no signal",
+    "P107": "not merged: no signal",
+    "P108": "not merged: no signal",
+    "P109": "not merged: negationx2",
+    "P110": "not merged: no signal",
+    "P111": "not merged: no signal",
+    "P112": "not merged: no signal",
+    "P113": "not merged: descriptionx2",
+    "P114": "not merged: no signal",
+    "P115": "not merged: no signal",
+    "P116": "not merged: no signal",
+    "P117": "not merged: descriptionx2",
+    "P118": "not merged: no signal",
+    "P119": "not merged: no signal",
+    "P120": "not merged: no signal",
+    "P121": "not merged: no signal",
+    "P122": "not merged: no signal",
+    "P123": "not merged: no signal",
+    "P124": "not merged: no signal",
+    "P125": "not merged: no signal",
+    "P126": "not merged: no signal",
+    "P127": "not merged: no signal",
+    "P128": "not merged: no signal",
+    "P129": "not merged: no signal",
+    "P130": "not merged: no signal",
+    "P131": "not merged: no signal",
+    "P132": "not merged: no signal",
+    "P133": "not merged: no signal",
+    "P134": "not merged: no signal",
+    "P135": "not merged: no signal",
+    "P136": "not merged: no signal",
+    "P137": "not merged: no signal",
+    "P138": "not merged: no signal",
+    "P139": "not merged: no signal",
+    "P140": "not merged: no signal",
+    "P141": "not merged: protected_expressionx2",
+    "P142": "not merged: no signal",
+    "P143": "not merged: no signal",
+    "P144": "not merged: descriptionx2",
+    "P145": "not merged: no signal",
+    "P146": "not merged: no signal",
+    "P147": "not merged: no signal",
+    "P148": "not merged: no signal",
+    "P149": "not merged: no signal",
+    "P150": "not merged: no signal",
+    "P151": "not merged: no signal",
+    "P152": "not merged: no signal",
+    "P153": "not merged: no signal"
+  },
+  "isolated_pair_metrics": {
+    "accuracy": 0.8013245033112583,
+    "counts": {
+      "false_negative": 30,
+      "false_positive": 0,
+      "true_negative": 73,
+      "true_positive": 48
+    },
+    "f1": 0.761904761904762,
+    "pair_ids": {
+      "false_negative": [
+        "P049",
+        "P050",
+        "P051",
+        "P052",
+        "P053",
+        "P054",
+        "P055",
+        "P056",
+        "P057",
+        "P058",
+        "P059",
+        "P060",
+        "P061",
+        "P062",
+        "P063",
+        "P064",
+        "P065",
+        "P066",
+        "P067",
+        "P068",
+        "P069",
+        "P070",
+        "P071",
+        "P072",
+        "P073",
+        "P074",
+        "P075",
+        "P076",
+        "P077",
+        "P078"
+      ],
+      "false_positive": [],
+      "true_negative": [
+        "P079",
+        "P080",
+        "P081",
+        "P082",
+        "P083",
+        "P084",
+        "P085",
+        "P086",
+        "P087",
+        "P088",
+        "P089",
+        "P090",
+        "P091",
+        "P092",
+        "P093",
+        "P094",
+        "P095",
+        "P096",
+        "P097",
+        "P098",
+        "P099",
+        "P100",
+        "P101",
+        "P102",
+        "P103",
+        "P104",
+        "P105",
+        "P106",
+        "P107",
+        "P108",
+        "P109",
+        "P110",
+        "P111",
+        "P112",
+        "P113",
+        "P114",
+        "P115",
+        "P116",
+        "P117",
+        "P118",
+        "P119",
+        "P120",
+        "P121",
+        "P122",
+        "P123",
+        "P124",
+        "P125",
+        "P126",
+        "P127",
+        "P128",
+        "P129",
+        "P130",
+        "P131",
+        "P132",
+        "P134",
+        "P135",
+        "P136",
+        "P137",
+        "P139",
+        "P140",
+        "P141",
+        "P142",
+        "P143",
+        "P144",
+        "P145",
+        "P146",
+        "P147",
+        "P148",
+        "P149",
+        "P150",
+        "P151",
+        "P152",
+        "P153"
+      ],
+      "true_positive": [
+        "P001",
+        "P002",
+        "P003",
+        "P004",
+        "P005",
+        "P006",
+        "P007",
+        "P008",
+        "P009",
+        "P010",
+        "P011",
+        "P012",
+        "P013",
+        "P014",
+        "P015",
+        "P016",
+        "P017",
+        "P018",
+        "P019",
+        "P020",
+        "P021",
+        "P022",
+        "P023",
+        "P024",
+        "P025",
+        "P026",
+        "P027",
+        "P028",
+        "P029",
+        "P030",
+        "P031",
+        "P032",
+        "P033",
+        "P034",
+        "P035",
+        "P036",
+        "P037",
+        "P038",
+        "P039",
+        "P040",
+        "P041",
+        "P042",
+        "P043",
+        "P044",
+        "P045",
+        "P046",
+        "P047",
+        "P048"
+      ]
+    },
+    "precision": 1.0,
+    "recall": 0.6153846153846154
+  },
+  "limitation": "Isolated-pair metrics measure whether a two-item invocation of the stage merges a pair. Production clustering can differ on the same two records in a multi-item batch, because cluster-wide compatibility, transitivity, provider-conflict quarantine, and capacity behaviour all depend on the companion items in the batch. These numbers therefore cannot on their own validate production clustering; see multi_item_cluster_metrics.",
+  "merge_recall": 0.6153846153846154,
+  "predictor": "m2",
+  "schema_version": "phase0.eval_report.isolated_pairs.v2",
+  "scope": "isolated_pairs",
+  "scores": {},
+  "threshold": null,
+  "trust_contract": {
+    "adjudicated": false,
+    "dataset_kind": "synthetic_development",
+    "gate_eligible": false,
+    "labeling_status": "single_author_unadjudicated",
+    "metrics_purpose": "development_regression_only",
+    "real_ingested_evidence": false,
+    "reviewer_count": 1,
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  },
+  "trust_summary": {
+    "detail": "Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "headline": "Synthetic, single-author, unadjudicated development dataset.",
+    "level": "WARNING",
+    "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  }
+}

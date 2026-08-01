@@ -213,3 +213,318 @@ python -m black --check nlp/dedup tests/test_dedup_core*.py
 python -m flake8 nlp/dedup tests/test_dedup_core*.py
 python -m pytest tests/test_dedup_core.py tests/test_dedup_core_signals.py
 ```
+
+## Phase 0 dedup evaluation sets and evaluators (M4, issue #67)
+
+`nlp.eval` holds the labelled deduplication datasets and the deterministic
+evaluators that measure a stage against them. The evaluators call the public
+stage APIs and only count what they return, so a reported number cannot
+drift away from shipped behaviour.
+
+```bash
+python -m tools.eval_dedup --stage m2                    # isolated pairs
+python -m tools.eval_dedup --stage m2 --scope clusters   # whole batches
+python -m tools.eval_dedup --composition                 # dataset makeup
+python -m tools.eval_dedup --stage m2 --json             # committed form
+```
+
+### Read this before reading any number below
+
+**WARNING: Synthetic, single-author, unadjudicated development dataset.
+Metrics are not valid for K3/G4 or final AC-3 acceptance.**
+
+| | |
+|---|---|
+| `dataset_kind` | `synthetic_development` |
+| `real_ingested_evidence` | `false` |
+| `labeling_status` | `single_author_unadjudicated` |
+| `reviewer_count` | 1 |
+| `adjudicated` | `false` |
+| `gate_eligible` | `false` |
+| `metrics_purpose` | `development_regression_only` |
+
+This block is **enforced, not documented**, and validation is *relational*
+rather than per-field. `dataset_kind`, `labeling_status` and
+`metrics_purpose` are enums with no unknown values accepted, and each
+dataset kind's invariants live in one table, `DATASET_KIND_RULES`, which the
+validator asserts covers every enum member — so a new kind cannot silently
+inherit permissive behaviour.
+
+| | `synthetic_development` | `sampled_production` |
+|---|---|---|
+| `real_ingested_evidence` | must be `false` | must be **`true`** |
+| `metrics_purpose` | only `development_regression_only` | any |
+| may be gate eligible | no | yes, subject to the rules below |
+| `provenance.kind` | `synthetic` | `sampled` |
+| `provenance.collection_method` | `authored` | `sampled` or `ingested` |
+| `provenance.urls_are_synthetic` | `true` | `false` |
+| extra provenance required | `why_synthetic`, `blocked_by` | `ingestion_source`, `sample_selection` |
+
+A production sample must name what it was sampled *from*, and cannot
+describe itself as authored — the combination `sampled_production` with
+`real_ingested_evidence=false` used to load and no longer does.
+
+On top of the per-kind table, kind-independent rules: a
+`single_author_unadjudicated` set has exactly one reviewer, is not
+adjudicated, and is not gate eligible; `adjudicated=true` needs at least two
+reviewers *and* an adjudicated status; `gate_eligible=true` needs real
+ingested evidence, adjudication, two or more reviewers, a
+gate-or-acceptance purpose, and a kind that permits it; and a gate purpose
+declared without `gate_eligible` is refused. The `labeling` block must agree
+with the contract on all four shared fields.
+
+### The banner is derived, never supplied
+
+There is no `warning` field on a trust contract and a manifest that supplies
+one is **rejected** — a banner a caller could write is a banner that could
+contradict the fields beside it. `derive_trust_summary()` computes it from
+`dataset_kind`, evidence status, `labeling_status`, `reviewer_count`,
+`adjudicated`, `gate_eligible` and `metrics_purpose`:
+
+| state | banner |
+|---|---|
+| synthetic | `WARNING: Synthetic, {labelling} development dataset.` / `Metrics are not valid for K3/G4 or final AC-3 acceptance.` |
+| production, unadjudicated | `WARNING: Production-sampled evidence has not completed independent adjudication.` / `Metrics are development-only and not gate eligible.` |
+| production, adjudicated, not gated | `NOTICE: Production-sampled, independently adjudicated evaluation dataset.` / `Metrics are not configured as a release gate.` |
+| production, adjudicated, gated | `NOTICE: Production-sampled, independently adjudicated gate-eligible dataset.` |
+
+The labelling phrase is derived too — `single-author, unadjudicated`,
+`3-reviewer, unadjudicated`, `2-reviewer, independently adjudicated` — so
+the wording tracks the fields rather than a constant. Branching on
+`dataset_kind` first means **no production dataset can receive synthetic
+wording and no synthetic dataset can receive a production or adjudicated
+notice**; both directions are tested.
+
+Every text renderer prints the derived summary above and below the numbers,
+and every JSON payload carries **both** the structured `trust_contract`
+block and the derived `trust_summary` (`level`, `headline`, `detail`,
+`text`) — including the low-level sweep document.
+
+Every loaded pair, item, and case is stamped `synthetic=True` from the
+manifest.
+
+Issue #67 asks for ~150 pairs **sampled from real ingested data**,
+co-labelled with Kartik under the K3 (#60) guidelines. None of that is
+possible on `main`: I2 (#61) and I3 (#62) are open, so there is no ingestion
+and no populated `raw_items`; K3 is open, so the co-labelling protocol is
+not written. Every headline, URL, outlet and timestamp is authored. Real
+outlet names are used so the syndication and attribution cases exercise the
+real publisher policy; invented names (`Wolfsberg Motors`, `Pacific Advanced
+Packaging`, `Harbourline Media`, `Northfield Securities`, `Calder Bank
+Markets`) are used wherever a label needs to name a third party.
+
+### The two measurements are not interchangeable
+
+| scope | what it does | what it can see |
+|---|---|---|
+| `isolated_pair_metrics` | one pair per invocation, two records | whether a **two-item call** merges a pair |
+| `multi_item_cluster_metrics` | one whole group per invocation | cluster-wide compatibility, transitivity, provider quarantine, window-on-span |
+
+The pairwise evaluator previously claimed its results were faithful to
+production clustering because M2 guarantees a record's clusters do not
+depend on batch companions. **That claim was wrong and has been removed.**
+M2 makes the opposite guarantee explicitly: the compatibility gate is
+applied to the whole prospective cluster, merges are transitive, quarantine
+looks at every record under a provider id, and the window applies to a
+cluster's span. All four mean a third record *can* change what happens to
+two others. Isolated-pair metrics therefore cannot on their own validate
+production clustering, the report is scoped `isolated_pairs`, the field is
+named `isolated_pair_metrics` rather than `overall`, and
+`ISOLATED_PAIR_LIMITATION` travels with every rendering.
+
+### Composition (153 pairs)
+
+| | count |
+|---|---|
+| duplicate / distinct / ambiguous | 78 / 73 / **2** |
+| expected stage m2 / m3 / none | 48 / 30 / 75 |
+| tickers AAPL / AMD / META / NVDA / TSLA | 32 / 27 / 29 / 32 / 33 |
+
+`ambiguous` now means **the records do not contain enough to decide it**,
+not "the author expects disagreement". Two pairs qualify: `P133`, one EU
+fine reported in euros by one outlet and dollars by another, where a rounded
+conversion explains the pair as well as two decisions do; and `P138`, a point
+estimate of 62 billion inside a published 60-65 billion range, which is
+exactly how a second outlet summarizes one disclosure. Both were confident
+hard negatives and should not have been.
+
+Five pairs went the other way. `P149`-`P153` (a live blog beside an article
+about one announcement in it, a report beside a follow-up analysis, a rumour
+beside its confirmation, a release beside an executive interview, an
+announcement beside a hands-on) were labelled ambiguous. The article-level
+contract settles all five: a canonical story is one event reported by
+multiple outlets, and none of these is a copy of the other. Labelling them
+ambiguous was class balancing. They are now `distinct`, in a new
+`same_event_different_article` category.
+
+### M2 isolated-pair baseline
+
+`nlp/eval/data/results/m2_baseline.json`, 151 scored pairs:
+
+| metric | value |
+|---|---|
+| precision | **1.0000** (48 merges, 0 false) |
+| recall | 0.6154 |
+| F1 | 0.7619 |
+| tp / fp / tn / fn | 48 / 0 / **73** / 30 |
+| recall on `expected_stage=m2` | **1.0000** (48/48) |
+| recall on `expected_stage=m3` | 0.0000 (0/30) |
+| ambiguous pairs merged | 0 |
+| complete | true (0 failures) |
+
+The true-negative count moved 70 → 73 because three pairs joined the scored
+set. Precision, recall and F1 are unchanged: the relabelled pairs were all
+ones M2 correctly refused, so they moved from "excluded" to "true negative"
+without touching a numerator. M2 was not tuned.
+
+### M2 multi-item cluster results
+
+Nine authored cases, 30 records, covering a sparse bridge between
+contradictory endpoints, a legitimate sparse bridge, a provider-conflict
+group, a recycled-URL group, a repeated quarterly group, three-item semantic
+transitivity, a mixed-stage group, a permutation-equivalence batch, and a
+release-plus-interview group.
+
+**Three expectations per case, kept apart on purpose:**
+
+| field | what it is |
+|---|---|
+| `expected_partition` | ground truth — how a reader groups the *articles* |
+| `indeterminate_item_ids` | items the records do not place; never scored |
+| `exact_stage_partition` | what the exact stage alone should produce |
+
+Recording an implementation's traversal order as human truth would make the
+fixture agree with the code by construction. Three cases were corrected for
+exactly that:
+
+- **C001** previously asserted `[[1,2],[3]]` as ground truth. Item 2 carries
+  the same headline and no standfirst — nothing in the records says which of
+  the two contradicting articles it is a copy of. It is now
+  `indeterminate`, ground truth asserts only the decidable part (1 and 3
+  stay apart), and no pair involving item 2 is scored. M2's answer is kept
+  in `exact_stage_partition`, where it belongs.
+- **C003** previously made ground truth all-singleton because M2 quarantines
+  a provider conflict. As articles, records 1 and 3 are one story and record
+  2 is a different recall. Ground truth now says so, quarantine stays in
+  `exact_stage_partition`, and the gap shows up as an under-merge — the
+  honest cost of the policy rather than a definition that hides it.
+- **C009** was `ambiguous` on the same question P152 answers. P152 is
+  `distinct`; C009 now takes the same decision and declares the link, so the
+  two fixtures cannot disagree silently.
+
+**Cross-fixture claims.** A case may declare that a relationship it contains
+is the same one a pair records. The loader checks the claim against the
+pair's label *and* against the case's own partition, refuses a claim that
+borrows authority from an `ambiguous` pair, and refuses a contradiction
+unless the case states a `divergence_reason`. Eleven claims are committed.
+
+Against `exact_stage_partition` (`m2_clusters_exact_stage.json`):
+
+| metric | value |
+|---|---|
+| exact partition match | **9/9** (1.0000) |
+| co-clustering precision / recall / F1 | 1.0000 / 1.0000 / 1.0000 |
+| over-merged / under-merged cases | none / none |
+| permutation failures | none |
+| accounting violations | none |
+
+Against `expected_partition` (`m2_clusters_ground_truth.json`):
+
+| metric | value |
+|---|---|
+| exact partition match | 6/9 (0.6667) |
+| co-clustering precision / recall / F1 | 1.0000 / 0.5882 / 0.7407 |
+| over-merged cases | **none** |
+| under-merged cases | `C003` (quarantine), `C006`, `C007` (semantic) |
+
+### Cluster-member accounting is checked before any metric
+
+A predicted partition must contain exactly the case's item ids. Missing ids,
+duplicate ids across groups, invented ids, empty groups, blank ids and
+non-collection groups all raise `PartitionAccountingError`, and the case is
+**failed** — excluded from every denominator, with `missing_item_ids`,
+`duplicated_item_ids` and `unexpected_item_ids` reported per case and in
+aggregate. A clusterer that returns the right answer plus one invented id
+scores `exact_partition_matches=0` and undefined precision, not a perfect
+run.
+
+### Permutation coverage
+
+Every case is re-run under **every ordering** while the factorial stays at or
+below 120 — which covers all nine fixtures (6, 6, 6, 6, 6, 6, 24, 120, 6
+orderings). Above that the set is the original, the reverse, every cyclic
+rotation, and eight shuffles seeded on the case id, so it is documented,
+deterministic and reproducible from the case alone. Each case reports
+`permutation_count` and `unstable_permutation_count`.
+
+### Dataset integrity, enforced at load
+
+Refused: unknown vocabulary values; duplicate `pair_id` or `item_id`; a pair
+that repeats another pair's **content**, including with the two sides
+swapped; a non-duplicate pair whose two records are byte-identical; a
+missing `canonical_url` key (it must be present even when null); a URL that
+is not parseable http(s) with a host; a naive timestamp; a timestamp outside
+the range `nlp.dedup` itself accepts, imported rather than restated; a label
+contradicting its expected stage; rows out of `pair_id` order; and any
+malformed trust, provenance, or labeling block. Sweep thresholds must be
+finite numbers inside `[0, 1]` and distinct.
+
+### Failures are reported, never swallowed
+
+A stage that raises on one case does not end the run. The case is recorded
+with its id, exception type and message, left out of **every** denominator,
+and the report exposes `evaluated_case_count`, `failed_case_count`,
+`failed_case_ids` and `complete`. The text renderer prints the failures and
+states that they were excluded; the CLI exits 1 on an incomplete run.
+
+### One validator for every gate value
+
+`nlp/eval/validation.py` is the only place a threshold or floor becomes a
+number. It rejects NaN, `inf`, `-inf`, values outside `[0, 1]`,
+non-numbers, and booleans — `True` would otherwise be read as `1.0`. It is
+used by the CLI's `--precision-floor`, `--recall-floor` and `--threshold`,
+by the sweep, and by the report constructor.
+
+This matters because **NaN loses every comparison silently**: a gate checked
+against it does not fail loudly, it passes or fails depending on which way
+the comparison happens to be written. `argparse`'s `type=float` accepts
+`nan`, `inf` and `-inf` without complaint, so the check happens after
+parsing and before any comparison. All six of `--precision-floor nan`,
+`--recall-floor nan`, `--precision-floor inf`, `--recall-floor -inf`,
+`--precision-floor -0.1` and `--recall-floor 1.1` exit 2 with a message
+naming the field and the reason.
+
+### The trust block reaches the raw rows, not only the rendering
+
+Every public payload-producing function — `to_payload`, `cluster_payload`
+and `sweep_payload` — returns a document carrying the trust contract, the
+dataset id, a versioned `schema_version`, the scope, the limitation, and the
+completeness counts. `sweep_payload` used to return a bare list of rows,
+which is exactly the object somebody quotes; it now returns the document and
+the rows live under `points`, each carrying its own scope and completeness.
+
+### Evaluator conventions
+
+- **Undefined is `None`, not zero.** Precision over zero predicted merges is
+  unmeasured, not 0%. An undefined metric never clears a gate.
+- **Ambiguous pairs and cases are excluded** from the headline numbers and
+  reported separately.
+- **Candidate recall is reported beside merge recall**, so a sweep can tell
+  a missing candidate from a refused one.
+- **Everything is deterministic.** Both committed baselines are byte-compared
+  against a fresh run in the test suite, under three `PYTHONHASHSEED` values.
+
+### This does not close issue #67
+
+The DoD's "sampled from real ingested data" and "co-label with Kartik per
+K3" halves remain blocked on #61, #62 and #60. The numbers here are
+development regression signals. G4 needs the real sample, a second reviewer,
+and adjudication.
+
+Lint and test with:
+
+```bash
+python -m black --check nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
+python -m flake8 nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
+python -m pytest tests/test_dedup_eval.py
+```
