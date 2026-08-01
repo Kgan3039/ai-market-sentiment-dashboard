@@ -1,0 +1,62 @@
+{
+  "schema_version": "phase0.dedup_eval.v1",
+  "dataset_id": "phase0-dedup-pairs-v1",
+  "issue": "#67",
+  "acceptance_criteria": "AC-3 (precision >= 0.85, recall >= 0.75); gate G4",
+  "pairs_file": "dedup_pairs.jsonl",
+  "tickers": ["AAPL", "AMD", "META", "NVDA", "TSLA"],
+  "labels": ["duplicate", "distinct", "ambiguous"],
+  "expected_stages": ["m2", "m3", "none"],
+  "confidences": ["high", "medium", "low"],
+  "categories": [
+    "exact_duplicate",
+    "syndicated_copy",
+    "trivial_title_variant",
+    "provider_repeat",
+    "url_repeat",
+    "semantic_rewrite",
+    "same_template_different_event",
+    "repeated_quarterly",
+    "role_change",
+    "guidance_direction",
+    "approval_decision",
+    "beat_miss",
+    "profit_loss",
+    "number_change",
+    "date_change",
+    "quarter_change",
+    "currency_change",
+    "unit_change",
+    "range_change",
+    "sign_change",
+    "different_company",
+    "ambiguous"
+  ],
+  "provenance": {
+    "kind": "synthetic",
+    "statement": "Every headline, description, URL, outlet, and timestamp in this dataset is authored, not scraped. No pair asserts anything about a real published article, and no URL in this file is guaranteed to resolve. Company names and tickers are real because the dataset has to exercise the five Phase 0 symbols, but the events described are invented and must not be quoted, cited, or used as evidence about any company.",
+    "why_synthetic": "Issue #67 asks for ~150 pairs sampled from real ingested data. Sampling requires I2 (#61) and I3 (#62), which are not on main: there is no ingestion path and no populated raw_items table in this repository. Rather than block M4 entirely or invent provenance for articles nobody fetched, the set is authored against the same raw_items field contract (docs/PHASE_0_SPEC.md section 5) and marked synthetic here and in every consumer of the file.",
+    "authoring_method": "Cases were written from the failure modes the reviewer guidelines are meant to catch (syndication, wire decoration, attribution suffixes, recycled URLs, repeated quarterly events, opposing claims, changed magnitudes and units, similar headlines about different companies), not by running M2's normalizer over a seed corpus and keeping whatever it collapsed. The labels are therefore independent of the implementation: a pair is labelled 'duplicate' when a reader would say the two records describe one event, whatever any stage happens to do with it.",
+    "blocked_by": {
+      "#61": "I2 Yahoo ingestion - open; no real items to sample",
+      "#62": "I3 RSS ingestion - open; no real items to sample",
+      "#60": "K3 reviewer guidelines - open; the co-labelling protocol this set is supposed to follow is not written yet"
+    }
+  },
+  "labeling": {
+    "status": "authored_pending_colabel",
+    "protocol": "Issue #67 requires co-labelling with Kartik under the K3 (#60) guidelines and adjudication of disagreements. Neither the guidelines nor a second reviewer exist on main, so every label here carries exactly one author and has not been adjudicated. Per-pair 'confidence' records how the author expects a second reviewer to land: 'high' means the label should be uncontroversial, 'low' marks pairs written specifically to be argued about.",
+    "reviewers": [],
+    "adjudicated": false
+  },
+  "field_contract": {
+    "pair_id": "Unique within the set; stable across revisions; used in every confusion report.",
+    "ticker": "The Phase 0 symbol the pair is evaluated under. Both items normally carry it; different_company pairs deliberately do not.",
+    "label": "duplicate = one event, the two records should end up in one canonical story. distinct = two events, they must never merge. ambiguous = a reasonable reviewer could argue either way; excluded from the headline precision/recall numbers and reported separately.",
+    "category": "Which failure mode the pair exercises.",
+    "expected_stage": "Which stage's documented responsibility covers this pair. m2 = collapsible by exact identity after M2's normalization. m3 = same event, different wording, needs embeddings. none = must not merge at any stage. It is a statement about design intent, not a prediction: a positive M2 misses is a false negative and is reported as one.",
+    "rationale": "Why the label is what it is, in reviewer language.",
+    "confidence": "Author's expected agreement level with a second reviewer.",
+    "item_a/item_b": "raw_items projections: item_id, title, description, url, canonical_url, source, published_at (ISO-8601 with offset), provider_item_id. Absent optional fields are null and mean 'this feed did not supply it', never 'empty'."
+  }
+}

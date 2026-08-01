@@ -213,3 +213,107 @@ python -m black --check nlp/dedup tests/test_dedup_core*.py
 python -m flake8 nlp/dedup tests/test_dedup_core*.py
 python -m pytest tests/test_dedup_core.py tests/test_dedup_core_signals.py
 ```
+
+## Phase 0 dedup evaluation set and evaluator (M4, issue #67)
+
+`nlp.eval` holds the labelled deduplication pair set and the deterministic
+evaluator that measures a stage against it. The evaluator calls the public
+stage APIs and only counts what they return, so a reported number cannot
+drift away from shipped behaviour.
+
+```bash
+python -m tools.eval_dedup --stage m2                     # text report
+python -m tools.eval_dedup --stage m2 --json              # committed form
+python -m tools.eval_dedup --composition                  # dataset makeup
+python -m tools.eval_dedup --stage m2 \
+    --precision-floor 0.85 --recall-floor 0.75            # AC-3 as a gate
+```
+
+### The dataset is synthetic, and that is a blocker, not a detail
+
+Issue #67 asks for ~150 pairs **sampled from real ingested data**, co-labelled
+with Kartik under the K3 (#60) reviewer guidelines. None of that is possible
+on `main`: I2 (#61) and I3 (#62) are open, so there is no ingestion path and
+no populated `raw_items`; K3 is open, so the co-labelling protocol is not
+written. Rather than block M4 entirely or invent provenance for articles
+nobody fetched, `nlp/eval/data/dedup_pairs.jsonl` is **authored** and marked
+synthetic in its manifest, in the loader, and here.
+
+Every headline, URL, outlet, and timestamp in it is invented. Company names
+and tickers are real because the set has to exercise the five Phase 0
+symbols; the events are not, and nothing in the file should be quoted or
+cited as a claim about any company. **The AC-3 numbers this set produces are
+a design measurement, not the G4 gate result.** G4 needs the real sample.
+
+Cases were written from the failure modes a reviewer has to catch, not by
+running M2's normalizer over a corpus and keeping what it collapsed — the
+labels are independent of the implementation.
+
+### Composition (153 pairs)
+
+| | count |
+|---|---|
+| duplicate / distinct / ambiguous | 78 / 70 / 5 |
+| expected stage m2 / m3 / none | 48 / 30 / 75 |
+| tickers AAPL / AMD / META / NVDA / TSLA | 32 / 27 / 29 / 32 / 33 |
+
+Positives: exact duplicates, syndicated copies, trivial title variants (wire
+prefixes, attribution suffixes, typography, entities, thousands separators),
+provider-id repeats, URL repeats, and 30 semantic rewrites deliberately left
+for M3. Negatives: same-template different events, repeated quarterly
+stories, role changes, guidance direction, approval/rejection, beat/miss,
+profit/loss, and changed numbers, dates, quarters, currencies, units, ranges
+and signs, plus similar headlines about different companies. Five ambiguous
+pairs are labelled as such and **excluded from the headline metrics** —
+scoring against a label the author already flagged as arguable measures the
+coin flip, not the stage.
+
+### M2 baseline (committed, `nlp/eval/data/results/m2_baseline.json`)
+
+| metric | value |
+|---|---|
+| precision | **1.0000** (48 merges, 0 false) |
+| recall | 0.6154 |
+| F1 | 0.7619 |
+| tp / fp / tn / fn | 48 / 0 / 70 / 30 |
+| recall on `expected_stage=m2` | **1.0000** (48/48) |
+| recall on `expected_stage=m3` | 0.0000 (0/30) |
+| ambiguous pairs merged | 0 |
+
+M2 clears AC-3's precision floor (≥0.85) with room to spare and **fails its
+recall floor** (≥0.75). It merges every positive it is responsible for and
+none of the 30 semantic rewrites, because none of them share an exact key.
+That gap is the measured case for M3 (#70) existing at all, and it is the
+reason M4 lands first: the threshold M3 picks has to come from this set, not
+from intuition.
+
+M2 was not loosened to improve these numbers, and must not be.
+
+### Evaluator conventions
+
+- **Undefined is `None`, not zero.** Precision over zero predicted merges is
+  unmeasured, not 0%. Returning 0.0 would let a stage that merges nothing
+  look like a failing stage rather than an unevaluated one. An undefined
+  metric never clears a gate.
+- **Pairs are scored two records at a time.** M2 guarantees a record's
+  clusters do not depend on batch companions, so this is faithful and it
+  keeps every false merge attributable to exactly one pair id.
+- **Candidate recall is reported next to merge recall.** The gap separates
+  "the generator never proposed it" from "the predicate refused it", which is
+  what a threshold sweep needs to mean anything.
+- **Loading is strict.** Unknown category, duplicate pair or item id, naive
+  timestamp, empty-string optional field, label contradicting its expected
+  stage, or rows out of `pair_id` order all raise `EvalDatasetError` rather
+  than being scored around.
+- **Everything is deterministic.** Reports are pure functions of the dataset
+  and the stage: no clock, no run id, no hash-order. The committed baseline
+  is byte-compared against a fresh run in the test suite, under three
+  different `PYTHONHASHSEED` values.
+
+Lint and test with:
+
+```bash
+python -m black --check nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
+python -m flake8 nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
+python -m pytest tests/test_dedup_eval.py
+```
