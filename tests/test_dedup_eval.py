@@ -2441,3 +2441,318 @@ def test_no_renderer_hardcodes_a_dataset_judgement():
     for name in ("report.py", "metrics.py", "clusters.py", "dataset.py"):
         source = (REPO_ROOT / "nlp" / "eval" / name).read_text("utf-8")
         assert "Synthetic, single-author" not in source, name
+
+
+# --------------------------------------------------------------------------
+# The construction boundary
+# --------------------------------------------------------------------------
+
+_SYNTHETIC_FIELDS = {
+    "dataset_kind": "synthetic_development",
+    "real_ingested_evidence": False,
+    "labeling_status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "adjudicated": False,
+    "gate_eligible": False,
+    "metrics_purpose": "development_regression_only",
+}
+_PRODUCTION_FIELDS = {
+    "dataset_kind": "sampled_production",
+    "real_ingested_evidence": True,
+    "labeling_status": "multi_reviewer_adjudicated",
+    "reviewer_count": 2,
+    "adjudicated": True,
+    "gate_eligible": False,
+    "metrics_purpose": "development_regression_only",
+}
+
+
+def build(base: dict, **overrides) -> TrustContract:
+    return TrustContract(**{**base, **overrides})
+
+
+@pytest.mark.parametrize(
+    "base,overrides,message",
+    [
+        (
+            _PRODUCTION_FIELDS,
+            {"real_ingested_evidence": False},
+            "requires real_ingested_evidence=true",
+        ),
+        (
+            _SYNTHETIC_FIELDS,
+            {"gate_eligible": True},
+            "cannot claim gate_eligible",
+        ),
+        (
+            _SYNTHETIC_FIELDS,
+            {"metrics_purpose": "final_acceptance"},
+            "must declare a metrics_purpose in",
+        ),
+        (
+            _SYNTHETIC_FIELDS,
+            {"adjudicated": True},
+            "cannot be adjudicated",
+        ),
+        (
+            _SYNTHETIC_FIELDS,
+            {"reviewer_count": 4},
+            "requires reviewer_count=1",
+        ),
+        (
+            _PRODUCTION_FIELDS,
+            {"labeling_status": "multi_reviewer_unadjudicated"},
+            "requires an adjudicated labeling_status",
+        ),
+        (
+            _PRODUCTION_FIELDS,
+            {"reviewer_count": 1},
+            "requires reviewer_count >= 2",
+        ),
+        (
+            _PRODUCTION_FIELDS,
+            {
+                "real_ingested_evidence": False,
+                "gate_eligible": True,
+                "metrics_purpose": "gate_acceptance",
+            },
+            "requires real_ingested_evidence=true",
+        ),
+        (
+            _PRODUCTION_FIELDS,
+            {
+                "labeling_status": "multi_reviewer_unadjudicated",
+                "adjudicated": False,
+                "gate_eligible": True,
+                "metrics_purpose": "gate_acceptance",
+            },
+            "requires adjudicated=true",
+        ),
+        (
+            _PRODUCTION_FIELDS,
+            {
+                "labeling_status": "single_author_unadjudicated",
+                "reviewer_count": 1,
+                "adjudicated": False,
+                "gate_eligible": True,
+                "metrics_purpose": "gate_acceptance",
+            },
+            "cannot be gate_eligible",
+        ),
+        (
+            _PRODUCTION_FIELDS,
+            {"gate_eligible": True},
+            "requires a metrics_purpose in",
+        ),
+        (
+            _PRODUCTION_FIELDS,
+            {"metrics_purpose": "final_acceptance"},
+            "but gate_eligible is false",
+        ),
+        (_SYNTHETIC_FIELDS, {"dataset_kind": "warehouse_dump"}, "is not one of"),
+        (_SYNTHETIC_FIELDS, {"labeling_status": "somebody_looked"}, "is not one of"),
+        (_SYNTHETIC_FIELDS, {"metrics_purpose": "shipping"}, "is not one of"),
+        (_SYNTHETIC_FIELDS, {"dataset_kind": 7}, "must be a non-blank string"),
+        (_SYNTHETIC_FIELDS, {"real_ingested_evidence": 0}, "must be a boolean"),
+        (_SYNTHETIC_FIELDS, {"adjudicated": "false"}, "must be a boolean"),
+        (_SYNTHETIC_FIELDS, {"gate_eligible": None}, "must be a boolean"),
+        (_SYNTHETIC_FIELDS, {"reviewer_count": True}, "must be a positive integer"),
+        (_SYNTHETIC_FIELDS, {"reviewer_count": 0}, "must be a positive integer"),
+        (_SYNTHETIC_FIELDS, {"reviewer_count": "1"}, "must be a positive integer"),
+    ],
+)
+def test_direct_construction_rejects_an_invalid_contract(base, overrides, message):
+    with pytest.raises(TrustContractError, match=message):
+        build(base, **overrides)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        _SYNTHETIC_FIELDS,
+        dict(
+            _PRODUCTION_FIELDS,
+            labeling_status="multi_reviewer_unadjudicated",
+            adjudicated=False,
+        ),
+        _PRODUCTION_FIELDS,
+        dict(
+            _PRODUCTION_FIELDS,
+            gate_eligible=True,
+            metrics_purpose="final_acceptance",
+        ),
+    ],
+    ids=["synthetic", "production-unadjudicated", "production-adjudicated", "gate"],
+)
+def test_direct_construction_accepts_every_valid_state(fields):
+    contract = TrustContract(**fields)
+
+    assert contract.dataset_kind is DatasetKind(fields["dataset_kind"])
+    assert contract.labeling_status is LabelingStatus(fields["labeling_status"])
+    assert contract.metrics_purpose is MetricsPurpose(fields["metrics_purpose"])
+    # The summary derives from the object, and the block round-trips.
+    assert contract.summary.text == contract.warning
+    assert contract.as_dict()["warning"] == contract.summary.text
+    assert contract.summary.level in {"WARNING", "NOTICE"}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        _SYNTHETIC_FIELDS,
+        dict(
+            _PRODUCTION_FIELDS,
+            labeling_status="multi_reviewer_unadjudicated",
+            adjudicated=False,
+        ),
+        _PRODUCTION_FIELDS,
+        dict(
+            _PRODUCTION_FIELDS,
+            gate_eligible=True,
+            metrics_purpose="final_acceptance",
+        ),
+    ],
+    ids=["synthetic", "production-unadjudicated", "production-adjudicated", "gate"],
+)
+def test_a_directly_built_contract_is_accepted_by_the_public_report_apis(fields):
+    """A valid contract of any state travels through the payload builders."""
+
+    from dataclasses import replace
+
+    contract = TrustContract(**fields)
+    report = replace(evaluate_m2_isolated_pairs(), trust=contract)
+    payload = to_payload(report)
+
+    assert payload["trust_contract"] == contract.as_dict()
+    assert payload["trust_summary"] == contract.summary.as_dict()
+    assert render_text(report).splitlines()[0] == contract.summary.text.splitlines()[0]
+
+
+def test_the_parser_and_the_constructor_produce_the_same_object(tmp_path):
+    """Not two paths with two standards: parsing is a constructor call."""
+
+    parsed = load_pair_set(write_set(tmp_path, [_pair("P001")])).trust
+    direct = TrustContract(**_SYNTHETIC_FIELDS)
+
+    assert parsed == direct
+    assert parsed.as_dict() == direct.as_dict()
+    assert parsed.summary == direct.summary
+    assert parsed.banner() == direct.banner()
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"real_ingested_evidence": True}, "requires real_ingested_evidence=false"),
+        ({"gate_eligible": True}, "cannot claim gate_eligible"),
+        ({"adjudicated": True}, "cannot be adjudicated"),
+        ({"metrics_purpose": "gate_acceptance"}, "must declare a metrics_purpose in"),
+        ({"reviewer_count": 5}, "requires reviewer_count=1"),
+    ],
+)
+def test_the_parser_reports_the_same_objection_as_the_constructor(
+    tmp_path, overrides, message
+):
+    trust = dict(_TRUST, **overrides)
+    labeling = dict(_LABELING)
+    for field in ("adjudicated", "gate_eligible", "reviewer_count"):
+        if field in overrides:
+            labeling[field] = overrides[field]
+    meta_path = write_set(
+        tmp_path, [_pair("P001")], {"trust_contract": trust, "labeling": labeling}
+    )
+
+    with pytest.raises(TrustContractError, match=message):
+        load_pair_set(meta_path)
+    with pytest.raises(TrustContractError, match=message):
+        build(_SYNTHETIC_FIELDS, **overrides)
+
+
+def test_the_parser_adds_the_file_location_to_the_constructor_message(tmp_path):
+    meta_path = write_set(
+        tmp_path,
+        [_pair("P001")],
+        {"trust_contract": dict(_TRUST, gate_eligible=True)},
+    )
+
+    with pytest.raises(TrustContractError) as excinfo:
+        load_pair_set(meta_path)
+
+    assert str(meta_path) in str(excinfo.value)
+    assert "cannot claim gate_eligible" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# No unchecked escape hatch
+# --------------------------------------------------------------------------
+
+
+def test_dataclasses_replace_cannot_derive_an_invalid_contract():
+    from dataclasses import replace
+
+    valid = TrustContract(**_SYNTHETIC_FIELDS)
+
+    with pytest.raises(TrustContractError, match="cannot claim gate_eligible"):
+        replace(valid, gate_eligible=True)
+    with pytest.raises(TrustContractError, match="cannot be adjudicated"):
+        replace(valid, adjudicated=True)
+    with pytest.raises(TrustContractError, match="is not one of"):
+        replace(valid, dataset_kind="warehouse_dump")
+
+
+def test_dataclasses_replace_still_works_for_a_valid_change():
+    from dataclasses import replace
+
+    valid = TrustContract(**_PRODUCTION_FIELDS)
+    gated = replace(
+        valid, gate_eligible=True, metrics_purpose=MetricsPurpose.FINAL_ACCEPTANCE
+    )
+
+    assert gated.gate_eligible is True
+    assert gated.summary.level == "NOTICE"
+    assert "gate-eligible" in gated.summary.headline
+
+
+def test_the_contract_stays_immutable_after_construction():
+    import dataclasses
+
+    contract = TrustContract(**_SYNTHETIC_FIELDS)
+
+    assert dataclasses.fields(contract)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        contract.gate_eligible = True  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        contract.reviewer_count = 9  # type: ignore[misc]
+
+
+def test_there_is_one_invariant_definition_and_the_constructor_calls_it():
+    """No second copy of the matrix to drift away from the first."""
+
+    source = (REPO_ROOT / "nlp" / "eval" / "trust.py").read_text("utf-8")
+
+    from nlp.eval.trust import check_trust_invariants
+
+    assert callable(check_trust_invariants)
+    assert source.count("def check_trust_invariants(") == 1
+    assert source.count("check_trust_invariants(self)") == 1
+    assert source.count("DATASET_KIND_RULES: dict") == 1
+    # parse_trust_contract must not re-implement the field checks.
+    parse = source[source.index("def parse_trust_contract(") :]
+    parse = parse[: parse.index("def validate_provenance(")]
+    assert "check_trust_invariants" not in parse
+    assert "TrustContract(" in parse
+
+
+def test_no_public_helper_constructs_a_contract_without_validation():
+    """Every construction site in the package goes through __init__."""
+
+    import re
+
+    for name in ("trust.py", "dataset.py", "clusters.py", "metrics.py", "report.py"):
+        source = (REPO_ROOT / "nlp" / "eval" / name).read_text("utf-8")
+        assert "object.__new__(TrustContract" not in source, name
+        assert not re.search(r"TrustContract\.__new__", source), name
+        # object.__setattr__ on a contract is only allowed inside its own
+        # __post_init__, where the coercions happen before validation.
+        if name != "trust.py":
+            assert "object.__setattr__" not in source, name

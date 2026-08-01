@@ -288,8 +288,20 @@ def derive_trust_summary(contract: "TrustContract") -> TrustSummary:
 class TrustContract:
     """What a consumer of these metrics is entitled to know.
 
+    **An instance cannot exist in a contradictory state.**  Construction
+    coerces the three enum fields, type-checks the rest, and then runs
+    :func:`check_trust_invariants` — the same validator manifest parsing
+    uses, called from the same place.  Parsing a manifest and calling the
+    constructor directly are therefore not two paths with two standards;
+    parsing *is* a call to the constructor, wrapped only to name the file
+    in the error.
+
+    ``dataclasses.replace`` re-runs ``__init__`` and so re-runs this, which
+    means there is no supported way to derive an invalid contract from a
+    valid one either.
+
     There is no ``warning`` field.  The banner is a *function* of the seven
-    validated fields (:func:`derive_trust_summary`), so no manifest can
+    validated fields (:func:`derive_trust_summary`), so nothing can
     describe itself as something the metadata says it is not.
     """
 
@@ -300,6 +312,29 @@ class TrustContract:
     adjudicated: bool
     gate_eligible: bool
     metrics_purpose: MetricsPurpose
+
+    def __post_init__(self) -> None:
+        # Frozen, so the coercions go through object.__setattr__. They run
+        # before the invariants because an invariant over a raw string
+        # would compare the wrong things.
+        for field, enum in (
+            ("dataset_kind", DatasetKind),
+            ("labeling_status", LabelingStatus),
+            ("metrics_purpose", MetricsPurpose),
+        ):
+            object.__setattr__(
+                self, field, _require_enum(getattr(self, field), enum, field, "")
+            )
+        for field in ("real_ingested_evidence", "adjudicated", "gate_eligible"):
+            object.__setattr__(
+                self, field, _require_bool(getattr(self, field), field, "")
+            )
+        object.__setattr__(
+            self,
+            "reviewer_count",
+            _require_positive_int(self.reviewer_count, "reviewer_count", ""),
+        )
+        check_trust_invariants(self)
 
     @property
     def is_synthetic(self) -> bool:
@@ -346,50 +381,67 @@ class TrustContract:
         )
 
 
+def _at(where: str, message: str) -> str:
+    """Prefix a message with a location only when there is one."""
+
+    return f"{where}: {message}" if where else message
+
+
 def _require_mapping(value: Any, field: str, where: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
-        raise TrustContractError(f"{where}: {field} must be a mapping")
+        raise TrustContractError(_at(where, f"{field} must be a mapping"))
     return value
 
 
 def _require_bool(value: Any, field: str, where: str) -> bool:
     if not isinstance(value, bool):
-        raise TrustContractError(f"{where}: {field} must be a boolean, not {value!r}")
+        raise TrustContractError(
+            _at(where, f"{field} must be a boolean, not {value!r}")
+        )
     return value
 
 
 def _require_positive_int(value: Any, field: str, where: str) -> int:
+    # bool is an int in Python; True as a reviewer count would read as 1.
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise TrustContractError(
-            f"{where}: {field} must be a positive integer, not {value!r}"
+            _at(where, f"{field} must be a positive integer, not {value!r}")
         )
     return value
 
 
 def _require_text(value: Any, field: str, where: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise TrustContractError(f"{where}: {field} must be a non-blank string")
+        raise TrustContractError(_at(where, f"{field} must be a non-blank string"))
     return value
 
 
 def _require_enum(value: Any, enum: type[Enum], field: str, where: str) -> Any:
+    if isinstance(value, enum):
+        return value
     text = _require_text(value, field, where)
     try:
         return enum(text)
     except ValueError as exc:
         allowed = sorted(member.value for member in enum)
         raise TrustContractError(
-            f"{where}: {field}={text!r} is not one of {allowed}"
+            _at(where, f"{field}={text!r} is not one of {allowed}")
         ) from exc
 
 
-def _check_invariants(contract: TrustContract, where: str) -> None:
+def check_trust_invariants(contract: TrustContract) -> None:
     """Refuse every combination that would misrepresent the dataset.
+
+    The single invariant definition.  :meth:`TrustContract.__post_init__`
+    calls it, which means every construction path calls it: a manifest, a
+    direct constructor call, and ``dataclasses.replace`` alike.
 
     The per-kind half comes from :data:`DATASET_KIND_RULES`, so a kind
     added without an entry fails rather than inheriting whatever the last
     ``if`` happened to allow.  The reviewer, adjudication and gate rules
     are kind-independent and apply on top.
+
+    Messages carry no file location: the caller that has one adds it.
     """
 
     rules = rules_for(contract.dataset_kind)
@@ -400,91 +452,95 @@ def _check_invariants(contract: TrustContract, where: str) -> None:
     if contract.real_ingested_evidence != rules.real_ingested_evidence:
         wanted = str(rules.real_ingested_evidence).lower()
         raise TrustContractError(
-            f"{where}: dataset_kind={kind} requires "
+            f"dataset_kind={kind} requires "
             f"real_ingested_evidence={wanted}; it is {rules.description}"
         )
     if purpose not in rules.allowed_metrics_purposes:
         allowed = sorted(member.value for member in rules.allowed_metrics_purposes)
         raise TrustContractError(
-            f"{where}: dataset_kind={kind} must declare a metrics_purpose in "
+            f"dataset_kind={kind} must declare a metrics_purpose in "
             f"{allowed}, not {purpose.value!r}"
         )
     if contract.gate_eligible and not rules.may_be_gate_eligible:
         raise TrustContractError(
-            f"{where}: dataset_kind={kind} cannot claim gate_eligible; its "
+            f"dataset_kind={kind} cannot claim gate_eligible; its "
             "numbers cannot clear K3/G4 or final AC-3"
         )
 
     if status is LabelingStatus.SINGLE_AUTHOR_UNADJUDICATED:
         if contract.reviewer_count != 1:
             raise TrustContractError(
-                f"{where}: labeling_status=single_author_unadjudicated "
+                f"labeling_status=single_author_unadjudicated "
                 f"requires reviewer_count=1, got {contract.reviewer_count}"
             )
         if contract.adjudicated:
             raise TrustContractError(
-                f"{where}: labeling_status=single_author_unadjudicated cannot "
+                "labeling_status=single_author_unadjudicated cannot "
                 "be adjudicated; one author has nobody to disagree with"
             )
         if contract.gate_eligible:
             raise TrustContractError(
-                f"{where}: labeling_status=single_author_unadjudicated cannot "
-                "be gate_eligible"
+                "labeling_status=single_author_unadjudicated cannot " "be gate_eligible"
             )
     elif status in MULTI_REVIEWER_STATUSES and contract.reviewer_count < 2:
         raise TrustContractError(
-            f"{where}: labeling_status={status.value} requires "
+            f"labeling_status={status.value} requires "
             f"reviewer_count >= 2, got {contract.reviewer_count}"
         )
 
     if contract.adjudicated:
         if contract.reviewer_count < 2:
             raise TrustContractError(
-                f"{where}: adjudicated=true requires reviewer_count >= 2, got "
+                f"adjudicated=true requires reviewer_count >= 2, got "
                 f"{contract.reviewer_count}; adjudication resolves a "
                 "disagreement between reviewers"
             )
         if status not in ADJUDICATED_STATUSES:
             raise TrustContractError(
-                f"{where}: adjudicated=true requires an adjudicated "
+                f"adjudicated=true requires an adjudicated "
                 f"labeling_status, got {status.value!r}"
             )
     elif status in ADJUDICATED_STATUSES:
         raise TrustContractError(
-            f"{where}: labeling_status={status.value} but adjudicated=false"
+            f"labeling_status={status.value} but adjudicated=false"
         )
 
     if contract.gate_eligible:
         if not contract.real_ingested_evidence:
             raise TrustContractError(
-                f"{where}: gate_eligible=true requires "
+                "gate_eligible=true requires "
                 "real_ingested_evidence=true; a gate cannot be cleared on "
                 "records nobody fetched"
             )
         if not contract.adjudicated:
-            raise TrustContractError(
-                f"{where}: gate_eligible=true requires adjudicated=true"
-            )
+            raise TrustContractError("gate_eligible=true requires adjudicated=true")
         if contract.reviewer_count < 2:
             raise TrustContractError(
-                f"{where}: gate_eligible=true requires reviewer_count >= 2, "
+                f"gate_eligible=true requires reviewer_count >= 2, "
                 f"got {contract.reviewer_count}"
             )
         if purpose not in GATE_PURPOSES:
             allowed = sorted(member.value for member in GATE_PURPOSES)
             raise TrustContractError(
-                f"{where}: gate_eligible=true requires a metrics_purpose in "
+                f"gate_eligible=true requires a metrics_purpose in "
                 f"{allowed}, got {purpose.value!r}"
             )
     elif purpose in GATE_PURPOSES:
         raise TrustContractError(
-            f"{where}: metrics_purpose={purpose.value!r} claims these numbers "
+            f"metrics_purpose={purpose.value!r} claims these numbers "
             "may settle a gate, but gate_eligible is false"
         )
 
 
 def parse_trust_contract(metadata: Mapping[str, Any], *, where: str) -> TrustContract:
-    """Validate a manifest's trust block, values and relationships, and return it."""
+    """Validate a manifest's trust block and return the contract.
+
+    The field checks and the invariants both live in
+    :class:`TrustContract`; this function's own job is the *manifest*
+    shape — required keys present, no supplied banner, no unknown keys —
+    after which it hands the raw values to the constructor and adds the
+    file location to whatever the constructor objects to.
+    """
 
     block = _require_mapping(metadata.get("trust_contract"), "trust_contract", where)
     missing = sorted(set(REQUIRED_TRUST_FIELDS) - set(block))
@@ -502,28 +558,18 @@ def parse_trust_contract(metadata: Mapping[str, Any], *, where: str) -> TrustCon
         raise TrustContractError(
             f"{where}: trust_contract has unknown field(s) {unknown}"
         )
-
-    contract = TrustContract(
-        dataset_kind=_require_enum(
-            block["dataset_kind"], DatasetKind, "dataset_kind", where
-        ),
-        real_ingested_evidence=_require_bool(
-            block["real_ingested_evidence"], "real_ingested_evidence", where
-        ),
-        labeling_status=_require_enum(
-            block["labeling_status"], LabelingStatus, "labeling_status", where
-        ),
-        reviewer_count=_require_positive_int(
-            block["reviewer_count"], "reviewer_count", where
-        ),
-        adjudicated=_require_bool(block["adjudicated"], "adjudicated", where),
-        gate_eligible=_require_bool(block["gate_eligible"], "gate_eligible", where),
-        metrics_purpose=_require_enum(
-            block["metrics_purpose"], MetricsPurpose, "metrics_purpose", where
-        ),
-    )
-    _check_invariants(contract, where)
-    return contract
+    try:
+        return TrustContract(
+            dataset_kind=block["dataset_kind"],
+            real_ingested_evidence=block["real_ingested_evidence"],
+            labeling_status=block["labeling_status"],
+            reviewer_count=block["reviewer_count"],
+            adjudicated=block["adjudicated"],
+            gate_eligible=block["gate_eligible"],
+            metrics_purpose=block["metrics_purpose"],
+        )
+    except TrustContractError as exc:
+        raise TrustContractError(f"{where}: {exc}") from exc
 
 
 def validate_provenance(
