@@ -34,27 +34,20 @@ DEFAULT_WINDOW_HOURS = 36.0
 MAX_WINDOW_HOURS = 168.0
 
 #: Selected on the M4 labelled set, not chosen by intuition, and
-#: re-derived from scratch after M4's trust-contract correction relabelled
-#: five pairs into the scored set.
+#: re-derived from scratch whenever the guards change.
 #:
-#: Sweeping 0.50-0.95 there, precision reaches 1.0000 from 0.68 upward and
-#: the highest-scoring false merge is 0.6753 (P079, two different
-#: partnerships announced under one headline template).  0.68 would sit
-#: 0.005 above a single observation; 0.70 keeps a real margin over the
-#: worst false merge while recall (0.8077) still clears AC-3's 0.75 floor
-#: with room.  F1 peaks at 0.50 (0.9677) and that threshold is *not* used:
-#: it buys F1 with two false merges, and a false merge is the failure the
-#: whole trust-first design exists to prevent.
+#: The authoritative numbers are the generated ``selection`` block in
+#: ``nlp/eval/data/results/m3_threshold_sweep.json``; no metric is restated
+#: here, because a comment cannot be regenerated and drifts.  The *policy*
+#: is what this constant records: take the lowest tested threshold at which
+#: no false merge survives, then step above it far enough that the choice
+#: does not rest on a single observation, provided recall still clears
+#: AC-3's floor.  The F1 maximum is never taken - it buys F1 with false
+#: merges, and a false merge is the failure this stage exists to prevent.
 #:
-#: The value is unchanged from the pre-correction run, but the reason is
-#: not.  Before the relabelling, 0.70 hid four false merges that the old
-#: labels scored as ambiguous or positive; those are now refused by the
-#: ``article_type`` and magnitude guards, so the threshold no longer
-#: carries work a guard should be doing.
-#:
-#: **Provisional.**  It was selected on a synthetic, single-author,
-#: unadjudicated development dataset that is not gate eligible.  It is a
-#: development default, not an accepted operating point.
+#: **Provisional.**  Selected on a synthetic, single-author, unadjudicated
+#: development dataset that is not gate eligible.  A development default,
+#: not an accepted operating point.
 #:
 #: It is the *floor* under a merge that has already survived every
 #: contradiction guard, never a merge rule on its own.
@@ -222,6 +215,15 @@ class SemanticDedupConfig:
             {
                 f"evidence.{name}": value
                 for name, value in evidence_policy_components().items()
+            }
+        )
+        # Imported here rather than at module scope: service imports config.
+        from .service import cluster_compatibility_components
+
+        components.update(
+            {
+                f"cluster_compatibility.{name}": value
+                for name, value in cluster_compatibility_components().items()
             }
         )
         return components

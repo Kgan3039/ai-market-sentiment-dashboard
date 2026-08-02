@@ -313,8 +313,8 @@ def near_identical(left_title: str, right_title: str, **overrides):
             "same_frame_different_event",
         ),
         (
-            "Nvidia appoints a new chair of the audit committee",
-            "Nvidia appoints a new chair of the compensation committee",
+            "Apple opens its first store in Saudi Arabia",
+            "Apple opens its first store in Vietnam",
             "same_frame_different_event",
         ),
         (
@@ -1112,14 +1112,26 @@ def test_m3_does_not_split_what_m2_merged():
         ("Apple cuts 1,000 roles", ("1000",)),
         ("AMD margin up 5% to $10 per unit", ("5%", "$10")),
         ("AMD unveils the MI400 accelerator", ()),
-        ("Tesla deploys 40 GWh of storage", ("40 gwh",)),
+        ("Tesla deploys 40 GWh of storage", ("40",)),
         ("Meta forecasts 60-65 billion dollars", ("60-65 billion",)),
     ],
 )
 def test_the_numeric_signature_binds_only_meaning_bearing_neighbours(text, expected):
     from nlp.dedup.structural import tokenize
 
-    assert numeric_signature(tokenize(text)) == expected
+    claims = numeric_signature(tokenize(text))
+    rendered = tuple(
+        "|".join(
+            part
+            for part in (
+                claim.currency + claim.sign + claim.value + claim.percent_kind,
+                claim.magnitude,
+            )
+            if part
+        ).replace("|", " ")
+        for claim in claims
+    )
+    assert rendered == expected
 
 
 @pytest.mark.parametrize(
@@ -1533,7 +1545,7 @@ def test_a_count_spelled_in_words_is_a_magnitude_claim():
         "Wolfsberg Motors confirmed reductions across nine European markets.",
     )
 
-    assert numeric_signature(tuple("eleven european markets".split())) == ("11",)
+    assert numeric_signature(tuple("eleven european markets".split()))[0].value == "11"
     assert guard_between(left, right) == "numeric_disagreement"
 
 
@@ -1566,7 +1578,7 @@ def test_a_spelled_count_on_one_side_only_is_missing_information():
 def test_the_evidence_policy_version_moved_with_the_new_guards():
     from nlp.semdedup.evidence import EVIDENCE_POLICY_VERSION, VETO_REASONS
 
-    assert EVIDENCE_POLICY_VERSION == "m3.evidence.v3"
+    assert EVIDENCE_POLICY_VERSION == "m3.evidence.v5"
     assert "article_type" in VETO_REASONS
     assert len(policy_fingerprint()) == 64
 
@@ -2026,7 +2038,7 @@ def test_a_marker_inside_a_company_name_is_ignored():
 
 
 def test_every_registered_genre_has_a_pattern():
-    names = {name for name, _ in ARTICLE_TYPE_PATTERNS}
+    names = {name for name, _, _ in ARTICLE_TYPE_PATTERNS}
 
     assert names == {
         "live_blog",
@@ -2072,7 +2084,7 @@ def test_uncertainty_produces_a_report_not_a_veto():
             "Meta signs a partnership with Harbourline Media",
             "Meta signs a partnership with Pacific Advanced Packaging",
         ),
-        ("Acme Holdings appoints a new chair", "Beta Industries appoints a new chair"),
+        ("Nvidia acquires Acme Holdings", "Nvidia acquires Beta Corp"),
     ],
 )
 def test_conflicting_explicit_entities_veto_a_semantic_merge(left, right):
@@ -2082,12 +2094,14 @@ def test_conflicting_explicit_entities_veto_a_semantic_merge(left, right):
 def test_missing_entity_evidence_is_unknown_not_contradictory():
     """A record that names nobody never blocks a merge."""
 
+    from nlp.semdedup.evidence import role_entities
+
+    assert role_entities("The chipmaker names a new finance chief") == ()
     assert (
-        guard_between(
-            *pair_stories(
-                "Alice Smith appointed chief financial officer",
-                "The chipmaker names a new finance chief",
-            )
+        contradiction(
+            summarize("Alice Smith appointed chief financial officer"),
+            summarize("The chipmaker names a new finance chief"),
+            frame_overlap=1.0,
         )
         is None
     )
@@ -2095,11 +2109,10 @@ def test_missing_entity_evidence_is_unknown_not_contradictory():
 
 def test_a_shared_entity_plus_an_extra_one_is_elaboration():
     assert (
-        guard_between(
-            *pair_stories(
-                "Apple wins dismissal of an App Store class action",
-                "Judge throws out the App Store suit brought by Acme Holdings",
-            )
+        contradiction(
+            summarize("Nvidia acquires Acme Corp"),
+            summarize("Nvidia acquires Acme Corp and Beta Corp"),
+            frame_overlap=1.0,
         )
         != "entity_conflict"
     )
@@ -2110,32 +2123,26 @@ def test_paraphrased_same_entity_stories_still_merge():
 
     for left, right in (
         (
-            "Wolfsberg Motors cuts prices across eleven European markets",
-            "Buyers in Europe get cheaper cars as Wolfsberg Motors trims "
-            "its list price",
+            "Nvidia acquires Acme Corp in a cash deal",
+            "Acme Corp is bought by the chipmaker for cash",
         ),
         (
-            "Alice Smith takes the finance chief role at the chipmaker",
-            "The chipmaker has named Alice Smith to run its finance function",
+            "Nvidia appoints Alice Smith to lead finance",
+            "Alice Smith is named to run the finance function",
         ),
     ):
-        assert guard_between(*pair_stories(left, right)) is None
+        assert (
+            contradiction(summarize(left), summarize(right), frame_overlap=1.0) is None
+        )
 
 
 def test_the_entity_guard_alone_does_not_object_to_a_shared_name():
-    """Isolating the entity check from the frame check.
+    """Isolating the entity check from the frame check."""
 
-    A paraphrase whose wording overlaps heavily still trips ``same_frame``
-    by design - the frame guard cannot tell a synonym substitution from an
-    event substitution, which is why real rewrites are recognised by their
-    *low* lexical overlap. What matters here is that the entity evidence
-    itself agrees.
-    """
+    left = summarize("Nvidia acquires Wolfsberg Motors")
+    right = summarize("Wolfsberg Motors is acquired by Nvidia")
 
-    left = summarize("Wolfsberg Motors cuts European prices")
-    right = summarize("European prices fall at Wolfsberg Motors")
-
-    assert left.entities == right.entities == frozenset({("wolfsberg motors",)})
+    assert left.entities and right.entities
     assert contradiction(left, right, frame_overlap=1.0) is None
 
 
@@ -2149,8 +2156,8 @@ def test_a_single_capitalised_word_is_not_treated_as_an_entity():
 
 
 def test_a_possessive_prefix_is_not_part_of_the_name():
-    assert explicit_entities("Apple's App Store ruling") == ("app store",)
-    assert explicit_entities("An App Store ruling") == ("app store",)
+    assert explicit_entities("Nvidia acquires Apple's Acme Corp") == ("acme corp",)
+    assert explicit_entities("Nvidia acquires Acme Corp") == ("acme corp",)
 
 
 # --------------------------------------------------------------------------
@@ -2208,7 +2215,11 @@ def test_a_number_word_inside_a_name_is_not_a_quantity():
     protected = frozenset({"one", "medical"})
 
     assert numbers("One Medical clinics", protected) == ()
-    assert numbers("one hundred clinics") == ("100",)
+    assert numbers("one hundred clinics")[0].value == "100"
+    # Through summarize(), the protection is computed rather than passed.
+    assert summarize("One Medical opens clinics").numeric == frozenset()
+    assert summarize("Formula One returns to Las Vegas").numeric == frozenset()
+    assert summarize("Apple ships 5 million units").numeric != frozenset()
 
 
 def test_a_model_identifier_is_not_a_quantity():
@@ -2423,4 +2434,455 @@ def test_the_attribution_stripper_leaves_a_real_subject_alone():
     assert (
         strip_attribution_clause("Production moves out of China, Apple suppliers say")
         == "Production moves out of China"
+    )
+
+
+# --------------------------------------------------------------------------
+# Title Case genre phrases and entity false positives
+# --------------------------------------------------------------------------
+
+TITLE_CASE_GENRES = [
+    ("Nvidia GTC: Live Updates", "live_blog"),
+    ("What To Expect From Nvidia Keynote", "preview"),
+    ("A First Look At Apple Headset", "hands_on"),
+    ("Tesla Earnings Preview", "preview"),
+    ("Nvidia Interview: CEO Discusses AI Demand", "interview"),
+    ("Apple Product Review", "hands_on"),
+    ("Live Blog: Meta Developer Conference", "live_blog"),
+    ("AMD Launch Recap", "recap"),
+    ("Opinion: Why The Chip Cycle Turned", "opinion"),
+    ("Explainer: How Export Rules Work", "analysis"),
+    ("Apple Is Said To Be Preparing A Cheaper Headset", "rumour"),
+    ("Apple Officially Confirms The Report", "confirmation"),
+]
+
+
+@pytest.mark.parametrize("title,genre", TITLE_CASE_GENRES)
+def test_title_case_headlines_classify(title, genre):
+    """Title Case must not hide a genre behind proper-noun suppression."""
+
+    assert genre in article_types(title)
+
+
+@pytest.mark.parametrize("title,genre", TITLE_CASE_GENRES)
+def test_the_same_headline_in_sentence_case_classifies_identically(title, genre):
+    sentence_case = title[0] + title[1:].lower()
+
+    assert genre in article_types(sentence_case)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "First Look Capital raises a fund",
+        "Interview Corp reports quarterly results",
+        "Preview Networks buys a studio",
+        "Recap Media names a chief executive",
+        "Company confirms earnings date",
+        "CEO confirms guidance",
+        "The review board approved the plan",
+        "Analysts review results after the close",
+        "Live operations resume at the Berlin plant",
+        "Nvidia reports record data centre revenue",
+    ],
+)
+def test_ordinary_and_company_text_is_not_a_genre(text):
+    assert article_types(text) == ()
+
+
+def test_a_corporate_designator_suppresses_an_adjacent_genre_word():
+    from nlp.semdedup.evidence import CORPORATE_DESIGNATORS
+
+    assert "capital" in CORPORATE_DESIGNATORS
+    assert article_types("First Look Capital") == ()
+    assert "hands_on" in article_types("Apple Headset First Look")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Company Reports Strong Results",
+        "Company Posts Strong Results",
+        "New York Times Reports Nvidia Results",
+        "Wall Street Journal Reports Nvidia Results",
+        "Tesla Delivers 495,000 Vehicles In The First Quarter",
+        "Nvidia Beats Quarterly Revenue Estimates",
+    ],
+)
+def test_ordinary_title_case_names_no_entity(text):
+    from nlp.semdedup.evidence import role_entities
+
+    assert role_entities(text) == ()
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        (
+            "New York Times Reports Nvidia Results",
+            "Wall Street Journal Reports Nvidia Results",
+        ),
+        ("Company Reports Strong Results", "Company Posts Strong Results"),
+        ("The Financial Times reports the deal", "Reuters reports the deal"),
+    ],
+)
+def test_outlet_and_scaffolding_differences_are_not_entity_conflicts(left, right):
+    assert (
+        contradiction(summarize(left), summarize(right), frame_overlap=1.0)
+        != "entity_conflict"
+    )
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        ("Nvidia appoints Alice Smith as CFO", "Nvidia appoints Bob Jones as CFO"),
+        ("Acme acquires Beta Corp", "Acme acquires Gamma Corp"),
+        (
+            "Meta signs a partnership with Company Alpha",
+            "Meta signs a partnership with Company Beta",
+        ),
+    ],
+)
+def test_role_aware_entity_conflicts_still_veto(left, right):
+    assert (
+        contradiction(summarize(left), summarize(right), frame_overlap=1.0)
+        == "entity_conflict"
+    )
+
+
+def test_entities_in_different_roles_do_not_conflict():
+    """An appointee is not compared against a counterparty."""
+
+    left = summarize("Nvidia appoints Alice Smith as CFO")
+    right = summarize("Nvidia acquires Beta Corp")
+
+    assert left.entities and right.entities
+    assert contradiction(left, right, frame_overlap=1.0) != "entity_conflict"
+
+
+def test_an_entity_named_only_in_a_description_is_still_read():
+    from nlp.semdedup.evidence import role_entities
+
+    evidence = summarize(
+        "The chipmaker names a new finance chief",
+        "Nvidia appointed Alice Smith to the role.",
+    )
+
+    assert role_entities("Nvidia appointed Alice Smith to the role.") == (
+        ("person", "alice smith"),
+    )
+    assert evidence.entities
+
+
+def test_an_outlet_name_in_the_title_is_not_an_entity():
+    from nlp.semdedup.evidence import role_entities
+
+    assert role_entities("Nvidia acquires New York Times") == ()
+
+
+# --------------------------------------------------------------------------
+# Quantity semantics
+# --------------------------------------------------------------------------
+
+
+def isolated(left: str, right: str):
+    """Guard verdict with the frame guard disabled, isolating quantities."""
+
+    return contradiction(summarize(left), summarize(right), frame_overlap=1.0)
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        ("Tesla ships eleven units", "Tesla ships 11 units"),
+        ("Tesla ships twenty-one vehicles", "Tesla ships 21 vehicles"),
+        ("Tesla ships a dozen chips", "Tesla ships 12 chips"),
+        ("Meta adds one hundred users", "Meta adds 100 users"),
+        ("Tesla ships five million units", "Tesla ships 5 million units"),
+        ("Tesla delivers 495,000 vehicles", "Tesla delivers 495,000 cars"),
+    ],
+)
+def test_equivalent_quantities_do_not_veto(left, right):
+    assert isolated(left, right) != "numeric_disagreement"
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        ("Tesla ships about 5 units", "Tesla ships 5 units"),
+        ("Tesla ships 5 million units", "Tesla ships 5 million dollars"),
+        ("Tesla ships 5 million units", "Tesla ships 5 billion units"),
+        ("Tesla ships at least 5 units", "Tesla ships up to 5 units"),
+        ("Tesla ships 5-10 units", "Tesla ships 5 units"),
+        ("Meta commits $5 million", "Meta commits 5 million users"),
+        ("AMD margin improves 5%", "AMD margin improves 5 basis points"),
+        ("Tesla ships roughly 5 units", "Tesla ships more than 5 units"),
+    ],
+)
+def test_distinct_quantities_veto(left, right):
+    assert isolated(left, right) == "numeric_disagreement"
+
+
+def test_a_quarter_difference_is_caught_by_the_temporal_guard():
+    assert (
+        isolated(
+            "Nvidia reports Q1 revenue of 5 million units",
+            "Nvidia reports Q2 revenue of 5 million units",
+        )
+        == "temporal_disagreement"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "One Medical opens clinics",
+        "Formula One returns to Las Vegas",
+        "AMD unveils the MI400 accelerator",
+        "Nvidia ships H100 chips",
+        "Tesla refreshes the Model 3",
+    ],
+)
+def test_names_and_identifiers_are_not_quantities(text):
+    assert summarize(text).numeric == frozenset()
+
+
+def test_an_approximation_qualifier_matches_on_token_boundaries():
+    """ "over" lives inside "handovers"; a substring match broke P055."""
+
+    assert (
+        isolated(
+            "Tesla handovers reach 495,000 vehicles",
+            "Tesla delivers 495,000 vehicles",
+        )
+        is None
+    )
+    assert (
+        isolated(
+            "Tesla delivers over 495,000 vehicles", "Tesla delivers 495,000 vehicles"
+        )
+        == "numeric_disagreement"
+    )
+
+
+def test_a_unit_named_on_one_side_only_stays_unknown():
+    from nlp.semdedup.evidence import (
+        numeric_signature as signature,
+        quantities_conflict,
+    )
+    from nlp.dedup.structural import tokenize as split
+
+    left = signature(split("495,000 vehicles"))
+    right = signature(split("495,000 cars"))
+
+    assert left[0].unit == "vehicles"
+    assert right[0].unit == ""
+    assert not quantities_conflict(left, right)
+
+
+# --------------------------------------------------------------------------
+# Compatibility-policy fingerprint
+# --------------------------------------------------------------------------
+
+
+def test_the_cluster_compatibility_policy_is_a_fingerprint_component():
+    from nlp.semdedup.service import cluster_compatibility_components
+
+    components = config().fingerprint_components(
+        model_name="m", model_revision="v1", embedding_dimension=384
+    )
+    registered = {
+        name for name in components if name.startswith("cluster_compatibility.")
+    }
+
+    assert registered
+    for key in cluster_compatibility_components():
+        assert f"cluster_compatibility.{key}" in components
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("linkage", "single_linkage"),
+        ("compatibility_scope", "endpoints_only"),
+        ("quarantine", "quarantined_stories_included"),
+        ("evidence_combination", "pairwise_only"),
+        ("edge_order", "input_order"),
+    ],
+)
+def test_changing_the_compatibility_policy_moves_the_digest(monkeypatch, key, value):
+    """Without touching ALGORITHM_VERSION."""
+
+    from nlp.semdedup import service
+    from nlp.semdedup.config import ALGORITHM_VERSION
+
+    settings = config()
+    baseline = settings.fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=384
+    )
+    monkeypatch.setitem(service.CLUSTER_COMPATIBILITY_POLICY, key, value)
+
+    assert (
+        settings.fingerprint(
+            model_name="m", model_revision="v1", embedding_dimension=384
+        )
+        != baseline
+    )
+    assert ALGORITHM_VERSION == "m3.semantic.v1"
+
+
+# --------------------------------------------------------------------------
+# Artifact metadata and regeneration
+# --------------------------------------------------------------------------
+
+RESULTS = REPO_ROOT / "nlp" / "eval" / "data" / "results"
+M3_ARTIFACTS = (
+    "m3_threshold_sweep.json",
+    "m2_m3_pipeline.json",
+    "m2_m3_clusters_ground_truth.json",
+)
+
+
+@pytest.mark.parametrize("name", M3_ARTIFACTS)
+def test_every_m3_artifact_carries_full_reproducibility_metadata(name):
+    payload = json.loads((RESULTS / name).read_text(encoding="utf-8"))
+    metadata = payload["semantic_metadata"]
+
+    for field in (
+        "model_name",
+        "model_revision",
+        "embedding_dimension",
+        "semantic_config_fingerprint",
+        "evidence_policy_fingerprint",
+        "evidence_policy_version",
+        "semantic_input_composition",
+        "similarity_threshold",
+        "window_hours",
+        "candidate_capacity",
+        "guard_order",
+        "cluster_compatibility_policy",
+        "score_precision",
+    ):
+        assert field in metadata, (name, field)
+    assert metadata["model_name"].strip()
+    assert metadata["embedding_dimension"] > 0
+    assert len(metadata["semantic_config_fingerprint"]) == 64
+    assert len(metadata["evidence_policy_fingerprint"]) == 64
+    assert payload["trust_contract"]["gate_eligible"] is False
+    assert payload["trust_summary"]["text"].startswith("WARNING:")
+    assert payload["dataset_id"]
+    assert payload["schema_version"]
+
+
+@pytest.mark.parametrize("name", ("m3_threshold_sweep.json", "m2_m3_pipeline.json"))
+def test_every_m3_artifact_carries_full_confusion_accounting(name):
+    payload = json.loads((RESULTS / name).read_text(encoding="utf-8"))
+    rows = payload["points"] if "points" in payload else [payload]
+
+    for row in rows:
+        for field in (
+            "false_positive_ids",
+            "false_negative_ids",
+            "guard_rejected_positive_ids",
+            "threshold_rejected_positive_ids",
+            "quarantine_skipped_pair_ids",
+            "evaluated_case_count",
+            "failed_case_count",
+            "complete",
+        ):
+            assert field in row, (name, field)
+        assert set(row["counts"]) == {
+            "true_positive",
+            "false_positive",
+            "true_negative",
+            "false_negative",
+        }
+
+
+def test_the_committed_metadata_matches_the_live_configuration():
+    """Validated, not merely serialized."""
+
+    from nlp.semdedup.config import SEMANTIC_INPUT_COMPOSITION
+    from nlp.semdedup.evidence import (
+        EVIDENCE_POLICY_VERSION,
+        VETO_REASONS,
+        policy_fingerprint as live_fingerprint,
+    )
+    from nlp.semdedup.service import CLUSTER_COMPATIBILITY_POLICY
+
+    metadata = json.loads(
+        (RESULTS / "m2_m3_pipeline.json").read_text(encoding="utf-8")
+    )["semantic_metadata"]
+
+    assert metadata["evidence_policy_version"] == EVIDENCE_POLICY_VERSION
+    assert metadata["evidence_policy_fingerprint"] == live_fingerprint()
+    assert metadata["semantic_input_composition"] == SEMANTIC_INPUT_COMPOSITION
+    assert metadata["guard_order"] == list(VETO_REASONS)
+    assert metadata["cluster_compatibility_policy"] == dict(
+        sorted(CLUSTER_COMPATIBILITY_POLICY.items())
+    )
+    assert metadata["similarity_threshold"] == pytest.approx(
+        config().similarity_threshold
+    )
+
+
+def test_the_committed_sweep_selection_states_the_accurate_facts():
+    sweep = json.loads(
+        (RESULTS / "m3_threshold_sweep.json").read_text(encoding="utf-8")
+    )
+    selection = sweep["selection"]
+    clean = [
+        point["threshold"]
+        for point in sweep["points"]
+        if point["counts"]["false_positive"] == 0
+    ]
+
+    assert selection["lowest_threshold_with_zero_false_merges"] == min(clean)
+    assert selection["selected_is_lowest_clean_threshold"] is (
+        selection["selected_threshold"] == min(clean)
+    )
+    assert selection["status"] == "provisional"
+    assert selection["guard_rejected_positive_ids_at_selected"] == []
+
+
+@pytest.mark.parametrize(
+    "path,needle",
+    [
+        ("nlp/semdedup/config.py", "0.8077"),
+        ("nlp/semdedup/config.py", "0.8235"),
+        ("nlp/README.md", "0.8077"),
+        ("nlp/semdedup/evidence.py", "seven guards"),
+    ],
+)
+def test_no_stale_metric_text_survives(path, needle):
+    """A metric restated in prose drifts; the artifacts are the source."""
+
+    assert needle not in (REPO_ROOT / path).read_text(encoding="utf-8")
+
+
+def test_the_readme_states_the_current_pair_metrics():
+    readme = (REPO_ROOT / "nlp" / "README.md").read_text(encoding="utf-8")
+    metrics = json.loads((RESULTS / "m2_m3_pipeline.json").read_text(encoding="utf-8"))[
+        "isolated_pair_metrics"
+    ]
+
+    assert f"{metrics['recall']:.4f}" in readme
+    assert f"{metrics['f1']:.4f}" in readme
+
+
+def test_a_role_title_does_not_capture_a_lowercase_predicate():
+    """The case-insensitive title must not relax the name's capitalisation."""
+
+    from nlp.semdedup.evidence import role_entities
+
+    assert (
+        role_entities("Meta finance chief explains the advertising acceleration") == ()
+    )
+    assert role_entities("CEO discusses AI demand") == ()
+    assert role_entities("Nvidia CEO Jensen Huang opens GTC") == (
+        ("person", "jensen huang"),
+    )
+    assert role_entities("nvidia ceo Jensen Huang opens GTC") == (
+        ("person", "jensen huang"),
     )

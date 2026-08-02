@@ -290,6 +290,54 @@ _THRESHOLD_REFUSAL = "below_threshold"
 SCORE_PRECISION = 6
 
 
+def _semantic_metadata(dataset: Any) -> dict[str, Any]:
+    """Everything needed to reproduce an M3 run, validated not guessed.
+
+    Each value is read from the object that governs it - the encoder, the
+    configuration, the evidence policy - rather than restated here, and the
+    fingerprints are the ones the stage actually used.
+    """
+
+    from nlp.semdedup import validate_model_metadata
+    from nlp.semdedup.config import SEMANTIC_INPUT_COMPOSITION
+    from nlp.semdedup.evidence import (
+        EVIDENCE_POLICY_VERSION,
+        VETO_REASONS,
+        policy_fingerprint as evidence_fingerprint,
+    )
+    from nlp.semdedup.service import CLUSTER_COMPATIBILITY_POLICY
+
+    encoder = _shared_encoder()
+    model_name, model_revision = validate_model_metadata(encoder)
+    dimension = getattr(encoder, "dimension", None)
+    settings = semantic_config_for(dataset)
+    if not model_name:
+        raise SystemExit("encoder did not declare a model name")
+    return {
+        "model_name": model_name,
+        "model_revision": model_revision,
+        "embedding_dimension": dimension,
+        "semantic_input_composition": SEMANTIC_INPUT_COMPOSITION,
+        "similarity_threshold": settings.similarity_threshold,
+        "window_hours": settings.window_hours,
+        "frame_overlap_threshold": settings.frame_overlap_threshold,
+        "candidate_capacity": settings.max_partition_stories,
+        "allow_undated_merges": settings.allow_undated_merges,
+        "guard_order": list(VETO_REASONS),
+        "evidence_policy_version": EVIDENCE_POLICY_VERSION,
+        "evidence_policy_fingerprint": evidence_fingerprint(),
+        "cluster_compatibility_policy": dict(
+            sorted(CLUSTER_COMPATIBILITY_POLICY.items())
+        ),
+        "semantic_config_fingerprint": settings.fingerprint(
+            model_name=model_name,
+            model_revision=model_revision,
+            embedding_dimension=dimension,
+        ),
+        "score_precision": SCORE_PRECISION,
+    }
+
+
 def _round_scores(payload: dict[str, Any]) -> dict[str, Any]:
     """Round every serialized similarity to :data:`SCORE_PRECISION`."""
 
@@ -492,7 +540,10 @@ def _run_clusters(args: argparse.Namespace) -> int:
         name=args.stage,
         target=target,
     )
-    text = _dump(cluster_payload(report), args.write)
+    payload = cluster_payload(report)
+    if args.stage in CLUSTER_STAGES and args.stage != "m2":
+        payload["semantic_metadata"] = _semantic_metadata(case_set)
+    text = _dump(payload, args.write)
     if args.json:
         print(text, end="")
     else:
@@ -559,6 +610,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = sweep_payload(points)
         payload["stage"] = args.stage
         payload["score_precision"] = SCORE_PRECISION
+        payload["semantic_metadata"] = _semantic_metadata(pair_set)
         for point, entry in zip(points, payload["points"]):
             detail = _confusion_detail(point.report)
             if detail["worst_false_positive_score"] is not None:
@@ -585,7 +637,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         name=args.stage,
         threshold=effective,
     )
-    text = _dump(_round_scores(to_payload(report)), args.write)
+    payload = _round_scores(to_payload(report))
+    if args.stage in SWEEPABLE:
+        payload["semantic_metadata"] = _semantic_metadata(pair_set)
+        payload.update(_confusion_detail(report))
+    text = _dump(payload, args.write)
     if args.json:
         print(text, end="")
     else:

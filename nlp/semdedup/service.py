@@ -60,6 +60,28 @@ _EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
 #: Namespace for semantic story fingerprints.
 STORY_NAMESPACE = "m3.story.v1"
 
+#: How prospective clusters are built and checked.  Registered as its own
+#: fingerprint component rather than represented by ALGORITHM_VERSION, so
+#: changing the linkage rule, the evidence-combination semantics or the
+#: quarantine policy invalidates cached output without anyone remembering
+#: to bump a global constant.
+CLUSTER_COMPATIBILITY_POLICY: dict[str, str] = {
+    "version": "m3.cluster_compatibility.v1",
+    "linkage": "clique_complete_linkage",
+    "compatibility_scope": "whole_prospective_cluster",
+    "evidence_combination": "union_of_member_summaries_then_veto_scan",
+    "quarantine": "provider_quarantined_stories_excluded_from_candidates",
+    "edge_order": "similarity_descending_then_time_ordered_position",
+    "window_applies_to": "every_pair_inside_the_story",
+    "candidate_generation": "exhaustive_within_ticker_and_window",
+}
+
+
+def cluster_compatibility_components() -> dict[str, str]:
+    """Return the cluster-compatibility policy, for the fingerprint."""
+
+    return dict(sorted(CLUSTER_COMPATIBILITY_POLICY.items()))
+
 
 def _encode_fields(fields: Sequence[str]) -> bytes:
     """Length-prefix every field so no value can forge a boundary."""

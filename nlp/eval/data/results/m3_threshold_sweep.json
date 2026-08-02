@@ -3009,6 +3009,42 @@
       "P078"
     ]
   },
+  "semantic_metadata": {
+    "allow_undated_merges": false,
+    "candidate_capacity": 250,
+    "cluster_compatibility_policy": {
+      "candidate_generation": "exhaustive_within_ticker_and_window",
+      "compatibility_scope": "whole_prospective_cluster",
+      "edge_order": "similarity_descending_then_time_ordered_position",
+      "evidence_combination": "union_of_member_summaries_then_veto_scan",
+      "linkage": "clique_complete_linkage",
+      "quarantine": "provider_quarantined_stories_excluded_from_candidates",
+      "version": "m3.cluster_compatibility.v1",
+      "window_applies_to": "every_pair_inside_the_story"
+    },
+    "embedding_dimension": 384,
+    "evidence_policy_fingerprint": "3c40b3d8d5c93b460d466bfcb49cf34debad910e7362e5c947617ff59dc72316",
+    "evidence_policy_version": "m3.evidence.v5",
+    "frame_overlap_threshold": 0.5,
+    "guard_order": [
+      "article_type",
+      "temporal_disagreement",
+      "role_disagreement",
+      "subject_shift",
+      "numeric_disagreement",
+      "contrast_polarity",
+      "negation",
+      "entity_conflict",
+      "same_frame_different_event"
+    ],
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "score_precision": 6,
+    "semantic_config_fingerprint": "57de9b5c021710d96cb7585d75adc029572bda7736b60dd03f01316291cd5f5c",
+    "semantic_input_composition": "m1.compose_embedding_text(title, description)",
+    "similarity_threshold": 0.7,
+    "window_hours": 36.0
+  },
   "stage": "m2+m3",
   "trust_contract": {
     "adjudicated": false,

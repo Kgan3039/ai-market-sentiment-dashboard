@@ -603,8 +603,8 @@ has them. Numbers bind only to neighbours that change their meaning, so
 ### Threshold selection, from evidence
 
 Committed sweep: `nlp/eval/data/results/m3_threshold_sweep.json`, recomputed
-from source against the corrected 153-pair set (151 scored) **after** the
-guard fixes below.
+from source after every guard change. Its `selection` block is generated
+from the rows; nothing below is restated by hand in code.
 
 | threshold | P | R | F1 | fp | false positives | guard-driven FN |
 |---|---|---|---|---|---|---|
@@ -616,101 +616,123 @@ guard fixes below.
 | 0.75 | 1.0000 | 0.7821 | 0.8777 | 0 | — | none |
 | 0.90 | 1.0000 | 0.6282 | 0.7717 | 0 | — | none |
 
-The accurate statements, all generated into the artifact's `selection`
-block from the rows rather than written by hand:
-
 - **0.68 is the lowest tested threshold with zero false positives.**
   `selected_is_lowest_clean_threshold` is `false`.
-- **0.70 is a provisional precision-first choice with additional margin.**
+- **0.70 is the provisional precision-first selection**, taken for margin.
 - Highest surviving false-positive score: **0.675315** (P079).
-- Margin at 0.70: **0.024685**; at 0.68 it would be 0.004685.
-- At 0.70 all **13** false negatives are threshold-driven and **none** is
-  guard-driven — but that is a measured result, not a property of the
-  design, and the sweep records both lists separately at every point.
+- Margin at 0.70: **0.024685**.
+- At 0.70 **all 13 false negatives are threshold-driven; none is
+  guard-driven** — measured, and recorded per point as
+  `guard_rejected_positive_ids` / `threshold_rejected_positive_ids`.
 
-F1 peaks at 0.50 (0.9809) and is not used: it buys F1 with two false
-merges. The threshold is **provisional** — selected on a synthetic,
-single-author, unadjudicated dataset that is not gate eligible.
+F1 peaks at 0.50 and is not used: it buys F1 with two false merges.
+Provisional — synthetic, single-author, unadjudicated, not gate eligible.
 
 ### M2 quarantine is authoritative and survives the bridge
 
 M2 quarantines every item under a provider identity that described two
-different articles: the feed is wrong about something and M2 cannot tell
-which payload is right. That decision used to be **dropped at the M2→M3
-bridge**, so M3 could re-merge on cosine exactly what M2 had isolated — and
-did, at cosine 1.0000.
+different articles. That decision used to be dropped at the M2→M3 bridge,
+so M3 could re-merge on cosine what M2 had isolated — and did, at 1.0000.
 
 `StoryInput` now carries `quarantined_member_ids` and `provider_conflicts`,
-read from the public `DedupResult.quarantined_item_ids` and
-`DedupResult.provider_conflicts` and never inferred from M2 internals. A
-quarantined story is **excluded from candidate generation**, retained
-unchanged in the output, and stamped
-`semantic_skip_reason=provider_quarantine`; the counts appear in
-`stats.skipped_story_counts` and in every evaluation artifact.
+read from the public `DedupResult` fields and never inferred. A quarantined
+story is excluded from candidate generation, retained unchanged, and stamped
+`semantic_skip_reason=provider_quarantine`.
 
-**C003 is therefore no longer a semantic improvement**, and the previous
-claim that it was has been withdrawn. Its two byte-identical wire stories
-genuinely are one story, but recovering them requires overruling an
-authoritative conflict with a similarity score, which the trust policy does
-not permit. C003 stays an under-merge for M2+M3 exactly as it is for M2
-alone. That is the cost of the policy, stated rather than hidden.
+**C003 is therefore not a semantic improvement.** Its two identical wire
+stories are one story, but recovering them requires overruling an
+authoritative conflict with a similarity score. C003 stays an under-merge
+for M2+M3 exactly as for M2 alone.
 
-### Guard corrections
+### The nine guards
 
-Both are scope defects: a headline-level rule was reading the standfirst.
+`article_type`, `temporal_disagreement`, `role_disagreement`,
+`subject_shift`, `numeric_disagreement`, `contrast_polarity`, `negation`,
+`entity_conflict`, `same_frame_different_event` — in that veto order, which
+is itself a fingerprint component.
 
-- **`same_frame` now reads the headline only.** A frame is a headline
-  template. Two paraphrased standfirsts of one briefing inflate the overlap
-  until ordinary synonym choices look like a swapped event slot — which is
-  what rejected **P054** (0.739321).
-- **`subject_shift` now reads the headline only, minus a trailing
-  attribution clause, with lemma-folded markers.** "…, Apple suppliers say"
-  is attribution, not the article being about a supplier, and "supplier"
-  versus "suppliers" is one subject, not two. Together those rejected
-  **P068** (0.829236).
+**`same_frame` and `subject_shift` read the headline only** (subject_shift
+also strips a trailing attribution clause and lemma-folds its markers). A
+frame is a headline template and a subject is a headline subject; reading
+the standfirst as well rejected P054 and P068.
 
-Both fixes are general. All three subject-shift negatives (P145, P146,
-P148) and every same-frame negative (P081, P087, P100 …) still veto.
+### Article-type classification
 
-### Article-type classification, hardened
+Two match modes. *Anywhere* phrases identify a genre wherever they appear
+("live updates", "hands on", "what to expect", "is said to"). *Anchored*
+single words are genre labels only in headline position — at the start
+before a delimiter, immediately before a delimiter, or at the end. Either
+way a match adjacent to a corporate designator is discarded.
 
-Each genre is an anchored regular expression with word boundaries, and a
-match inside a capitalised proper-noun run is discarded, so `First Look
-Capital`, `Interview Corp`, `Preview Networks` and `Recap Media` are
-ordinary reports. Bare verbs are not markers: `Company confirms earnings
-date`, `analysts review results`, `live operations` and `the review board`
-all classify as `report`. `confirmation` now requires a
-confirming-a-prior-report shape (`officially confirms`, `confirms the
-report`); P151 still vetoes, via rumour-versus-report.
+That combination handles Title Case without a capitalisation heuristic:
 
-### Explicit entity evidence
+| classifies | as | | stays `report` |
+|---|---|---|---|
+| `Nvidia GTC: Live Updates` | live_blog | | `First Look Capital` |
+| `What To Expect From Nvidia Keynote` | preview | | `Interview Corp` |
+| `A First Look At Apple Headset` | hands_on | | `Preview Networks` |
+| `Tesla Earnings Preview` | preview | | `Recap Media` |
+| `Nvidia Interview: CEO Discusses AI Demand` | interview | | `Company confirms earnings date` |
+| `Apple Product Review` | hands_on | | `CEO confirms guidance` |
+| `Live Blog: Meta Developer Conference` | live_blog | | `the review board` |
+| `AMD Launch Recap` | recap | | `analysts review results` |
+| | | | `live operations` |
 
-A conservative, deterministic guard with no NER dependency: only a
-**capitalised run of two or more words** counts as an entity, a leading
-possessive is stripped (`Apple's App Store` and `App Store` are one
-entity), and a veto needs *both* sides to name an entity the other does
-not. Missing entity evidence is unknown, not contradictory.
+Each classifies identically in sentence case. `confirmation` requires a
+confirming-a-prior-report shape, so a bare "confirms" is ordinary copy.
 
-It catches appointee swaps (`Alice Smith` vs `Bob Jones`), analyst-house
-swaps (`Northfield Securities` vs `Calder Bank Markets`) and partner swaps.
-**Documented limitation:** single-token organisation names are out of scope
-— `Acme acquires Beta` versus `Acme acquires Gamma` is not caught, because
-treating one capitalised word as an entity would misread ordinary headline
-casing. Stripping possessives was required to stop the guard rejecting P059
-and P067.
+### Explicit entity evidence, context-anchored
 
-### Cardinal normalization
+A capitalised run counts **only** when a context puts it in a named slot:
+an appointment verb, a counterparty preposition (`partnership with`,
+`acquires`), a role word (`CEO X`), an analyst-action verb, or a corporate
+designator of its own. Outlet names come from M2's versioned publisher list
+and are excluded outright; headline scaffolding is filtered; a leading
+possessive is stripped.
 
-`eleven ↔ 11`, `twenty-one ↔ 21`, `dozen ↔ 12`, `one hundred ↔ 100`,
-`five million ↔ 5 million`. Conversion is context-sensitive: ordinals stay
-period markers (`first quarter` → `q1`, not `1`), ranges, signs,
-approximation markers, currencies and units stay attached to what they
-qualify, model identifiers like `MI400` are not quantities, and a number
-word inside a capitalised name (`One Medical`) is left alone.
+Roles are compared **separately** — an appointee conflicts with an
+appointee, a counterparty with a counterparty, never across. Missing entity
+evidence is unknown, not contradictory.
+
+| vetoes | does not veto |
+|---|---|
+| `Alice Smith` vs `Bob Jones` appointed | `New York Times` vs `Wall Street Journal` reporting one event |
+| `acquires Beta Corp` vs `Gamma Corp` | `Company Reports Strong Results` vs `Company Posts Strong Results` |
+| `partnership with Company Alpha` vs `Company Beta` | `Apple's App Store` vs `App Store` |
+
+**Documented limitation, unchanged:** single-token organisation names are
+out of scope. `Acme acquires Beta` (no designator) is not caught; adding a
+broad single-token heuristic would misread ordinary headline casing.
+
+### Structured quantities
+
+A quantity is decomposed into approximation, sign, value, range-ness,
+magnitude, currency, percent kind and counted unit, and each field compares
+on its own. Only the **unit** is unknown-if-absent — a record naming no unit
+does not contradict one that does, which is what lets "495,000 vehicles" and
+"495,000 cars" merge.
+
+| equivalent | distinct |
+|---|---|
+| `eleven units` ≡ `11 units` | `about 5 units` ≠ `5 units` |
+| `twenty-one vehicles` ≡ `21 vehicles` | `5 million units` ≠ `5 million dollars` |
+| `dozen chips` ≡ `12 chips` | `5 million` ≠ `5 billion` |
+| `one hundred users` ≡ `100 users` | `at least 5` ≠ `up to 5` |
+| `five million units` ≡ `5 million units` | `5-10 units` ≠ `5 units` |
+| `495,000 vehicles` ≡ `495,000 cars` | `$5 million` ≠ `5 million users` |
+| | `5%` ≠ `5 basis points` |
+
+Quarter and year context is carried by the temporal guard, so `Q1 5 million
+units` and `Q2 5 million units` differ there. Names and identifiers stay
+protected: `One Medical`, `Formula One`, `MI400`, `H100`, `Model 3`.
+
+Approximation qualifiers match on **token boundaries**. They did not, and
+`over` inside `handovers` turned an exact delivery figure into "more than",
+rejecting P055.
 
 ### Result at the committed threshold
 
-`nlp/eval/data/results/m2_m3_pipeline.json`, M2 then M3, 151 scored pairs:
+`m2_m3_pipeline.json`, M2 then M3, 151 scored pairs:
 
 | metric | value | AC-3 |
 |---|---|---|
@@ -719,8 +741,6 @@ word inside a capitalised name (`One Medical`) is left alone.
 | F1 | 0.9091 | |
 | tp / fp / tn / fn | 65 / 0 / 73 / 13 | |
 | complete / failed | true / 0 | |
-
-Recall rose from 0.8077 because P054 and P068 are no longer guard-rejected.
 
 **False positives: none.** **False negatives: 13**, all threshold-driven:
 P049, P050, P051, P057, P058, P059, P060, P065, P067, P072, P073, P075,
@@ -738,26 +758,28 @@ P078.
 | under-merged | C003, C006, C007 | **C003, C006** |
 | permutation failures | none | none |
 
-M3 recovers **C007** only. C003 is held by quarantine (above) and C006 by
-the threshold — its three pairs score 0.6064, 0.6860 and 0.6990.
+M3 recovers C007. C003 is held by quarantine and C006 by the threshold.
 
 ### Reproducibility
 
-Every artifact carries the trust contract and summary, dataset id and
-schema version, model name, revision and embedding dimension, the semantic
-policy fingerprint, the selected threshold with its generated rationale,
-the complete confusion accounting with false-positive and false-negative
-ids, the guard-driven and threshold-driven split, complete/evaluated/failed
-counts, and quarantine-skip counts.
+Every M3 artifact carries a `semantic_metadata` block — model name,
+revision, embedding dimension, semantic input composition, threshold, time
+window, frame-overlap threshold, candidate capacity, guard ordering,
+evidence policy version and fingerprint, the cluster-compatibility policy,
+and the semantic config fingerprint the run actually used — beside the
+trust contract and summary, dataset id and schema version, complete
+confusion accounting with FP/FN ids, the guard-driven and threshold-driven
+split, quarantine-skip ids, and complete/evaluated/failed counts.
 
-Similarity scores are serialized at **six decimal places**
-(`score_precision`). Cosine values come from a float32 model whose last
-bits are not reproducible across BLAS builds or thread counts; six places
-is diffable and re-derivable on the same model build, and it is four orders
-of magnitude finer than the tightest margin in the sweep (0.0247), so no
-decision boundary is obscured. Across *different* model executions the
-artifacts are equal to within that precision — **not byte-identical**, and
-nothing here claims otherwise.
+Cluster-wide compatibility is its own fingerprint component
+(`cluster_compatibility.*`: linkage, compatibility scope, evidence
+combination, quarantine policy, edge order, window scope, candidate
+generation), so changing the linkage rule moves the digest without touching
+`ALGORITHM_VERSION`.
+
+Scores serialize at six decimal places, four orders of magnitude finer than
+the tightest margin in the sweep. Artifacts are equal to within that
+precision across model executions — **not byte-identical**.
 
 ### Cluster semantics
 
