@@ -1,0 +1,449 @@
+{
+  "accounting": {
+    "duplicated_item_ids": [],
+    "failed_case_ids": [],
+    "missing_item_ids": [],
+    "unexpected_item_ids": [],
+    "violations": []
+  },
+  "cases": [
+    {
+      "case_id": "C001",
+      "category": "sparse_bridge_contradictory",
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C001-1"
+        ],
+        [
+          "C001-3"
+        ]
+      ],
+      "indeterminate_item_ids": [
+        "C001-2"
+      ],
+      "over_merged_pairs": [],
+      "permutation_count": 6,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C001-1"
+        ],
+        [
+          "C001-3"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C002",
+      "category": "sparse_bridge_compatible",
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C002-1",
+          "C002-2",
+          "C002-3"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 6,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C002-1",
+          "C002-2",
+          "C002-3"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C003",
+      "category": "provider_conflict_group",
+      "exact_match": false,
+      "expected_partition": [
+        [
+          "C003-2"
+        ],
+        [
+          "C003-1",
+          "C003-3"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 6,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C003-1"
+        ],
+        [
+          "C003-2"
+        ],
+        [
+          "C003-3"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [
+        [
+          "C003-1",
+          "C003-3"
+        ]
+      ],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C004",
+      "category": "url_reuse_group",
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C004-3"
+        ],
+        [
+          "C004-1",
+          "C004-2"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 6,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C004-3"
+        ],
+        [
+          "C004-1",
+          "C004-2"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C005",
+      "category": "repeated_quarterly_group",
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C005-1"
+        ],
+        [
+          "C005-2"
+        ],
+        [
+          "C005-3"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 6,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C005-1"
+        ],
+        [
+          "C005-2"
+        ],
+        [
+          "C005-3"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C006",
+      "category": "semantic_transitivity",
+      "exact_match": false,
+      "expected_partition": [
+        [
+          "C006-1",
+          "C006-2",
+          "C006-3"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 6,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C006-1"
+        ],
+        [
+          "C006-2"
+        ],
+        [
+          "C006-3"
+        ]
+      ],
+      "resolvable_by": "m3",
+      "status": "decidable",
+      "under_merged_pairs": [
+        [
+          "C006-1",
+          "C006-2"
+        ],
+        [
+          "C006-1",
+          "C006-3"
+        ],
+        [
+          "C006-2",
+          "C006-3"
+        ]
+      ],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C007",
+      "category": "mixed_stage_group",
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C007-1",
+          "C007-2",
+          "C007-3",
+          "C007-4"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 24,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C007-1",
+          "C007-2",
+          "C007-3",
+          "C007-4"
+        ]
+      ],
+      "resolvable_by": "m3",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C008",
+      "category": "permutation_equivalence",
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C008-3"
+        ],
+        [
+          "C008-1",
+          "C008-4"
+        ],
+        [
+          "C008-2",
+          "C008-5"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 120,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C008-3"
+        ],
+        [
+          "C008-1",
+          "C008-4"
+        ],
+        [
+          "C008-2",
+          "C008-5"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
+    },
+    {
+      "case_id": "C009",
+      "category": "same_event_different_article",
+      "exact_match": true,
+      "expected_partition": [
+        [
+          "C009-3"
+        ],
+        [
+          "C009-1",
+          "C009-2"
+        ]
+      ],
+      "indeterminate_item_ids": [],
+      "over_merged_pairs": [],
+      "permutation_count": 6,
+      "permutation_stable": true,
+      "predicted_partition": [
+        [
+          "C009-3"
+        ],
+        [
+          "C009-1",
+          "C009-2"
+        ]
+      ],
+      "resolvable_by": "m2",
+      "status": "decidable",
+      "under_merged_pairs": [],
+      "unstable_permutation_count": 0
+    }
+  ],
+  "completeness": {
+    "complete": true,
+    "evaluated_case_count": 9,
+    "failed_case_count": 0,
+    "failed_case_ids": [],
+    "failures": []
+  },
+  "dataset_id": "phase0-dedup-cluster-cases-v1",
+  "limitation": "Multi-item cluster metrics run each case as one batch, so they do observe cluster-wide compatibility, transitivity, quarantine, and window-on-span behaviour that isolated-pair metrics cannot. They are still nine authored cases, not a sample of production traffic, and they are not evidence of production acceptance.",
+  "multi_item_cluster_metrics": {
+    "ambiguous_case_count": 0,
+    "exact_partition_matches": 7,
+    "exact_partition_rate": 0.7777777777777778,
+    "over_merge_case_ids": [],
+    "pairwise_co_clustering": {
+      "accuracy": 0.8857142857142857,
+      "counts": {
+        "false_negative": 4,
+        "false_positive": 0,
+        "true_negative": 18,
+        "true_positive": 13
+      },
+      "f1": 0.8666666666666666,
+      "pair_ids": {
+        "false_negative": [
+          "C003:C003-1|C003-3",
+          "C006:C006-1|C006-2",
+          "C006:C006-1|C006-3",
+          "C006:C006-2|C006-3"
+        ],
+        "false_positive": [],
+        "true_negative": [
+          "C001:C001-1|C001-3",
+          "C003:C003-1|C003-2",
+          "C003:C003-2|C003-3",
+          "C004:C004-1|C004-3",
+          "C004:C004-2|C004-3",
+          "C005:C005-1|C005-2",
+          "C005:C005-1|C005-3",
+          "C005:C005-2|C005-3",
+          "C008:C008-1|C008-2",
+          "C008:C008-1|C008-3",
+          "C008:C008-1|C008-5",
+          "C008:C008-2|C008-3",
+          "C008:C008-2|C008-4",
+          "C008:C008-3|C008-4",
+          "C008:C008-3|C008-5",
+          "C008:C008-4|C008-5",
+          "C009:C009-1|C009-3",
+          "C009:C009-2|C009-3"
+        ],
+        "true_positive": [
+          "C002:C002-1|C002-2",
+          "C002:C002-1|C002-3",
+          "C002:C002-2|C002-3",
+          "C004:C004-1|C004-2",
+          "C007:C007-1|C007-2",
+          "C007:C007-1|C007-3",
+          "C007:C007-1|C007-4",
+          "C007:C007-2|C007-3",
+          "C007:C007-2|C007-4",
+          "C007:C007-3|C007-4",
+          "C008:C008-1|C008-4",
+          "C008:C008-2|C008-5",
+          "C009:C009-1|C009-2"
+        ]
+      },
+      "precision": 1.0,
+      "recall": 0.7647058823529411
+    },
+    "permutation_failures": [],
+    "scored_case_count": 9,
+    "under_merge_case_ids": [
+      "C003",
+      "C006"
+    ]
+  },
+  "predictor": "m2+m3",
+  "schema_version": "phase0.eval_report.clusters.v2",
+  "scope": "multi_item_clusters",
+  "semantic_metadata": {
+    "allow_undated_merges": false,
+    "candidate_capacity": 250,
+    "cluster_compatibility_policy": {
+      "candidate_generation": "exhaustive_within_ticker_and_window",
+      "compatibility_scope": "whole_prospective_cluster",
+      "edge_order": "similarity_descending_then_time_ordered_position",
+      "evidence_combination": "union_of_member_summaries_then_veto_scan",
+      "linkage": "clique_complete_linkage",
+      "quarantine": "provider_quarantined_stories_excluded_from_candidates",
+      "version": "m3.cluster_compatibility.v1",
+      "window_applies_to": "every_pair_inside_the_story"
+    },
+    "embedding_dimension": 384,
+    "evidence_policy_fingerprint": "4400b4803bc6a22dbf1ea8efb4a4ab0c30188c4f8d21c92b980eb9d3d120baef",
+    "evidence_policy_version": "m3.evidence.v6",
+    "frame_overlap_threshold": 0.5,
+    "guard_order": [
+      "article_type",
+      "temporal_disagreement",
+      "role_disagreement",
+      "subject_shift",
+      "numeric_disagreement",
+      "contrast_polarity",
+      "negation",
+      "entity_conflict",
+      "same_frame_different_event"
+    ],
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "score_precision": 6,
+    "semantic_config_fingerprint": "72f9e9f1a9216ad6111b837cb7767ef8ab2c2d0c4a8969cd3d091b14ced5910e",
+    "semantic_input_composition": "m1.compose_embedding_text(title, description)",
+    "similarity_threshold": 0.7,
+    "window_hours": 36.0
+  },
+  "target": "expected_partition",
+  "trust_contract": {
+    "adjudicated": false,
+    "dataset_kind": "synthetic_development",
+    "gate_eligible": false,
+    "labeling_status": "single_author_unadjudicated",
+    "metrics_purpose": "development_regression_only",
+    "real_ingested_evidence": false,
+    "reviewer_count": 1,
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  },
+  "trust_summary": {
+    "detail": "Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "headline": "Synthetic, single-author, unadjudicated development dataset.",
+    "level": "WARNING",
+    "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  }
+}

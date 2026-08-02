@@ -528,3 +528,328 @@ python -m black --check nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
 python -m flake8 nlp/eval tools/eval_dedup.py tests/test_dedup_eval.py
 python -m pytest tests/test_dedup_eval.py
 ```
+
+## Phase 0 semantic dedup (M3, issue #70)
+
+`nlp.semdedup` merges canonical stories that describe one event in different
+words, using M1 embeddings and a threshold selected on M4's labelled set. It
+runs **after** M2 and never changes it.
+
+```python
+from nlp.dedup import DedupConfig, deduplicate
+from nlp.embeddings import EmbeddingService
+from nlp.semdedup import (
+    SemanticDedupConfig, merge_semantic_duplicates, stories_from_dedup,
+)
+
+exact = deduplicate(raw_items, config=DedupConfig(supported_tickers=TICKERS))
+result = merge_semantic_duplicates(
+    stories_from_dedup(exact, raw_items),
+    config=SemanticDedupConfig(supported_tickers=TICKERS),
+    encoder=EmbeddingService(),
+)
+```
+
+**This does not close issue #70.** The DoD requires the stage to be
+"integrated in pipeline"; `pipeline.py` is issue #68 (open, blocked by
+#61/#62). The AC-3 half of the DoD is met *on the committed labelled set* —
+which is synthetic, so it is a design measurement, not the G4 gate result.
+
+### The finding that shaped the design
+
+Sweeping the labelled set with the Phase 0 encoder, cosine similarity alone
+**cannot separate the classes at any threshold**:
+
+| | cosine range |
+|---|---|
+| genuine same-story rewrites | 0.42 – 0.73 |
+| hard negatives (date, magnitude, role, sign changes) | 0.97 – 0.996 |
+
+The classes are *inverted* with respect to similarity, and for a structural
+reason: a real rewrite shares almost no wording with its twin, while a
+template negative that swaps one date or one number shares almost all of it.
+A stage that merged on similarity would merge exactly the pairs it must not.
+
+So M3 is not a threshold with guards bolted on. It is a set of guards with a
+threshold behind them.
+
+### The guards (`nlp/semdedup/evidence.py`)
+
+Each is a static, versioned policy over M2's tokenizer, tried in this order
+so a recorded veto names the most specific true objection:
+
+| guard | refuses |
+|---|---|
+| `temporal_disagreement` | different quarters, fiscal years, months, dates |
+| `numeric_disagreement` | different magnitudes, currencies, units, ranges, signs |
+| `role_disagreement` | different named roles (CFO vs COO) |
+| `subject_shift` | one story is about a supplier, reseller, or agency |
+| `contrast_polarity` | opposing claims: raised/cut, approved/rejected, beat/missed, profit/loss, maintained/withdrawn |
+| `negation` | one explicitly negates where the other does not |
+| `same_frame_different_event` | heavy lexical overlap with a substituted content slot |
+
+The last is the load-bearing one for "same template, different event": when
+two headlines overlap heavily, the tokens they do *not* share are the story.
+A rewrite has the opposite shape — low overlap, high similarity — so it never
+triggers. A strict elaboration ("Apple opens a store" / "…a store in
+Riyadh") adds detail rather than substituting an event and is not caught.
+
+M2's asymmetry is preserved: **explicit disagreement vetoes, missing
+information does not.** A story with no numbers does not contradict one that
+has them. Numbers bind only to neighbours that change their meaning, so
+"1,000 roles" and "1,000 under the plan" agree while "5 million" and
+"5 billion" do not.
+
+### Threshold selection, from evidence
+
+Committed sweep: `nlp/eval/data/results/m3_threshold_sweep.json`, recomputed
+from source after every guard change. Its `selection` block is generated
+from the rows; nothing below is restated by hand in code.
+
+| threshold | P | R | F1 | fp | false positives | guard-driven FN |
+|---|---|---|---|---|---|---|
+| 0.50 | 0.9747 | 0.9872 | **0.9809** | 2 | P079, P080 | none |
+| 0.58 | 0.9867 | 0.9487 | 0.9673 | 1 | P079 | none |
+| 0.65 | 0.9859 | 0.8974 | 0.9396 | 1 | P079 | none |
+| **0.68** | **1.0000** | 0.8590 | 0.9241 | **0** | — | none |
+| **0.70** | **1.0000** | **0.8333** | 0.9091 | **0** | — | none |
+| 0.75 | 1.0000 | 0.7821 | 0.8777 | 0 | — | none |
+| 0.90 | 1.0000 | 0.6282 | 0.7717 | 0 | — | none |
+
+- **0.68 is the lowest tested threshold with zero false positives.**
+  `selected_is_lowest_clean_threshold` is `false`.
+- **0.70 is the provisional precision-first selection**, taken for margin.
+- Highest surviving false-positive score: **0.675315** (P079).
+- Margin at 0.70: **0.024685**.
+- At 0.70 **all 13 false negatives are threshold-driven; none is
+  guard-driven** — measured, and recorded per point as
+  `guard_rejected_positive_ids` / `threshold_rejected_positive_ids`.
+
+F1 peaks at 0.50 and is not used: it buys F1 with two false merges.
+Provisional — synthetic, single-author, unadjudicated, not gate eligible.
+
+### M2 quarantine is authoritative and survives the bridge
+
+M2 quarantines every item under a provider identity that described two
+different articles. That decision used to be dropped at the M2→M3 bridge,
+so M3 could re-merge on cosine what M2 had isolated — and did, at 1.0000.
+
+`StoryInput` now carries `quarantined_member_ids` and `provider_conflicts`,
+read from the public `DedupResult` fields and never inferred. A quarantined
+story is excluded from candidate generation, retained unchanged, and stamped
+`semantic_skip_reason=provider_quarantine`.
+
+**C003 is therefore not a semantic improvement.** Its two identical wire
+stories are one story, but recovering them requires overruling an
+authoritative conflict with a similarity score. C003 stays an under-merge
+for M2+M3 exactly as for M2 alone.
+
+### The nine guards
+
+`article_type`, `temporal_disagreement`, `role_disagreement`,
+`subject_shift`, `numeric_disagreement`, `contrast_polarity`, `negation`,
+`entity_conflict`, `same_frame_different_event` — in that veto order, which
+is itself a fingerprint component.
+
+**`same_frame` and `subject_shift` read the headline only** (subject_shift
+also strips a trailing attribution clause and lemma-folds its markers). A
+frame is a headline template and a subject is a headline subject; reading
+the standfirst as well rejected P054 and P068.
+
+**`same_frame` compares canonicalized quantities, not raw number tokens.**
+Each quantity span in the headline is replaced by one placeholder carrying
+exactly the fields `quantities_conflict` treats as assertions — the counted
+unit is left out, since it is unknown when absent and survives as its own
+token. Without this the guard answered a question about spelling: "five
+million units" and "5 million units" are one claim written two ways, but as
+bare tokens `five` and `5` look like a substituted slot, and the guard
+refused the pair after the quantity comparison had already accepted it. A
+genuinely different quantity still yields a different placeholder, and
+reaches `numeric_disagreement` first in any case — that guard is scanned
+before `same_frame`, so the recorded reason stays the specific one.
+
+### Article-type classification
+
+Two match modes. *Anywhere* phrases identify a genre wherever they appear
+("live updates", "hands on", "what to expect", "is said to"). *Anchored*
+single words are genre labels only in headline position — at the start
+before a delimiter, immediately before a delimiter, or at the end. Either
+way a match adjacent to a corporate designator is discarded.
+
+That combination handles Title Case without a capitalisation heuristic:
+
+| classifies | as | | stays `report` |
+|---|---|---|---|
+| `Nvidia GTC: Live Updates` | live_blog | | `First Look Capital` |
+| `What To Expect From Nvidia Keynote` | preview | | `Interview Corp` |
+| `A First Look At Apple Headset` | hands_on | | `Preview Networks` |
+| `Tesla Earnings Preview` | preview | | `Recap Media` |
+| `Nvidia Interview: CEO Discusses AI Demand` | interview | | `Company confirms earnings date` |
+| `Apple Product Review` | hands_on | | `CEO confirms guidance` |
+| `Live Blog: Meta Developer Conference` | live_blog | | `the review board` |
+| `AMD Launch Recap` | recap | | `analysts review results` |
+| | | | `live operations` |
+
+Each classifies identically in sentence case. `confirmation` requires a
+confirming-a-prior-report shape, so a bare "confirms" is ordinary copy.
+
+### Explicit entity evidence, context-anchored
+
+A capitalised run counts **only** when a context puts it in a named slot:
+an appointment verb, a counterparty preposition (`partnership with`,
+`acquires`), a role word (`CEO X`), an analyst-action verb, or a corporate
+designator of its own. Outlet names come from M2's versioned publisher list
+and are excluded outright; headline scaffolding is filtered; a leading
+possessive is stripped.
+
+Roles are compared **separately** — an appointee conflicts with an
+appointee, a counterparty with a counterparty, never across. Missing entity
+evidence is unknown, not contradictory.
+
+| vetoes | does not veto |
+|---|---|
+| `Alice Smith` vs `Bob Jones` appointed | `New York Times` vs `Wall Street Journal` reporting one event |
+| `acquires Beta Corp` vs `Gamma Corp` | `Company Reports Strong Results` vs `Company Posts Strong Results` |
+| `partnership with Company Alpha` vs `Company Beta` | `Apple's App Store` vs `App Store` |
+
+**Documented limitation, unchanged:** single-token organisation names are
+out of scope. `Acme acquires Beta` (no designator) is not caught; adding a
+broad single-token heuristic would misread ordinary headline casing.
+
+### Structured quantities
+
+A quantity is decomposed into approximation, sign, value, range-ness,
+magnitude, currency, percent kind and counted unit, and each field compares
+on its own. Only the **unit** is unknown-if-absent — a record naming no unit
+does not contradict one that does, which is what lets "495,000 vehicles" and
+"495,000 cars" merge.
+
+| equivalent | distinct |
+|---|---|
+| `eleven units` ≡ `11 units` | `about 5 units` ≠ `5 units` |
+| `twenty-one vehicles` ≡ `21 vehicles` | `5 million units` ≠ `5 million dollars` |
+| `dozen chips` ≡ `12 chips` | `5 million` ≠ `5 billion` |
+| `one hundred users` ≡ `100 users` | `at least 5` ≠ `up to 5` |
+| `five million units` ≡ `5 million units` | `5-10 units` ≠ `5 units` |
+| `495,000 vehicles` ≡ `495,000 cars` | `$5 million` ≠ `5 million users` |
+| | `5%` ≠ `5 basis points` |
+
+Quarter and year context is carried by the temporal guard, so `Q1 5 million
+units` and `Q2 5 million units` differ there. Names and identifiers stay
+protected: `One Medical`, `Formula One`, `MI400`, `H100`, `Model 3`.
+
+Approximation qualifiers match on **token boundaries**. They did not, and
+`over` inside `handovers` turned an exact delivery figure into "more than",
+rejecting P055.
+
+### Result at the committed threshold
+
+`m2_m3_pipeline.json`, M2 then M3, 151 scored pairs:
+
+| metric | value | AC-3 |
+|---|---|---|
+| precision | **1.0000** | ≥ 0.85 ✓ |
+| recall | **0.8333** | ≥ 0.75 ✓ |
+| F1 | 0.9091 | |
+| tp / fp / tn / fn | 65 / 0 / 73 / 13 | |
+| complete / failed | true / 0 | |
+
+**False positives: none.** **False negatives: 13**, all threshold-driven:
+P049, P050, P051, P057, P058, P059, P060, P065, P067, P072, P073, P075,
+P078.
+
+### Multi-item cluster results
+
+`m2_m3_clusters_ground_truth.json`, nine cases against ground truth:
+
+| | M2 alone | M2 + M3 |
+|---|---|---|
+| exact partition match | 6/9 | **7/9** |
+| co-clustering P / R / F1 | 1.0000 / 0.5882 / 0.7407 | **1.0000 / 0.7647 / 0.8667** |
+| over-merged | none | **none** |
+| under-merged | C003, C006, C007 | **C003, C006** |
+| permutation failures | none | none |
+
+M3 recovers C007. C003 is held by quarantine and C006 by the threshold.
+
+### Reproducibility
+
+Every M3 artifact carries a `semantic_metadata` block — model name,
+revision, embedding dimension, semantic input composition, threshold, time
+window, frame-overlap threshold, candidate capacity, guard ordering,
+evidence policy version and fingerprint, the cluster-compatibility policy,
+and the semantic config fingerprint the run actually used — beside the
+trust contract and summary, dataset id and schema version, complete
+confusion accounting with FP/FN ids, the guard-driven and threshold-driven
+split, quarantine-skip ids, and complete/evaluated/failed counts.
+
+Cluster-wide compatibility is its own fingerprint component
+(`cluster_compatibility.*`: linkage, compatibility scope, evidence
+combination, quarantine policy, edge order, window scope, candidate
+generation), so changing the linkage rule moves the digest without touching
+`ALGORITHM_VERSION`.
+
+Scores serialize at six decimal places, four orders of magnitude finer than
+the tightest margin in the sweep. Artifacts are equal to within that
+precision across model executions — **not byte-identical**.
+
+### Cluster semantics
+
+A story is a **clique**: every pair inside it independently cleared the
+threshold, every guard, and the ±36 h window. Single-link chaining would let
+A–B and B–C place A and C together without anything ever comparing them.
+On top of that, each prospective story carries a combined evidence summary,
+so a vague story cannot bridge two that contradict each other — the same
+constant-cost trick M2 uses for its compatibility gate.
+
+Canonical member is the earliest published, outlet then story key breaking
+ties. Every member id, outlet, and source link is carried through, and
+`outlet_count` unions the declared outlets with the retained links so it can
+never undercount them. Merges never cross a ticker. Undated stories do not
+merge by default — without a timestamp the window cannot be enforced.
+
+No durable story id is invented: `story_fingerprint` is a change-detection
+digest over the ticker and the sorted member set, exactly as M2 does.
+
+### Boundaries
+
+- **The encoder is injected**, never constructed. `EmbeddingService`
+  satisfies `StoryEncoder` as-is. No test in this package loads a model or
+  touches the network, and one asserts `sentence_transformers` is not in
+  `sys.modules` after a run.
+- **The embedded text is M1's composition** (`title + "\n\n" + description`),
+  deliberately unlike M2, which owns its content rules: M2's identity keys
+  must not move when the encoder's input changes, whereas M3's whole job is
+  to ask the encoder a question and it must ask it the way everyone else
+  does.
+- **Encoder identity is in the fingerprint.** Same stories, same settings,
+  different model is a different result.
+- **`nlp/semdedup/bridge.py` is the only place M3 knows what an M2 cluster
+  looks like.** Everything else takes `StoryInput`.
+- An encoder failure, wrong vector count, ragged dimension, non-finite or
+  zero vector raises rather than falling back to a lexical comparison.
+  Silently changing which algorithm produced a merge would make the run
+  unexplainable.
+
+### Honest limitations
+
+- **The dataset and the guards share an author.** The reported precision is
+  optimistic for that reason alone: the guard families were written from the
+  same failure taxonomy the negatives were written from. Real-sample
+  numbers (blocked on #61/#62) should be expected to be worse, and the
+  guards will need cases they have not seen.
+- **The guard lexicons are English and finite.** An opposing claim phrased
+  outside them ("greenlights"/"nixes") is invisible to `contrast_polarity`,
+  and the threshold is the only thing left.
+- **Recall is the sacrifice.** Half the semantic rewrites in the set are
+  missed at the committed threshold. That is the deliberate trade, not an
+  accident, and the sweep documents its price exactly.
+
+Lint and test with:
+
+```bash
+python -m black --check nlp/semdedup tests/test_semantic_dedup.py
+python -m flake8 nlp/semdedup tests/test_semantic_dedup.py
+python -m pytest tests/test_semantic_dedup.py
+python -m tools.eval_dedup --stage m2+m3 --precision-floor 0.85 --recall-floor 0.75
+```

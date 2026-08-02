@@ -43,6 +43,12 @@ from nlp.eval.dataset import (
     load_pair_set,
 )
 from nlp.eval.dedup import config_for, m2_isolated_pair_predictor
+from nlp.eval.semantic import (
+    CachingEncoder,
+    pipeline_cluster_predictor,
+    pipeline_isolated_pair_predictor,
+    semantic_config_for,
+)
 from nlp.eval.metrics import (
     EvaluationReport,
     PairPredictor,
@@ -70,24 +76,66 @@ def config_for_cluster_set(case_set: ClusterCaseSet) -> Any:
     return DedupConfig(supported_tickers=tuple(case_set.metadata["tickers"]))
 
 
+_ENCODER: Any = None
+
+
+def _shared_encoder() -> Any:
+    """Build the real embedding service once, on first use.
+
+    Lazily, because scoring M2 must never load a model, and cached, because
+    a sweep re-scores the same stories at every threshold and would
+    otherwise measure the encoder rather than the predicate.
+    """
+
+    global _ENCODER
+    if _ENCODER is None:
+        from nlp.embeddings import EmbeddingService
+
+        _ENCODER = CachingEncoder(EmbeddingService())
+    return _ENCODER
+
+
 #: Stages this build can score one pair at a time.
 StageFactory = Callable[[PairSet], PairPredictor]
 
+
+def _pipeline_pairs(pair_set: PairSet, threshold: float | None = None) -> PairPredictor:
+    return pipeline_isolated_pair_predictor(
+        config_for(pair_set),
+        semantic_config_for(pair_set, threshold),
+        _shared_encoder(),
+    )
+
+
 STAGES: dict[str, StageFactory] = {
     "m2": lambda pair_set: m2_isolated_pair_predictor(config_for(pair_set)),
+    "m2+m3": _pipeline_pairs,
 }
 
 #: Stages this build can score on whole batches.
 ClusterStageFactory = Callable[[ClusterCaseSet], ClusterPredictor]
 
+
+def _pipeline_clusters(case_set: ClusterCaseSet) -> ClusterPredictor:
+    return pipeline_cluster_predictor(
+        config_for_cluster_set(case_set),
+        semantic_config_for(case_set),
+        _shared_encoder(),
+    )
+
+
 CLUSTER_STAGES: dict[str, ClusterStageFactory] = {
     "m2": lambda case_set: m2_cluster_predictor(config_for_cluster_set(case_set)),
+    "m2+m3": _pipeline_clusters,
 }
 
 #: Stages whose merge predicate has a tunable threshold, mapped to the
 #: factory a sweep needs.  M2 has none by construction: no similarity value
-#: participates in any of its accept decisions.
-SWEEPABLE: dict[str, Callable[[PairSet, float], PairPredictor]] = {}
+#: participates in any of its accept decisions.  M3's cosine floor is one,
+#: and it is the only tunable value in the pipeline.
+SWEEPABLE: dict[str, Callable[[PairSet, float], PairPredictor]] = {
+    "m2+m3": _pipeline_pairs,
+}
 
 DEFAULT_SWEEP = (0.70, 0.75, 0.78, 0.80, 0.82, 0.84, 0.86, 0.88, 0.90, 0.92, 0.95)
 
@@ -120,11 +168,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target",
-        default="exact_stage_partition",
+        default=None,
         choices=("exact_stage_partition", "expected_partition"),
         help=(
             "cluster scope only: which committed expectation to score "
-            "against (default: what the exact stage alone should produce)"
+            "against (default: exact_stage_partition for m2, "
+            "expected_partition for m2+m3, since closing the gap to ground "
+            "truth is what the semantic stage is for)"
         ),
     )
     parser.add_argument(
@@ -224,6 +274,263 @@ def _gate(report: EvaluationReport, args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+#: A refusal whose reason names the similarity floor rather than a guard.
+_THRESHOLD_REFUSAL = "below_threshold"
+
+#: Decimal places every similarity score is serialized at.
+#:
+#: Cosine values come out of a float32 model and the last bits are not
+#: reproducible across BLAS builds, thread counts or hardware.  Rounding to
+#: six places makes a committed artifact diffable and re-derivable on the
+#: same model build, and it is far finer than any decision this stage
+#: makes: the tightest margin in the sweep is 0.0247, four orders of
+#: magnitude above the rounding step, so no decision boundary is obscured.
+#: Across *different* model executions the artifacts are equal to within
+#: this precision - not byte-identical, and nothing here claims they are.
+SCORE_PRECISION = 6
+
+
+def _semantic_metadata(dataset: Any) -> dict[str, Any]:
+    """Everything needed to reproduce an M3 run, validated not guessed.
+
+    Each value is read from the object that governs it - the encoder, the
+    configuration, the evidence policy - rather than restated here, and the
+    fingerprints are the ones the stage actually used.
+    """
+
+    from nlp.semdedup import validate_model_metadata
+    from nlp.semdedup.config import SEMANTIC_INPUT_COMPOSITION
+    from nlp.semdedup.evidence import (
+        EVIDENCE_POLICY_VERSION,
+        VETO_REASONS,
+        policy_fingerprint as evidence_fingerprint,
+    )
+    from nlp.semdedup.service import CLUSTER_COMPATIBILITY_POLICY
+
+    encoder = _shared_encoder()
+    model_name, model_revision = validate_model_metadata(encoder)
+    dimension = getattr(encoder, "dimension", None)
+    settings = semantic_config_for(dataset)
+    if not model_name:
+        raise SystemExit("encoder did not declare a model name")
+    return {
+        "model_name": model_name,
+        "model_revision": model_revision,
+        "embedding_dimension": dimension,
+        "semantic_input_composition": SEMANTIC_INPUT_COMPOSITION,
+        "similarity_threshold": settings.similarity_threshold,
+        "window_hours": settings.window_hours,
+        "frame_overlap_threshold": settings.frame_overlap_threshold,
+        "candidate_capacity": settings.max_partition_stories,
+        "allow_undated_merges": settings.allow_undated_merges,
+        "guard_order": list(VETO_REASONS),
+        "evidence_policy_version": EVIDENCE_POLICY_VERSION,
+        "evidence_policy_fingerprint": evidence_fingerprint(),
+        "cluster_compatibility_policy": dict(
+            sorted(CLUSTER_COMPATIBILITY_POLICY.items())
+        ),
+        "semantic_config_fingerprint": settings.fingerprint(
+            model_name=model_name,
+            model_revision=model_revision,
+            embedding_dimension=dimension,
+        ),
+        "score_precision": SCORE_PRECISION,
+    }
+
+
+def _round_scores(payload: dict[str, Any]) -> dict[str, Any]:
+    """Round every serialized similarity to :data:`SCORE_PRECISION`."""
+
+    scores = payload.get("scores")
+    if isinstance(scores, dict):
+        payload["scores"] = {
+            key: round(value, SCORE_PRECISION) if isinstance(value, float) else value
+            for key, value in scores.items()
+        }
+    payload["score_precision"] = SCORE_PRECISION
+    return payload
+
+
+def _confusion_detail(report: EvaluationReport) -> dict[str, Any]:
+    """Split a report's confusion into the fields a reader needs.
+
+    In particular it separates the two reasons a true positive can be
+    missed, which the aggregate recall hides: the pair scored under the
+    similarity floor, or a guard refused it outright.  A guard-driven false
+    negative is a guard defect and a threshold-driven one is the cost of
+    the margin, and conflating them makes the second look like the first.
+    """
+
+    confusion = report.isolated_pair_metrics.confusion
+    guard_driven: list[str] = []
+    threshold_driven: list[str] = []
+    other: list[str] = []
+    for pair_id in confusion.false_negatives:
+        detail = report.details.get(pair_id, "")
+        if _THRESHOLD_REFUSAL in detail:
+            threshold_driven.append(pair_id)
+        elif "not merged:" in detail:
+            guard_driven.append(pair_id)
+        else:
+            other.append(pair_id)
+    return {
+        "counts": {
+            "true_positive": confusion.tp,
+            "false_positive": confusion.fp,
+            "true_negative": confusion.tn,
+            "false_negative": confusion.fn,
+        },
+        "true_positive_ids": list(confusion.true_positives),
+        "false_positive_ids": list(confusion.false_positives),
+        "true_negative_ids": list(confusion.true_negatives),
+        "false_negative_ids": list(confusion.false_negatives),
+        "guard_rejected_positive_ids": sorted(guard_driven),
+        "threshold_rejected_positive_ids": sorted(threshold_driven),
+        "unclassified_negative_ids": sorted(other),
+        "worst_false_positive_score": (
+            max(
+                (
+                    report.scores[pair_id]
+                    for pair_id in confusion.false_positives
+                    if pair_id in report.scores
+                ),
+                default=None,
+            )
+        ),
+        "quarantine_skipped_pair_ids": sorted(
+            pair_id
+            for pair_id, detail in report.details.items()
+            if "provider quarantine" in detail
+        ),
+        "evaluated_case_count": report.evaluated_case_count,
+        "failed_case_count": report.failed_case_count,
+        "failed_case_ids": list(report.failed_case_ids),
+        "complete": report.complete,
+    }
+
+
+def _false_negative_attribution(
+    guard_rejected: list[str], threshold_rejected: list[str]
+) -> str:
+    """Describe what refused the missed merges, from the ID lists themselves.
+
+    A recall number says how many were missed; it does not say whether the
+    threshold or a guard refused them, and those call for opposite
+    remedies.  The sentence is derived rather than written down because a
+    standing claim about which kind exists goes stale the moment a guard
+    changes - the previous wording said "not every false negative is
+    threshold-driven" long after the last guard-driven one had gone.
+    """
+
+    guards, thresholds = len(guard_rejected), len(threshold_rejected)
+    if not guards and not thresholds:
+        return "There are no false negatives at the selected threshold."
+    if not guards:
+        return (
+            f"All {thresholds} false negative(s) at the selected threshold "
+            "are threshold-driven: no guard refused a labelled duplicate, "
+            "and guard_rejected_positive_ids_at_selected is empty. Raising "
+            "recall here is a question about the score, not the guards."
+        )
+    if not thresholds:
+        return (
+            f"All {guards} false negative(s) at the selected threshold are "
+            "guard-driven: every one scored at or above the threshold and "
+            "was refused by a guard, listed in "
+            "guard_rejected_positive_ids_at_selected. Raising recall here is "
+            "a question about the guards, not the score."
+        )
+    return (
+        f"{thresholds} false negative(s) at the selected threshold are "
+        f"threshold-driven and {guards} are guard-driven; the two lists are "
+        "threshold_rejected_positive_ids_at_selected and "
+        "guard_rejected_positive_ids_at_selected. The two call for different "
+        "remedies, so neither count stands for the other."
+    )
+
+
+def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Describe which sweep point the build ships, and why.
+
+    Computed from the sweep rows rather than typed in, so the rationale a
+    reader sees cannot drift from the numbers beside it.  ``None`` for a
+    stage with no configured threshold.
+    """
+
+    if stage not in SWEEPABLE:
+        return None
+    from nlp.semdedup.config import DEFAULT_SIMILARITY_THRESHOLD
+
+    chosen = next(
+        (
+            point
+            for point in points
+            if abs(point["threshold"] - DEFAULT_SIMILARITY_THRESHOLD) < 1e-9
+        ),
+        None,
+    )
+    if chosen is None:
+        return None
+    dirty = [point for point in points if point["counts"]["false_positive"]]
+    clean = [point for point in points if not point["counts"]["false_positive"]]
+    lowest_clean = min(point["threshold"] for point in clean) if clean else None
+    worst_fp_score = max(
+        (
+            score
+            for point in points
+            for score in (point.get("worst_false_positive_score"),)
+            if score is not None
+        ),
+        default=None,
+    )
+    guard_rejected = list(chosen.get("guard_rejected_positive_ids", []))
+    threshold_rejected = list(chosen.get("threshold_rejected_positive_ids", []))
+    return {
+        "selected_threshold": DEFAULT_SIMILARITY_THRESHOLD,
+        "status": "provisional",
+        "basis": "precision_first",
+        "precision_at_selected": chosen["precision"],
+        "recall_at_selected": chosen["recall"],
+        "f1_at_selected": chosen["f1"],
+        "false_positives_at_selected": chosen["false_positives"],
+        "guard_rejected_positive_ids_at_selected": guard_rejected,
+        "threshold_rejected_positive_ids_at_selected": threshold_rejected,
+        "false_negative_attribution": _false_negative_attribution(
+            guard_rejected, threshold_rejected
+        ),
+        "highest_threshold_still_producing_a_false_merge": (
+            max(point["threshold"] for point in dirty) if dirty else None
+        ),
+        "highest_surviving_false_positive_score": worst_fp_score,
+        "margin_over_worst_false_positive": (
+            round(DEFAULT_SIMILARITY_THRESHOLD - worst_fp_score, 6)
+            if worst_fp_score is not None
+            else None
+        ),
+        "lowest_threshold_with_zero_false_merges": lowest_clean,
+        "selected_is_lowest_clean_threshold": (
+            lowest_clean is not None
+            and abs(lowest_clean - DEFAULT_SIMILARITY_THRESHOLD) < 1e-9
+        ),
+        "max_f1_threshold": max(points, key=lambda point: point["f1"] or 0.0)[
+            "threshold"
+        ],
+        "rationale": (
+            "Precision-first. The lowest tested threshold with zero false "
+            "merges is reported as lowest_threshold_with_zero_false_merges; "
+            "the selected value sits above it by a deliberate margin over the "
+            "highest-scoring surviving false positive, rather than on the "
+            "knife edge. The F1 maximum is not used: it buys F1 with false "
+            "merges. " + _false_negative_attribution(guard_rejected, threshold_rejected)
+        ),
+        "caveat": (
+            "Provisional and development-only. Selected on a synthetic, "
+            "single-author, unadjudicated dataset that is not gate eligible; "
+            "these numbers cannot clear K3/G4 or final AC-3."
+        ),
+    }
+
+
 def _dump(payload: object, path: Path | None) -> str:
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     if path is not None:
@@ -263,13 +570,19 @@ def _run_clusters(args: argparse.Namespace) -> int:
             )
         )
         return 0
+    target = args.target or (
+        "expected_partition" if args.stage == "m2+m3" else "exact_stage_partition"
+    )
     report = evaluate_clusters(
         case_set,
         CLUSTER_STAGES[args.stage](case_set),
         name=args.stage,
-        target=args.target,
+        target=target,
     )
-    text = _dump(cluster_payload(report), args.write)
+    payload = cluster_payload(report)
+    if args.stage in CLUSTER_STAGES and args.stage != "m2":
+        payload["semantic_metadata"] = _semantic_metadata(case_set)
+    text = _dump(payload, args.write)
     if args.json:
         print(text, end="")
     else:
@@ -333,13 +646,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             thresholds,
             name=args.stage,
         )
-        payload = {
-            "trust_contract": pair_set.trust.as_dict(),
-            "dataset_id": pair_set.dataset_id,
-            "stage": args.stage,
-            "scope": "isolated_pairs",
-            "sweep": sweep_payload(points),
-        }
+        payload = sweep_payload(points)
+        payload["stage"] = args.stage
+        payload["score_precision"] = SCORE_PRECISION
+        payload["semantic_metadata"] = _semantic_metadata(pair_set)
+        for point, entry in zip(points, payload["points"]):
+            detail = _confusion_detail(point.report)
+            if detail["worst_false_positive_score"] is not None:
+                detail["worst_false_positive_score"] = round(
+                    detail["worst_false_positive_score"], SCORE_PRECISION
+                )
+            entry.update(detail)
+        selection = _selection_block(args.stage, payload["points"])
+        if selection is not None:
+            payload["selection"] = selection
         text = _dump(payload, args.write)
         print(text if args.json else render_sweep(points), end="")
         return 0
@@ -348,13 +668,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     # happened to type: a committed report whose threshold reads "null"
     # cannot be checked against the sweep it is supposed to come from.
     effective = args.threshold
+    if effective is None and args.stage in SWEEPABLE:
+        effective = semantic_config_for(pair_set).similarity_threshold
     report = evaluate_isolated_pairs(
         pair_set,
         _predictor_for(args.stage, pair_set, args.threshold),
         name=args.stage,
         threshold=effective,
     )
-    text = _dump(to_payload(report), args.write)
+    payload = _round_scores(to_payload(report))
+    if args.stage in SWEEPABLE:
+        payload["semantic_metadata"] = _semantic_metadata(pair_set)
+        payload.update(_confusion_detail(report))
+    text = _dump(payload, args.write)
     if args.json:
         print(text, end="")
     else:
