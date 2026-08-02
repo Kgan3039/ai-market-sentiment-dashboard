@@ -681,8 +681,16 @@ def test_the_committed_sweep_reports_every_required_column():
         assert set(point["counts"]) == {
             "true_positive",
             "false_positive",
+            "true_negative",
             "false_negative",
         }
+        for field in (
+            "false_positive_ids",
+            "false_negative_ids",
+            "guard_rejected_positive_ids",
+            "threshold_rejected_positive_ids",
+        ):
+            assert field in point, field
     assert sweep["complete"] is True
     assert sweep["failed_case_count"] == 0
 
@@ -840,7 +848,7 @@ def test_an_encoder_returning_mixed_dimensions_is_an_error():
                 [1.0, 0.0, 0.0] if index else [1.0, 0.0] for index in range(len(texts))
             ]
 
-    with pytest.raises(SemanticDedupEncodingError, match="inconsistent vector"):
+    with pytest.raises(SemanticDedupEncodingError, match="dimension"):
         run(sample_stories(), RaggedEncoder())
 
 
@@ -1417,7 +1425,7 @@ def pair_stories(
             "Apple is said to be preparing a cheaper headset",
             "Apple confirms a cheaper headset is in development",
             ("rumour",),
-            ("confirmation",),
+            (),
         ),
         (
             "P152",
@@ -1525,7 +1533,7 @@ def test_a_count_spelled_in_words_is_a_magnitude_claim():
         "Wolfsberg Motors confirmed reductions across nine European markets.",
     )
 
-    assert numeric_signature(tuple("eleven european markets".split())) == ("eleven",)
+    assert numeric_signature(tuple("eleven european markets".split())) == ("11",)
     assert guard_between(left, right) == "numeric_disagreement"
 
 
@@ -1558,7 +1566,7 @@ def test_a_spelled_count_on_one_side_only_is_missing_information():
 def test_the_evidence_policy_version_moved_with_the_new_guards():
     from nlp.semdedup.evidence import EVIDENCE_POLICY_VERSION, VETO_REASONS
 
-    assert EVIDENCE_POLICY_VERSION == "m3.evidence.v2"
+    assert EVIDENCE_POLICY_VERSION == "m3.evidence.v3"
     assert "article_type" in VETO_REASONS
     assert len(policy_fingerprint()) == 64
 
@@ -1678,11 +1686,12 @@ def test_the_committed_pipeline_cluster_result_matches_a_fresh_run():
     metrics = committed["multi_item_cluster_metrics"]
     assert metrics["over_merge_case_ids"] == []
     assert metrics["permutation_failures"] == []
+    assert set(metrics["under_merge_case_ids"]) == {"C003", "C006"}
     assert committed["completeness"]["complete"] is True
 
 
-def test_m3_closes_the_cluster_under_merges_it_is_responsible_for():
-    """C003 and C007 are M3's to recover; C006 stays below threshold."""
+def test_m3_closes_only_the_under_merges_the_trust_policy_permits():
+    """C007 is M3's to recover. C003 is not: M2 quarantined it."""
 
     committed = json.loads(
         (
@@ -1696,9 +1705,722 @@ def test_m3_closes_the_cluster_under_merges_it_is_responsible_for():
     )
     by_id = {case["case_id"]: case for case in committed["cases"]}
 
-    assert by_id["C003"]["exact_match"]
     assert by_id["C007"]["exact_match"]
+    # C003's two identical wire stories really are one story, but M2
+    # quarantined every item under the conflicting provider identity and a
+    # cosine score is not evidence about which payload was right. M3 leaves
+    # it alone, so it stays an under-merge rather than becoming a false
+    # claim of semantic improvement.
+    assert not by_id["C003"]["exact_match"]
+    assert by_id["C003"]["under_merged_pairs"]
+    assert by_id["C003"]["over_merged_pairs"] == []
     assert not by_id["C006"]["exact_match"]
     assert by_id["C006"]["under_merged_pairs"]
     for case in committed["cases"]:
         assert case["over_merged_pairs"] == [], case["case_id"]
+
+
+# --------------------------------------------------------------------------
+# Quarantine survives the bridge and is never overruled by a score
+# --------------------------------------------------------------------------
+
+from nlp.semdedup import (  # noqa: E402
+    SemanticSkipReason,
+    conflicts_by_item,
+    validate_dimension,
+    validate_model_metadata,
+)
+from nlp.semdedup.evidence import (  # noqa: E402
+    ARTICLE_TYPE_PATTERNS,
+    explicit_entities,
+    policy_components,
+    strip_attribution_clause,
+)
+
+
+def conflicted_items(count: int = 3, ticker: str = "TSLA") -> list[RawItem]:
+    """A feed emitting several different articles under one item id."""
+
+    titles = [
+        "Tesla recalls 12,000 Cybertrucks over a wiper fault",
+        "Tesla recalls Model Y vehicles over a seatbelt anchor",
+        "Tesla recalls 12,000 Cybertrucks over a wiper fault",
+        "Tesla recalls Model 3 vehicles over a brake sensor",
+    ]
+    return [
+        RawItem(
+            item_id=f"c{index}",
+            ticker=ticker,
+            title=titles[index % len(titles)],
+            source="Reuters",
+            url=f"https://reuters.com/{index}",
+            published_at=BASE + timedelta(minutes=10 * index),
+            provider_item_id="reuters:conflict-1",
+        )
+        for index in range(count)
+    ]
+
+
+def bridged(items):
+    exact = deduplicate(items, config=DedupConfig(supported_tickers=UNIVERSE))
+    return exact, stories_from_dedup(exact, items)
+
+
+class IdenticalEncoder(FakeEncoder):
+    """Every story lands on the same point: cosine 1.0 for every pair."""
+
+    def embed_batch(self, texts):
+        self.calls.append(list(texts))
+        return [[1.0, 0.0, 0.0] for _ in texts]
+
+
+def test_quarantine_survives_the_bridge():
+    exact, stories = bridged(conflicted_items())
+
+    assert exact.quarantined_item_ids
+    assert all(entry.is_quarantined for entry in stories)
+    assert all(entry.provider_conflicts for entry in stories)
+    # Read from public result fields, never inferred.
+    assert set(exact.quarantined_item_ids) == {
+        item for entry in stories for item in entry.quarantined_member_ids
+    }
+    assert conflicts_by_item(exact)
+
+
+def test_a_provider_conflict_is_never_overruled_by_cosine_one():
+    """The blocker: identical text under a conflicting feed identity."""
+
+    _, stories = bridged(conflicted_items())
+    result = run(list(stories), IdenticalEncoder())
+
+    assert all(len(entry.member_story_keys) == 1 for entry in result.stories)
+    assert result.stats.candidate_pair_count == 0
+    assert result.stats.skipped_count("provider_quarantine") == len(stories)
+    assert all(
+        entry.semantic_skip_reason is SemanticSkipReason.PROVIDER_QUARANTINE
+        for entry in result.stories
+    )
+
+
+def test_a_quarantined_story_never_merges_with_a_compatible_clean_one():
+    _, quarantined = bridged(conflicted_items(2))
+    clean = story(
+        "clean",
+        "Tesla recalls 12,000 Cybertrucks over a wiper fault",
+        ticker="TSLA",
+        published_at=BASE + timedelta(hours=1),
+        member_ids=("clean-1",),
+        source_links=(SourceLink("clean-1", "cnbc", "https://c/1"),),
+    )
+    result = run(list(quarantined) + [clean], IdenticalEncoder())
+
+    for entry in result.stories:
+        assert len(entry.member_story_keys) == 1
+    assert result.stats.candidate_pair_count == 0
+
+
+def test_two_clean_stories_still_merge_beside_a_quarantined_one():
+    """Quarantine isolates its own items, not the whole batch."""
+
+    _, quarantined = bridged(conflicted_items(2))
+    clean = [
+        story(
+            "a",
+            "Tesla opens a supercharger corridor across Norway",
+            ticker="TSLA",
+            published_at=BASE + timedelta(hours=1),
+            member_ids=("a-1",),
+            source_links=(SourceLink("a-1", "reuters", "https://r/a"),),
+        ),
+        story(
+            "b",
+            "A continuous Tesla charging route now spans Norway",
+            ticker="TSLA",
+            published_at=BASE + timedelta(hours=2),
+            member_ids=("b-1",),
+            source_links=(SourceLink("b-1", "cnbc", "https://c/b"),),
+        ),
+    ]
+    encoder = IdenticalEncoder()
+    result = run(list(quarantined) + clean, encoder)
+    merged = [entry for entry in result.stories if entry.member_count == 2]
+
+    assert len(merged) == 1
+    assert set(merged[0].member_story_keys) == {"a", "b"}
+
+
+def test_multiple_quarantined_clusters_are_all_held_out():
+    tsla = conflicted_items(2, ticker="TSLA")
+    nvda = [
+        RawItem(
+            item_id=f"n{index}",
+            ticker="NVDA",
+            title=title,
+            source="CNBC",
+            url=f"https://cnbc.com/{index}",
+            published_at=BASE + timedelta(minutes=5 * index),
+            provider_item_id="cnbc:conflict-9",
+        )
+        for index, title in enumerate(
+            ["Nvidia posts record revenue", "Nvidia cuts its outlook"]
+        )
+    ]
+    _, stories = bridged(tsla + nvda)
+    result = run(list(stories), IdenticalEncoder())
+
+    assert result.stats.skipped_count("provider_quarantine") == 4
+    assert result.stats.candidate_pair_count == 0
+
+
+def test_quarantine_handling_is_permutation_invariant():
+    _, stories = bridged(conflicted_items(3))
+    baseline = run(list(stories), IdenticalEncoder())
+
+    for shift in range(1, len(stories)):
+        rotated = list(stories[shift:]) + list(stories[:shift])
+        result = run(rotated, IdenticalEncoder())
+        assert [entry.story_fingerprint for entry in result.stories] == [
+            entry.story_fingerprint for entry in baseline.stories
+        ]
+
+
+def test_a_quarantined_story_keeps_every_member_and_link():
+    items = conflicted_items(3)
+    _, stories = bridged(items)
+    result = run(list(stories), IdenticalEncoder())
+
+    assert sorted(
+        member for entry in result.stories for member in entry.member_ids
+    ) == sorted(str(item.item_id) for item in items)
+    assert all(entry.source_links for entry in result.stories)
+
+
+def test_quarantine_metadata_reaches_the_output_model():
+    _, stories = bridged(conflicted_items(2))
+    result = run(list(stories), IdenticalEncoder())
+
+    for entry in result.stories:
+        assert entry.quarantined_member_ids == entry.member_ids
+        assert entry.provider_conflicts == (("reuters", "reuters:conflict-1"),)
+        assert entry.is_quarantined
+
+
+def test_a_story_may_not_quarantine_a_member_it_does_not_own():
+    bad = story("s", "a headline", quarantined_member_ids=("someone-else",))
+
+    with pytest.raises(SemanticDedupInputError, match="not.*its own members"):
+        run([bad], FakeEncoder())
+
+
+# --------------------------------------------------------------------------
+# Overlapping member ids
+# --------------------------------------------------------------------------
+
+
+def test_one_member_shared_between_two_stories_is_refused():
+    stories = [
+        story("a", "first", member_ids=("x", "y")),
+        story("b", "second", member_ids=("y", "z")),
+    ]
+
+    with pytest.raises(SemanticDedupInputError, match="input stories overlap"):
+        run(stories, FakeEncoder())
+
+
+def test_multiple_overlaps_are_all_named():
+    stories = [
+        story("a", "first", member_ids=("x", "y")),
+        story("b", "second", member_ids=("y", "z")),
+        story("c", "third", member_ids=("z", "w")),
+    ]
+
+    with pytest.raises(SemanticDedupInputError) as excinfo:
+        run(stories, FakeEncoder())
+
+    assert "y in" in str(excinfo.value)
+    assert "z in" in str(excinfo.value)
+
+
+def test_overlap_detection_is_permutation_invariant():
+    stories = [
+        story("a", "first", member_ids=("x", "y")),
+        story("b", "second", member_ids=("y", "z")),
+        story("c", "third", member_ids=("q",)),
+    ]
+
+    for shift in range(len(stories)):
+        rotated = stories[shift:] + stories[:shift]
+        with pytest.raises(SemanticDedupInputError, match="input stories overlap"):
+            run(rotated, FakeEncoder())
+
+
+def test_disjoint_member_ids_are_accepted():
+    stories = [
+        story("a", "first", member_ids=("x",)),
+        story("b", "second", member_ids=("y",), published_at=BASE + timedelta(hours=1)),
+    ]
+
+    result = run(stories, FakeEncoder())
+
+    assert sorted(
+        member for entry in result.stories for member in entry.member_ids
+    ) == ["x", "y"]
+
+
+# --------------------------------------------------------------------------
+# Article-type classification: boundaries and entity names
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Nvidia GTC keynote: live updates", ("live_blog",)),
+        ("Nvidia GTC: as it happened", ("live_blog",)),
+        ("What Tesla's delivery number means for the year", ("analysis",)),
+        ("Explainer: how the chip export rules work", ("analysis",)),
+        ("Meta finance chief explains the advertising acceleration", ("interview",)),
+        ("Nvidia chief executive sits down with the FT", ("interview",)),
+        ("Hands on with AMD's MI400 accelerator", ("hands_on",)),
+        ("A first look at the cheaper Apple headset", ("hands_on",)),
+        ("Apple is said to be preparing a cheaper headset", ("rumour",)),
+        ("Tesla reportedly delays the Roadster again", ("rumour",)),
+        (
+            "Apple officially confirms the report of a cheaper headset",
+            ("confirmation",),
+        ),
+        ("Opinion: why the chip cycle turned", ("opinion",)),
+        ("What to expect from the Nvidia keynote", ("preview",)),
+        ("The week in chip supply", ("recap",)),
+        ("Nvidia reports record data centre revenue", ()),
+    ],
+)
+def test_each_article_genre_is_detected(text, expected):
+    assert article_types(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Company confirms earnings date",
+        "First Look Capital raises a new fund",
+        "Interview Corp reports quarterly results",
+        "Preview Networks buys a studio",
+        "Recap Media names a chief executive",
+        "The review board approved the plan",
+        "Analysts review results after the close",
+        "Live operations resume at the Berlin plant",
+        "Tesla previews nothing at the shareholder meeting",
+        "Apple confirms it will report on Thursday",
+    ],
+)
+def test_ordinary_text_is_not_given_a_genre(text):
+    """A genre veto on ordinary copy would split real rewrites."""
+
+    assert article_types(text) == ()
+
+
+def test_a_marker_inside_a_company_name_is_ignored():
+    assert article_types("First Look Capital raises a fund") == ()
+    assert "look capital" in explicit_entities("First Look Capital raises a fund")
+
+
+def test_every_registered_genre_has_a_pattern():
+    names = {name for name, _ in ARTICLE_TYPE_PATTERNS}
+
+    assert names == {
+        "live_blog",
+        "analysis",
+        "interview",
+        "hands_on",
+        "rumour",
+        "confirmation",
+        "opinion",
+        "preview",
+        "recap",
+    }
+
+
+def test_uncertainty_produces_a_report_not_a_veto():
+    left, right = pair_stories(
+        "Nvidia reports record data centre revenue",
+        "Nvidia's data centre business posts an all-time high",
+    )
+
+    assert article_types(left.title) == ()
+    assert article_types(right.title) == ()
+    assert guard_between(left, right) is None
+
+
+# --------------------------------------------------------------------------
+# Explicit entity evidence
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        (
+            "Alice Smith appointed chief financial officer",
+            "Bob Jones appointed chief financial officer",
+        ),
+        (
+            "Northfield Securities raised its Nvidia target",
+            "Calder Bank Markets raised its Nvidia target",
+        ),
+        (
+            "Meta signs a partnership with Harbourline Media",
+            "Meta signs a partnership with Pacific Advanced Packaging",
+        ),
+        ("Acme Holdings appoints a new chair", "Beta Industries appoints a new chair"),
+    ],
+)
+def test_conflicting_explicit_entities_veto_a_semantic_merge(left, right):
+    assert guard_between(*pair_stories(left, right)) == "entity_conflict"
+
+
+def test_missing_entity_evidence_is_unknown_not_contradictory():
+    """A record that names nobody never blocks a merge."""
+
+    assert (
+        guard_between(
+            *pair_stories(
+                "Alice Smith appointed chief financial officer",
+                "The chipmaker names a new finance chief",
+            )
+        )
+        is None
+    )
+
+
+def test_a_shared_entity_plus_an_extra_one_is_elaboration():
+    assert (
+        guard_between(
+            *pair_stories(
+                "Apple wins dismissal of an App Store class action",
+                "Judge throws out the App Store suit brought by Acme Holdings",
+            )
+        )
+        != "entity_conflict"
+    )
+
+
+def test_paraphrased_same_entity_stories_still_merge():
+    """The entity guard must not block a rewrite that names one entity."""
+
+    for left, right in (
+        (
+            "Wolfsberg Motors cuts prices across eleven European markets",
+            "Buyers in Europe get cheaper cars as Wolfsberg Motors trims "
+            "its list price",
+        ),
+        (
+            "Alice Smith takes the finance chief role at the chipmaker",
+            "The chipmaker has named Alice Smith to run its finance function",
+        ),
+    ):
+        assert guard_between(*pair_stories(left, right)) is None
+
+
+def test_the_entity_guard_alone_does_not_object_to_a_shared_name():
+    """Isolating the entity check from the frame check.
+
+    A paraphrase whose wording overlaps heavily still trips ``same_frame``
+    by design - the frame guard cannot tell a synonym substitution from an
+    event substitution, which is why real rewrites are recognised by their
+    *low* lexical overlap. What matters here is that the entity evidence
+    itself agrees.
+    """
+
+    left = summarize("Wolfsberg Motors cuts European prices")
+    right = summarize("European prices fall at Wolfsberg Motors")
+
+    assert left.entities == right.entities == frozenset({("wolfsberg motors",)})
+    assert contradiction(left, right, frame_overlap=1.0) is None
+
+
+def test_a_single_capitalised_word_is_not_treated_as_an_entity():
+    """Ordinary headline casing is not evidence."""
+
+    assert explicit_entities("Acme acquires Beta") == ()
+    assert guard_between(
+        *pair_stories("Acme acquires Beta", "Acme acquires Gamma")
+    ) != ("entity_conflict")
+
+
+def test_a_possessive_prefix_is_not_part_of_the_name():
+    assert explicit_entities("Apple's App Store ruling") == ("app store",)
+    assert explicit_entities("An App Store ruling") == ("app store",)
+
+
+# --------------------------------------------------------------------------
+# Cardinal normalization
+# --------------------------------------------------------------------------
+
+
+def numbers(text: str, protected: frozenset[str] = frozenset()):
+    from nlp.dedup.structural import tokenize as _tokenize
+
+    return numeric_signature(_tokenize(text), protected)
+
+
+@pytest.mark.parametrize(
+    "written,digits",
+    [
+        ("eleven European markets", "11 European markets"),
+        ("twenty-one new sites", "21 new sites"),
+        ("a dozen models", "12 models"),
+        ("one hundred stores", "100 stores"),
+        ("five million units", "5 million units"),
+        ("forty-two engineers", "42 engineers"),
+    ],
+)
+def test_equivalent_cardinal_forms_normalize_together(written, digits):
+    assert numbers(written) == numbers(digits)
+    assert numbers(written)
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        ("eleven markets", "nine markets"),
+        ("five million units", "five billion units"),
+        ("twenty-one sites", "twenty sites"),
+        ("100 stores", "1,000 stores"),
+        ("$35,000 price", "€35,000 price"),
+        ("5-10% growth", "10-15% growth"),
+        ("-5% margin", "5% margin"),
+        ("50bps improvement", "50% improvement"),
+    ],
+)
+def test_distinct_quantities_stay_distinct(left, right):
+    assert numbers(left) != numbers(right)
+
+
+def test_ordinals_are_not_cardinals():
+    """ "first quarter" is a period, not the number one."""
+
+    assert numbers("the first quarter") == ()
+    assert temporal_markers(tuple("the first quarter".split())) == ("q1",)
+
+
+def test_a_number_word_inside_a_name_is_not_a_quantity():
+    protected = frozenset({"one", "medical"})
+
+    assert numbers("One Medical clinics", protected) == ()
+    assert numbers("one hundred clinics") == ("100",)
+
+
+def test_a_model_identifier_is_not_a_quantity():
+    assert numbers("the MI400 accelerator") == ()
+
+
+# --------------------------------------------------------------------------
+# Model and encoder validation
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name,revision,message",
+    [
+        ("", "v1", "non-blank model_name"),
+        ("   ", "v1", "non-blank model_name"),
+        (None, "v1", "non-blank model_name"),
+        ("m", "", "model_revision"),
+        ("m", "  ", "model_revision"),
+    ],
+)
+def test_unusable_model_metadata_is_refused(name, revision, message):
+    encoder = FakeEncoder()
+    encoder.model_name = name
+    encoder.model_revision = revision
+
+    with pytest.raises(SemanticDedupEncodingError, match=message):
+        validate_model_metadata(encoder)
+
+
+def test_a_missing_revision_is_allowed():
+    encoder = FakeEncoder()
+    encoder.model_revision = None
+
+    assert validate_model_metadata(encoder) == ("fake-encoder", None)
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, "384"])
+def test_an_unusable_declared_dimension_is_refused(value):
+    with pytest.raises(SemanticDedupEncodingError, match="positive integer"):
+        validate_dimension(value)
+
+
+def test_a_vector_that_contradicts_the_declared_dimension_is_refused():
+    class Declared(FakeEncoder):
+        dimension = 5
+
+        def embed_batch(self, texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    with pytest.raises(SemanticDedupEncodingError, match="dimension"):
+        run(sample_stories(), Declared())
+
+
+def test_the_result_records_the_model_and_the_dimension():
+    result = run(sample_stories(), sample_encoder())
+
+    assert result.model_name == "fake-encoder"
+    assert result.model_revision == "v1"
+    assert result.embedding_dimension == 3
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_the_caching_encoder_rejects_a_count_mismatch(delta):
+    from nlp.eval.semantic import CachingEncoder
+
+    class Miscounting(FakeEncoder):
+        def embed_batch(self, texts):
+            base = [[1.0, 0.0, 0.0] for _ in texts]
+            return base[:-1] if delta < 0 else base + [[1.0, 0.0, 0.0]]
+
+    with pytest.raises(SemanticDedupEncodingError, match="counts must match"):
+        CachingEncoder(Miscounting()).embed_batch(["a", "b", "c"])
+
+
+def test_the_caching_encoder_rejects_a_blank_model_name():
+    from nlp.eval.semantic import CachingEncoder
+
+    encoder = FakeEncoder()
+    encoder.model_name = "   "
+
+    with pytest.raises(SemanticDedupEncodingError, match="non-blank model_name"):
+        CachingEncoder(encoder)
+
+
+def test_the_caching_encoder_returns_one_vector_per_request_in_order():
+    from nlp.eval.semantic import CachingEncoder
+
+    inner = FakeEncoder()
+    cached = CachingEncoder(inner)
+
+    first = cached.embed_batch(["a", "b", "a"])
+    second = cached.embed_batch(["b", "c"])
+
+    assert len(first) == 3 and first[0] == first[2]
+    assert second[0] == first[1]
+    assert inner.calls == [["a", "b"], ["c"]]
+
+
+# --------------------------------------------------------------------------
+# Policy fingerprint coverage
+# --------------------------------------------------------------------------
+
+
+def test_every_behaviour_changing_rule_is_a_registered_component():
+    components = policy_components()
+
+    for name in (
+        "article_type_patterns",
+        "article_type_version",
+        "cardinal_values",
+        "cardinal_version",
+        "contrasts",
+        "entity_version",
+        "evidence_version",
+        "function_words",
+        "guard_order",
+        "months",
+        "negation_tokens",
+        "non_entity_capitals",
+        "numeric_token",
+        "proper_run",
+        "quarters",
+        "roles",
+        "same_frame_scope",
+        "subject_lemmas",
+        "subject_scope",
+        "attribution_clause",
+        "tokenizer",
+    ):
+        assert name in components, name
+
+
+def test_the_config_fingerprint_registers_every_component():
+    settings = config()
+    components = settings.fingerprint_components(
+        model_name="m", model_revision="v1", embedding_dimension=384
+    )
+
+    for name in (
+        "algorithm_version",
+        "semantic_input_composition",
+        "similarity_threshold",
+        "window_hours",
+        "frame_overlap_threshold",
+        "max_partition_stories",
+        "supported_tickers",
+        "model_name",
+        "model_revision",
+        "embedding_dimension",
+    ):
+        assert name in components, name
+    assert any(name.startswith("evidence.") for name in components)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"similarity_threshold": 0.71},
+        {"window_hours": 24},
+        {"frame_overlap_threshold": 0.6},
+        {"max_partition_stories": 100},
+        {"allow_undated_merges": True},
+        {"supported_tickers": ["NVDA"]},
+    ],
+)
+def test_each_setting_moves_the_fingerprint(overrides):
+    baseline = config().fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=384
+    )
+    changed = config(**overrides).fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=384
+    )
+
+    assert baseline != changed
+
+
+@pytest.mark.parametrize(
+    "model_name,revision,dimension",
+    [("other", "v1", 384), ("m", "v2", 384), ("m", "v1", 8), ("m", None, 384)],
+)
+def test_model_identity_moves_the_fingerprint(model_name, revision, dimension):
+    baseline = config().fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=384
+    )
+
+    assert baseline != config().fingerprint(
+        model_name=model_name,
+        model_revision=revision,
+        embedding_dimension=dimension,
+    )
+
+
+def test_editing_a_guard_lexicon_moves_the_fingerprint(monkeypatch):
+    """No manual version bump required."""
+
+    from nlp.semdedup import evidence
+
+    baseline = policy_fingerprint()
+    monkeypatch.setattr(
+        evidence, "_SUBJECT_LEMMAS", dict(evidence._SUBJECT_LEMMAS, broker="broker")
+    )
+
+    assert policy_fingerprint() != baseline
+
+
+def test_the_attribution_stripper_leaves_a_real_subject_alone():
+    assert (
+        strip_attribution_clause("Nvidia's packaging supplier expands capacity")
+        == "Nvidia's packaging supplier expands capacity"
+    )
+    assert (
+        strip_attribution_clause("Production moves out of China, Apple suppliers say")
+        == "Production moves out of China"
+    )

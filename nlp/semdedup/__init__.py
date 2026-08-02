@@ -31,7 +31,7 @@ same-story rewrites from hard negatives at any threshold; see
 
 from __future__ import annotations
 
-from .bridge import stories_from_dedup, story_from_cluster
+from .bridge import conflicts_by_item, stories_from_dedup, story_from_cluster
 from .config import (
     ALGORITHM_VERSION,
     DEFAULT_FRAME_OVERLAP,
@@ -39,7 +39,12 @@ from .config import (
     DEFAULT_WINDOW_HOURS,
     SemanticDedupConfig,
 )
-from .encoding import StoryEncoder, story_text
+from .encoding import (
+    StoryEncoder,
+    story_text,
+    validate_dimension,
+    validate_model_metadata,
+)
 from .errors import (
     SemanticDedupCapacityError,
     SemanticDedupConfigError,
@@ -54,6 +59,7 @@ from .models import (
     SemanticDedupStats,
     SemanticMerge,
     SemanticMergeReason,
+    SemanticSkipReason,
     SemanticStory,
     SourceLink,
     StoryInput,
@@ -77,13 +83,17 @@ __all__ = [
     "SemanticDedupStats",
     "SemanticMerge",
     "SemanticMergeReason",
+    "SemanticSkipReason",
     "SemanticStory",
     "SourceLink",
     "StoryEncoder",
     "StoryInput",
     "merge_semantic_duplicates",
+    "conflicts_by_item",
     "stories_from_dedup",
     "story_fingerprint_for",
     "story_from_cluster",
     "story_text",
+    "validate_dimension",
+    "validate_model_metadata",
 ]

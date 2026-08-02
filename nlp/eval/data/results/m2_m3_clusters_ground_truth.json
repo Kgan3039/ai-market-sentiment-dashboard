@@ -68,7 +68,7 @@
     {
       "case_id": "C003",
       "category": "provider_conflict_group",
-      "exact_match": true,
+      "exact_match": false,
       "expected_partition": [
         [
           "C003-2"
@@ -84,16 +84,23 @@
       "permutation_stable": true,
       "predicted_partition": [
         [
+          "C003-1"
+        ],
+        [
           "C003-2"
         ],
         [
-          "C003-1",
           "C003-3"
         ]
       ],
       "resolvable_by": "m2",
       "status": "decidable",
-      "under_merged_pairs": [],
+      "under_merged_pairs": [
+        [
+          "C003-1",
+          "C003-3"
+        ]
+      ],
       "unstable_permutation_count": 0
     },
     {
@@ -317,20 +324,21 @@
   "limitation": "Multi-item cluster metrics run each case as one batch, so they do observe cluster-wide compatibility, transitivity, quarantine, and window-on-span behaviour that isolated-pair metrics cannot. They are still nine authored cases, not a sample of production traffic, and they are not evidence of production acceptance.",
   "multi_item_cluster_metrics": {
     "ambiguous_case_count": 0,
-    "exact_partition_matches": 8,
-    "exact_partition_rate": 0.8888888888888888,
+    "exact_partition_matches": 7,
+    "exact_partition_rate": 0.7777777777777778,
     "over_merge_case_ids": [],
     "pairwise_co_clustering": {
-      "accuracy": 0.9142857142857143,
+      "accuracy": 0.8857142857142857,
       "counts": {
-        "false_negative": 3,
+        "false_negative": 4,
         "false_positive": 0,
         "true_negative": 18,
-        "true_positive": 14
+        "true_positive": 13
       },
-      "f1": 0.9032258064516129,
+      "f1": 0.8666666666666666,
       "pair_ids": {
         "false_negative": [
+          "C003:C003-1|C003-3",
           "C006:C006-1|C006-2",
           "C006:C006-1|C006-3",
           "C006:C006-2|C006-3"
@@ -360,7 +368,6 @@
           "C002:C002-1|C002-2",
           "C002:C002-1|C002-3",
           "C002:C002-2|C002-3",
-          "C003:C003-1|C003-3",
           "C004:C004-1|C004-2",
           "C007:C007-1|C007-2",
           "C007:C007-1|C007-3",
@@ -374,11 +381,12 @@
         ]
       },
       "precision": 1.0,
-      "recall": 0.8235294117647058
+      "recall": 0.7647058823529411
     },
     "permutation_failures": [],
     "scored_case_count": 9,
     "under_merge_case_ids": [
+      "C003",
       "C006"
     ]
   },

@@ -15,6 +15,16 @@ from datetime import datetime
 from enum import Enum
 
 
+class SemanticSkipReason(str, Enum):
+    """Why a story was kept out of semantic candidate generation."""
+
+    #: Every member is under an M2 provider-identity quarantine.  M2 found
+    #: one feed identifier describing two different articles and could not
+    #: tell which payload was right; a cosine score is not evidence about
+    #: which one is, so M3 does not get to overrule it.
+    PROVIDER_QUARANTINE = "provider_quarantine"
+
+
 class SemanticMergeReason(str, Enum):
     """Why two canonical stories were merged."""
 
@@ -51,6 +61,25 @@ class StoryInput:
     #: Every raw item collapsed into this story.
     member_ids: tuple[str, ...] = ()
     source_links: tuple[SourceLink, ...] = ()
+    #: Member ids M2 quarantined under a provider-identity conflict, read
+    #: from ``DedupResult.quarantined_item_ids``.  Never inferred.
+    quarantined_member_ids: tuple[str, ...] = ()
+    #: ``(namespace, provider_item_id)`` of every conflict touching this
+    #: story, from ``DedupResult.provider_conflicts``.
+    provider_conflicts: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def is_quarantined(self) -> bool:
+        """True when M2 isolated this story's members on a conflict.
+
+        A story is quarantined when *every* member is, which is what M2
+        produces: quarantine applies to all items under a conflicting
+        provider identity, and such a cluster is always a singleton.
+        """
+
+        return bool(self.member_ids) and set(self.quarantined_member_ids) == set(
+            self.member_ids
+        )
 
 
 @dataclass(frozen=True)
@@ -102,8 +131,20 @@ class SemanticStory:
     source_links: tuple[SourceLink, ...]
     #: Accepted merge edges, sorted; empty for a story M3 did not touch.
     merges: tuple[SemanticMerge, ...]
+    #: Quarantined member ids carried through unchanged from M2.
+    quarantined_member_ids: tuple[str, ...]
+    #: Provider conflicts touching this story, carried through from M2.
+    provider_conflicts: tuple[tuple[str, str], ...]
+    #: Set when the story was held out of candidate generation.
+    semantic_skip_reason: SemanticSkipReason | None
     content_hash: str
     algorithm_version: str
+
+    @property
+    def is_quarantined(self) -> bool:
+        """True when this story carries an unresolved M2 provider conflict."""
+
+        return self.semantic_skip_reason is SemanticSkipReason.PROVIDER_QUARANTINE
 
     @property
     def member_count(self) -> int:
@@ -142,6 +183,13 @@ class SemanticDedupStats:
     veto_counts: tuple[tuple[str, int], ...] = ()
     #: Stories with no usable text, which cannot be compared at all.
     unencodable_story_count: int = 0
+    #: Stories held out of candidate generation, by reason, sorted.
+    skipped_story_counts: tuple[tuple[str, int], ...] = ()
+
+    def skipped_count(self, reason: str) -> int:
+        """Number of stories held out for this reason."""
+
+        return dict(self.skipped_story_counts).get(reason, 0)
 
     def veto_count(self, reason: str) -> int:
         """Number of candidate pairs refused for this reason."""
@@ -162,6 +210,8 @@ class SemanticDedupResult:
     #: be invalidated when the model moves.
     model_name: str
     model_revision: str | None
+    #: Vector width the run actually used; ``None`` when nothing encodable.
+    embedding_dimension: int | None = None
 
     @property
     def story_by_member(self) -> dict[str, SemanticStory]:

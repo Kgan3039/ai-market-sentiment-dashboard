@@ -53,6 +53,41 @@ def story_text(story: StoryInput) -> str | None:
         return None
 
 
+def validate_model_metadata(encoder: StoryEncoder) -> tuple[str, str | None]:
+    """Return the encoder's declared identity, or refuse to record nothing.
+
+    A stored vector is only reusable if the run that produced it is
+    identifiable.  A blank model name makes the fingerprint meaningless and
+    a cached result unfalsifiable, so it is rejected rather than recorded
+    as an empty string.
+    """
+
+    name = getattr(encoder, "model_name", None)
+    if not isinstance(name, str) or not name.strip():
+        raise SemanticDedupEncodingError(
+            "encoder must declare a non-blank model_name; a vector whose "
+            "producer is unnamed cannot be invalidated when the model moves"
+        )
+    revision = getattr(encoder, "model_revision", None)
+    if revision is not None and (not isinstance(revision, str) or not revision.strip()):
+        raise SemanticDedupEncodingError(
+            "encoder model_revision must be a non-blank string or None"
+        )
+    return name.strip(), revision.strip() if isinstance(revision, str) else None
+
+
+def validate_dimension(value: object) -> int | None:
+    """Validate a declared embedding dimension, or ``None`` when unknown."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SemanticDedupEncodingError(
+            f"declared embedding dimension must be a positive integer, got {value!r}"
+        )
+    return value
+
+
 def encode_stories(
     stories: Sequence[StoryInput], encoder: StoryEncoder
 ) -> tuple[list[Any | None], int]:
@@ -69,20 +104,24 @@ def encode_stories(
     vectors: list[Any | None] = [None] * len(stories)
     if not texts:
         return vectors, len(stories)
-    encoded = encoder.embed_batch(texts)
+    encoded = list(encoder.embed_batch(texts))
     if len(encoded) != len(texts):
         raise SemanticDedupEncodingError(
-            f"encoder returned {len(encoded)} vectors for {len(texts)} stories"
+            f"encoder returned {len(encoded)} vectors for {len(texts)} stories; "
+            "the counts must match exactly, in order"
         )
-    dimension: int | None = None
+    declared = validate_dimension(getattr(encoder, "dimension", None))
+    dimension: int | None = declared
     for index, vector in zip(indices, encoded):
         size = _validated_size(vector, stories[index].story_key)
         if dimension is None:
             dimension = size
         elif size != dimension:
             raise SemanticDedupEncodingError(
-                "encoder returned inconsistent vector dimensions "
-                f"({dimension} then {size})"
+                "encoder returned a vector of dimension "
+                f"{size} where {dimension} was "
+                + ("declared" if declared is not None else "seen first")
+                + f" (story {stories[index].story_key!r})"
             )
         vectors[index] = vector
     return vectors, len(stories) - len(indices)

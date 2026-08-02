@@ -603,76 +603,110 @@ has them. Numbers bind only to neighbours that change their meaning, so
 ### Threshold selection, from evidence
 
 Committed sweep: `nlp/eval/data/results/m3_threshold_sweep.json`, recomputed
-from source against the **corrected 153-pair set** (78 duplicate / 73
-distinct / 2 ambiguous, 151 scored). The old sweep was recorded against
-labels in which five of these pairs were `ambiguous` and therefore excluded
-from scoring; they are now scored negatives, and the numbers below are the
-honest ones.
+from source against the corrected 153-pair set (151 scored) **after** the
+guard fixes below.
 
-| threshold | P | R | F1 | fp | false positives |
-|---|---|---|---|---|---|
-| 0.50 | 0.9740 | 0.9615 | **0.9677** | 2 | P079, P080 |
-| 0.58 | 0.9863 | 0.9231 | 0.9536 | 1 | P079 |
-| 0.65 | 0.9855 | 0.8718 | 0.9252 | 1 | P079 |
-| 0.68 | 1.0000 | 0.8333 | 0.9091 | 0 | — |
-| **0.70** | **1.0000** | **0.8077** | 0.8936 | **0** | — |
-| 0.75 | 1.0000 | 0.7692 | 0.8696 | 0 | — |
-| 0.90 | 1.0000 | 0.6282 | 0.7717 | 0 | — |
+| threshold | P | R | F1 | fp | false positives | guard-driven FN |
+|---|---|---|---|---|---|---|
+| 0.50 | 0.9747 | 0.9872 | **0.9809** | 2 | P079, P080 | none |
+| 0.58 | 0.9867 | 0.9487 | 0.9673 | 1 | P079 | none |
+| 0.65 | 0.9859 | 0.8974 | 0.9396 | 1 | P079 | none |
+| **0.68** | **1.0000** | 0.8590 | 0.9241 | **0** | — | none |
+| **0.70** | **1.0000** | **0.8333** | 0.9091 | **0** | — | none |
+| 0.75 | 1.0000 | 0.7821 | 0.8777 | 0 | — | none |
+| 0.90 | 1.0000 | 0.6282 | 0.7717 | 0 | — | none |
 
-**0.70 remains the committed default, but for a different reason.** Under the
-old labels it produced zero *apparent* false merges; under the corrected ones
-the same threshold produced **four** (P144, P150, P151, P153). Those are now
-refused by guards, not by the number. Precision reaches 1.0000 at 0.68; 0.70
-is taken for margin over the highest-scoring false merge that survives (P079
-at 0.6753) while recall still clears AC-3's 0.75 floor. F1 peaks at 0.50 and
-is not used: it buys F1 with two false merges.
+The accurate statements, all generated into the artifact's `selection`
+block from the rows rather than written by hand:
 
-The threshold is **provisional** — selected on a synthetic, single-author,
-unadjudicated development dataset that is not gate eligible. The committed
-sweep carries that caveat in a `selection` block generated from the rows
-rather than typed in.
+- **0.68 is the lowest tested threshold with zero false positives.**
+  `selected_is_lowest_clean_threshold` is `false`.
+- **0.70 is a provisional precision-first choice with additional margin.**
+- Highest surviving false-positive score: **0.675315** (P079).
+- Margin at 0.70: **0.024685**; at 0.68 it would be 0.004685.
+- At 0.70 all **13** false negatives are threshold-driven and **none** is
+  guard-driven — but that is a measured result, not a property of the
+  design, and the sweep records both lists separately at every point.
 
-### The article-type guard
+F1 peaks at 0.50 (0.9809) and is not used: it buys F1 with two false
+merges. The threshold is **provisional** — selected on a synthetic,
+single-author, unadjudicated dataset that is not gate eligible.
 
-The corrected labels exposed a guard family M3 did not have. Five
-`same_event_different_article` negatives and one `different_company` negative
-merged on cosine alone, with **no guard firing at all**:
+### M2 quarantine is authoritative and survives the bridge
 
-| pair | cosine | what it is |
-|---|---|---|
-| P151 | 0.9282 | rumour vs confirmation |
-| P144 | 0.8889 | two automakers, identical headline |
-| P153 | 0.8410 | announcement vs hands-on |
-| P150 | 0.7083 | report vs follow-up analysis |
-| P152 | 0.5243 | release vs executive interview |
-| P149 | 0.4639 | live blog vs standalone article |
+M2 quarantines every item under a provider identity that described two
+different articles: the feed is wrong about something and M2 cannot tell
+which payload is right. That decision used to be **dropped at the M2→M3
+bridge**, so M3 could re-merge on cosine exactly what M2 had isolated — and
+did, at cosine 1.0000.
 
-Two general, versioned evidence categories close it (`m3.evidence.v2`):
+`StoryInput` now carries `quarantined_member_ids` and `provider_conflicts`,
+read from the public `DedupResult.quarantined_item_ids` and
+`DedupResult.provider_conflicts` and never inferred from M2 internals. A
+quarantined story is **excluded from candidate generation**, retained
+unchanged in the output, and stamped
+`semantic_skip_reason=provider_quarantine`; the counts appear in
+`stats.skipped_story_counts` and in every evaluation artifact.
 
-- **`article_type`** — every record has a type, defaulting to `report`, and
-  two records of different types never merge. Markers cover live blog,
-  analysis/explainer, interview, hands-on/first-look, rumour, confirmation,
-  opinion, preview and recap. Because `report` is itself a type, a marker on
-  one side and none on the other is a difference. Markers are narrow phrases,
-  never bare verbs: "says" and "tells" appear in ordinary wire copy and
-  treating them as types would split legitimate rewrites — a test asserts
-  they do not.
-- **spelled-out cardinals** folded into the existing magnitude signature, so
-  "eleven European markets" and "nine European markets" disagree exactly as
-  "11" and "9" would. The multipliers stay out; they already bind to a
-  preceding digit.
+**C003 is therefore no longer a semantic improvement**, and the previous
+claim that it was has been withdrawn. Its two byte-identical wire stories
+genuinely are one story, but recovering them requires overruling an
+authoritative conflict with a similarity score, which the trust policy does
+not permit. C003 stays an under-merge for M2+M3 exactly as it is for M2
+alone. That is the cost of the policy, stated rather than hidden.
 
-Neither guard rejects a single semantic rewrite in the set. Two M2-handled
-pairs (P025, P042) trip the magnitude guard on an asymmetric count — the
-ordered numeric signature is compared as one value, which is stricter than
-"missing information does not veto". Both are collapsed by M2 before M3 sees
-them, so the pipeline is unaffected; it is recorded here as a known
-conservatism rather than papered over.
+### Guard corrections
 
-P079 (0.6753) and P080 (0.5708) remain false positives *below* the threshold.
-Both are `same_template_different_event` at genuinely low similarity, where
-the threshold is the right instrument; lowering the frame-overlap guard to
-catch them would split real rewrites sitting at 0.42–0.45 overlap.
+Both are scope defects: a headline-level rule was reading the standfirst.
+
+- **`same_frame` now reads the headline only.** A frame is a headline
+  template. Two paraphrased standfirsts of one briefing inflate the overlap
+  until ordinary synonym choices look like a swapped event slot — which is
+  what rejected **P054** (0.739321).
+- **`subject_shift` now reads the headline only, minus a trailing
+  attribution clause, with lemma-folded markers.** "…, Apple suppliers say"
+  is attribution, not the article being about a supplier, and "supplier"
+  versus "suppliers" is one subject, not two. Together those rejected
+  **P068** (0.829236).
+
+Both fixes are general. All three subject-shift negatives (P145, P146,
+P148) and every same-frame negative (P081, P087, P100 …) still veto.
+
+### Article-type classification, hardened
+
+Each genre is an anchored regular expression with word boundaries, and a
+match inside a capitalised proper-noun run is discarded, so `First Look
+Capital`, `Interview Corp`, `Preview Networks` and `Recap Media` are
+ordinary reports. Bare verbs are not markers: `Company confirms earnings
+date`, `analysts review results`, `live operations` and `the review board`
+all classify as `report`. `confirmation` now requires a
+confirming-a-prior-report shape (`officially confirms`, `confirms the
+report`); P151 still vetoes, via rumour-versus-report.
+
+### Explicit entity evidence
+
+A conservative, deterministic guard with no NER dependency: only a
+**capitalised run of two or more words** counts as an entity, a leading
+possessive is stripped (`Apple's App Store` and `App Store` are one
+entity), and a veto needs *both* sides to name an entity the other does
+not. Missing entity evidence is unknown, not contradictory.
+
+It catches appointee swaps (`Alice Smith` vs `Bob Jones`), analyst-house
+swaps (`Northfield Securities` vs `Calder Bank Markets`) and partner swaps.
+**Documented limitation:** single-token organisation names are out of scope
+— `Acme acquires Beta` versus `Acme acquires Gamma` is not caught, because
+treating one capitalised word as an entity would misread ordinary headline
+casing. Stripping possessives was required to stop the guard rejecting P059
+and P067.
+
+### Cardinal normalization
+
+`eleven ↔ 11`, `twenty-one ↔ 21`, `dozen ↔ 12`, `one hundred ↔ 100`,
+`five million ↔ 5 million`. Conversion is context-sensitive: ordinals stay
+period markers (`first quarter` → `q1`, not `1`), ranges, signs,
+approximation markers, currencies and units stay attached to what they
+qualify, model identifiers like `MI400` are not quantities, and a number
+word inside a capitalised name (`One Medical`) is left alone.
 
 ### Result at the committed threshold
 
@@ -681,45 +715,49 @@ catch them would split real rewrites sitting at 0.42–0.45 overlap.
 | metric | value | AC-3 |
 |---|---|---|
 | precision | **1.0000** | ≥ 0.85 ✓ |
-| recall | **0.8077** | ≥ 0.75 ✓ |
-| F1 | 0.8936 | |
-| tp / fp / tn / fn | 63 / 0 / 73 / 15 | |
-| candidate recall | 1.0000 | |
+| recall | **0.8333** | ≥ 0.75 ✓ |
+| F1 | 0.9091 | |
+| tp / fp / tn / fn | 65 / 0 / 73 / 13 | |
 | complete / failed | true / 0 | |
 
-**False positives: none.** All 73 hard negatives refused, including the six
-that merged before the guards existed.
+Recall rose from 0.8077 because P054 and P068 are no longer guard-rejected.
 
-**False negatives: 15**, every one a semantic rewrite below 0.70 — 0.4205
-(`P075`) through 0.6957 (`P051`). No guard rejects a true positive.
-
-These are `isolated_pair_metrics`: two records per invocation. They cannot on
-their own validate production clustering — see below.
+**False positives: none.** **False negatives: 13**, all threshold-driven:
+P049, P050, P051, P057, P058, P059, P060, P065, P067, P072, P073, P075,
+P078.
 
 ### Multi-item cluster results
 
-`nlp/eval/data/results/m2_m3_clusters_ground_truth.json`, the nine committed
-cases scored against ground truth:
+`m2_m3_clusters_ground_truth.json`, nine cases against ground truth:
 
 | | M2 alone | M2 + M3 |
 |---|---|---|
-| exact partition match | 6/9 | **8/9** |
-| co-clustering P / R / F1 | 1.0000 / 0.5882 / 0.7407 | **1.0000 / 0.8235 / 0.9032** |
-| over-merged cases | none | **none** |
-| under-merged cases | C003, C006, C007 | **C006** |
+| exact partition match | 6/9 | **7/9** |
+| co-clustering P / R / F1 | 1.0000 / 0.5882 / 0.7407 | **1.0000 / 0.7647 / 0.8667** |
+| over-merged | none | **none** |
+| under-merged | C003, C006, C007 | **C003, C006** |
 | permutation failures | none | none |
-| missing / duplicated members | none | none |
 
-M3 recovers **C003** — the provider-conflict group, where M2's quarantine
-correctly refused two byte-identical wire stories and M3 rejoins them at
-cosine 1.0000 while keeping the different recall apart at 0.4988 — and
-**C007**, the mixed-stage group, at 0.8137. **C006** stays split: its three
-pairs score 0.6064, 0.6860 and 0.6990, all below the floor, one of them by
-0.001. That is the recall cost of the margin, visible rather than argued
-away.
+M3 recovers **C007** only. C003 is held by quarantine (above) and C006 by
+the threshold — its three pairs score 0.6064, 0.6860 and 0.6990.
 
-Nine authored cases are a regression fixture, not a sample of production
-traffic; they are not evidence of production cluster quality.
+### Reproducibility
+
+Every artifact carries the trust contract and summary, dataset id and
+schema version, model name, revision and embedding dimension, the semantic
+policy fingerprint, the selected threshold with its generated rationale,
+the complete confusion accounting with false-positive and false-negative
+ids, the guard-driven and threshold-driven split, complete/evaluated/failed
+counts, and quarantine-skip counts.
+
+Similarity scores are serialized at **six decimal places**
+(`score_precision`). Cosine values come from a float32 model whose last
+bits are not reproducible across BLAS builds or thread counts; six places
+is diffable and re-derivable on the same model build, and it is four orders
+of magnitude finer than the tightest margin in the sweep (0.0247), so no
+decision boundary is obscured. Across *different* model executions the
+artifacts are equal to within that precision — **not byte-identical**, and
+nothing here claims otherwise.
 
 ### Cluster semantics
 

@@ -274,6 +274,93 @@ def _gate(report: EvaluationReport, args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+#: A refusal whose reason names the similarity floor rather than a guard.
+_THRESHOLD_REFUSAL = "below_threshold"
+
+#: Decimal places every similarity score is serialized at.
+#:
+#: Cosine values come out of a float32 model and the last bits are not
+#: reproducible across BLAS builds, thread counts or hardware.  Rounding to
+#: six places makes a committed artifact diffable and re-derivable on the
+#: same model build, and it is far finer than any decision this stage
+#: makes: the tightest margin in the sweep is 0.0247, four orders of
+#: magnitude above the rounding step, so no decision boundary is obscured.
+#: Across *different* model executions the artifacts are equal to within
+#: this precision - not byte-identical, and nothing here claims they are.
+SCORE_PRECISION = 6
+
+
+def _round_scores(payload: dict[str, Any]) -> dict[str, Any]:
+    """Round every serialized similarity to :data:`SCORE_PRECISION`."""
+
+    scores = payload.get("scores")
+    if isinstance(scores, dict):
+        payload["scores"] = {
+            key: round(value, SCORE_PRECISION) if isinstance(value, float) else value
+            for key, value in scores.items()
+        }
+    payload["score_precision"] = SCORE_PRECISION
+    return payload
+
+
+def _confusion_detail(report: EvaluationReport) -> dict[str, Any]:
+    """Split a report's confusion into the fields a reader needs.
+
+    In particular it separates the two reasons a true positive can be
+    missed, which the aggregate recall hides: the pair scored under the
+    similarity floor, or a guard refused it outright.  A guard-driven false
+    negative is a guard defect and a threshold-driven one is the cost of
+    the margin, and conflating them makes the second look like the first.
+    """
+
+    confusion = report.isolated_pair_metrics.confusion
+    guard_driven: list[str] = []
+    threshold_driven: list[str] = []
+    other: list[str] = []
+    for pair_id in confusion.false_negatives:
+        detail = report.details.get(pair_id, "")
+        if _THRESHOLD_REFUSAL in detail:
+            threshold_driven.append(pair_id)
+        elif "not merged:" in detail:
+            guard_driven.append(pair_id)
+        else:
+            other.append(pair_id)
+    return {
+        "counts": {
+            "true_positive": confusion.tp,
+            "false_positive": confusion.fp,
+            "true_negative": confusion.tn,
+            "false_negative": confusion.fn,
+        },
+        "true_positive_ids": list(confusion.true_positives),
+        "false_positive_ids": list(confusion.false_positives),
+        "true_negative_ids": list(confusion.true_negatives),
+        "false_negative_ids": list(confusion.false_negatives),
+        "guard_rejected_positive_ids": sorted(guard_driven),
+        "threshold_rejected_positive_ids": sorted(threshold_driven),
+        "unclassified_negative_ids": sorted(other),
+        "worst_false_positive_score": (
+            max(
+                (
+                    report.scores[pair_id]
+                    for pair_id in confusion.false_positives
+                    if pair_id in report.scores
+                ),
+                default=None,
+            )
+        ),
+        "quarantine_skipped_pair_ids": sorted(
+            pair_id
+            for pair_id, detail in report.details.items()
+            if "provider quarantine" in detail
+        ),
+        "evaluated_case_count": report.evaluated_case_count,
+        "failed_case_count": report.failed_case_count,
+        "failed_case_ids": list(report.failed_case_ids),
+        "complete": report.complete,
+    }
+
+
 def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Describe which sweep point the build ships, and why.
 
@@ -298,6 +385,16 @@ def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any]
         return None
     dirty = [point for point in points if point["counts"]["false_positive"]]
     clean = [point for point in points if not point["counts"]["false_positive"]]
+    lowest_clean = min(point["threshold"] for point in clean) if clean else None
+    worst_fp_score = max(
+        (
+            score
+            for point in points
+            for score in (point.get("worst_false_positive_score"),)
+            if score is not None
+        ),
+        default=None,
+    )
     return {
         "selected_threshold": DEFAULT_SIMILARITY_THRESHOLD,
         "status": "provisional",
@@ -306,21 +403,38 @@ def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any]
         "recall_at_selected": chosen["recall"],
         "f1_at_selected": chosen["f1"],
         "false_positives_at_selected": chosen["false_positives"],
+        "guard_rejected_positive_ids_at_selected": chosen.get(
+            "guard_rejected_positive_ids", []
+        ),
+        "threshold_rejected_positive_ids_at_selected": chosen.get(
+            "threshold_rejected_positive_ids", []
+        ),
         "highest_threshold_still_producing_a_false_merge": (
             max(point["threshold"] for point in dirty) if dirty else None
         ),
-        "lowest_threshold_with_zero_false_merges": (
-            min(point["threshold"] for point in clean) if clean else None
+        "highest_surviving_false_positive_score": worst_fp_score,
+        "margin_over_worst_false_positive": (
+            round(DEFAULT_SIMILARITY_THRESHOLD - worst_fp_score, 6)
+            if worst_fp_score is not None
+            else None
+        ),
+        "lowest_threshold_with_zero_false_merges": lowest_clean,
+        "selected_is_lowest_clean_threshold": (
+            lowest_clean is not None
+            and abs(lowest_clean - DEFAULT_SIMILARITY_THRESHOLD) < 1e-9
         ),
         "max_f1_threshold": max(points, key=lambda point: point["f1"] or 0.0)[
             "threshold"
         ],
         "rationale": (
-            "Precision-first. The selected point is the lowest threshold that "
-            "produces no false merge, taken with a margin over the highest "
-            "threshold that still produces one rather than sitting on it. The "
-            "F1 maximum is deliberately not used: it buys F1 with false merges, "
-            "and a false merge is the failure this stage exists to prevent."
+            "Precision-first. The lowest tested threshold with zero false "
+            "merges is reported as lowest_threshold_with_zero_false_merges; "
+            "the selected value sits above it by a deliberate margin over the "
+            "highest-scoring surviving false positive, rather than on the "
+            "knife edge. The F1 maximum is not used: it buys F1 with false "
+            "merges. Note that not every false negative is threshold-driven - "
+            "guard_rejected_positive_ids_at_selected lists the ones a guard "
+            "refused."
         ),
         "caveat": (
             "Provisional and development-only. Selected on a synthetic, "
@@ -444,6 +558,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         payload = sweep_payload(points)
         payload["stage"] = args.stage
+        payload["score_precision"] = SCORE_PRECISION
+        for point, entry in zip(points, payload["points"]):
+            detail = _confusion_detail(point.report)
+            if detail["worst_false_positive_score"] is not None:
+                detail["worst_false_positive_score"] = round(
+                    detail["worst_false_positive_score"], SCORE_PRECISION
+                )
+            entry.update(detail)
         selection = _selection_block(args.stage, payload["points"])
         if selection is not None:
             payload["selection"] = selection
@@ -463,7 +585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         name=args.stage,
         threshold=effective,
     )
-    text = _dump(to_payload(report), args.write)
+    text = _dump(_round_scores(to_payload(report)), args.write)
     if args.json:
         print(text, end="")
     else:

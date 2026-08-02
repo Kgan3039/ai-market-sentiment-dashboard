@@ -19,6 +19,7 @@ from typing import Collection
 from nlp.dedup.text import TICKER_PATTERN
 
 from .errors import SemanticDedupConfigError
+from .evidence import policy_components as evidence_policy_components
 from .evidence import policy_fingerprint as evidence_policy_fingerprint
 
 #: Bumped when a change to candidate generation, the predicate, or story
@@ -66,6 +67,11 @@ DEFAULT_FRAME_OVERLAP = 0.5
 #: Candidate generation is exhaustive within a ticker window; Phase 0 sees
 #: a few dozen canonical stories per ticker per day.
 DEFAULT_MAX_PARTITION_STORIES = 250
+
+#: The exact text handed to the encoder, named so a change to it moves the
+#: fingerprint: M1's ``compose_embedding_text`` over the canonical title and
+#: the chosen standfirst.
+SEMANTIC_INPUT_COMPOSITION = "m1.compose_embedding_text(title, description)"
 
 _POLICY_FINGERPRINTS = {
     "evidence_policy": evidence_policy_fingerprint,
@@ -183,17 +189,25 @@ class SemanticDedupConfig:
 
         return timedelta(hours=float(self.window_hours))
 
-    def fingerprint(self, *, model_name: str, model_revision: str | None) -> str:
-        """Return a stable digest of the settings, the policies, and the model.
+    def fingerprint_components(
+        self,
+        *,
+        model_name: str,
+        model_revision: str | None,
+        embedding_dimension: int | None = None,
+    ) -> dict[str, object]:
+        """Return every behaviour-changing input, named.
 
-        The encoder identity is part of it: the same stories under the same
-        settings but a different model are a different result, and a cache
-        that ignored that would serve merges nobody can reproduce.
+        The fingerprint is a digest of exactly this map, and every guard
+        lexicon, pattern, scope and ordering reaches it through
+        :func:`nlp.semdedup.evidence.policy_components`.  A new rule
+        registered there changes the digest without anyone bumping a
+        constant by hand.
         """
 
-        payload = {
+        components: dict[str, object] = {
             "algorithm_version": ALGORITHM_VERSION,
-            **{name: digest() for name, digest in _POLICY_FINGERPRINTS.items()},
+            "semantic_input_composition": SEMANTIC_INPUT_COMPOSITION,
             "similarity_threshold": float(self.similarity_threshold),
             "window_hours": float(self.window_hours),
             "frame_overlap_threshold": float(self.frame_overlap_threshold),
@@ -202,6 +216,35 @@ class SemanticDedupConfig:
             "supported_tickers": sorted(self.ticker_universe),
             "model_name": model_name,
             "model_revision": model_revision,
+            "embedding_dimension": embedding_dimension,
         }
+        components.update(
+            {
+                f"evidence.{name}": value
+                for name, value in evidence_policy_components().items()
+            }
+        )
+        return components
+
+    def fingerprint(
+        self,
+        *,
+        model_name: str,
+        model_revision: str | None,
+        embedding_dimension: int | None = None,
+    ) -> str:
+        """Return a stable digest of the settings, the policies, and the model.
+
+        The encoder identity and vector width are part of it: the same
+        stories under the same settings but a different model are a
+        different result, and a cache that ignored that would serve merges
+        nobody can reproduce.
+        """
+
+        payload = self.fingerprint_components(
+            model_name=model_name,
+            model_revision=model_revision,
+            embedding_dimension=embedding_dimension,
+        )
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

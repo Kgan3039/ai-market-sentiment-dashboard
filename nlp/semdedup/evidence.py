@@ -20,8 +20,10 @@ reader would ask:
 ``contrast``         do they make opposing claims (raised vs cut, approved
                      vs rejected, beat vs missed, profit vs loss)?
 ``negation``         does one explicitly negate where the other does not?
-``subject_shift``    is one about a supplier, reseller, or agency rather
-                     than the company itself?
+``subject_shift``    is the *headline* about a supplier, reseller, or
+                     agency rather than the company itself?
+``entity``           do they name different explicit organisations or
+                     people in the same slot?
 ``article_type``     is one a live blog, an analysis, a rumour, a
                      confirmation, an interview, or a hands-on where the
                      other is a plain report?
@@ -33,6 +35,14 @@ event".  When two headlines overlap heavily, the tokens they do *not* share
 are the story, so a substitution in that slot is a different story however
 close the vectors are.  A real rewrite has the opposite shape: low lexical
 overlap, high semantic similarity, and it never triggers this guard.
+
+``same_frame`` and ``subject_shift`` read the **headline only**.  A frame is
+a headline template and a subject is a headline subject; running either over
+the standfirst as well was a defect.  Two paraphrased standfirsts of one
+briefing inflate the overlap until ordinary synonym choices look like a
+swapped slot, and an attribution clause ("suppliers told the paper") is not
+the article being about a supplier.  Both cost real rewrites: P054 and P068
+respectively.
 
 The asymmetry from M2 is preserved throughout: **explicit disagreement
 vetoes, missing information does not.**  A story with no numbers does not
@@ -53,7 +63,14 @@ from nlp.dedup.structural import tokenize
 from nlp.dedup.text import display_text
 
 #: Bumped whenever a guard, a lexicon, or the comparison changes.
-EVIDENCE_POLICY_VERSION = "m3.evidence.v2"
+EVIDENCE_POLICY_VERSION = "m3.evidence.v3"
+
+#: Bumped when the article-type classifier changes shape.
+ARTICLE_TYPE_POLICY_VERSION = "m3.article_type.v2"
+#: Bumped when cardinal normalization changes.
+CARDINAL_POLICY_VERSION = "m3.cardinal.v1"
+#: Bumped when explicit-entity extraction changes.
+ENTITY_POLICY_VERSION = "m3.entity.v1"
 
 #: A numeric token as M2's tokenizer emits it: optional sign, optional
 #: currency symbol, then a digit.  Deliberately stricter than "contains a
@@ -114,6 +131,43 @@ _BOUND_WORDS = _MAGNITUDE_WORDS | _UNIT_WORDS
 #: it.  The multipliers (million, billion) stay out: they already bind to a
 #: preceding number, and treating a bare one as a count would double-count
 #: "5 million".
+_CARDINAL_VALUES: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+    "dozen": 12,
+}
+#: Tens that can take a following unit ("twenty-one" tokenizes as two).
+_TENS_WORDS = frozenset(
+    {"twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"}
+)
+_UNIT_CARDINALS = frozenset(
+    {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine"}
+)
 _CARDINAL_WORDS = frozenset(
     {
         "one",
@@ -363,81 +417,183 @@ _CONTRAST_GROUPS: tuple[tuple[str, frozenset[str], frozenset[str]], ...] = (
 #: Every record has a type; the default is a plain ``report``.  A veto
 #: therefore fires on a marker present on one side and absent on the other,
 #: not only on two different markers, because "plain report" is itself a
-#: type.  Markers are narrow phrases rather than single common verbs: "says"
-#: and "tells" appear in ordinary wire copy and would split legitimate
-#: rewrites.
+#: type.
+#:
+#: Classification is deliberately hard to trigger.  Each marker is an
+#: anchored regular expression with word boundaries, not a substring, and a
+#: match is discarded when it sits inside a capitalised proper-noun run, so
+#: "First Look Capital", "Interview Corp", "Preview Networks" and
+#: "Recap Media" are ordinary reports.  Bare verbs are not markers at all:
+#: "confirms", "review", "says" and "live" appear in ordinary copy
+#: ("Company confirms earnings date", "analysts review results", "live
+#: operations"), so a genre is only claimed when the phrase identifies the
+#: genre on its own.  Uncertainty yields ``report``, never a veto.
 DEFAULT_ARTICLE_TYPE = "report"
 
-ARTICLE_TYPE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("live_blog", ("live updates", "live blog", "liveblog", "as it happened")),
+ARTICLE_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "live_blog",
+        re.compile(
+            r"\b(?:live (?:updates?|blog|coverage)|liveblog|as it happened)\b",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "analysis",
-        (
-            "means for",
-            "what it means",
-            "analysis:",
-            "explainer",
-            "what to know",
-            "takeaways",
-            "deep dive",
-            "breaking down",
+        re.compile(
+            r"\b(?:what (?:it|this|that|the \w+) means?\b"
+            r"|means? for (?:the |his |her |its )?\w+"
+            r"|explainer\b"
+            r"|what to know\b"
+            r"|key takeaways\b"
+            r"|deep dive\b"
+            r"|breaking down\b)",
+            re.IGNORECASE,
         ),
     ),
     (
         "interview",
-        (
-            "interview",
-            "q&a",
-            "in conversation with",
-            "speaks to",
-            "sits down with",
-            "explains the",
-            "explains how",
-            "explains why",
+        re.compile(
+            r"\b(?:in an interview\b|interview with\b|q&a with\b"
+            r"|in conversation with\b|speaks to\b|sits down with\b"
+            r"|tells (?:cnbc|reuters|bloomberg|the ft)\b"
+            r"|explains (?:the|how|why)\b)",
+            re.IGNORECASE,
         ),
     ),
     (
         "hands_on",
-        ("hands on", "hands-on", "first look", "we tried", "road test", "reviewed:"),
+        re.compile(
+            r"\b(?:hands[- ]on\b|first look at\b|we tried\b|road test\b"
+            r"|hands[- ]on review\b)",
+            re.IGNORECASE,
+        ),
     ),
     (
         "rumour",
-        (
-            "is said to",
-            "are said to",
-            "reportedly",
-            "rumoured",
-            "rumored",
-            "sources say",
-            "people familiar",
-            "is expected to",
+        re.compile(
+            r"\b(?:is said to\b|are said to\b|reportedly\b|rumou?red\b"
+            r"|sources say\b|people familiar\b|is expected to\b)",
+            re.IGNORECASE,
         ),
     ),
-    ("confirmation", ("confirms", "confirmed", "officially")),
-    ("opinion", ("opinion:", "column:", "commentary")),
-    ("preview", ("preview", "what to expect")),
-    ("recap", ("recap", "wrap-up", "round-up")),
+    (
+        "confirmation",
+        re.compile(
+            r"\b(?:officially confirms?\b|confirms? (?:the |earlier )?reports?\b"
+            r"|confirms? plans to\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "opinion",
+        re.compile(r"^\s*(?:opinion|column|commentary)\s*[:\-]", re.IGNORECASE),
+    ),
+    (
+        "preview",
+        re.compile(r"\b(?:what to expect\b|ahead of the\b)", re.IGNORECASE),
+    ),
+    (
+        "recap",
+        re.compile(r"\b(?:wrap[- ]up\b|round[- ]up\b|the week in\b)", re.IGNORECASE),
+    ),
 )
+
+#: A capitalised run of two or more words: the shape of an organisation or
+#: a person's name.  Used to keep genre markers out of entity names and to
+#: keep entity words out of the magnitude signature.
+_PROPER_RUN = re.compile(r"(?:\b[A-Z][\w&.'-]*(?:\s+|$)){2,}")
+
+#: Capitalised words that begin a great many headlines but name nothing.
+_NON_ENTITY_CAPITALS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "what",
+        "why",
+        "how",
+        "first",
+        "second",
+        "third",
+        "fourth",
+        "new",
+        "q1",
+        "q2",
+        "q3",
+        "q4",
+        "update",
+        "exclusive",
+        "breaking",
+        "refile",
+        "wrapup",
+    }
+)
+
+
+def _proper_noun_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return the character spans of capitalised multi-word runs."""
+
+    return tuple((match.start(), match.end()) for match in _PROPER_RUN.finditer(text))
+
+
+def _inside_span(spans: tuple[tuple[int, int], ...], start: int, end: int) -> bool:
+    return any(begin <= start and end <= finish for begin, finish in spans)
 
 
 def article_types(text: str) -> tuple[str, ...]:
     """Return the sorted article-type markers a text carries.
 
     Empty means the default :data:`DEFAULT_ARTICLE_TYPE`; the comparison in
-    :func:`combine` treats the empty set as its own value, so a marked
+    :func:`combine` treats the empty tuple as its own value, so a marked
     record never merges with an unmarked one.
+
+    A match inside a capitalised proper-noun run is discarded: "First Look
+    Capital" names a fund, not a genre.
     """
 
-    lowered = text.casefold()
-    return tuple(
-        sorted(
-            {
-                name
-                for name, markers in ARTICLE_TYPE_MARKERS
-                if any(marker in lowered for marker in markers)
-            }
-        )
-    )
+    spans = _proper_noun_spans(text)
+    found: set[str] = set()
+    for name, pattern in ARTICLE_TYPE_PATTERNS:
+        for match in pattern.finditer(text):
+            if not _inside_span(spans, match.start(), match.end()):
+                found.add(name)
+                break
+    return tuple(sorted(found))
+
+
+def explicit_entities(text: str) -> tuple[str, ...]:
+    """Return the sorted explicit named entities a text carries.
+
+    Deliberately narrow: only a **capitalised run of two or more words**
+    counts, because a single capitalised token in a headline is far more
+    often ordinary headline casing than a name.  That keeps "Alice Smith"
+    and "Wolfsberg Motors" in and leaves "Acme acquires Beta" out; the
+    limitation is documented rather than papered over with heuristics.
+
+    A run that is entirely non-entity capitals ("The New") is dropped, a
+    leading non-entity word is trimmed so "The Acme Group" yields ``acme
+    group``, and a leading possessive is dropped so "Apple's App Store" and
+    "App Store" are the same entity rather than two.
+    """
+
+    entities: set[str] = set()
+    for match in _PROPER_RUN.finditer(text):
+        words = [word for word in match.group(0).split() if word]
+        # A leading possessive is a *relation*, not part of the name:
+        # "Apple's App Store" and "App Store" are one entity, and
+        # "Tesla's Berlin" is Tesla plus a place word rather than a name.
+        # Keeping it made the guard reject two real rewrites.
+        while words and words[0].casefold().endswith("'s"):
+            words.pop(0)
+        while words and words[0].casefold().strip(".,'") in _NON_ENTITY_CAPITALS:
+            words.pop(0)
+        while words and words[-1].casefold().strip(".,'") in _NON_ENTITY_CAPITALS:
+            words.pop()
+        if len(words) < 2:
+            continue
+        entities.add(" ".join(word.casefold().strip(".,'") for word in words))
+    return tuple(sorted(entities))
 
 
 #: Nouns that make a headline about somebody other than the company the
@@ -520,23 +676,59 @@ def _text_of(title: str, description: str | None) -> str:
     return display_text(" ".join(parts))
 
 
-def numeric_signature(tokens: tuple[str, ...]) -> tuple[str, ...]:
+def numeric_signature(
+    tokens: tuple[str, ...], protected: frozenset[str] = frozenset()
+) -> tuple[str, ...]:
     """Return the ordered magnitude claims of a token sequence.
 
     Each numeric token is bound to the following token only when that token
     changes what the number means (a magnitude or a unit).  Order is
     preserved and never sorted, so "up 5% to $10" cannot equal "up 10% to
-    $5".  Counts spelled out in words count too: a newsroom writes "eleven
-    European markets" as readily as "11", and the disagreement is the same
-    one either way.
+    $5".
+
+    Counts spelled out in words are **normalized to their digit form**, so
+    "eleven" and "11", "twenty-one" and "21", "a dozen" and "12", "one
+    hundred" and "100", and "five million" and "5 million" are the same
+    claim.  What is *not* normalized: ordinals ("first quarter" stays a
+    period marker), ranges, approximation markers, currency symbols and
+    units, all of which stay attached to the token they qualify.
+
+    ``protected`` holds tokens that sit inside a capitalised proper-noun
+    run.  A number word there is part of a name - One Medical, Big Four -
+    and is left alone rather than turned into a quantity.
     """
 
     claims: list[str] = []
-    for index, token in enumerate(tokens):
-        if not _NUMERIC_TOKEN.match(token) and token not in _CARDINAL_WORDS:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if _NUMERIC_TOKEN.match(token):
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            claims.append(
+                f"{token} {following}" if following in _BOUND_WORDS else token
+            )
+            index += 1
             continue
-        following = tokens[index + 1] if index + 1 < len(tokens) else ""
-        claims.append(f"{token} {following}" if following in _BOUND_WORDS else token)
+        if token in _CARDINAL_VALUES and token not in protected:
+            value = _CARDINAL_VALUES[token]
+            consumed = 1
+            nxt = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if token in _TENS_WORDS and nxt in _UNIT_CARDINALS and nxt not in protected:
+                value += _CARDINAL_VALUES[nxt]
+                consumed += 1
+                nxt = tokens[index + consumed] if index + consumed < len(tokens) else ""
+            if nxt == "hundred":
+                value *= 100
+                consumed += 1
+                nxt = tokens[index + consumed] if index + consumed < len(tokens) else ""
+            if nxt in _BOUND_WORDS:
+                claims.append(f"{value} {nxt}")
+                consumed += 1
+            else:
+                claims.append(str(value))
+            index += consumed
+            continue
+        index += 1
     return tuple(claims)
 
 
@@ -585,10 +777,54 @@ def contrasts(tokens: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(found))
 
 
-def subject_markers(tokens: tuple[str, ...]) -> tuple[str, ...]:
-    """Return the sorted third-party subject nouns a text mentions."""
+#: Surface forms folded onto one lemma, so "supplier" and "suppliers" are
+#: the same subject rather than two.
+_SUBJECT_LEMMAS = {
+    "agencies": "agency",
+    "agency": "agency",
+    "contractor": "contractor",
+    "contractors": "contractor",
+    "distributor": "distributor",
+    "distributors": "distributor",
+    "reseller": "reseller",
+    "resellers": "reseller",
+    "subcontractor": "contractor",
+    "supplier": "supplier",
+    "suppliers": "supplier",
+    "vendor": "vendor",
+    "vendors": "vendor",
+}
 
-    return tuple(sorted(set(tokens) & _SUBJECT_SHIFT_TOKENS))
+
+#: A trailing clause that attributes the headline to somebody rather than
+#: making the headline about them: ", Apple suppliers say", ", sources
+#: said", ", according to two dealers".  Stripped before subjects are read,
+#: because an attribution is not a subject - reading one as a subject cost
+#: a real rewrite (P068).
+_ATTRIBUTION_CLAUSE = re.compile(
+    r",\s*[^,]*\b(?:says?|said|sources|according to|tells?|told)\b[^,]*$",
+    re.IGNORECASE,
+)
+
+
+def strip_attribution_clause(headline: str) -> str:
+    """Return the headline without a trailing attribution clause."""
+
+    return _ATTRIBUTION_CLAUSE.sub("", headline).strip()
+
+
+def subject_markers(tokens: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the sorted third-party subjects a *headline* names.
+
+    Lemma-folded, so a plural and a singular are one subject.  The caller
+    passes headline tokens only: a standfirst that merely attributes a
+    quote ("suppliers told the paper") is not the article being about a
+    supplier, and treating it as one cost a real rewrite.
+    """
+
+    return tuple(
+        sorted({_SUBJECT_LEMMAS[token] for token in tokens if token in _SUBJECT_LEMMAS})
+    )
 
 
 @dataclass(frozen=True)
@@ -607,18 +843,30 @@ class StoryEvidence:
     roles: frozenset[tuple[str, ...]]
     contrasts: frozenset[tuple[str, str]]
     negations: frozenset[bool]
+    #: Third-party subjects named in the *headline*.
     subjects: frozenset[tuple[str, ...]]
     article_types: frozenset[tuple[str, ...]]
+    #: Explicit multi-word named entities, from headline and standfirst.
+    entities: frozenset[tuple[str, ...]]
     #: Token sets of each member, kept for the ``same_frame`` guard, which
     #: is pairwise by nature: it asks whether *these two* share a frame.
     token_sets: frozenset[frozenset[str]]
 
 
 def summarize(title: str, description: str | None = None) -> StoryEvidence:
-    """Return the evidence one story carries."""
+    """Return the evidence one story carries.
 
-    text = _text_of(title, description)
-    tokens = tokenize(text)
+    Scope matters and is deliberate.  Magnitudes, periods, roles,
+    polarity, negation and named entities are read from the **headline and
+    the standfirst**, because a contradiction anywhere in the record is a
+    contradiction.  The frame and the subject are read from the **headline
+    alone**, because a frame is a headline template and a subject is a
+    headline subject.
+    """
+
+    combined = _text_of(title, description)
+    headline = display_text(title or "")
+    tokens = tokenize(combined)
     if not tokens:
         return StoryEvidence(
             numeric=frozenset(),
@@ -628,12 +876,20 @@ def summarize(title: str, description: str | None = None) -> StoryEvidence:
             negations=frozenset(),
             subjects=frozenset(),
             article_types=frozenset({()}),
+            entities=frozenset(),
             token_sets=frozenset(),
         )
-    numeric = numeric_signature(tokens)
+    protected = frozenset(
+        word.casefold()
+        for start, end in _proper_noun_spans(combined)
+        for word in combined[start:end].split()
+    )
+    numeric = numeric_signature(tokens, protected)
     temporal = temporal_markers(tokens)
-    role_keys = roles(text)
-    subjects = subject_markers(tokens)
+    role_keys = roles(combined)
+    headline_tokens = tokenize(headline)
+    subjects = subject_markers(tokenize(strip_attribution_clause(headline)))
+    names = explicit_entities(combined)
     return StoryEvidence(
         numeric=frozenset({numeric}) if numeric else frozenset(),
         temporal=frozenset({temporal}) if temporal else frozenset(),
@@ -641,8 +897,9 @@ def summarize(title: str, description: str | None = None) -> StoryEvidence:
         contrasts=frozenset(contrasts(tokens)),
         negations=frozenset({bool(set(tokens) & NEGATION_TOKENS)}),
         subjects=frozenset({subjects}),
-        article_types=frozenset({article_types(text)}),
-        token_sets=frozenset({frozenset(tokens)}),
+        article_types=frozenset({article_types(combined)}),
+        entities=frozenset({names}) if names else frozenset(),
+        token_sets=frozenset({frozenset(headline_tokens)}),
     )
 
 
@@ -664,6 +921,29 @@ _BEFORE_POLARITY: tuple[tuple[str, str], ...] = (
     ("subject_shift", "subjects"),
 )
 _AFTER_POLARITY: tuple[tuple[str, str], ...] = (("negation", "negations"),)
+
+
+def _entity_conflict(
+    left: frozenset[tuple[str, ...]], right: frozenset[tuple[str, ...]]
+) -> bool:
+    """True when both sides name entities and each names one the other does not.
+
+    Missing entity evidence is *unknown*, not contradictory: a record that
+    names nobody never blocks a merge.  A shared entity plus an extra one
+    on a single side is elaboration, not disagreement.  Only a genuine
+    substitution - Alice Smith against Bob Jones, Northfield Securities
+    against Calder Bank Markets - is refused.
+    """
+
+    if not left or not right:
+        return False
+    left_names = {name for group in left for name in group}
+    right_names = {name for group in right for name in group}
+    if not left_names or not right_names:
+        return False
+    return bool(left_names - right_names) and bool(right_names - left_names)
+
+
 _VALUE_CHECKS = _BEFORE_POLARITY + _AFTER_POLARITY
 
 #: Every reason :func:`combine` can return, in the order it tries them.
@@ -671,7 +951,7 @@ VETO_REASONS = (
     tuple(reason for reason, _ in _BEFORE_POLARITY)
     + ("contrast_polarity",)
     + tuple(reason for reason, _ in _AFTER_POLARITY)
-    + ("same_frame_different_event",)
+    + ("entity_conflict", "same_frame_different_event")
 )
 
 
@@ -707,6 +987,7 @@ def combine(
         negations=left.negations | right.negations,
         subjects=left.subjects | right.subjects,
         article_types=left.article_types | right.article_types,
+        entities=left.entities | right.entities,
         token_sets=left.token_sets | right.token_sets,
     )
     for reason, field in _BEFORE_POLARITY:
@@ -718,6 +999,8 @@ def combine(
     for reason, field in _AFTER_POLARITY:
         if len(getattr(merged, field)) > 1:
             return None, reason
+    if _entity_conflict(left.entities, right.entities):
+        return None, "entity_conflict"
     for left_tokens in left.token_sets:
         for right_tokens in right.token_sets:
             if _same_frame(left_tokens, right_tokens, frame_overlap):
@@ -733,34 +1016,75 @@ def contradiction(
     return combine(left, right, frame_overlap=frame_overlap)[1]
 
 
+#: Every behaviour-changing policy in this module, named once.  The
+#: fingerprint walks this map, so adding a rule here is all it takes for it
+#: to invalidate cached M3 output - no manual version bump to forget.
+POLICY_COMPONENTS: dict[str, "object"] = {}
+
+
+def _register(name: str, value: object) -> None:
+    POLICY_COMPONENTS[name] = value
+
+
+def _component_values() -> dict[str, str]:
+    """Render every registered component as a stable string."""
+
+    return {
+        "evidence_version": EVIDENCE_POLICY_VERSION,
+        "article_type_version": ARTICLE_TYPE_POLICY_VERSION,
+        "cardinal_version": CARDINAL_POLICY_VERSION,
+        "entity_version": ENTITY_POLICY_VERSION,
+        "tokenizer": structural_policy_fingerprint(),
+        "numeric_token": _NUMERIC_TOKEN.pattern,
+        "bound_words": ",".join(sorted(_BOUND_WORDS)),
+        "cardinal_values": ",".join(
+            f"{word}={value}" for word, value in sorted(_CARDINAL_VALUES.items())
+        ),
+        "tens_words": ",".join(sorted(_TENS_WORDS)),
+        "unit_cardinals": ",".join(sorted(_UNIT_CARDINALS)),
+        "months": ",".join(sorted(_MONTHS)),
+        "quarters": ",".join(sorted(_QUARTER_WORDS)),
+        "iso_date": _ISO_DATE.pattern,
+        "year": _YEAR.pattern,
+        "roles": ";".join(f"{key}:{p.pattern}" for key, p in _ROLE_PATTERNS),
+        "contrasts": ";".join(
+            f"{family}:{','.join(sorted(positive))}|{','.join(sorted(negative))}"
+            for family, positive, negative in _CONTRAST_GROUPS
+        ),
+        "negation_tokens": ",".join(sorted(NEGATION_TOKENS)),
+        "subject_lemmas": ",".join(
+            f"{k}={v}" for k, v in sorted(_SUBJECT_LEMMAS.items())
+        ),
+        "article_type_patterns": ";".join(
+            f"{name}:{pattern.pattern}" for name, pattern in ARTICLE_TYPE_PATTERNS
+        ),
+        "proper_run": _PROPER_RUN.pattern,
+        "non_entity_capitals": ",".join(sorted(_NON_ENTITY_CAPITALS)),
+        "function_words": ",".join(sorted(_FUNCTION_WORDS)),
+        "guard_order": ",".join(VETO_REASONS),
+        "same_frame_scope": "headline_only",
+        "subject_scope": "headline_only_minus_attribution",
+        "attribution_clause": _ATTRIBUTION_CLAUSE.pattern,
+    }
+
+
+def policy_components() -> dict[str, str]:
+    """Return every registered policy component and its rendered value."""
+
+    return dict(sorted(_component_values().items()))
+
+
 def policy_fingerprint() -> str:
     """Return a digest of every static policy this module applies.
 
-    Folds in M2's structural fingerprint as well: M3 reads its tokens
-    through M2's tokenizer, so a tokenizer change moves M3's guards too and
-    must invalidate M3's cached output.
+    Folded into :meth:`nlp.semdedup.config.SemanticDedupConfig.fingerprint`,
+    so editing any lexicon, pattern, guard order or scope changes the
+    configuration fingerprint automatically.  M2's structural fingerprint is
+    one of the components, because M3 reads its tokens through M2's
+    tokenizer.
     """
 
     payload = "|".join(
-        (
-            EVIDENCE_POLICY_VERSION,
-            structural_policy_fingerprint(),
-            _NUMERIC_TOKEN.pattern,
-            ",".join(sorted(_BOUND_WORDS)),
-            ",".join(sorted(_MONTHS)),
-            ",".join(sorted(_QUARTER_WORDS)),
-            ",".join(f"{key}:{pattern.pattern}" for key, pattern in _ROLE_PATTERNS),
-            ";".join(
-                f"{family}:{','.join(sorted(positive))}|{','.join(sorted(negative))}"
-                for family, positive, negative in _CONTRAST_GROUPS
-            ),
-            ",".join(sorted(_CARDINAL_WORDS)),
-            ";".join(
-                f"{name}:{','.join(markers)}" for name, markers in ARTICLE_TYPE_MARKERS
-            ),
-            ",".join(sorted(_SUBJECT_SHIFT_TOKENS)),
-            ",".join(sorted(_FUNCTION_WORDS)),
-            ",".join(sorted(NEGATION_TOKENS)),
-        )
+        f"{name}={value}" for name, value in sorted(_component_values().items())
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

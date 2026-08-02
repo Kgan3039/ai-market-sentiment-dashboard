@@ -33,7 +33,12 @@ from typing import Any, Sequence
 from nlp.embeddings import EmbeddingInputError, cosine_similarity
 
 from .config import ALGORITHM_VERSION, SemanticDedupConfig
-from .encoding import StoryEncoder, encode_stories
+from .encoding import (
+    StoryEncoder,
+    encode_stories,
+    validate_dimension,
+    validate_model_metadata,
+)
 from .errors import (
     SemanticDedupCapacityError,
     SemanticDedupEncodingError,
@@ -42,6 +47,7 @@ from .errors import (
 from .evidence import StoryEvidence, combine, summarize
 from .models import (
     RejectedPair,
+    SemanticSkipReason,
     SemanticDedupResult,
     SemanticDedupStats,
     SemanticMerge,
@@ -113,6 +119,29 @@ def _validate(stories: Sequence[StoryInput], config: SemanticDedupConfig) -> Non
                 )
         if len(set(story.member_ids)) != len(story.member_ids):
             raise SemanticDedupInputError(f"stories[{index}] repeats a member_id")
+        unknown = set(story.quarantined_member_ids) - set(story.member_ids)
+        if unknown:
+            raise SemanticDedupInputError(
+                f"stories[{index}] quarantines {sorted(unknown)}, which are not "
+                "its own members"
+            )
+    # A raw item belongs to exactly one canonical story. Two input stories
+    # sharing a member mean the caller's upstream partition is broken, and
+    # merging or silently duplicating them would carry that corruption into
+    # the output instead of surfacing it.
+    owner: dict[str, str] = {}
+    overlaps: set[str] = set()
+    for story in stories:
+        for item_id in story.member_ids:
+            if item_id in owner and owner[item_id] != story.story_key:
+                overlaps.add(f"{item_id} in {owner[item_id]!r} and {story.story_key!r}")
+            else:
+                owner.setdefault(item_id, story.story_key)
+    if overlaps:
+        raise SemanticDedupInputError(
+            "input stories overlap; a member id belongs to exactly one "
+            "canonical story: " + "; ".join(sorted(overlaps))
+        )
 
 
 def _order_key(story: StoryInput) -> tuple[bool, datetime, str]:
@@ -152,12 +181,20 @@ def _candidate_pairs(
     small, and an approximate generator would make a missing merge
     unattributable — you could not tell a refused pair from a pair the
     generator never proposed.
+
+    A story M2 quarantined under a provider-identity conflict is not
+    eligible at all.  M2 found one feed identifier describing two different
+    articles and could not tell which payload was right; cosine similarity
+    is not evidence about which one is, so an authoritative conflict is
+    never overruled by a score.  The story is retained unchanged in the
+    output with its skip reason recorded.
     """
 
     eligible = [
         position
         for position, story in enumerate(partition)
-        if story.published_at is not None or config.allow_undated_merges
+        if not story.is_quarantined
+        and (story.published_at is not None or config.allow_undated_merges)
     ]
     window = config.window
     pairs: list[tuple[int, int]] = []
@@ -363,6 +400,17 @@ def _build_story(
         },
         key=lambda link: (link[0], link[1], link[2] or ""),
     )
+    quarantined = tuple(
+        sorted({item for story in members for item in story.quarantined_member_ids})
+    )
+    conflicts = tuple(
+        sorted({entry for story in members for entry in story.provider_conflicts})
+    )
+    skip = (
+        SemanticSkipReason.PROVIDER_QUARANTINE
+        if any(story.is_quarantined for story in members)
+        else None
+    )
     fingerprint = story_fingerprint_for(ticker, member_keys)
     relevant = tuple(
         merge
@@ -385,6 +433,9 @@ def _build_story(
             for item_id, outlet, url in links
         ),
         merges=relevant,
+        quarantined_member_ids=quarantined,
+        provider_conflicts=conflicts,
+        semantic_skip_reason=skip,
         content_hash=hashlib.sha256(
             _encode_fields(
                 [
@@ -398,8 +449,10 @@ def _build_story(
                     if canonical.published_at
                     else "",
                     str(len(outlets)),
+                    skip.value if skip is not None else "",
                     *member_keys,
                     *member_ids,
+                    *quarantined,
                 ]
             )
         ).hexdigest(),
@@ -440,12 +493,18 @@ def merge_semantic_duplicates(
                 ticker, len(partitions[ticker]), config.max_partition_stories
             )
 
-    model_name = str(getattr(encoder, "model_name", "") or "")
-    model_revision = getattr(encoder, "model_revision", None)
-    fingerprint = config.fingerprint(
-        model_name=model_name, model_revision=model_revision
-    )
+    model_name, model_revision = validate_model_metadata(encoder)
+    declared_dimension = validate_dimension(getattr(encoder, "dimension", None))
     vectors, unencodable = encode_stories(snapshot, encoder)
+    observed = next(
+        (len(list(vector)) for vector in vectors if vector is not None), None
+    )
+    dimension = declared_dimension if declared_dimension is not None else observed
+    fingerprint = config.fingerprint(
+        model_name=model_name,
+        model_revision=model_revision,
+        embedding_dimension=dimension,
+    )
 
     built: list[SemanticStory] = []
     rejected: list[RejectedPair] = []
@@ -502,6 +561,15 @@ def merge_semantic_duplicates(
             accepted_pair_count=accepted_edges,
             veto_counts=tuple(sorted(vetoes.items())),
             unencodable_story_count=unencodable,
+            skipped_story_counts=tuple(
+                sorted(
+                    {
+                        SemanticSkipReason.PROVIDER_QUARANTINE.value: sum(
+                            1 for story in built if story.is_quarantined
+                        )
+                    }.items()
+                )
+            ),
         ),
         rejected_pairs=tuple(
             sorted(
@@ -513,4 +581,5 @@ def merge_semantic_duplicates(
         algorithm_version=ALGORITHM_VERSION,
         model_name=model_name,
         model_revision=model_revision,
+        embedding_dimension=dimension,
     )

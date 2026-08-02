@@ -63,17 +63,47 @@ class CachingEncoder:
     """
 
     def __init__(self, encoder: StoryEncoder) -> None:
+        from nlp.semdedup import validate_model_metadata
+
         self._encoder = encoder
         self._cache: dict[str, Any] = {}
-        self.model_name = getattr(encoder, "model_name", "")
-        self.model_revision = getattr(encoder, "model_revision", None)
+        self.model_name, self.model_revision = validate_model_metadata(encoder)
+        self.dimension = getattr(encoder, "dimension", None)
 
     def embed_batch(self, texts: Sequence[str]) -> list[Any]:
-        missing = [text for text in dict.fromkeys(texts) if text not in self._cache]
+        """Return one vector per text, in order, or raise.
+
+        The wrapper is as strict as the stage it feeds: an inner encoder
+        that returns the wrong number of vectors would otherwise be
+        silently re-aligned by the cache, and a missing key would surface
+        as an incidental ``KeyError`` rather than a typed encoding error.
+        """
+
+        from nlp.semdedup.errors import SemanticDedupEncodingError
+
+        requested = list(texts)
+        missing = [text for text in dict.fromkeys(requested) if text not in self._cache]
         if missing:
-            for text, vector in zip(missing, self._encoder.embed_batch(missing)):
+            produced = list(self._encoder.embed_batch(missing))
+            if len(produced) != len(missing):
+                raise SemanticDedupEncodingError(
+                    f"encoder returned {len(produced)} vectors for "
+                    f"{len(missing)} uncached texts; the counts must match "
+                    "exactly, in order"
+                )
+            for text, vector in zip(missing, produced):
+                if vector is None:
+                    raise SemanticDedupEncodingError(
+                        "encoder returned no vector for a requested text"
+                    )
                 self._cache[text] = vector
-        return [self._cache[text] for text in texts]
+        absent = [text for text in requested if text not in self._cache]
+        if absent:
+            raise SemanticDedupEncodingError(
+                f"{len(absent)} requested text(s) have no cached vector; the "
+                "encoder did not supply an identity mapping for every input"
+            )
+        return [self._cache[text] for text in requested]
 
 
 def semantic_config_for(
@@ -142,6 +172,16 @@ def pipeline_isolated_pair_predictor(
             )
         rejection = result.rejected_pairs[0] if result.rejected_pairs else None
         if rejection is None:
+            quarantined = [story for story in result.stories if story.is_quarantined]
+            if quarantined:
+                return PairPrediction(
+                    merged=False,
+                    candidate=False,
+                    detail=(
+                        "not merged: m2 provider quarantine, held out of "
+                        "semantic candidate generation"
+                    ),
+                )
             return PairPrediction(
                 merged=False,
                 candidate=False,
