@@ -13,7 +13,6 @@ import math
 from typing import Collection
 
 from nlp.dedup.text import TICKER_PATTERN
-from nlp.semdedup.evidence import policy_fingerprint as evidence_policy_fingerprint
 
 from .errors import ThemeConfigError
 
@@ -31,6 +30,34 @@ DEFAULT_MAX_THEMES = 6
 #: Phase 0 sees a few dozen canonical stories per ticker per day.  Beyond
 #: this the stage refuses rather than returning a partial day.
 DEFAULT_MAX_STORIES_PER_DAY = 250
+
+#: The exact text handed to the encoder, named so a change to it moves the
+#: fingerprint.  The same composition M1 and M3 use, so a ticker-day costs
+#: no extra model calls when both stages run.
+SEMANTIC_INPUT_COMPOSITION = "m1.compose_embedding_text(title, description)"
+
+#: Namespace prefix for theme fingerprints, so a digest computed here can
+#: never collide with one computed by another stage over the same fields.
+THEME_NAMESPACE = "m5.theme.v1"
+
+#: Static policies, stated rather than implied, and fingerprinted.  Each
+#: names a decision a reader of the output would otherwise have to infer
+#: from the code.
+LABEL_POLICY = (
+    "leading_member_title; deterministic; no model call; label never "
+    "participates in membership identity"
+)
+OUTLIER_POLICY = "clustering_noise_to_other_coverage_never_dropped"
+OTHER_COVERAGE_POLICY = (
+    "explicit_entry_per_story_with_stated_reason; never a narrative theme"
+)
+RANKING_POLICY = "salience = weighted(story_count, outlet_diversity, recency)"
+TIE_BREAK_POLICY = "salience_desc, earliest_member, theme_fingerprint"
+STORY_ORDERING_POLICY = "undated_last, published_at_asc, story_key_asc"
+QUARANTINE_POLICY = (
+    "upstream_quarantined_and_semantically_skipped_stories_held_out_of "
+    "_clustering_and_shown_under_other_coverage"
+)
 
 
 def _unit_interval(value: object, field: str) -> float:
@@ -92,8 +119,17 @@ class ThemeConfig:
     #: unstable and re-run agglomeratively, and a cluster still below it
     #: afterwards is dissolved into other coverage.  Together these are what
     #: stop a giant catch-all of unrelated market language from being
-    #: presented to a reader as a theme.  Calibrated on the committed
-    #: ticker-days: real strands there hold 0.42-0.72, the grab-bag 0.35.
+    #: presented to a reader as a theme.
+    #:
+    #: **Not independently validated.**  The value was chosen by looking at
+    #: the committed ticker-days - where authored strands hold 0.42-0.72 and
+    #: the grab-bag holds 0.35 - and those are the same days it is then
+    #: evaluated on, which makes every cohesion number the fixtures produce
+    #: partly a restatement of the threshold.  It cannot be calibrated
+    #: honestly until real ingested days exist (#57/#68) and a human review
+    #: (#60/K3) says which groups a reader would accept.  Until then treat
+    #: it as a development default, and read any theme sitting within a few
+    #: hundredths of it as unadjudicated.
     min_theme_cohesion: float = 0.40
     #: Fewest stories a group must hold to be shown as a theme.  A lone
     #: story is coverage, not a theme; it goes under "Other coverage" where
@@ -178,12 +214,31 @@ class ThemeConfig:
             self.recency_weight / total,
         )
 
-    def fingerprint(self, *, model_name: str, model_revision: str | None) -> str:
-        """Return a stable digest of the settings, policies, and encoder."""
+    def fingerprint_components(
+        self,
+        *,
+        model_name: str,
+        model_revision: str | None,
+        embedding_dimension: int | None = None,
+    ) -> dict[str, object]:
+        """Return every behaviour-changing input, named.
 
-        payload = {
+        The fingerprint is a digest of exactly this map.  Static policies —
+        the compatibility contract, the fallback objective, the label rule,
+        the other-coverage vocabulary, the ordering rules — reach it
+        through the modules that own them, so adding a term to a lexicon or
+        a reason to an enum invalidates cached themes without anyone
+        bumping a constant by hand.
+        """
+
+        # Imported here rather than at module scope: both import config.
+        from .clustering import FALLBACK_SELECTION_POLICY
+        from .compatibility import policy_components as compatibility_components
+        from .models import ExclusionReason, OtherCoverageReason
+
+        components: dict[str, object] = {
             "algorithm_version": ALGORITHM_VERSION,
-            "coherence_policy": evidence_policy_fingerprint(),
+            "semantic_input_composition": SEMANTIC_INPUT_COMPOSITION,
             "min_stories_for_clustering": self.min_stories_for_clustering,
             "min_themes": self.min_themes,
             "max_themes": self.max_themes,
@@ -198,6 +253,49 @@ class ThemeConfig:
             "supported_tickers": sorted(self.ticker_universe),
             "model_name": model_name,
             "model_revision": model_revision,
+            "embedding_dimension": embedding_dimension,
+            "label_policy": LABEL_POLICY,
+            "outlier_policy": OUTLIER_POLICY,
+            "other_coverage_policy": OTHER_COVERAGE_POLICY,
+            "other_coverage_reasons": ",".join(
+                sorted(reason.value for reason in OtherCoverageReason)
+            ),
+            "exclusion_reasons": ",".join(
+                sorted(reason.value for reason in ExclusionReason)
+            ),
+            "ranking_policy": RANKING_POLICY,
+            "tie_break_policy": TIE_BREAK_POLICY,
+            "story_ordering_policy": STORY_ORDERING_POLICY,
+            "theme_namespace": THEME_NAMESPACE,
+            "quarantine_policy": QUARANTINE_POLICY,
         }
+        components.update(
+            {
+                f"fallback.{name}": value
+                for name, value in FALLBACK_SELECTION_POLICY.items()
+            }
+        )
+        components.update(
+            {
+                f"compatibility.{name}": value
+                for name, value in compatibility_components().items()
+            }
+        )
+        return components
+
+    def fingerprint(
+        self,
+        *,
+        model_name: str,
+        model_revision: str | None,
+        embedding_dimension: int | None = None,
+    ) -> str:
+        """Return a stable digest of the settings, policies, and encoder."""
+
+        payload = self.fingerprint_components(
+            model_name=model_name,
+            model_revision=model_revision,
+            embedding_dimension=embedding_dimension,
+        )
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

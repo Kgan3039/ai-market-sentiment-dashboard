@@ -25,9 +25,29 @@ from typing import Sequence
 import numpy as np
 
 from .config import ThemeConfig
+from .errors import ThemeClusteringError
 
 #: Label for stories HDBSCAN considers noise; they become "Other coverage".
 NOISE = -1
+
+#: How the fallback picks its cluster count, and when the fallback engages.
+#: Stated here so both reach the configuration fingerprint: changing either
+#: changes the themes produced from identical input.
+FALLBACK_SELECTION_POLICY: dict[str, str] = {
+    "trigger": "cluster_count_outside_band_or_a_cluster_below_cohesion_floor",
+    "objective": "max_stories_in_themes_clearing_size_and_cohesion_floors",
+    "tie_break": "higher_mean_cohesion, fewer_themes, smaller_k",
+    "linkage": "average",
+    "metric": "precomputed_cosine_distance",
+    "label_numbering": "renumbered_by_first_appearance",
+    "candidate_band": "min_themes..min(max_themes, n-1)",
+}
+
+
+def fallback_selection_components() -> dict[str, str]:
+    """The fallback policy, sorted, for the configuration fingerprint."""
+
+    return dict(sorted(FALLBACK_SELECTION_POLICY.items()))
 
 
 @dataclass(frozen=True)
@@ -88,7 +108,11 @@ def _hdbscan(distance: np.ndarray, config: ThemeConfig) -> tuple[int, ...]:
         metric="precomputed",
         allow_single_cluster=False,
     )
-    return _renumber(model.fit_predict(distance).tolist())
+    try:
+        labels = model.fit_predict(distance)
+    except Exception as exc:  # the library's failures are not M5's contract
+        raise ThemeClusteringError("hdbscan", exc) from exc
+    return _renumber(labels.tolist())
 
 
 def _agglomerative(distance: np.ndarray, clusters: int) -> tuple[int, ...]:
@@ -97,32 +121,90 @@ def _agglomerative(distance: np.ndarray, clusters: int) -> tuple[int, ...]:
     model = AgglomerativeClustering(
         n_clusters=clusters, metric="precomputed", linkage="average"
     )
-    return _renumber(model.fit_predict(distance).tolist())
+    try:
+        labels = model.fit_predict(distance)
+    except Exception as exc:
+        raise ThemeClusteringError("agglomerative", exc) from exc
+    return _renumber(labels.tolist())
 
 
-def _best_agglomerative(distance: np.ndarray, config: ThemeConfig) -> tuple[int, str]:
-    """Choose a cluster count in the allowed band by silhouette score.
+def _qualifying_shape(
+    vectors: np.ndarray, labels: Sequence[int], config: ThemeConfig
+) -> tuple[int, float, int]:
+    """Score one candidate clustering by the contract the stage will apply.
 
-    Silhouette is deterministic and needs no ground truth, which is what
-    makes it usable here; it is a shape statistic, not a claim that the
-    clustering is *correct*.  Ties go to the smaller count, so the stage
-    prefers fewer, broader themes over more, thinner ones.
+    Returns ``(stories in themes that will survive, their mean cohesion,
+    theme count)``.  A cluster *qualifies* only if it clears both the size
+    floor and the cohesion floor — the same two rules
+    :func:`~nlp.themes.service.cluster_themes` applies afterwards.
     """
 
-    from sklearn.metrics import silhouette_score
+    groups: dict[int, list[int]] = {}
+    for position, label in enumerate(labels):
+        if label != NOISE:
+            groups.setdefault(label, []).append(position)
+    qualifying = [
+        members
+        for members in groups.values()
+        if len(members) >= config.min_theme_stories
+        and mean_pairwise_similarity(vectors, members) >= config.min_theme_cohesion
+    ]
+    if not qualifying:
+        return 0, 0.0, 0
+    covered = sum(len(members) for members in qualifying)
+    cohesion = sum(
+        mean_pairwise_similarity(vectors, members) for members in qualifying
+    ) / len(qualifying)
+    return covered, cohesion, len(qualifying)
+
+
+def _best_agglomerative(
+    vectors: np.ndarray, distance: np.ndarray, config: ThemeConfig
+) -> tuple[int, str]:
+    """Choose a cluster count in the allowed band by the theme contract.
+
+    **Not by silhouette.**  Silhouette is a geometric shape statistic that
+    knows nothing about the size and cohesion floors this stage enforces
+    two steps later, and on the committed days the two objectives point in
+    opposite directions: at n=17 the silhouette maximum sits at k=2, whose
+    clusters the stage then dissolves, leaving one theme and fourteen
+    stories in other coverage — while k=6 places sixteen of seventeen in
+    themes that survive.  Choosing a clustering the stage is about to
+    reject is not a defensible objective, and because the silhouette values
+    involved differ in the third decimal, dropping a single story could
+    flip the choice and collapse the day.
+
+    So the objective is the outcome the stage actually wants: **the most
+    stories placed in themes that will still be themes afterwards**, then
+    the highest mean cohesion among them, then the fewest themes (broader
+    over thinner), then the smallest k.  Every tie-break is a total order
+    on data, so the choice is reproducible.
+    """
 
     upper = min(config.max_themes, len(distance) - 1)
     lower = min(config.min_themes, upper)
-    best_count, best_score = lower, None
+    best: tuple[int, float, int, int] | None = None
     for count in range(lower, upper + 1):
         labels = _agglomerative(distance, count)
-        if len({label for label in labels}) < 2:
+        if len(set(labels)) < 2:
             continue
-        score = float(silhouette_score(distance, list(labels), metric="precomputed"))
-        if best_score is None or score > best_score:
-            best_count, best_score = count, score
-    detail = "n/a" if best_score is None else f"{best_score:.4f}"
-    return best_count, f"best silhouette {detail} at k={best_count}"
+        covered, cohesion, themes = _qualifying_shape(vectors, labels, config)
+        # Maximize coverage, then cohesion; minimize theme count, then k.
+        candidate = (-covered, -cohesion, themes, count)
+        if best is None or candidate < best:
+            best = candidate
+    if best is None:
+        return lower, f"no candidate k produced two clusters; used k={lower}"
+    covered, cohesion, themes, count = -best[0], -best[1], best[2], best[3]
+    if not covered:
+        return count, (
+            f"no k in {lower}-{upper} produced a theme clearing the size and "
+            f"cohesion floors; used k={count}"
+        )
+    return count, (
+        f"k={count} places {covered} stories in {themes} theme(s) clearing "
+        f"the floors, mean cohesion {cohesion:.4f}"
+    )
 
 
 def _weakest_cohesion(vectors: np.ndarray, labels: Sequence[int]) -> float | None:
@@ -181,7 +263,7 @@ def assign_clusters(vectors: np.ndarray, config: ThemeConfig) -> ClusterAssignme
                 else f"hdbscan found {found} clusters inside the allowed band"
             ),
         )
-    count, detail = _best_agglomerative(distance, config)
+    count, detail = _best_agglomerative(vectors, distance, config)
     return ClusterAssignment(
         labels=_agglomerative(distance, count),
         method="agglomerative",
@@ -198,6 +280,16 @@ def mean_pairwise_similarity(vectors: np.ndarray, members: Sequence[int]) -> flo
     similarity = 1.0 - cosine_distances(subset)
     upper = similarity[np.triu_indices(len(members), k=1)]
     return float(np.mean(upper))
+
+
+def min_pairwise_similarity(vectors: np.ndarray, members: Sequence[int]) -> float:
+    """Return the lowest cosine between distinct members, 1.0 for a single one."""
+
+    if len(members) < 2:
+        return 1.0
+    subset = vectors[list(members)]
+    similarity = 1.0 - cosine_distances(subset)
+    return float(np.min(similarity[np.triu_indices(len(members), k=1)]))
 
 
 def centroid_of(vectors: np.ndarray, members: Sequence[int]) -> tuple[float, ...]:

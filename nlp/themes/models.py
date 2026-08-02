@@ -40,12 +40,43 @@ class ExclusionReason(str, Enum):
     NO_ENCODABLE_TEXT = "no_encodable_text"
 
 
+class OtherCoverageReason(str, Enum):
+    """Why a story is outside every theme but still shown to the reader.
+
+    Recorded per story rather than inferred from the theme set.  "Other
+    coverage" is four different situations wearing one name, and a reviewer
+    asking why a story is not in a theme is asking which of them applies.
+    """
+
+    #: The day is below the clustering floor, so nothing was clustered.
+    BELOW_CLUSTERING_FLOOR = "below_clustering_floor"
+    #: The clustering algorithm called this story noise.
+    CLUSTERING_NOISE = "clustering_noise"
+    #: Its cluster held fewer stories than a theme must.
+    BELOW_THEME_SIZE_FLOOR = "below_theme_size_floor"
+    #: Its cluster was looser than a theme may be, so it was dissolved.
+    BELOW_COHESION_FLOOR = "below_cohesion_floor"
+    #: It contradicted the theme it would otherwise have joined.
+    THEME_INCOMPATIBLE = "theme_incompatible"
+    #: M2 could not settle which article this feed identity described, and
+    #: M3 held it out of semantic merging.  A story whose payload identity
+    #: is disputed is never grouped or handed to a summarizer as part of a
+    #: narrative, but it is not dropped either.
+    PROVIDER_QUARANTINE = "provider_quarantine"
+    #: M3 held it out of candidate generation for some other stated reason.
+    SEMANTIC_SKIP = "semantic_skip"
+
+
 @dataclass(frozen=True)
 class ThemeStory:
     """One canonical story arriving from M3 (or from M2 when M3 is off).
 
     ``story_key`` is opaque: M3's ``story_fingerprint`` in the Phase 0
     pipeline.  ``item_ids`` are the raw items a citation may resolve to.
+
+    The trust-bearing fields below are carried through from M2 and M3
+    unchanged.  M5 never infers them: a quarantine that M5 guessed at would
+    be a quarantine nobody upstream asserted.
     """
 
     story_key: str
@@ -57,6 +88,58 @@ class ThemeStory:
     item_ids: tuple[str, ...] = ()
     #: ``(item_id, outlet, url)`` for every retained source link.
     source_links: tuple[tuple[str, str, str | None], ...] = ()
+    #: Distinct outlets as M3 counted them.  Kept alongside ``outlets``
+    #: because M3's count is the one the salience number must agree with.
+    outlet_count: int | None = None
+    #: The M2 story keys M3 collapsed into this one, canonical first.
+    member_story_keys: tuple[str, ...] = ()
+    #: Raw item ids M2 quarantined under a provider-identity conflict.
+    quarantined_member_ids: tuple[str, ...] = ()
+    #: ``(namespace, provider_item_id)`` of every conflict touching this
+    #: story, carried through from M2 by way of M3.
+    provider_conflicts: tuple[tuple[str, str], ...] = ()
+    #: M3's ``SemanticSkipReason`` value, or ``None``.
+    semantic_skip_reason: str | None = None
+    #: ``(left_key, right_key, similarity, reason)`` for each merge M3
+    #: accepted into this story.  Audit evidence, never a merge input.
+    merge_evidence: tuple[tuple[str, str, float, str], ...] = ()
+    #: M3's content hash for the story, when it supplied one.
+    content_hash: str | None = None
+
+    @property
+    def is_quarantined(self) -> bool:
+        """True when M3 held this story out under an M2 provider conflict."""
+
+        return self.semantic_skip_reason == "provider_quarantine"
+
+    @property
+    def is_semantically_skipped(self) -> bool:
+        """True when M3 held this story out of candidate generation at all."""
+
+        return self.semantic_skip_reason is not None
+
+
+@dataclass(frozen=True)
+class ThemeSourceMetadata:
+    """What produced the stories M5 was handed.
+
+    Recorded so a theme set can be traced to the dedup run behind it.  A
+    theme set whose stories came from a different encoder, or from a
+    differently configured M3, is a different result even when the member
+    keys look the same.
+    """
+
+    #: ``"m3.semantic"`` or ``"m2.exact"`` — which stage produced the input.
+    stage: str
+    algorithm_version: str
+    config_fingerprint: str
+    model_name: str
+    model_revision: str | None
+    embedding_dimension: int | None
+    story_count: int
+    quarantined_story_count: int
+    semantically_skipped_story_count: int
+    merged_story_count: int
 
 
 @dataclass(frozen=True)
@@ -119,6 +202,10 @@ class Theme:
     salience_features: SalienceFeatures
     #: Mean pairwise cosine between members; 1.0 for a single-member theme.
     cohesion: float
+    #: Lowest cosine between any two members; 1.0 for a single-member theme.
+    #: Reported beside the mean because a mean hides the loosest pair, and
+    #: the loosest pair is what a reader notices first in a theme.
+    min_pairwise_cohesion: float
     #: Unit-length mean of the member vectors, for the next run's stability
     #: matching.  Rounded so a stored value round-trips exactly.
     centroid: tuple[float, ...]
@@ -141,6 +228,18 @@ class Theme:
         return tuple(
             sorted({item_id for entry in self.evidence for item_id in entry.item_ids})
         )
+
+
+@dataclass(frozen=True)
+class OtherCoverageEntry:
+    """One story shown under "Other coverage", with the reason it is there."""
+
+    evidence: ThemeEvidence
+    reason: OtherCoverageReason
+
+    @property
+    def story_key(self) -> str:
+        return self.evidence.story_key
 
 
 @dataclass(frozen=True)
@@ -186,9 +285,10 @@ class ThemeSet:
     trading_day: date
     themes: tuple[Theme, ...]
     #: Stories deliberately not in any theme: clustering noise, incoherent
-    #: outliers, or every story on a day below the clustering floor.  These
-    #: are shown to the reader under "Other coverage", not dropped.
-    other_coverage: tuple[ThemeEvidence, ...]
+    #: outliers, quarantined stories, or every story on a day below the
+    #: clustering floor.  Shown to the reader under "Other coverage" with a
+    #: stated reason each, not dropped.
+    other_coverage: tuple[OtherCoverageEntry, ...]
     excluded: tuple[ExcludedStory, ...]
     method: ClusteringMethod
     #: Why the method is what it is, in one auditable phrase.
@@ -198,6 +298,11 @@ class ThemeSet:
     algorithm_version: str
     model_name: str
     model_revision: str | None
+    #: Vector width the run used; ``None`` when nothing was encodable.
+    embedding_dimension: int | None = None
+    #: What produced the input stories, when the caller came through the
+    #: bridge.  ``None`` when stories were constructed directly.
+    source_metadata: ThemeSourceMetadata | None = None
 
     @property
     def accounted_story_keys(self) -> tuple[str, ...]:
@@ -215,6 +320,20 @@ class ThemeSet:
                 + [entry.story_key for entry in self.excluded]
             )
         )
+
+    @property
+    def other_coverage_evidence(self) -> tuple[ThemeEvidence, ...]:
+        """The other-coverage entries' evidence, in order."""
+
+        return tuple(entry.evidence for entry in self.other_coverage)
+
+    def other_coverage_by_reason(self) -> dict[str, tuple[str, ...]]:
+        """Story keys under other coverage, grouped by stated reason."""
+
+        grouped: dict[str, list[str]] = {}
+        for entry in self.other_coverage:
+            grouped.setdefault(entry.reason.value, []).append(entry.story_key)
+        return {reason: tuple(sorted(keys)) for reason, keys in sorted(grouped.items())}
 
     @property
     def is_clustered(self) -> bool:

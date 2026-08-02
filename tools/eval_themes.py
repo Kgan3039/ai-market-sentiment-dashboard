@@ -23,21 +23,67 @@ from pathlib import Path
 import sys
 from typing import Any, Sequence
 
-from nlp.themes.config import ThemeConfig
-from nlp.themes.dataset import DEFAULT_FIXTURE_PATH, load_ticker_days, tickers_of
+from nlp.themes.compatibility import (
+    policy_fingerprint as compatibility_policy_fingerprint,
+)
+from nlp.themes.config import (
+    ALGORITHM_VERSION,
+    SEMANTIC_INPUT_COMPOSITION,
+    ThemeConfig,
+)
+from nlp.themes.dataset import (
+    DEFAULT_FIXTURE_PATH,
+    SUPPORTED_SCHEMA_VERSION,
+    load_ticker_days,
+    tickers_of,
+)
 from nlp.themes.errors import ThemeError
 from nlp.themes.quality import TickerDayReport, evaluate_ticker_day
 
 
+def _plain(value: Any) -> Any:
+    """Render tuples as lists so the committed JSON diffs cleanly."""
+
+    if isinstance(value, tuple):
+        return [_plain(item) for item in value]
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _plain(item) for key, item in value.items()}
+    return value
+
+
 def _payload(report: TickerDayReport) -> dict[str, Any]:
-    data = asdict(report)
+    data = {key: _plain(value) for key, value in asdict(report).items()}
     data["trading_day"] = report.trading_day.isoformat()
-    data["themes"] = [list(theme) for theme in report.themes]
-    data["other_coverage"] = list(report.other_coverage)
     # Runtime is a property of the machine, not of the algorithm; keeping it
     # out of the committed file means a re-run on a slower box does not read
     # as a behaviour change.
     data.pop("elapsed_seconds", None)
+    for name, stability in (
+        ("permutation", report.permutation),
+        ("perturbation", report.perturbation),
+    ):
+        data[name]["interpretation"] = stability.interpretation
+    # The accounting the "no story lost" boolean stands on, spelled out: a
+    # bool cannot distinguish a lost story from an invented one.
+    data["story_accounting"] = {
+        "input_story_count": report.story_count,
+        "in_themes": sum(detail.member_count for detail in report.theme_details),
+        "other_coverage": report.other_coverage_count,
+        "excluded": report.excluded_count,
+        "accounted": (
+            sum(detail.member_count for detail in report.theme_details)
+            + report.other_coverage_count
+            + report.excluded_count
+        ),
+        "missing_story_keys": list(report.missing_story_keys),
+        "unexpected_story_keys": list(report.unexpected_story_keys),
+        "duplicate_membership_keys": list(report.duplicate_membership_keys),
+        "complete": report.no_story_lost
+        and not report.duplicate_membership_keys
+        and not report.unexpected_story_keys,
+    }
     return data
 
 
@@ -73,15 +119,23 @@ def _render(reports: Sequence[TickerDayReport]) -> str:
             f"identity {report.perturbation.identity_retained:.2f}, "
             f"{report.perturbation.theme_count_before} -> "
             f"{report.perturbation.theme_count_after} themes",
+            f"                    {report.perturbation.interpretation}",
             f"  runtime           {report.elapsed_seconds:.3f}s",
         ]
-        for rank, label, stories, outlets, salience in report.themes:
+        for detail in report.theme_details:
+            flag = " NEAR COHESION FLOOR" if detail.near_cohesion_floor else ""
             lines.append(
-                f"    {rank}. {label}  "
-                f"[{stories} stories, {outlets} outlets, salience {salience:.4f}]"
+                f"    {detail.rank}. {detail.label}  "
+                f"[{detail.member_count} stories, {detail.outlet_count} outlets, "
+                f"salience {detail.salience:.4f}, cohesion {detail.cohesion:.4f} "
+                f"(min pair {detail.min_pairwise_cohesion:.4f}, "
+                f"margin {detail.cohesion_margin:+.4f}){flag}]"
             )
-        if report.other_coverage:
-            lines.append(f"    other: {', '.join(report.other_coverage)}")
+            lines.append(f"        members: {', '.join(detail.member_story_keys)}")
+        for reason, keys in report.other_coverage_by_reason.items():
+            lines.append(f"    other ({reason}): {', '.join(keys)}")
+        for reason, keys in report.excluded_by_reason.items():
+            lines.append(f"    excluded ({reason}): {', '.join(keys)}")
         lines.append("")
     return "\n".join(lines)
 
@@ -106,30 +160,83 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     encoder = EmbeddingService()
     config = ThemeConfig(supported_tickers=tickers_of(day_set))
-    reports = [
-        evaluate_ticker_day(
-            day.stories,
-            ticker=day.ticker,
-            trading_day=day.trading_day,
-            volume=day.volume,
-            config=config,
-            encoder=encoder,
-        )
-        for day in day_set.days
-    ]
+    # One ticker-day that refuses to cluster must not erase the days that
+    # did.  Each failure is named and counted; the run reports incomplete
+    # rather than reporting fewer days as if that were the whole fixture.
+    reports: list[TickerDayReport] = []
+    failed: list[dict[str, str]] = []
+    for day in day_set.days:
+        case_id = f"{day.ticker} {day.trading_day.isoformat()}"
+        try:
+            reports.append(
+                evaluate_ticker_day(
+                    day.stories,
+                    ticker=day.ticker,
+                    trading_day=day.trading_day,
+                    volume=day.volume,
+                    config=config,
+                    encoder=encoder,
+                )
+            )
+        except ThemeError as exc:
+            failed.append(
+                {"case_id": case_id, "error": type(exc).__name__, "detail": str(exc)}
+            )
 
+    evaluated = [_payload(report) for report in reports]
     payload = {
+        "schema_version": SUPPORTED_SCHEMA_VERSION,
         "dataset_id": day_set.dataset_id,
+        "dataset_version": day_set.metadata.get("schema_version"),
+        "issue": day_set.metadata.get("issue"),
+        "acceptance_criteria": day_set.metadata.get("acceptance_criteria"),
+        "trust_contract": day_set.trust_contract.as_dict(),
+        "trust_summary": day_set.trust_summary.as_dict(),
+        "known_limitations": list(day_set.known_limitations),
         "model_name": encoder.model_name,
         "model_revision": encoder.model_revision,
-        "ticker_days": [_payload(report) for report in reports],
+        "embedding_dimension": getattr(encoder, "dimension", None),
+        "semantic_input_composition": SEMANTIC_INPUT_COMPOSITION,
+        "theme_config_fingerprint": config.fingerprint(
+            model_name=encoder.model_name,
+            model_revision=encoder.model_revision,
+            embedding_dimension=getattr(encoder, "dimension", None),
+        ),
+        "theme_policy_components": {
+            key: _plain(value)
+            for key, value in config.fingerprint_components(
+                model_name=encoder.model_name,
+                model_revision=encoder.model_revision,
+                embedding_dimension=getattr(encoder, "dimension", None),
+            ).items()
+        },
+        "compatibility_policy_fingerprint": compatibility_policy_fingerprint(),
+        "algorithm_version": ALGORITHM_VERSION,
+        "case_count": len(day_set.days),
+        "evaluated_case_count": len(evaluated),
+        "failed_case_count": len(failed),
+        "failed_cases": failed,
+        "complete": not failed
+        and all(row["story_accounting"]["complete"] for row in evaluated),
+        "ticker_days": evaluated,
     }
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     if args.write is not None:
         args.write.parent.mkdir(parents=True, exist_ok=True)
         args.write.write_text(text, encoding="utf-8")
-    print(text if args.json else _render(reports), end="")
+    if args.json:
+        print(text, end="")
+    else:
+        banner = day_set.trust_summary.text
+        print(banner)
+        print()
+        print(_render(reports), end="")
+        print(banner)
 
+    for case in failed:
+        print(
+            f"EVALUATION FAILED: {case['case_id']}: {case['detail']}", file=sys.stderr
+        )
     failures = [
         report
         for report in reports
@@ -140,7 +247,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"AC-4 FAILED: {report.ticker} {report.trading_day}",
             file=sys.stderr,
         )
-    return 1 if failures else 0
+    return 1 if (failures or failed) else 0
 
 
 if __name__ == "__main__":

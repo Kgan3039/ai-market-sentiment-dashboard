@@ -13,6 +13,9 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from nlp.eval.trust import TrustContract, TrustSummary, derive_trust_summary
+from nlp.eval.trust import parse_trust_contract
+
 from .errors import ThemeInputError
 from .models import ThemeStory
 
@@ -30,6 +33,19 @@ _STORY_KEYS = frozenset(
     }
 )
 _DAY_KEYS = frozenset({"ticker", "trading_day", "volume", "expectation", "stories"})
+_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "dataset_id",
+        "issue",
+        "acceptance_criteria",
+        "trust_contract",
+        "known_limitations",
+        "provenance",
+        "shape_notes",
+        "ticker_days",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +66,22 @@ class TickerDaySet:
     dataset_id: str
     metadata: Mapping[str, Any]
     days: tuple[TickerDay, ...]
+    #: Validated provenance, parsed by M4's contract so M5 states its
+    #: trust the same way M3 and M4 do rather than inventing a second
+    #: vocabulary for the same warning.
+    trust_contract: TrustContract = None  # type: ignore[assignment]
+
+    @property
+    def trust_summary(self) -> TrustSummary:
+        """The banner, derived from the validated fields, never supplied."""
+
+        return derive_trust_summary(self.trust_contract)
+
+    @property
+    def known_limitations(self) -> tuple[str, ...]:
+        """What this fixture cannot show, as the manifest states it."""
+
+        return tuple(self.metadata.get("known_limitations", ()))
 
 
 def _require(payload: Mapping[str, Any], key: str, where: str) -> Any:
@@ -105,6 +137,9 @@ def load_ticker_days(path: str | Path = DEFAULT_FIXTURE_PATH) -> TickerDaySet:
         raise ThemeInputError(f"{fixture}: fixture not found") from exc
     except json.JSONDecodeError as exc:
         raise ThemeInputError(f"{fixture}: not valid JSON: {exc}") from exc
+    unknown = sorted(set(payload) - _MANIFEST_KEYS)
+    if unknown:
+        raise ThemeInputError(f"{fixture}: unknown manifest field(s) {unknown}")
     if payload.get("schema_version") != SUPPORTED_SCHEMA_VERSION:
         raise ThemeInputError(
             f"{fixture}: unsupported schema_version "
@@ -139,10 +174,17 @@ def load_ticker_days(path: str | Path = DEFAULT_FIXTURE_PATH) -> TickerDaySet:
         )
     if not days:
         raise ThemeInputError(f"{fixture}: holds no ticker-days")
+    try:
+        contract = parse_trust_contract(payload, where=str(fixture))
+    except ValueError as exc:
+        # A fixture that cannot say what it is worth is not clustered
+        # around; an unstated provenance is the one a reader assumes away.
+        raise ThemeInputError(f"{fixture}: {exc}") from exc
     return TickerDaySet(
         dataset_id=str(payload.get("dataset_id", "")),
         metadata=payload,
         days=tuple(days),
+        trust_contract=contract,
     )
 
 

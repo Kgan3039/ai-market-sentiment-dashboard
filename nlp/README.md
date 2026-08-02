@@ -879,6 +879,29 @@ three *real* ticker-days. Real days need I2 (#61), I3 (#62) and I1 (#57),
 none of which are on main. The three committed days are authored to the same
 shape and marked synthetic; they demonstrate the behaviour, not the DoD.
 
+### The bridge from M3, and what it must not drop
+
+`nlp.themes.bridge` reads **only M3's public result**. It projects the
+canonical title, ticker, timestamp, outlets and M3's own `outlet_count`,
+every member id and source link, the collapsed `member_story_keys`, the
+`content_hash`, and — the part a thinner projection would silently launder —
+the trust-bearing state: `quarantined_member_ids`, `provider_conflicts`,
+`semantic_skip_reason`, and the accepted `merge_evidence`.
+`source_metadata_from_semantic` records the M3 run itself: algorithm
+version, config fingerprint, model name/revision/dimension, and the
+quarantined, skipped and merged story counts.
+
+**A quarantined story never joins a theme.** M2 could not settle which
+article a feed identity described and M3 held it out of merging; nothing
+downstream is entitled to fold it into a narrative or hand it to a
+summarizer as part of one. It is held out of clustering and shown under
+"Other coverage" with `provider_quarantine` on it — visible, attributed,
+and never dropped.
+
+M5 reaches into no private M3 module. A test parses every `nlp/themes/*.py`
+and fails on an import of any stage's `evidence`, `guards` or internal
+`compatibility` module.
+
 ### No story disappears
 
 Every input comes back in exactly one of three places — a theme,
@@ -886,6 +909,14 @@ Every input comes back in exactly one of three places — a theme,
 `cluster_themes` asserts that partition before returning. `excluded` is
 currently only ever "no encodable text". A story that is in none of the
 three is a bug the function raises on rather than ships.
+
+**Other coverage carries a reason per story**, not one label for four
+different situations: `below_clustering_floor`, `clustering_noise`,
+`below_theme_size_floor`, `below_cohesion_floor`, `theme_incompatible`,
+`provider_quarantine`, `semantic_skip`. The evaluation artifact reports
+`missing_story_keys`, `unexpected_story_keys` and
+`duplicate_membership_keys` explicitly, because a "no story lost" boolean
+cannot distinguish a lost story from an invented one.
 
 ### Algorithm, and when it gives way
 
@@ -901,25 +932,69 @@ The second case is the one that bites. On the committed TSLA day HDBSCAN
 under-split 18 stories into a seven-story grab-bag at cohesion 0.351 holding
 the robotaxi permit, the Berlin factory restart, the Nevada battery line and
 the investor-day notice together. That is the "one giant catch-all cluster"
-a reader must never be shown as a theme. The fallback picks a cluster count
-in the band by silhouette (ties to the smaller count) and produced five
-themes at 0.42-0.58.
+a reader must never be shown as a theme.
+
+**The fallback picks its cluster count by the theme contract, not by
+silhouette.** Silhouette is a geometric shape statistic that knows nothing
+about the size and cohesion floors the stage enforces two steps later, and
+on this fixture the two objectives point in opposite directions. At n=17
+the silhouette maximum sits at k=2 (0.1825), whose clusters the stage then
+dissolves — leaving **one theme and fourteen stories in Other coverage** —
+while k=6 places sixteen of seventeen in themes that survive. Because the
+silhouette values differ in the third decimal, dropping a single story
+flipped the choice and collapsed the day. The objective is now the outcome
+the stage actually wants: the most stories placed in themes that clear both
+floors, then the highest mean cohesion among them, then the fewest themes,
+then the smallest k. Every tie-break is a total order on data.
+
+The effect on the same perturbation: 5 themes → 1 became 5 themes → 5, and
+membership retention rose from 0.20 to 0.60.
 
 Below four stories the day is not clustered at all (AC-4): stories are
 listed individually under "Other coverage". A group of fewer than
 `min_theme_stories` (2) is coverage, not a theme, and goes the same way — so
 a day never shows a "theme" of one story.
 
-### Coherence: exactly one contradiction transfers from M3
+### The theme-compatibility contract (`nlp/themes/compatibility.py`)
 
 A theme is coarser than a story. Different quarters, different magnitudes
 and different people legitimately share an earnings theme, so applying M3's
 full guard set here would shred every theme into singletons. Exactly one
-family transfers: **opposing claims**. A theme holding both "raised
-guidance" and "cut guidance" cannot be summarized in 2-4 faithful sentences.
-The minority side moves to "Other coverage" — majority by story count, ties
-to the side holding the theme's leading story — and every move is reported
-in `method_reason`.
+question transfers: **a theme may not assert both sides of the same claim.**
+
+This is **M5's own contract**, not an import of M3's. M3's guard lexicons
+are private to `nlp/semdedup/evidence.py` and are versioned against a
+different question; importing them coupled every theme to a guard change
+that had nothing to do with themes. The contract is stated, versioned
+(`m5.compatibility.v1`) and fingerprinted here, and it names four families:
+
+| family | asserts |
+|---|---|
+| `direction` | which way the number moved (raise / cut) |
+| `performance` | against expectation (beat / miss) |
+| `decision` | which way it went (approve / reject) |
+| `commitment` | whether it is happening at all (confirm / cancel) |
+
+A negation marker inverts the story's polarity for every family it asserts,
+so "will not open the plant" contradicts "opens the plant" as plainly as
+"halts" does.
+
+Everything M5 **deliberately allows** inside one theme is listed in
+`PERMITTED_DIFFERENCES` with its reason — reporting period, named entities,
+named roles, article type, quantities and units, repeated distinct events —
+so each is a decision on the record rather than an omission. All six veto in
+M3, where the question is narrower.
+
+The check is **cluster-wide**: each family's members are split by polarity
+across the whole prospective theme and the minority side leaves together, so
+a theme cannot keep a contradiction because no single pair was examined.
+Majority by story count, ties to the side holding the theme's leading story,
+and every move is reported in `method_reason`.
+
+*Integration requirement:* M3 does not expose per-story compatibility
+evidence on its public result, so M5 derives polarity from the canonical
+title and standfirst. When #57/#68 land and M3 publishes a public evidence
+projection, this module should consume it instead.
 
 ### Salience and stability
 
@@ -944,17 +1019,21 @@ signal a reconciler needs. A genuinely new theme gets a new key.
 | | AAPL 03-04 | NVDA 03-05 | TSLA 03-06 |
 |---|---|---|---|
 | stories | 3 | 9 | 18 |
-| method | small-n fallback | hdbscan | agglomerative |
+| method | small n fallback | hdbscan | agglomerative |
 | themes | 0 | 3 | 5 |
 | other coverage | 3 | 3 | 1 |
 | excluded | 0 | 0 | 0 |
-| theme coverage | n/a | 0.667 | 0.944 |
+| theme coverage | 0.000 | 0.667 | 0.944 |
 | mean cohesion | n/a | 0.729 | 0.479 |
-| max inter-theme similarity | n/a | 0.583 | 0.617 |
+| max inter-theme similarity | n/a | 0.582 | 0.617 |
 | AC-4 shape | yes | yes | yes |
 | no story lost | yes | yes | yes |
 | permutation stable | yes | yes | yes |
 | re-run keeps identities | yes | yes | yes |
+| perturbation: membership | 1.00 | 0.67 | 0.60 |
+| perturbation: identity | 1.00 | 0.67 | 0.80 |
+| perturbation: themes | 0 -> 0 | 3 -> 2 | 5 -> 5 |
+| themes near cohesion floor | 0 | 0 | 2 |
 
 ### Honest limitations
 
@@ -963,19 +1042,39 @@ signal a reconciler needs. A genuinely new theme gets a new key.
   cohesion versus separation, stability. A day can score perfectly here and
   still group two stories a reader would separate — which is what the K3
   (#60) human review exists for, and it is not written yet.
-- **Two of the five TSLA themes are imperfect.** The top one puts the
-  battery line and the supercharger corridor with the delivery report; the
-  fourth puts the investor-day notice with the Berlin factory. Both are
-  above the cohesion floor and both would survive to a reader. Tuning the
-  parameters until this particular fixture looked clean would be fitting to
-  a fixture I wrote, so it has not been done.
-- **Membership is fragile under perturbation; identity is not.** Dropping
-  one story from the TSLA day re-runs the silhouette choice and retains only
-  20% of the exact memberships — but centroid matching retained 100% of the
-  theme identities, which is the property AC-4 actually asks for. On the
-  HDBSCAN days membership retention was 0.67-1.00.
-- **`min_theme_cohesion` was calibrated on these three days.** Real days
-  will need it re-measured.
+- **Two of the five TSLA themes are, on inspection, not one narrative each,
+  and they are flagged rather than fixed.** Theme 1 (cohesion 0.4205, margin
+  +0.0205 over the floor, loosest pair 0.2676) holds the quarterly delivery
+  number, the China delivery story, the Nevada battery line, the Norwegian
+  supercharger corridor, the energy-storage record and a grid-storage
+  contract. That is at least two narratives — quarterly performance, and
+  energy infrastructure — and a reader would separate them. Theme 4 (0.4168,
+  margin +0.0168) puts the investor-day notice with the Berlin factory
+  restart. Both sit *within two hundredths* of a threshold that was chosen by
+  looking at these same days, so "above the floor" is not evidence here. AC-4
+  caps themes at six and the day already produces five, so splitting theme 1
+  further is outside the band the issue allows. **They are reported with
+  `near_cohesion_floor: true`, their exact membership, and their loosest
+  pair, rather than tuned away** — moving the threshold until this fixture
+  looked clean would be fitting to a fixture with one author.
+- **Membership stability and identity stability are different properties and
+  the weaker one is not evidence for the stronger.** `membership_retained` is
+  the fraction of the *baseline's* themes whose exact member set survives;
+  `identity_retained` is the fraction whose `theme_key` survives. The earlier
+  report paired 0.20 membership with 1.00 identity and read as stable — the
+  1.00 came from dividing by the perturbed run's *one* remaining theme.
+  Identity is now measured against the baseline, the weak denominator is kept
+  beside it as `matched_fraction_of_new`, and each artifact carries an
+  `interpretation` sentence that says so in words. AC-4 asks only that
+  *re-running an unchanged day* does not rename a theme, which is
+  `rerun_keeps_identity` and holds on all three days; it does not ask for
+  membership stability under a changed day, and M5 does not claim it.
+- **`min_theme_cohesion` was chosen by looking at the same three days it is
+  evaluated on.** Every cohesion figure above is therefore partly a
+  restatement of the threshold. It cannot be calibrated honestly until real
+  ingested days exist (#57/#68) and the human review in #60/K3 says which
+  groups a reader accepts. The fixture manifest states this in
+  `known_limitations` and the config docstring repeats it.
 - **The fixture, the guards, and the thresholds share an author**, exactly
   as in M4, so the results are optimistic.
 

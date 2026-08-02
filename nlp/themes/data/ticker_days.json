@@ -3,6 +3,22 @@
   "dataset_id": "phase0-theme-ticker-days-v1",
   "issue": "#72",
   "acceptance_criteria": "AC-4; gate G1",
+  "trust_contract": {
+    "dataset_kind": "synthetic_development",
+    "real_ingested_evidence": false,
+    "labeling_status": "single_author_unadjudicated",
+    "reviewer_count": 1,
+    "adjudicated": false,
+    "gate_eligible": false,
+    "metrics_purpose": "development_regression_only",
+    "why": "Every headline, standfirst, outlet and timestamp in this fixture was written for it. The theme groupings it is expected to produce were chosen by the same person who wrote the stories, so a clustering that reproduces them has agreed with its author and nothing more. No number derived from this file measures whether a reader would accept the themes, and none of them can clear G1: that needs real ingested days (#57/#68) and the two-reviewer adjudicated assignment review in #60."
+  },
+  "known_limitations": [
+    "Authored, not sampled: the day shapes were chosen to exercise the small-n, HDBSCAN and fallback paths, not observed in the wild.",
+    "min_theme_cohesion was chosen by looking at these same days, so cohesion figures here are partly a restatement of the threshold.",
+    "One author, no second reviewer, no adjudication: there is no theme-assignment agreement number and G1 remains unmeasured.",
+    "Three ticker-days is a demonstration of shape, not a sample: it cannot show how often the fallback engages on real coverage."
+  ],
   "provenance": {
     "kind": "synthetic",
     "statement": "Every headline, standfirst, outlet, and timestamp here is authored, not scraped. No entry asserts anything about a real published article. Company names and tickers are real because the fixture has to exercise Phase 0 symbols; the events are invented and must not be quoted or cited as claims about any company.",
@@ -26,24 +42,38 @@
           "title": "Apple opens its first store in Saudi Arabia",
           "description": "The Riyadh location is the company's first owned store in the country.",
           "published_at": "2026-03-04T08:00:00+00:00",
-          "outlets": ["bloomberg", "cnbc"],
-          "item_ids": ["aapl-1-a", "aapl-1-b"]
+          "outlets": [
+            "bloomberg",
+            "cnbc"
+          ],
+          "item_ids": [
+            "aapl-1-a",
+            "aapl-1-b"
+          ]
         },
         {
           "story_key": "aapl-2",
           "title": "Apple wins dismissal of an App Store class action",
           "description": "A federal judge dismissed the developer suit in full.",
           "published_at": "2026-03-04T17:00:00+00:00",
-          "outlets": ["reuters"],
-          "item_ids": ["aapl-2-a"]
+          "outlets": [
+            "reuters"
+          ],
+          "item_ids": [
+            "aapl-2-a"
+          ]
         },
         {
           "story_key": "aapl-3",
           "title": "Apple names a new head of hardware engineering",
           "description": "The appointment takes effect next month.",
           "published_at": "2026-03-04T11:20:00+00:00",
-          "outlets": ["bloomberg"],
-          "item_ids": ["aapl-3-a"]
+          "outlets": [
+            "bloomberg"
+          ],
+          "item_ids": [
+            "aapl-3-a"
+          ]
         }
       ]
     },
@@ -58,72 +88,118 @@
           "title": "Nvidia reports record data centre revenue",
           "description": "Quarterly revenue came in above analyst estimates on continued accelerator demand.",
           "published_at": "2026-03-05T21:05:00+00:00",
-          "outlets": ["reuters", "cnbc", "yahoo finance"],
-          "item_ids": ["nvda-1-a", "nvda-1-b", "nvda-1-c"]
+          "outlets": [
+            "reuters",
+            "cnbc",
+            "yahoo finance"
+          ],
+          "item_ids": [
+            "nvda-1-a",
+            "nvda-1-b",
+            "nvda-1-c"
+          ]
         },
         {
           "story_key": "nvda-2",
           "title": "Nvidia guides to higher data centre revenue next quarter",
           "description": "Management pointed to accelerator bookings already on the books.",
           "published_at": "2026-03-05T21:40:00+00:00",
-          "outlets": ["bloomberg", "marketwatch"],
-          "item_ids": ["nvda-2-a", "nvda-2-b"]
+          "outlets": [
+            "bloomberg",
+            "marketwatch"
+          ],
+          "item_ids": [
+            "nvda-2-a",
+            "nvda-2-b"
+          ]
         },
         {
           "story_key": "nvda-3",
           "title": "Nvidia gross margin expands in the quarter",
           "description": "Margin improved on a richer accelerator mix.",
           "published_at": "2026-03-05T22:10:00+00:00",
-          "outlets": ["marketwatch"],
-          "item_ids": ["nvda-3-a"]
+          "outlets": [
+            "marketwatch"
+          ],
+          "item_ids": [
+            "nvda-3-a"
+          ]
         },
         {
           "story_key": "nvda-4",
           "title": "Washington clears Nvidia to ship a reduced-performance chip to China",
           "description": "The licence covers a scaled-back accelerator for Chinese buyers.",
           "published_at": "2026-03-05T08:20:00+00:00",
-          "outlets": ["reuters", "bloomberg"],
-          "item_ids": ["nvda-4-a", "nvda-4-b"]
+          "outlets": [
+            "reuters",
+            "bloomberg"
+          ],
+          "item_ids": [
+            "nvda-4-a",
+            "nvda-4-b"
+          ]
         },
         {
           "story_key": "nvda-5",
           "title": "China export licence for Nvidia accelerators draws Congressional scrutiny",
           "description": "Two senators asked the Commerce Department to explain the export decision.",
           "published_at": "2026-03-05T14:30:00+00:00",
-          "outlets": ["politico"],
-          "item_ids": ["nvda-5-a"]
+          "outlets": [
+            "politico"
+          ],
+          "item_ids": [
+            "nvda-5-a"
+          ]
         },
         {
           "story_key": "nvda-6",
           "title": "Nvidia unveils its next accelerator generation at GTC",
           "description": "The new parts ship to cloud customers later this year.",
           "published_at": "2026-03-05T17:00:00+00:00",
-          "outlets": ["cnbc", "the verge"],
-          "item_ids": ["nvda-6-a", "nvda-6-b"]
+          "outlets": [
+            "cnbc",
+            "the verge"
+          ],
+          "item_ids": [
+            "nvda-6-a",
+            "nvda-6-b"
+          ]
         },
         {
           "story_key": "nvda-7",
           "title": "Nvidia opens accelerator orders to European cloud providers at GTC",
           "description": "European operators can order the new systems from today.",
           "published_at": "2026-03-05T18:15:00+00:00",
-          "outlets": ["the verge"],
-          "item_ids": ["nvda-7-a"]
+          "outlets": [
+            "the verge"
+          ],
+          "item_ids": [
+            "nvda-7-a"
+          ]
         },
         {
           "story_key": "nvda-8",
           "title": "Nvidia GTC keynote draws record developer attendance",
           "description": "Organisers said registrations exceeded last year's conference.",
           "published_at": "2026-03-05T19:00:00+00:00",
-          "outlets": ["zacks"],
-          "item_ids": ["nvda-8-a"]
+          "outlets": [
+            "zacks"
+          ],
+          "item_ids": [
+            "nvda-8-a"
+          ]
         },
         {
           "story_key": "nvda-9",
           "title": "Nvidia adds two directors to its board",
           "description": "Both appointments take effect at the annual meeting.",
           "published_at": "2026-03-05T09:00:00+00:00",
-          "outlets": ["reuters"],
-          "item_ids": ["nvda-9-a"]
+          "outlets": [
+            "reuters"
+          ],
+          "item_ids": [
+            "nvda-9-a"
+          ]
         }
       ]
     },
@@ -138,144 +214,230 @@
           "title": "Tesla delivers 495,000 vehicles in the first quarter",
           "description": "Deliveries came in ahead of the consensus compiled by the company.",
           "published_at": "2026-03-06T11:00:00+00:00",
-          "outlets": ["reuters", "cnbc", "marketwatch"],
-          "item_ids": ["tsla-1-a", "tsla-1-b", "tsla-1-c"]
+          "outlets": [
+            "reuters",
+            "cnbc",
+            "marketwatch"
+          ],
+          "item_ids": [
+            "tsla-1-a",
+            "tsla-1-b",
+            "tsla-1-c"
+          ]
         },
         {
           "story_key": "tsla-2",
           "title": "Tesla quarterly deliveries top analyst estimates in China",
           "description": "China volumes accounted for most of the beat.",
           "published_at": "2026-03-06T11:40:00+00:00",
-          "outlets": ["bloomberg"],
-          "item_ids": ["tsla-2-a"]
+          "outlets": [
+            "bloomberg"
+          ],
+          "item_ids": [
+            "tsla-2-a"
+          ]
         },
         {
           "story_key": "tsla-3",
           "title": "Tesla cuts Model 3 prices across Europe",
           "description": "The reductions apply from today in eleven markets.",
           "published_at": "2026-03-06T12:20:00+00:00",
-          "outlets": ["reuters", "yahoo finance"],
-          "item_ids": ["tsla-3-a", "tsla-3-b"]
+          "outlets": [
+            "reuters",
+            "yahoo finance"
+          ],
+          "item_ids": [
+            "tsla-3-a",
+            "tsla-3-b"
+          ]
         },
         {
           "story_key": "tsla-4",
           "title": "European Model Y buyers get a lower sticker price from Tesla",
           "description": "The company trimmed prices on the crossover as well.",
           "published_at": "2026-03-06T13:05:00+00:00",
-          "outlets": ["marketwatch"],
-          "item_ids": ["tsla-4-a"]
+          "outlets": [
+            "marketwatch"
+          ],
+          "item_ids": [
+            "tsla-4-a"
+          ]
         },
         {
           "story_key": "tsla-5",
           "title": "Tesla recalls 12,000 Cybertrucks over a wiper fault",
           "description": "Owners will be notified by post; the remedy is a software update.",
           "published_at": "2026-03-06T15:20:00+00:00",
-          "outlets": ["reuters", "cnbc"],
-          "item_ids": ["tsla-5-a", "tsla-5-b"]
+          "outlets": [
+            "reuters",
+            "cnbc"
+          ],
+          "item_ids": [
+            "tsla-5-a",
+            "tsla-5-b"
+          ]
         },
         {
           "story_key": "tsla-6",
           "title": "Safety regulator opens a review of the Cybertruck wiper recall",
           "description": "The agency asked for the company's remedy documentation.",
           "published_at": "2026-03-06T16:45:00+00:00",
-          "outlets": ["axios"],
-          "item_ids": ["tsla-6-a"]
+          "outlets": [
+            "axios"
+          ],
+          "item_ids": [
+            "tsla-6-a"
+          ]
         },
         {
           "story_key": "tsla-7",
           "title": "Tesla recalls Model Y vehicles over a seatbelt anchor",
           "description": "A second recall filed the same week covers a different fault.",
           "published_at": "2026-03-06T17:10:00+00:00",
-          "outlets": ["reuters"],
-          "item_ids": ["tsla-7-a"]
+          "outlets": [
+            "reuters"
+          ],
+          "item_ids": [
+            "tsla-7-a"
+          ]
         },
         {
           "story_key": "tsla-8",
           "title": "Tesla's Berlin plant resumes output after a grid fault",
           "description": "Production restarted on the morning shift.",
           "published_at": "2026-03-06T07:00:00+00:00",
-          "outlets": ["reuters", "cnbc"],
-          "item_ids": ["tsla-8-a", "tsla-8-b"]
+          "outlets": [
+            "reuters",
+            "cnbc"
+          ],
+          "item_ids": [
+            "tsla-8-a",
+            "tsla-8-b"
+          ]
         },
         {
           "story_key": "tsla-9",
           "title": "Tesla adds a third shift at the Berlin factory",
           "description": "The plant will run around the clock from next month.",
           "published_at": "2026-03-06T08:30:00+00:00",
-          "outlets": ["bloomberg"],
-          "item_ids": ["tsla-9-a"]
+          "outlets": [
+            "bloomberg"
+          ],
+          "item_ids": [
+            "tsla-9-a"
+          ]
         },
         {
           "story_key": "tsla-10",
           "title": "Tesla plans a new battery line in Nevada",
           "description": "Two people familiar with the plan described the timeline.",
           "published_at": "2026-03-06T09:15:00+00:00",
-          "outlets": ["reuters"],
-          "item_ids": ["tsla-10-a"]
+          "outlets": [
+            "reuters"
+          ],
+          "item_ids": [
+            "tsla-10-a"
+          ]
         },
         {
           "story_key": "tsla-11",
           "title": "Tesla applies for a robotaxi permit in Arizona",
           "description": "The application covers driverless ride-hailing in two cities.",
           "published_at": "2026-03-06T12:50:00+00:00",
-          "outlets": ["reuters", "axios"],
-          "item_ids": ["tsla-11-a", "tsla-11-b"]
+          "outlets": [
+            "reuters",
+            "axios"
+          ],
+          "item_ids": [
+            "tsla-11-a",
+            "tsla-11-b"
+          ]
         },
         {
           "story_key": "tsla-12",
           "title": "Arizona regulators set a hearing date for the Tesla robotaxi application",
           "description": "The hearing is scheduled for next month.",
           "published_at": "2026-03-06T14:00:00+00:00",
-          "outlets": ["politico"],
-          "item_ids": ["tsla-12-a"]
+          "outlets": [
+            "politico"
+          ],
+          "item_ids": [
+            "tsla-12-a"
+          ]
         },
         {
           "story_key": "tsla-13",
           "title": "Tesla expands its supervised self-driving trial to two more states",
           "description": "The trial adds drivers in Nevada and New Mexico.",
           "published_at": "2026-03-06T15:00:00+00:00",
-          "outlets": ["the verge"],
-          "item_ids": ["tsla-13-a"]
+          "outlets": [
+            "the verge"
+          ],
+          "item_ids": [
+            "tsla-13-a"
+          ]
         },
         {
           "story_key": "tsla-14",
           "title": "Tesla energy storage deployments set a quarterly record",
           "description": "Megapack output rose at the Lathrop factory.",
           "published_at": "2026-03-06T20:00:00+00:00",
-          "outlets": ["cnbc", "marketwatch"],
-          "item_ids": ["tsla-14-a", "tsla-14-b"]
+          "outlets": [
+            "cnbc",
+            "marketwatch"
+          ],
+          "item_ids": [
+            "tsla-14-a",
+            "tsla-14-b"
+          ]
         },
         {
           "story_key": "tsla-15",
           "title": "Tesla signs a grid storage contract with a European utility",
           "description": "The contract covers Megapack deliveries over three years.",
           "published_at": "2026-03-06T20:40:00+00:00",
-          "outlets": ["reuters"],
-          "item_ids": ["tsla-15-a"]
+          "outlets": [
+            "reuters"
+          ],
+          "item_ids": [
+            "tsla-15-a"
+          ]
         },
         {
           "story_key": "tsla-16",
           "title": "Tesla's head of investor relations departs",
           "description": "A successor has not been named.",
           "published_at": "2026-03-06T18:00:00+00:00",
-          "outlets": ["bloomberg"],
-          "item_ids": ["tsla-16-a"]
+          "outlets": [
+            "bloomberg"
+          ],
+          "item_ids": [
+            "tsla-16-a"
+          ]
         },
         {
           "story_key": "tsla-17",
           "title": "Tesla schedules its investor day for 2026-05-14",
           "description": "The event will be held at the Austin factory.",
           "published_at": "2026-03-06T10:00:00+00:00",
-          "outlets": ["marketwatch"],
-          "item_ids": ["tsla-17-a"]
+          "outlets": [
+            "marketwatch"
+          ],
+          "item_ids": [
+            "tsla-17-a"
+          ]
         },
         {
           "story_key": "tsla-18",
           "title": "Tesla opens a supercharger corridor across Norway",
           "description": "The route links Oslo to Tromso with sixteen new sites.",
           "published_at": "2026-03-06T10:10:00+00:00",
-          "outlets": ["reuters"],
-          "item_ids": ["tsla-18-a"]
+          "outlets": [
+            "reuters"
+          ],
+          "item_ids": [
+            "tsla-18-a"
+          ]
         }
       ]
     }

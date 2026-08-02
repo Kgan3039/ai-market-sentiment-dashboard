@@ -26,9 +26,15 @@ import numpy as np
 
 from nlp.embeddings import EmbeddingError, compose_embedding_text
 
-from .clustering import NOISE, assign_clusters, centroid_of, mean_pairwise_similarity
-from .coherence import conflicting_members
-from .config import ALGORITHM_VERSION, ThemeConfig
+from .clustering import (
+    NOISE,
+    assign_clusters,
+    centroid_of,
+    mean_pairwise_similarity,
+    min_pairwise_similarity,
+)
+from .compatibility import incompatible_members
+from .config import ALGORITHM_VERSION, THEME_NAMESPACE, ThemeConfig
 from .errors import (
     ThemeCapacityError,
     ThemeEncodingError,
@@ -38,19 +44,20 @@ from .models import (
     ClusteringMethod,
     ExcludedStory,
     ExclusionReason,
+    OtherCoverageEntry,
+    OtherCoverageReason,
     PreviousTheme,
     SalienceFeatures,
     Theme,
     ThemeEvidence,
     ThemeQuality,
     ThemeSet,
+    ThemeSourceMetadata,
     ThemeStory,
 )
 from .salience import match_previous_themes, salience_features, salience_of
 
 _EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
-#: Namespace for theme fingerprints.
-THEME_NAMESPACE = "m5.theme.v1"
 
 
 def _encode_fields(fields: Sequence[str]) -> bytes:
@@ -145,8 +152,34 @@ def _story_text(story: ThemeStory) -> str | None:
         return None
 
 
+def encoder_identity(encoder: Any) -> tuple[str, str | None, int | None]:
+    """Return the encoder's validated ``(name, revision, dimension)``.
+
+    A theme set records which model produced it so a stored day can be
+    invalidated when the model moves.  A blank name would make that record
+    useless and the failure silent, so it is refused here rather than
+    written into an artifact as an empty string.
+    """
+
+    name = getattr(encoder, "model_name", None)
+    if not isinstance(name, str) or not name.strip():
+        raise ThemeEncodingError(
+            "encoder must expose a non-blank model_name; a theme set that "
+            "cannot name its encoder cannot be invalidated when the model moves"
+        )
+    revision = getattr(encoder, "model_revision", None)
+    if revision is not None and (not isinstance(revision, str) or not revision.strip()):
+        raise ThemeEncodingError("encoder model_revision must be a non-blank string")
+    dimension = getattr(encoder, "dimension", None)
+    if dimension is not None and (
+        isinstance(dimension, bool) or not isinstance(dimension, int) or dimension <= 0
+    ):
+        raise ThemeEncodingError("encoder dimension must be a positive integer")
+    return name.strip(), revision, dimension
+
+
 def _encode(
-    stories: Sequence[ThemeStory], encoder: Any
+    stories: Sequence[ThemeStory], encoder: Any, declared_dimension: int | None
 ) -> tuple[np.ndarray, list[int]]:
     positions = [index for index, story in enumerate(stories) if _story_text(story)]
     texts = [_story_text(stories[index]) or "" for index in positions]
@@ -168,6 +201,11 @@ def _encode(
     if np.any(np.linalg.norm(matrix, axis=1) == 0):
         raise ThemeEncodingError(
             "encoder returned a zero vector; cosine similarity is undefined for it"
+        )
+    if declared_dimension is not None and matrix.shape[1] != declared_dimension:
+        raise ThemeEncodingError(
+            f"encoder returned {matrix.shape[1]}-dimensional vectors but "
+            f"declares dimension {declared_dimension}"
         )
     return matrix, positions
 
@@ -197,12 +235,16 @@ def cluster_themes(
     config: ThemeConfig,
     encoder: Any,
     previous_themes: Sequence[PreviousTheme] = (),
+    source_metadata: ThemeSourceMetadata | None = None,
 ) -> ThemeSet:
     """Group one ticker-day's canonical stories into salience-ranked themes.
 
     Raises :class:`~nlp.themes.errors.ThemeCapacityError` before producing
     anything when the day holds more than ``config.max_stories_per_day``
     stories.
+
+    ``source_metadata`` records which dedup run produced the stories; pass
+    the bridge's projection so the theme set can be traced back to it.
     """
 
     if not isinstance(config, ThemeConfig):
@@ -217,11 +259,14 @@ def cluster_themes(
         raise ThemeCapacityError(symbol, len(stories), config.max_stories_per_day)
 
     ordered = sorted(stories, key=_order_key)
+    model_name, model_revision, declared_dimension = encoder_identity(encoder)
     fingerprint = config.fingerprint(
-        model_name=str(getattr(encoder, "model_name", "") or ""),
-        model_revision=getattr(encoder, "model_revision", None),
+        model_name=model_name,
+        model_revision=model_revision,
+        embedding_dimension=declared_dimension,
     )
-    vectors, encodable = _encode(ordered, encoder)
+    vectors, encodable = _encode(ordered, encoder, declared_dimension)
+    dimension = int(vectors.shape[1]) if vectors.size else declared_dimension
     excluded = tuple(
         ExcludedStory(
             story_key=ordered[index].story_key,
@@ -232,7 +277,29 @@ def cluster_themes(
     )
     usable = [ordered[index] for index in encodable]
 
-    if len(usable) < config.min_stories_for_clustering:
+    # A story M2 quarantined and M3 held out never joins a theme.  Its
+    # payload identity is disputed upstream: nothing downstream is entitled
+    # to fold it into a narrative or hand it to a summarizer as part of
+    # one.  It is still shown, with the reason on it.
+    held: dict[int, OtherCoverageReason] = {
+        position: (
+            OtherCoverageReason.PROVIDER_QUARANTINE
+            if story.is_quarantined
+            else OtherCoverageReason.SEMANTIC_SKIP
+        )
+        for position, story in enumerate(usable)
+        if story.is_semantically_skipped
+    }
+    clusterable = [position for position in range(len(usable)) if position not in held]
+
+    if len(clusterable) < config.min_stories_for_clustering:
+        reasons = dict(held)
+        for position in clusterable:
+            reasons[position] = OtherCoverageReason.BELOW_CLUSTERING_FLOOR
+        note = (
+            f"{len(clusterable)} clusterable stories, below the clustering "
+            f"floor of {config.min_stories_for_clustering}; listed individually"
+        )
         return _assemble(
             symbol,
             trading_day,
@@ -240,25 +307,27 @@ def cluster_themes(
             usable,
             vectors,
             groups=[],
-            other_positions=list(range(len(usable))),
+            other_reasons=reasons,
             excluded=excluded,
             method=ClusteringMethod.SMALL_N_FALLBACK,
-            method_reason=(
-                f"{len(usable)} stories, below the clustering floor of "
-                f"{config.min_stories_for_clustering}; listed individually"
-            ),
+            method_reason=_with_held(note, held),
             config=config,
             fingerprint=fingerprint,
             previous_themes=previous_themes,
-            encoder=encoder,
+            model_name=model_name,
+            model_revision=model_revision,
+            dimension=dimension,
+            source_metadata=source_metadata,
         )
 
-    assignment = assign_clusters(vectors, config)
+    subset = vectors[clusterable]
+    assignment = assign_clusters(subset, config)
     grouped: dict[int, list[int]] = {}
-    other: list[int] = []
-    for position, label in enumerate(assignment.labels):
+    reasons = dict(held)
+    for index, label in enumerate(assignment.labels):
+        position = clusterable[index]
         if label == NOISE:
-            other.append(position)
+            reasons[position] = OtherCoverageReason.CLUSTERING_NOISE
         else:
             grouped.setdefault(label, []).append(position)
 
@@ -273,7 +342,8 @@ def cluster_themes(
                 f"moved a {len(members)}-story cluster to other coverage, "
                 f"below the {config.min_theme_stories}-story theme floor"
             )
-            other.extend(members)
+            for position in members:
+                reasons[position] = OtherCoverageReason.BELOW_THEME_SIZE_FLOOR
             continue
         cohesion = mean_pairwise_similarity(vectors, members)
         if cohesion < config.min_theme_cohesion:
@@ -284,9 +354,10 @@ def cluster_themes(
                 f"dissolved a {len(members)}-story cluster with cohesion "
                 f"{cohesion:.4f} into other coverage"
             )
-            other.extend(members)
+            for position in members:
+                reasons[position] = OtherCoverageReason.BELOW_COHESION_FLOOR
             continue
-        ejected = conflicting_members(
+        ejected = incompatible_members(
             usable, sorted(members, key=lambda p: -_position_salience(usable, p))
         )
         if ejected:
@@ -294,10 +365,15 @@ def cluster_themes(
                 f"moved {len(ejected)} contradicting story(ies) out of a "
                 f"{len(members)}-story theme"
             )
-            other.extend(ejected)
+            for position in ejected:
+                reasons[position] = OtherCoverageReason.THEME_INCOMPATIBLE
             members = [position for position in members if position not in set(ejected)]
-        if members:
+        if len(members) >= config.min_theme_stories:
             groups.append(sorted(members))
+        else:
+            # Ejecting the contradiction left too few to be a theme.
+            for position in members:
+                reasons[position] = OtherCoverageReason.BELOW_THEME_SIZE_FLOOR
 
     return _assemble(
         symbol,
@@ -306,19 +382,34 @@ def cluster_themes(
         usable,
         vectors,
         groups=groups,
-        other_positions=sorted(other),
+        other_reasons=reasons,
         excluded=excluded,
         method=(
             ClusteringMethod.HDBSCAN
             if assignment.method == "hdbscan"
             else ClusteringMethod.AGGLOMERATIVE
         ),
-        method_reason="; ".join(notes),
+        method_reason=_with_held("; ".join(notes), held),
         config=config,
         fingerprint=fingerprint,
         previous_themes=previous_themes,
-        encoder=encoder,
+        model_name=model_name,
+        model_revision=model_revision,
+        dimension=dimension,
+        source_metadata=source_metadata,
     )
+
+
+def _with_held(note: str, held: dict[int, OtherCoverageReason]) -> str:
+    """Append the upstream hold-outs to the method reason, when there are any."""
+
+    if not held:
+        return note
+    counts: dict[str, int] = {}
+    for reason in held.values():
+        counts[reason.value] = counts.get(reason.value, 0) + 1
+    detail = ", ".join(f"{count} {name}" for name, count in sorted(counts.items()))
+    return f"{note}; held out of clustering by upstream state: {detail}"
 
 
 def _position_salience(usable: Sequence[ThemeStory], position: int) -> float:
@@ -337,14 +428,17 @@ def _assemble(
     vectors: np.ndarray,
     *,
     groups: Sequence[Sequence[int]],
-    other_positions: Sequence[int],
+    other_reasons: dict[int, OtherCoverageReason],
     excluded: tuple[ExcludedStory, ...],
     method: ClusteringMethod,
     method_reason: str,
     config: ThemeConfig,
     fingerprint: str,
     previous_themes: Sequence[PreviousTheme],
-    encoder: Any,
+    model_name: str,
+    model_revision: str | None,
+    dimension: int | None,
+    source_metadata: ThemeSourceMetadata | None,
 ) -> ThemeSet:
     reference_time = _latest(usable)
     counts = [len(group) for group in groups]
@@ -356,7 +450,7 @@ def _assemble(
     max_outlets = max(outlet_counts) if outlet_counts else 0
 
     drafts: list[
-        tuple[float, SalienceFeatures, list[int], float, tuple[float, ...]]
+        tuple[float, SalienceFeatures, list[int], float, tuple[float, ...], float]
     ] = []
     for group, outlet_count in zip(groups, outlet_counts):
         members = list(group)
@@ -376,6 +470,7 @@ def _assemble(
                 members,
                 mean_pairwise_similarity(vectors, members),
                 centroid_of(vectors, members),
+                min_pairwise_similarity(vectors, members),
             )
         )
 
@@ -395,7 +490,14 @@ def _assemble(
     )
 
     themes: list[Theme] = []
-    for rank, (salience, features, members, cohesion, centroid) in enumerate(drafts, 1):
+    for rank, (
+        salience,
+        features,
+        members,
+        cohesion,
+        centroid,
+        min_cohesion,
+    ) in enumerate(drafts, 1):
         leading = max(members, key=lambda p: _position_salience(usable, p))
         ordered_members = [leading] + sorted(
             (position for position in members if position != leading),
@@ -420,6 +522,7 @@ def _assemble(
                 salience_rank=rank,
                 salience_features=features,
                 cohesion=cohesion,
+                min_pairwise_cohesion=min_cohesion,
                 centroid=centroid,
                 matched_previous_key=previous_key,
                 method=method,
@@ -427,10 +530,10 @@ def _assemble(
         )
 
     other = tuple(
-        _evidence(usable[position])
-        for position in sorted(
-            set(other_positions), key=lambda p: _order_key(usable[p])
+        OtherCoverageEntry(
+            evidence=_evidence(usable[position]), reason=other_reasons[position]
         )
+        for position in sorted(other_reasons, key=lambda p: _order_key(usable[p]))
     )
     result = ThemeSet(
         ticker=ticker,
@@ -440,11 +543,13 @@ def _assemble(
         excluded=excluded,
         method=method,
         method_reason=method_reason,
-        quality=_quality(len(ordered), themes, other, excluded, config),
+        quality=_quality(len(ordered), themes, other, excluded, method, config),
         config_fingerprint=fingerprint,
         algorithm_version=ALGORITHM_VERSION,
-        model_name=str(getattr(encoder, "model_name", "") or ""),
-        model_revision=getattr(encoder, "model_revision", None),
+        model_name=model_name,
+        model_revision=model_revision,
+        embedding_dimension=dimension,
+        source_metadata=source_metadata,
     )
     expected = tuple(sorted(story.story_key for story in ordered))
     if result.accounted_story_keys != expected:
@@ -458,8 +563,9 @@ def _assemble(
 def _quality(
     story_count: int,
     themes: Sequence[Theme],
-    other: Sequence[ThemeEvidence],
+    other: Sequence[OtherCoverageEntry],
     excluded: Sequence[ExcludedStory],
+    method: ClusteringMethod,
     config: ThemeConfig,
 ) -> ThemeQuality:
     in_themes = sum(theme.story_count for theme in themes)
@@ -472,12 +578,15 @@ def _quality(
             for index, left in enumerate(themes)
             for right in themes[index + 1 :]
         )
-    small_day = story_count < config.min_stories_for_clustering
-    meets = (
-        (not themes and len(other) == story_count)
-        if small_day
-        else config.min_themes <= len(themes) <= config.max_themes
-    )
+    # AC-4's band applies to a day that was *clustered*.  Which branch ran
+    # is the method, not the raw input count: a five-story day with three
+    # encodable stories, or with two quarantined, is legitimately below the
+    # floor, and judging it against "2-6 themes" because five arrived
+    # reported a correct degradation as a failure.
+    if method is ClusteringMethod.SMALL_N_FALLBACK:
+        meets = not themes and len(other) + len(excluded) == story_count
+    else:
+        meets = config.min_themes <= len(themes) <= config.max_themes
     return ThemeQuality(
         story_count=story_count,
         theme_count=len(themes),

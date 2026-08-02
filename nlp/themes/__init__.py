@@ -29,13 +29,22 @@ from __future__ import annotations
 
 from .bridge import (
     descriptions_from_semantic,
+    source_metadata_from_exact,
+    source_metadata_from_semantic,
     theme_stories_from_exact,
     theme_stories_from_semantic,
 )
 from .clustering import ClusterAssignment, assign_clusters
+from .compatibility import (
+    COMPATIBILITY_POLICY_VERSION,
+    PERMITTED_DIFFERENCES,
+    incompatible_members,
+    story_claims,
+)
 from .config import ALGORITHM_VERSION, ThemeConfig
 from .errors import (
     ThemeCapacityError,
+    ThemeClusteringError,
     ThemeConfigError,
     ThemeEncodingError,
     ThemeError,
@@ -45,18 +54,32 @@ from .models import (
     ClusteringMethod,
     ExcludedStory,
     ExclusionReason,
+    OtherCoverageEntry,
+    OtherCoverageReason,
     PreviousTheme,
     SalienceFeatures,
     Theme,
     ThemeEvidence,
     ThemeQuality,
     ThemeSet,
+    ThemeSourceMetadata,
     ThemeStory,
 )
-from .service import cluster_themes, theme_fingerprint_for
+from .service import cluster_themes, encoder_identity, theme_fingerprint_for
 
 __all__ = [
     "ALGORITHM_VERSION",
+    "COMPATIBILITY_POLICY_VERSION",
+    "PERMITTED_DIFFERENCES",
+    "OtherCoverageEntry",
+    "OtherCoverageReason",
+    "ThemeClusteringError",
+    "ThemeSourceMetadata",
+    "encoder_identity",
+    "incompatible_members",
+    "source_metadata_from_exact",
+    "source_metadata_from_semantic",
+    "story_claims",
     "ClusterAssignment",
     "ClusteringMethod",
     "ExcludedStory",

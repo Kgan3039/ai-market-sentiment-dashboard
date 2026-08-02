@@ -19,6 +19,20 @@ class ThemeEncodingError(ThemeError):
     """The encoder returned something the stage cannot trust."""
 
 
+class ThemeClusteringError(ThemeError):
+    """The clustering library failed on input the stage had accepted.
+
+    Wrapped rather than propagated raw: a caller handling one ticker-day
+    among five needs to tell "sklearn raised" apart from "M5 refused", and
+    an unwrapped library exception makes that a string comparison.
+    """
+
+    def __init__(self, method: str, cause: BaseException) -> None:
+        super().__init__(f"the {method} clustering library failed: {cause}")
+        self.method = method
+        self.cause = cause
+
+
 class ThemeCapacityError(ThemeError):
     """A ticker-day holds more stories than the stage will cluster.
 

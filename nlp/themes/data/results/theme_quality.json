@@ -1,65 +1,319 @@
 {
+  "acceptance_criteria": "AC-4; gate G1",
+  "algorithm_version": "m5.themes.v1",
+  "case_count": 3,
+  "compatibility_policy_fingerprint": "5b2f5df530657a11c05ee4946ccebf6aa172b4ceffa20371260bf901591f2d09",
+  "complete": true,
   "dataset_id": "phase0-theme-ticker-days-v1",
+  "dataset_version": "phase0.theme_eval.v1",
+  "embedding_dimension": 384,
+  "evaluated_case_count": 3,
+  "failed_case_count": 0,
+  "failed_cases": [],
+  "issue": "#72",
+  "known_limitations": [
+    "Authored, not sampled: the day shapes were chosen to exercise the small-n, HDBSCAN and fallback paths, not observed in the wild.",
+    "min_theme_cohesion was chosen by looking at these same days, so cohesion figures here are partly a restatement of the threshold.",
+    "One author, no second reviewer, no adjudication: there is no theme-assignment agreement number and G1 remains unmeasured.",
+    "Three ticker-days is a demonstration of shape, not a sample: it cannot show how often the fallback engages on real coverage."
+  ],
   "model_name": "sentence-transformers/all-MiniLM-L6-v2",
   "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+  "schema_version": "phase0.theme_eval.v1",
+  "semantic_input_composition": "m1.compose_embedding_text(title, description)",
+  "theme_config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+  "theme_policy_components": {
+    "algorithm_version": "m5.themes.v1",
+    "compatibility.families": "direction,performance,decision,commitment",
+    "compatibility.family.commitment.negative": "abandon,abandoned,abandons,cancel,canceled,cancelled,cancels,delay,delayed,delays,denied,denies,halt,halted,halts,postpone,postponed,postpones,scrap,scrapped,scraps,suspend,suspended,suspends",
+    "compatibility.family.commitment.positive": "confirm,confirmed,confirms,launch,launched,launches,open,opened,opens,proceed,proceeding,proceeds,resume,resumed,resumes,sign,signed,signs,start,started,starts",
+    "compatibility.family.decision.negative": "ban,banned,bans,block,blocked,blocks,denied,denies,deny,lose,loses,lost,overturn,overturned,overturns,refuse,refused,refuses,reject,rejected,rejects",
+    "compatibility.family.decision.positive": "approval,approve,approved,approves,authorise,authorises,authorize,authorized,authorizes,clear,cleared,clears,grant,granted,grants,upheld,uphold,upholds,win,wins,won",
+    "compatibility.family.direction.negative": "cut,cuts,decline,declined,declines,downgrade,downgraded,downgrades,drop,dropped,drops,fall,falls,fell,lower,lowered,lowers,reduce,reduced,reduces,shrank,shrink,shrinks,slash,slashed,slashes,slow,slowed,slows,trim,trimmed,trims,weaker",
+    "compatibility.family.direction.positive": "add,added,adds,boost,boosted,boosts,climb,climbed,climbs,expand,expanded,expands,grew,grow,grows,higher,increase,increased,increases,jump,jumped,jumps,lift,lifted,lifts,raise,raised,raises,rise,rises,rose,stronger,upgrade,upgraded,upgrades",
+    "compatibility.family.performance.negative": "lag,lagged,lags,miss,missed,misses,trail,trailed,trails,underperform,underperforms",
+    "compatibility.family.performance.positive": "beat,beats,exceed,exceeded,exceeds,outperform,outperforms,top,topped,tops",
+    "compatibility.negation_markers": "cannot,denied,denies,never,no,not,wont",
+    "compatibility.permitted_differences": "reporting_period,named_entities,named_roles,article_type,quantities_and_units,repeated_distinct_events",
+    "compatibility.scope": "whole_prospective_theme",
+    "compatibility.text_scope": "title_and_description",
+    "compatibility.tie_break": "majority_then_leading_story",
+    "compatibility.tokenizer": "nlp.dedup.structural.tokenize",
+    "compatibility.version": "m5.compatibility.v1",
+    "embedding_dimension": 384,
+    "exclusion_reasons": "no_encodable_text",
+    "fallback.candidate_band": "min_themes..min(max_themes, n-1)",
+    "fallback.label_numbering": "renumbered_by_first_appearance",
+    "fallback.linkage": "average",
+    "fallback.metric": "precomputed_cosine_distance",
+    "fallback.objective": "max_stories_in_themes_clearing_size_and_cohesion_floors",
+    "fallback.tie_break": "higher_mean_cohesion, fewer_themes, smaller_k",
+    "fallback.trigger": "cluster_count_outside_band_or_a_cluster_below_cohesion_floor",
+    "label_policy": "leading_member_title; deterministic; no model call; label never participates in membership identity",
+    "max_stories_per_day": 250,
+    "max_themes": 6,
+    "min_cluster_size": 2,
+    "min_samples": 1,
+    "min_stories_for_clustering": 4,
+    "min_theme_cohesion": 0.4,
+    "min_theme_stories": 2,
+    "min_themes": 2,
+    "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+    "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "other_coverage_policy": "explicit_entry_per_story_with_stated_reason; never a narrative theme",
+    "other_coverage_reasons": "below_clustering_floor,below_cohesion_floor,below_theme_size_floor,clustering_noise,provider_quarantine,semantic_skip,theme_incompatible",
+    "outlier_policy": "clustering_noise_to_other_coverage_never_dropped",
+    "quarantine_policy": "upstream_quarantined_and_semantically_skipped_stories_held_out_of _clustering_and_shown_under_other_coverage",
+    "ranking_policy": "salience = weighted(story_count, outlet_diversity, recency)",
+    "recency_half_life_hours": 6.0,
+    "salience_weights": [
+      0.4,
+      0.3,
+      0.3
+    ],
+    "semantic_input_composition": "m1.compose_embedding_text(title, description)",
+    "stability_threshold": 0.9,
+    "story_ordering_policy": "undated_last, published_at_asc, story_key_asc",
+    "supported_tickers": [
+      "AAPL",
+      "NVDA",
+      "TSLA"
+    ],
+    "theme_namespace": "m5.theme.v1",
+    "tie_break_policy": "salience_desc, earliest_member, theme_fingerprint"
+  },
   "ticker_days": [
     {
+      "algorithm_version": "m5.themes.v1",
+      "config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+      "duplicate_membership_keys": [],
+      "embedding_dimension": 384,
+      "excluded_by_reason": {},
       "excluded_count": 0,
       "max_inter_theme_similarity": null,
       "mean_cohesion": null,
       "meets_ac4_shape": true,
       "method": "small_n_fallback",
-      "method_reason": "3 stories, below the clustering floor of 4; listed individually",
+      "method_reason": "3 clusterable stories, below the clustering floor of 4; listed individually",
+      "missing_story_keys": [],
+      "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+      "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
       "no_story_lost": true,
       "other_coverage": [
         "aapl-1",
         "aapl-3",
         "aapl-2"
       ],
+      "other_coverage_by_reason": {
+        "below_clustering_floor": [
+          "aapl-1",
+          "aapl-2",
+          "aapl-3"
+        ]
+      },
       "other_coverage_count": 3,
+      "partition": [],
+      "permutation": {
+        "identity_retained": 1.0,
+        "interpretation": "1.00 of the baseline's themes kept their exact membership.",
+        "matched_fraction_of_new": 1.0,
+        "membership_retained": 1.0,
+        "stories_retained_in_themes": 1.0,
+        "theme_count_after": 0,
+        "theme_count_before": 0
+      },
       "permutation_stable": true,
       "perturbation": {
         "identity_retained": 1.0,
+        "interpretation": "1.00 of the baseline's themes kept their exact membership.",
+        "matched_fraction_of_new": 1.0,
         "membership_retained": 1.0,
+        "stories_retained_in_themes": 1.0,
         "theme_count_after": 0,
         "theme_count_before": 0
       },
       "rerun_keeps_identity": true,
       "singleton_theme_count": 0,
+      "story_accounting": {
+        "accounted": 3,
+        "complete": true,
+        "duplicate_membership_keys": [],
+        "excluded": 0,
+        "in_themes": 0,
+        "input_story_count": 3,
+        "missing_story_keys": [],
+        "other_coverage": 3,
+        "unexpected_story_keys": []
+      },
       "story_count": 3,
       "theme_count": 0,
       "theme_coverage": 0.0,
+      "theme_details": [],
       "themes": [],
       "ticker": "AAPL",
       "trading_day": "2026-03-04",
+      "unexpected_story_keys": [],
       "volume": "low"
     },
     {
+      "algorithm_version": "m5.themes.v1",
+      "config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+      "duplicate_membership_keys": [],
+      "embedding_dimension": 384,
+      "excluded_by_reason": {},
       "excluded_count": 0,
       "max_inter_theme_similarity": 0.5824737467655388,
       "mean_cohesion": 0.7287741369137682,
       "meets_ac4_shape": true,
       "method": "hdbscan",
       "method_reason": "hdbscan found 3 clusters inside the allowed band, loosest cohesion 0.6897",
+      "missing_story_keys": [],
+      "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+      "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
       "no_story_lost": true,
       "other_coverage": [
         "nvda-9",
         "nvda-8",
         "nvda-3"
       ],
+      "other_coverage_by_reason": {
+        "clustering_noise": [
+          "nvda-3",
+          "nvda-8",
+          "nvda-9"
+        ]
+      },
       "other_coverage_count": 3,
+      "partition": [
+        [
+          "nvda-1",
+          "nvda-2"
+        ],
+        [
+          "nvda-4",
+          "nvda-5"
+        ],
+        [
+          "nvda-6",
+          "nvda-7"
+        ]
+      ],
+      "permutation": {
+        "identity_retained": 1.0,
+        "interpretation": "1.00 of the baseline's themes kept their exact membership.",
+        "matched_fraction_of_new": 1.0,
+        "membership_retained": 1.0,
+        "stories_retained_in_themes": 1.0,
+        "theme_count_after": 3,
+        "theme_count_before": 3
+      },
       "permutation_stable": true,
       "perturbation": {
-        "identity_retained": 1.0,
+        "identity_retained": 0.6666666666666666,
+        "interpretation": "0.67 of the baseline's themes kept their exact membership.",
+        "matched_fraction_of_new": 1.0,
         "membership_retained": 0.6666666666666666,
+        "stories_retained_in_themes": 0.8,
         "theme_count_after": 2,
         "theme_count_before": 3
       },
       "rerun_keeps_identity": true,
       "singleton_theme_count": 0,
+      "story_accounting": {
+        "accounted": 9,
+        "complete": true,
+        "duplicate_membership_keys": [],
+        "excluded": 0,
+        "in_themes": 6,
+        "input_story_count": 9,
+        "missing_story_keys": [],
+        "other_coverage": 3,
+        "unexpected_story_keys": []
+      },
       "story_count": 9,
       "theme_count": 3,
       "theme_coverage": 0.6666666666666666,
+      "theme_details": [
+        {
+          "cohesion": 0.719546,
+          "cohesion_margin": 0.319546,
+          "fingerprint": "d02333a575c129c56c5ed3f7d331ca47eabeb94870d3e4bdae104bf3fe3937c7",
+          "label": "Nvidia reports record data centre revenue",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 2,
+          "member_story_keys": [
+            "nvda-1",
+            "nvda-2"
+          ],
+          "method": "hdbscan",
+          "min_pairwise_cohesion": 0.719546,
+          "near_cohesion_floor": false,
+          "outlet_count": 5,
+          "outlets": [
+            "bloomberg",
+            "cnbc",
+            "marketwatch",
+            "reuters",
+            "yahoo finance"
+          ],
+          "rank": 1,
+          "representative_story_key": "nvda-1",
+          "salience": 0.983162,
+          "theme_key": "d02333a575c129c56c5ed3f7d331ca47eabeb94870d3e4bdae104bf3fe3937c7"
+        },
+        {
+          "cohesion": 0.777126,
+          "cohesion_margin": 0.377126,
+          "fingerprint": "1334609ad9ca2c41404876f3e0e7e973b01ff7210fc66939f43be717a7e80675",
+          "label": "Nvidia unveils its next accelerator generation at GTC",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 2,
+          "member_story_keys": [
+            "nvda-6",
+            "nvda-7"
+          ],
+          "method": "hdbscan",
+          "min_pairwise_cohesion": 0.777126,
+          "near_cohesion_floor": false,
+          "outlet_count": 2,
+          "outlets": [
+            "cnbc",
+            "the verge"
+          ],
+          "rank": 2,
+          "representative_story_key": "nvda-6",
+          "salience": 0.710816,
+          "theme_key": "1334609ad9ca2c41404876f3e0e7e973b01ff7210fc66939f43be717a7e80675"
+        },
+        {
+          "cohesion": 0.68965,
+          "cohesion_margin": 0.28965,
+          "fingerprint": "8bdd8acfe35f4d54ec69d09bebd0f64dca854093f0a0bcf9e8f7dec7bc0bd081",
+          "label": "Washington clears Nvidia to ship a reduced-performance chip to China",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 2,
+          "member_story_keys": [
+            "nvda-4",
+            "nvda-5"
+          ],
+          "method": "hdbscan",
+          "min_pairwise_cohesion": 0.68965,
+          "near_cohesion_floor": false,
+          "outlet_count": 3,
+          "outlets": [
+            "bloomberg",
+            "politico",
+            "reuters"
+          ],
+          "rank": 3,
+          "representative_story_key": "nvda-4",
+          "salience": 0.703729,
+          "theme_key": "8bdd8acfe35f4d54ec69d09bebd0f64dca854093f0a0bcf9e8f7dec7bc0bd081"
+        }
+      ],
       "themes": [
         [
           1,
@@ -85,32 +339,240 @@
       ],
       "ticker": "NVDA",
       "trading_day": "2026-03-05",
+      "unexpected_story_keys": [],
       "volume": "medium"
     },
     {
+      "algorithm_version": "m5.themes.v1",
+      "config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+      "duplicate_membership_keys": [],
+      "embedding_dimension": 384,
+      "excluded_by_reason": {},
       "excluded_count": 0,
       "max_inter_theme_similarity": 0.6167591575864638,
       "mean_cohesion": 0.4792599700127025,
       "meets_ac4_shape": true,
       "method": "agglomerative",
-      "method_reason": "hdbscan's loosest cluster has cohesion 0.3508, below 0.4; best silhouette 0.1767 at k=6; moved a 1-story cluster to other coverage, below the 2-story theme floor",
+      "method_reason": "hdbscan's loosest cluster has cohesion 0.3508, below 0.4; k=6 places 17 stories in 5 theme(s) clearing the floors, mean cohesion 0.4793; moved a 1-story cluster to other coverage, below the 2-story theme floor",
+      "missing_story_keys": [],
+      "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+      "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
       "no_story_lost": true,
       "other_coverage": [
         "tsla-16"
       ],
+      "other_coverage_by_reason": {
+        "below_theme_size_floor": [
+          "tsla-16"
+        ]
+      },
       "other_coverage_count": 1,
+      "partition": [
+        [
+          "tsla-1",
+          "tsla-10",
+          "tsla-14",
+          "tsla-15",
+          "tsla-18",
+          "tsla-2"
+        ],
+        [
+          "tsla-11",
+          "tsla-12",
+          "tsla-13"
+        ],
+        [
+          "tsla-17",
+          "tsla-8",
+          "tsla-9"
+        ],
+        [
+          "tsla-3",
+          "tsla-4"
+        ],
+        [
+          "tsla-5",
+          "tsla-6",
+          "tsla-7"
+        ]
+      ],
+      "permutation": {
+        "identity_retained": 1.0,
+        "interpretation": "1.00 of the baseline's themes kept their exact membership.",
+        "matched_fraction_of_new": 1.0,
+        "membership_retained": 1.0,
+        "stories_retained_in_themes": 1.0,
+        "theme_count_after": 5,
+        "theme_count_before": 5
+      },
       "permutation_stable": true,
       "perturbation": {
-        "identity_retained": 1.0,
-        "membership_retained": 0.2,
-        "theme_count_after": 1,
+        "identity_retained": 0.8,
+        "interpretation": "only 0.60 of the baseline's themes kept their exact membership, while 0.80 kept an identifier; stable identifiers over restructured membership is not stable clustering.",
+        "matched_fraction_of_new": 0.8,
+        "membership_retained": 0.6,
+        "stories_retained_in_themes": 1.0,
+        "theme_count_after": 5,
         "theme_count_before": 5
       },
       "rerun_keeps_identity": true,
       "singleton_theme_count": 0,
+      "story_accounting": {
+        "accounted": 18,
+        "complete": true,
+        "duplicate_membership_keys": [],
+        "excluded": 0,
+        "in_themes": 17,
+        "input_story_count": 18,
+        "missing_story_keys": [],
+        "other_coverage": 1,
+        "unexpected_story_keys": []
+      },
       "story_count": 18,
       "theme_count": 5,
       "theme_coverage": 0.9444444444444444,
+      "theme_details": [
+        {
+          "cohesion": 0.420504,
+          "cohesion_margin": 0.020504,
+          "fingerprint": "f20129319a6eecf7e8bf3a44c052b7d502a0749ea61bd6fc0173d0dcdb023d94",
+          "label": "Tesla delivers 495,000 vehicles in the first quarter",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 6,
+          "member_story_keys": [
+            "tsla-1",
+            "tsla-10",
+            "tsla-14",
+            "tsla-15",
+            "tsla-18",
+            "tsla-2"
+          ],
+          "method": "agglomerative",
+          "min_pairwise_cohesion": 0.267577,
+          "near_cohesion_floor": true,
+          "outlet_count": 4,
+          "outlets": [
+            "bloomberg",
+            "cnbc",
+            "marketwatch",
+            "reuters"
+          ],
+          "rank": 1,
+          "representative_story_key": "tsla-1",
+          "salience": 1.0,
+          "theme_key": "f20129319a6eecf7e8bf3a44c052b7d502a0749ea61bd6fc0173d0dcdb023d94"
+        },
+        {
+          "cohesion": 0.472479,
+          "cohesion_margin": 0.072479,
+          "fingerprint": "1db2e6edca4199d41a9930d734974c6a64187ee7e604f12d4e422d9f61518e50",
+          "label": "Tesla applies for a robotaxi permit in Arizona",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 3,
+          "member_story_keys": [
+            "tsla-11",
+            "tsla-12",
+            "tsla-13"
+          ],
+          "method": "agglomerative",
+          "min_pairwise_cohesion": 0.304832,
+          "near_cohesion_floor": false,
+          "outlet_count": 4,
+          "outlets": [
+            "axios",
+            "politico",
+            "reuters",
+            "the verge"
+          ],
+          "rank": 2,
+          "representative_story_key": "tsla-11",
+          "salience": 0.655889,
+          "theme_key": "1db2e6edca4199d41a9930d734974c6a64187ee7e604f12d4e422d9f61518e50"
+        },
+        {
+          "cohesion": 0.505574,
+          "cohesion_margin": 0.105574,
+          "fingerprint": "b7201a4bde44f7e44369c93c8019935d2fd3fa118d9cc34c3f3d837f33dc0f47",
+          "label": "Tesla recalls 12,000 Cybertrucks over a wiper fault",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 3,
+          "member_story_keys": [
+            "tsla-5",
+            "tsla-6",
+            "tsla-7"
+          ],
+          "method": "agglomerative",
+          "min_pairwise_cohesion": 0.409937,
+          "near_cohesion_floor": false,
+          "outlet_count": 3,
+          "outlets": [
+            "axios",
+            "cnbc",
+            "reuters"
+          ],
+          "rank": 3,
+          "representative_story_key": "tsla-5",
+          "salience": 0.625226,
+          "theme_key": "b7201a4bde44f7e44369c93c8019935d2fd3fa118d9cc34c3f3d837f33dc0f47"
+        },
+        {
+          "cohesion": 0.416818,
+          "cohesion_margin": 0.016818,
+          "fingerprint": "c5567e8d27fe188e3e48568e5998232d463387dc2b6fc1251f0248c2c1fca2cd",
+          "label": "Tesla's Berlin plant resumes output after a grid fault",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 3,
+          "member_story_keys": [
+            "tsla-17",
+            "tsla-8",
+            "tsla-9"
+          ],
+          "method": "agglomerative",
+          "min_pairwise_cohesion": 0.271743,
+          "near_cohesion_floor": true,
+          "outlet_count": 4,
+          "outlets": [
+            "bloomberg",
+            "cnbc",
+            "marketwatch",
+            "reuters"
+          ],
+          "rank": 4,
+          "representative_story_key": "tsla-8",
+          "salience": 0.58749,
+          "theme_key": "c5567e8d27fe188e3e48568e5998232d463387dc2b6fc1251f0248c2c1fca2cd"
+        },
+        {
+          "cohesion": 0.580924,
+          "cohesion_margin": 0.180924,
+          "fingerprint": "6b2000cddd2f0d77502d726fcae02ec6fb4c347ce10b7f1e9b37896225f703ea",
+          "label": "Tesla cuts Model 3 prices across Europe",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 2,
+          "member_story_keys": [
+            "tsla-3",
+            "tsla-4"
+          ],
+          "method": "agglomerative",
+          "min_pairwise_cohesion": 0.580924,
+          "near_cohesion_floor": false,
+          "outlet_count": 3,
+          "outlets": [
+            "marketwatch",
+            "reuters",
+            "yahoo finance"
+          ],
+          "rank": 5,
+          "representative_story_key": "tsla-3",
+          "salience": 0.483259,
+          "theme_key": "6b2000cddd2f0d77502d726fcae02ec6fb4c347ce10b7f1e9b37896225f703ea"
+        }
+      ],
       "themes": [
         [
           1,
@@ -150,7 +612,24 @@
       ],
       "ticker": "TSLA",
       "trading_day": "2026-03-06",
+      "unexpected_story_keys": [],
       "volume": "high"
     }
-  ]
+  ],
+  "trust_contract": {
+    "adjudicated": false,
+    "dataset_kind": "synthetic_development",
+    "gate_eligible": false,
+    "labeling_status": "single_author_unadjudicated",
+    "metrics_purpose": "development_regression_only",
+    "real_ingested_evidence": false,
+    "reviewer_count": 1,
+    "warning": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  },
+  "trust_summary": {
+    "detail": "Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "headline": "Synthetic, single-author, unadjudicated development dataset.",
+    "level": "WARNING",
+    "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  }
 }
