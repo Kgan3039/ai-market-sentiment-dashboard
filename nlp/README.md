@@ -656,6 +656,18 @@ also strips a trailing attribution clause and lemma-folds its markers). A
 frame is a headline template and a subject is a headline subject; reading
 the standfirst as well rejected P054 and P068.
 
+**`same_frame` compares canonicalized quantities, not raw number tokens.**
+Each quantity span in the headline is replaced by one placeholder carrying
+exactly the fields `quantities_conflict` treats as assertions — the counted
+unit is left out, since it is unknown when absent and survives as its own
+token. Without this the guard answered a question about spelling: "five
+million units" and "5 million units" are one claim written two ways, but as
+bare tokens `five` and `5` look like a substituted slot, and the guard
+refused the pair after the quantity comparison had already accepted it. A
+genuinely different quantity still yields a different placeholder, and
+reaches `numeric_disagreement` first in any case — that guard is scanned
+before `same_frame`, so the recorded reason stays the specific one.
+
 ### Article-type classification
 
 Two match modes. *Anywhere* phrases identify a genre wherever they appear

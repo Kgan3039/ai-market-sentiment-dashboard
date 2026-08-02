@@ -2980,6 +2980,7 @@
     "basis": "precision_first",
     "caveat": "Provisional and development-only. Selected on a synthetic, single-author, unadjudicated dataset that is not gate eligible; these numbers cannot clear K3/G4 or final AC-3.",
     "f1_at_selected": 0.9090909090909091,
+    "false_negative_attribution": "All 13 false negative(s) at the selected threshold are threshold-driven: no guard refused a labelled duplicate, and guard_rejected_positive_ids_at_selected is empty. Raising recall here is a question about the score, not the guards.",
     "false_positives_at_selected": [],
     "guard_rejected_positive_ids_at_selected": [],
     "highest_surviving_false_positive_score": 0.675315,
@@ -2988,7 +2989,7 @@
     "margin_over_worst_false_positive": 0.024685,
     "max_f1_threshold": 0.5,
     "precision_at_selected": 1.0,
-    "rationale": "Precision-first. The lowest tested threshold with zero false merges is reported as lowest_threshold_with_zero_false_merges; the selected value sits above it by a deliberate margin over the highest-scoring surviving false positive, rather than on the knife edge. The F1 maximum is not used: it buys F1 with false merges. Note that not every false negative is threshold-driven - guard_rejected_positive_ids_at_selected lists the ones a guard refused.",
+    "rationale": "Precision-first. The lowest tested threshold with zero false merges is reported as lowest_threshold_with_zero_false_merges; the selected value sits above it by a deliberate margin over the highest-scoring surviving false positive, rather than on the knife edge. The F1 maximum is not used: it buys F1 with false merges. All 13 false negative(s) at the selected threshold are threshold-driven: no guard refused a labelled duplicate, and guard_rejected_positive_ids_at_selected is empty. Raising recall here is a question about the score, not the guards.",
     "recall_at_selected": 0.8333333333333334,
     "selected_is_lowest_clean_threshold": false,
     "selected_threshold": 0.7,
@@ -3023,8 +3024,8 @@
       "window_applies_to": "every_pair_inside_the_story"
     },
     "embedding_dimension": 384,
-    "evidence_policy_fingerprint": "3c40b3d8d5c93b460d466bfcb49cf34debad910e7362e5c947617ff59dc72316",
-    "evidence_policy_version": "m3.evidence.v5",
+    "evidence_policy_fingerprint": "4400b4803bc6a22dbf1ea8efb4a4ab0c30188c4f8d21c92b980eb9d3d120baef",
+    "evidence_policy_version": "m3.evidence.v6",
     "frame_overlap_threshold": 0.5,
     "guard_order": [
       "article_type",
@@ -3040,7 +3041,7 @@
     "model_name": "sentence-transformers/all-MiniLM-L6-v2",
     "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
     "score_precision": 6,
-    "semantic_config_fingerprint": "57de9b5c021710d96cb7585d75adc029572bda7736b60dd03f01316291cd5f5c",
+    "semantic_config_fingerprint": "72f9e9f1a9216ad6111b837cb7767ef8ab2c2d0c4a8969cd3d091b14ced5910e",
     "semantic_input_composition": "m1.compose_embedding_text(title, description)",
     "similarity_threshold": 0.7,
     "window_hours": 36.0

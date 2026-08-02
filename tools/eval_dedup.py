@@ -409,6 +409,46 @@ def _confusion_detail(report: EvaluationReport) -> dict[str, Any]:
     }
 
 
+def _false_negative_attribution(
+    guard_rejected: list[str], threshold_rejected: list[str]
+) -> str:
+    """Describe what refused the missed merges, from the ID lists themselves.
+
+    A recall number says how many were missed; it does not say whether the
+    threshold or a guard refused them, and those call for opposite
+    remedies.  The sentence is derived rather than written down because a
+    standing claim about which kind exists goes stale the moment a guard
+    changes - the previous wording said "not every false negative is
+    threshold-driven" long after the last guard-driven one had gone.
+    """
+
+    guards, thresholds = len(guard_rejected), len(threshold_rejected)
+    if not guards and not thresholds:
+        return "There are no false negatives at the selected threshold."
+    if not guards:
+        return (
+            f"All {thresholds} false negative(s) at the selected threshold "
+            "are threshold-driven: no guard refused a labelled duplicate, "
+            "and guard_rejected_positive_ids_at_selected is empty. Raising "
+            "recall here is a question about the score, not the guards."
+        )
+    if not thresholds:
+        return (
+            f"All {guards} false negative(s) at the selected threshold are "
+            "guard-driven: every one scored at or above the threshold and "
+            "was refused by a guard, listed in "
+            "guard_rejected_positive_ids_at_selected. Raising recall here is "
+            "a question about the guards, not the score."
+        )
+    return (
+        f"{thresholds} false negative(s) at the selected threshold are "
+        f"threshold-driven and {guards} are guard-driven; the two lists are "
+        "threshold_rejected_positive_ids_at_selected and "
+        "guard_rejected_positive_ids_at_selected. The two call for different "
+        "remedies, so neither count stands for the other."
+    )
+
+
 def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Describe which sweep point the build ships, and why.
 
@@ -443,6 +483,8 @@ def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any]
         ),
         default=None,
     )
+    guard_rejected = list(chosen.get("guard_rejected_positive_ids", []))
+    threshold_rejected = list(chosen.get("threshold_rejected_positive_ids", []))
     return {
         "selected_threshold": DEFAULT_SIMILARITY_THRESHOLD,
         "status": "provisional",
@@ -451,11 +493,10 @@ def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any]
         "recall_at_selected": chosen["recall"],
         "f1_at_selected": chosen["f1"],
         "false_positives_at_selected": chosen["false_positives"],
-        "guard_rejected_positive_ids_at_selected": chosen.get(
-            "guard_rejected_positive_ids", []
-        ),
-        "threshold_rejected_positive_ids_at_selected": chosen.get(
-            "threshold_rejected_positive_ids", []
+        "guard_rejected_positive_ids_at_selected": guard_rejected,
+        "threshold_rejected_positive_ids_at_selected": threshold_rejected,
+        "false_negative_attribution": _false_negative_attribution(
+            guard_rejected, threshold_rejected
         ),
         "highest_threshold_still_producing_a_false_merge": (
             max(point["threshold"] for point in dirty) if dirty else None
@@ -480,9 +521,7 @@ def _selection_block(stage: str, points: list[dict[str, Any]]) -> dict[str, Any]
             "the selected value sits above it by a deliberate margin over the "
             "highest-scoring surviving false positive, rather than on the "
             "knife edge. The F1 maximum is not used: it buys F1 with false "
-            "merges. Note that not every false negative is threshold-driven - "
-            "guard_rejected_positive_ids_at_selected lists the ones a guard "
-            "refused."
+            "merges. " + _false_negative_attribution(guard_rejected, threshold_rejected)
         ),
         "caveat": (
             "Provisional and development-only. Selected on a synthetic, "

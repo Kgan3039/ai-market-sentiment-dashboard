@@ -65,7 +65,7 @@ from nlp.dedup.structural import tokenize
 from nlp.dedup.text import display_text
 
 #: Bumped whenever a guard, a lexicon, or the comparison changes.
-EVIDENCE_POLICY_VERSION = "m3.evidence.v5"
+EVIDENCE_POLICY_VERSION = "m3.evidence.v6"
 
 #: Bumped when the article-type classifier changes shape.
 ARTICLE_TYPE_POLICY_VERSION = "m3.article_type.v3"
@@ -943,6 +943,10 @@ _PRODUCT_QUALIFIERS = frozenset(
 _PERCENT_SUFFIX = re.compile(r"(%|bps|bp)$")
 _RANGE_TOKEN = re.compile(r"\d[\d,.]*\s*-\s*[+\-]?[^\w\s]?\d")
 
+#: Marks a token the tokenizer never emits, so a canonicalized quantity can
+#: never collide with a word that happens to look like one.
+_QUANTITY_PLACEHOLDER_PREFIX = "\x00qty:"
+
 
 class Quantity(NamedTuple):
     """One magnitude claim, decomposed so each part compares on its own.
@@ -1018,24 +1022,18 @@ def _decompose(token: str) -> tuple[str, str, str, bool]:
     return sign, currency, body, is_range
 
 
-def numeric_signature(
-    tokens: tuple[str, ...], protected: frozenset[str] = frozenset()
-) -> tuple[Quantity, ...]:
-    """Return the ordered, structured magnitude claims of a token sequence.
+def _scan_quantities(
+    tokens: tuple[str, ...], protected: frozenset[str]
+) -> tuple[tuple[Quantity, int, int], ...]:
+    """Return each quantity with the token span that expressed it.
 
-    Each claim keeps its approximation qualifier, sign, value, range-ness,
-    magnitude word, currency, percent/basis-point kind and counted unit as
-    separate fields, so "about 5 units" and "5 units", "5 million units"
-    and "5 million dollars", "5%" and "5 basis points" are all different
-    claims while "eleven units" and "11 units" are the same one.
-
-    Counts spelled out in words normalize to their digit value.  A number
-    word inside a capitalised name (One Medical, Formula One) or after a
-    product qualifier (Model 3) is not a quantity; ``protected`` carries
-    the first case and :data:`_PRODUCT_QUALIFIERS` the second.
+    One scanner, two readers.  :func:`numeric_signature` wants the claims;
+    :func:`canonical_frame_tokens` wants to know which tokens to replace.
+    Deriving both from the same walk is what keeps them from disagreeing
+    about where a quantity starts and ends.
     """
 
-    claims: list[Quantity] = []
+    claims: list[tuple[Quantity, int, int]] = []
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -1077,15 +1075,19 @@ def numeric_signature(
                 nxt = tokens[index + consumed] if index + consumed < len(tokens) else ""
             unit = nxt if nxt in _COUNTED_UNITS else ""
             claims.append(
-                Quantity(
-                    approximation=_approximation_before(tokens, index),
-                    sign=sign,
-                    value=body,
-                    is_range=is_range,
-                    magnitude=magnitude,
-                    currency=currency,
-                    percent_kind=percent,
-                    unit=unit,
+                (
+                    Quantity(
+                        approximation=_approximation_before(tokens, index),
+                        sign=sign,
+                        value=body,
+                        is_range=is_range,
+                        magnitude=magnitude,
+                        currency=currency,
+                        percent_kind=percent,
+                        unit=unit,
+                    ),
+                    index,
+                    consumed,
                 )
             )
             index += consumed
@@ -1108,21 +1110,96 @@ def numeric_signature(
                 consumed += 1
                 nxt = tokens[index + consumed] if index + consumed < len(tokens) else ""
             claims.append(
-                Quantity(
-                    approximation=_approximation_before(tokens, index),
-                    sign="",
-                    value=str(value),
-                    is_range=False,
-                    magnitude=magnitude,
-                    currency="",
-                    percent_kind="",
-                    unit=nxt if nxt in _COUNTED_UNITS else "",
+                (
+                    Quantity(
+                        approximation=_approximation_before(tokens, index),
+                        sign="",
+                        value=str(value),
+                        is_range=False,
+                        magnitude=magnitude,
+                        currency="",
+                        percent_kind="",
+                        unit=nxt if nxt in _COUNTED_UNITS else "",
+                    ),
+                    index,
+                    consumed,
                 )
             )
             index += consumed
             continue
         index += 1
     return tuple(claims)
+
+
+def numeric_signature(
+    tokens: tuple[str, ...], protected: frozenset[str] = frozenset()
+) -> tuple[Quantity, ...]:
+    """Return the ordered, structured magnitude claims of a token sequence.
+
+    Each claim keeps its approximation qualifier, sign, value, range-ness,
+    magnitude word, currency, percent/basis-point kind and counted unit as
+    separate fields, so "about 5 units" and "5 units", "5 million units"
+    and "5 million dollars", "5%" and "5 basis points" are all different
+    claims while "eleven units" and "11 units" are the same one.
+
+    Counts spelled out in words normalize to their digit value.  A number
+    word inside a capitalised name (One Medical, Formula One) or after a
+    product qualifier (Model 3) is not a quantity; ``protected`` carries
+    the first case and :data:`_PRODUCT_QUALIFIERS` the second.
+    """
+
+    return tuple(quantity for quantity, _, _ in _scan_quantities(tokens, protected))
+
+
+def quantity_placeholder(quantity: Quantity) -> str:
+    """The token that stands in for a quantity when frames are compared.
+
+    Carries exactly the fields :func:`quantities_conflict` compares as
+    assertions.  The counted unit is left out because it is unknown when
+    absent and survives as its own token anyway, so "495,000 vehicles" and
+    "495,000 cars" keep whatever difference they had rather than acquiring
+    a new one here.
+    """
+
+    return (
+        _QUANTITY_PLACEHOLDER_PREFIX
+        + quantity._replace(**{field: "" for field in _UNKNOWN_IF_ABSENT}).render()
+    )
+
+
+def canonical_frame_tokens(
+    tokens: tuple[str, ...], protected: frozenset[str] = frozenset()
+) -> tuple[str, ...]:
+    """Return ``tokens`` with each quantity span replaced by one placeholder.
+
+    The ``same_frame`` guard asks whether two headlines share a template
+    and swap the slot that carries the event.  Run over raw tokens it
+    answers that question about *spelling*: "five million units" and "5
+    million units" are one claim written two ways, but as bare tokens
+    "five" and "5" look like a substituted slot, and a real rewrite was
+    refused for it.  Canonicalizing first means the guard compares what the
+    headlines say.  A genuinely different quantity still yields a different
+    placeholder, and in any case reaches its own guard first - ``numeric``
+    is scanned before ``same_frame``.
+    """
+
+    spans = _scan_quantities(tokens, protected)
+    if not spans:
+        return tuple(tokens)
+    canonical: list[str] = []
+    consumed_until = 0
+    replacements = {start: (quantity, span) for quantity, start, span in spans}
+    for index, token in enumerate(tokens):
+        if index < consumed_until:
+            continue
+        replacement = replacements.get(index)
+        if replacement is None:
+            canonical.append(token)
+            continue
+        quantity, span = replacement
+        canonical.append(quantity_placeholder(quantity))
+        consumed_until = index + span
+    return tuple(canonical)
 
 
 def quantities_conflict(
@@ -1317,7 +1394,9 @@ def summarize(title: str, description: str | None = None) -> StoryEvidence:
         subjects=frozenset({subjects}),
         article_types=frozenset({article_types(combined)}),
         entities=frozenset({names}) if names else frozenset(),
-        token_sets=frozenset({frozenset(headline_tokens)}),
+        token_sets=frozenset(
+            {frozenset(canonical_frame_tokens(headline_tokens, protected))}
+        ),
     )
 
 
@@ -1499,6 +1578,10 @@ def _component_values() -> dict[str, str]:
         "function_words": ",".join(sorted(_FUNCTION_WORDS)),
         "guard_order": ",".join(VETO_REASONS),
         "same_frame_scope": "headline_only",
+        "same_frame_token_normalization": "quantity_spans_canonicalized",
+        "quantity_placeholder_fields": ",".join(
+            field for field in Quantity._fields if field not in _UNKNOWN_IF_ABSENT
+        ),
         "subject_scope": "headline_only_minus_attribution",
         "attribution_clause": _ATTRIBUTION_CLAUSE.pattern,
     }

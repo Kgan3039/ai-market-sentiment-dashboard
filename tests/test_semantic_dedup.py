@@ -1578,7 +1578,7 @@ def test_a_spelled_count_on_one_side_only_is_missing_information():
 def test_the_evidence_policy_version_moved_with_the_new_guards():
     from nlp.semdedup.evidence import EVIDENCE_POLICY_VERSION, VETO_REASONS
 
-    assert EVIDENCE_POLICY_VERSION == "m3.evidence.v5"
+    assert EVIDENCE_POLICY_VERSION == "m3.evidence.v6"
     assert "article_type" in VETO_REASONS
     assert len(policy_fingerprint()) == 64
 
@@ -2886,3 +2886,201 @@ def test_a_role_title_does_not_capture_a_lowercase_predicate():
     assert role_entities("nvidia ceo Jensen Huang opens GTC") == (
         ("person", "jensen huang"),
     )
+
+
+from nlp.dedup.structural import tokenize  # noqa: E402
+
+
+# --------------------------------------------------------------------------
+# Equivalent quantities survive the whole production path
+# --------------------------------------------------------------------------
+
+EQUIVALENT_QUANTITY_HEADLINES = [
+    ("Tesla ships five million units", "Tesla ships 5 million units"),
+    ("Tesla ships eleven vehicles", "Tesla ships 11 vehicles"),
+    ("Tesla ships twenty-one users", "Tesla ships 21 users"),
+    ("Tesla ships a dozen chips", "Tesla ships 12 chips"),
+    ("Tesla adds one hundred jobs", "Tesla adds 100 jobs"),
+]
+
+DISTINCT_QUANTITY_HEADLINES = [
+    ("Tesla ships five million units", "Tesla ships 5 billion units"),
+    ("Tesla ships about 5 units", "Tesla ships 5 units"),
+    ("Tesla ships 5 million units", "Tesla ships 5 million dollars"),
+    ("Tesla ships 5-10 units", "Tesla ships 5 units"),
+    (
+        "Tesla reports Q1 revenue of five million units",
+        "Tesla reports Q2 revenue of 5 million units",
+    ),
+    ("Tesla ships at least 5 units", "Tesla ships up to 5 units"),
+]
+
+
+def merged_by_production_path(left: str, right: str):
+    """Run the real stage, with every guard live and nothing patched."""
+
+    encoder = encoder_for((left, 0.0), (right, 5.0))
+    return run([story("a", left), story("b", right)], encoder=encoder)
+
+
+@pytest.mark.parametrize("left,right", EQUIVALENT_QUANTITY_HEADLINES)
+def test_equivalent_quantities_merge_through_the_production_path(left, right):
+    """The frame guard must not read a spelling difference as a new event."""
+
+    result = merged_by_production_path(left, right)
+
+    assert grouped(result) == [("a", "b")], result.rejected_pairs
+
+
+@pytest.mark.parametrize("left,right", DISTINCT_QUANTITY_HEADLINES)
+def test_distinct_quantities_are_still_refused_by_the_production_path(left, right):
+    result = merged_by_production_path(left, right)
+
+    assert grouped(result) == [("a",), ("b",)]
+    assert result.rejected_pairs
+    assert result.rejected_pairs[0].reason in {
+        "numeric_disagreement",
+        "temporal_disagreement",
+    }
+
+
+def test_a_substituted_slot_is_still_a_different_event():
+    """Canonicalizing quantities must not disarm the frame guard."""
+
+    left, right = (
+        "Nvidia opens a research centre in Berlin",
+        "Nvidia opens a research centre in Warsaw",
+    )
+    result = merged_by_production_path(left, right)
+
+    assert grouped(result) == [("a",), ("b",)]
+    assert result.rejected_pairs[0].reason == "same_frame_different_event"
+
+
+def test_a_quantity_span_becomes_one_canonical_token():
+    from nlp.semdedup.evidence import canonical_frame_tokens
+
+    spelled = canonical_frame_tokens(tokenize("Tesla ships five million units"))
+    digits = canonical_frame_tokens(tokenize("Tesla ships 5 million units"))
+
+    assert spelled == digits
+    assert sum(token.startswith("\x00qty:") for token in spelled) == 1
+    assert "units" in spelled  # the counted unit survives as its own token
+    assert "million" not in spelled  # the magnitude was consumed by the span
+
+
+def test_canonicalization_leaves_a_headline_without_quantities_alone():
+    from nlp.semdedup.evidence import canonical_frame_tokens
+
+    tokens = tokenize("Nvidia opens a research centre in Berlin")
+
+    assert canonical_frame_tokens(tokens) == tokens
+
+
+def test_a_protected_name_is_not_canonicalized_into_a_quantity():
+    from nlp.semdedup.evidence import canonical_frame_tokens
+
+    tokens = tokenize("One Medical opens clinics")
+
+    assert canonical_frame_tokens(tokens, frozenset({"one"})) == tokens
+
+
+def test_the_placeholder_carries_only_the_fields_that_compare():
+    from nlp.semdedup.evidence import (
+        Quantity,
+        numeric_signature as signature,
+        quantity_placeholder,
+    )
+
+    with_unit = signature(tokenize("495,000 vehicles"))[0]
+    without_unit = signature(tokenize("495,000 cars"))[0]
+
+    assert with_unit.unit == "vehicles" and without_unit.unit == ""
+    assert quantity_placeholder(with_unit) == quantity_placeholder(without_unit)
+    assert quantity_placeholder(
+        with_unit._replace(magnitude="million")
+    ) != quantity_placeholder(with_unit)
+    assert "unit" in Quantity._fields
+
+
+def test_the_frame_normalization_is_a_fingerprint_component():
+    from nlp.semdedup.evidence import policy_components
+
+    components = policy_components()
+
+    assert components["same_frame_token_normalization"] == (
+        "quantity_spans_canonicalized"
+    )
+    assert "unit" not in components["quantity_placeholder_fields"].split(",")
+
+
+# --------------------------------------------------------------------------
+# The sweep narrative is derived, not written down
+# --------------------------------------------------------------------------
+
+
+def test_threshold_driven_false_negatives_are_described_as_such():
+    from tools.eval_dedup import _false_negative_attribution
+
+    text = _false_negative_attribution([], ["P049", "P050"])
+
+    assert "All 2 false negative(s)" in text
+    assert "threshold-driven" in text
+    assert "guard-driven" not in text
+
+
+def test_guard_driven_false_negatives_are_described_as_such():
+    from tools.eval_dedup import _false_negative_attribution
+
+    text = _false_negative_attribution(["P049", "P050", "P051"], [])
+
+    assert "All 3 false negative(s)" in text
+    assert "guard-driven" in text
+    assert "are threshold-driven" not in text
+
+
+def test_mixed_false_negatives_report_both_counts():
+    from tools.eval_dedup import _false_negative_attribution
+
+    text = _false_negative_attribution(["P049"], ["P050", "P051"])
+
+    assert "2 false negative(s)" in text
+    assert "threshold-driven" in text
+    assert "1 are guard-driven" in text
+
+
+def test_no_false_negatives_is_stated_plainly():
+    from tools.eval_dedup import _false_negative_attribution
+
+    text = _false_negative_attribution([], [])
+
+    assert text == "There are no false negatives at the selected threshold."
+
+
+def test_the_committed_sweep_narrative_matches_its_own_id_lists():
+    from tools.eval_dedup import _false_negative_attribution
+
+    selection = json.loads(
+        (RESULTS / "m3_threshold_sweep.json").read_text(encoding="utf-8")
+    )["selection"]
+    expected = _false_negative_attribution(
+        selection["guard_rejected_positive_ids_at_selected"],
+        selection["threshold_rejected_positive_ids_at_selected"],
+    )
+
+    assert selection["false_negative_attribution"] == expected
+    assert expected in selection["rationale"]
+
+
+def test_no_sweep_text_claims_a_guard_driven_false_negative_that_is_absent():
+    """The defect this replaced: a standing claim that went stale."""
+
+    sweep = json.loads(
+        (RESULTS / "m3_threshold_sweep.json").read_text(encoding="utf-8")
+    )
+    selection = sweep["selection"]
+    narrative = selection["rationale"] + " " + selection["false_negative_attribution"]
+
+    if not selection["guard_rejected_positive_ids_at_selected"]:
+        assert "not every false negative is threshold-driven" not in narrative
+        assert "are guard-driven" not in narrative
