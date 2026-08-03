@@ -194,14 +194,34 @@ def source_metadata_from_exact(result: DedupResult) -> ThemeSourceMetadata:
     )
 
 
-def descriptions_from_semantic(
+#: How :func:`first_available_descriptions` picks, named so the choice is
+#: fingerprinted and so nobody has to read the loop to know what it did.
+DESCRIPTION_SELECTION_POLICY = (
+    "first_non_empty_description_in_member_id_order; not canonical "
+    "provenance, because M3 publishes no canonical raw member"
+)
+
+
+def first_available_descriptions(
     result: SemanticDedupResult, raw_descriptions: Mapping[str, str | None]
 ) -> dict[str, str | None]:
-    """Pick each M3 story's description from its member raw items.
+    """Pick one standfirst per M3 story, by member-id order.
 
-    The canonical member's standfirst wins; failing that, the first member
-    in the story's own order that has one. Deterministic and explainable:
-    the story is represented by the article it is named after.
+    **This is not the canonical member's description, and does not claim to
+    be.**  M3's public result exposes ``canonical_story_key`` — which M2
+    *story* was chosen — but no canonical *raw item*: ``member_ids`` is the
+    sorted union of the members' items, so its first element is whichever
+    id sorts first, not the article the story is named after. The previous
+    name and docstring said "the canonical member's standfirst wins", which
+    inferred canonical ownership from a sort order that carries none.
+
+    So the rule is stated for what it is: the first non-empty description in
+    ``member_ids`` order. Deterministic and reproducible; not provenance.
+
+    *Missing public contract:* M3 would need to publish the raw item id
+    behind ``canonical_story_key`` for a caller to recover the canonical
+    standfirst. Until it does (#57/#68), a caller that needs true canonical
+    provenance should pass its own mapping rather than use this helper.
     """
 
     chosen: dict[str, str | None] = {}
@@ -214,3 +234,8 @@ def descriptions_from_semantic(
                 break
         chosen[story.story_fingerprint] = description
     return chosen
+
+
+#: Former name.  It claimed a provenance the public M3 model cannot
+#: support; kept so callers do not break, documented so nobody believes it.
+descriptions_from_semantic = first_available_descriptions

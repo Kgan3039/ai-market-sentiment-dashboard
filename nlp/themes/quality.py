@@ -130,9 +130,15 @@ class TickerDayReport:
     method: str
     method_reason: str
     mean_cohesion: float | None
+    #: The day's weakest link: the lowest ``min_pairwise_cohesion`` across
+    #: its themes.  A mean cannot show it, and it is the pair a reader
+    #: notices first.
+    min_pairwise_cohesion: float | None
     max_inter_theme_similarity: float | None
     theme_coverage: float
     meets_ac4_shape: bool
+    #: Why, in one phrase, so an honest ``False`` is not an unexplained one.
+    ac4_shape_detail: str
     no_story_lost: bool
     #: Ranked themes as ``(rank, label, story_count, outlet_count, salience)``.
     themes: tuple[tuple[int, str, int, int, float], ...]
@@ -323,9 +329,11 @@ def evaluate_ticker_day(
         method=baseline.method.value,
         method_reason=baseline.method_reason,
         mean_cohesion=baseline.quality.mean_cohesion,
+        min_pairwise_cohesion=baseline.quality.min_pairwise_cohesion,
         max_inter_theme_similarity=baseline.quality.max_inter_theme_similarity,
         theme_coverage=baseline.quality.theme_coverage,
         meets_ac4_shape=baseline.quality.meets_ac4_shape,
+        ac4_shape_detail=baseline.quality.ac4_shape_detail,
         no_story_lost=baseline.accounted_story_keys == expected,
         themes=tuple(
             (

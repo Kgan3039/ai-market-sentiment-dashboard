@@ -31,6 +31,10 @@ class ClusteringMethod(str, Enum):
     #: Fewer stories than the clustering floor; stories are listed
     #: individually rather than forced into unstable groups.
     SMALL_N_FALLBACK = "small_n_fallback"
+    #: The day had enough stories but no partition worth shipping: the
+    #: vectors were degenerate, or nothing cleared the quality floors.  No
+    #: theme is invented to satisfy a count.
+    NO_SEPARABLE_STRUCTURE = "no_separable_structure"
 
 
 class ExclusionReason(str, Enum):
@@ -65,6 +69,12 @@ class OtherCoverageReason(str, Enum):
     PROVIDER_QUARANTINE = "provider_quarantine"
     #: M3 held it out of candidate generation for some other stated reason.
     SEMANTIC_SKIP = "semantic_skip"
+    #: Every story in the day sits at the same point in the embedding
+    #: space, so there is no structure to cluster and no theme is invented.
+    DEGENERATE_EMBEDDING_GEOMETRY = "degenerate_embedding_geometry"
+    #: No partition anywhere in AC-4's band produced a theme clearing the
+    #: mandatory quality floors.
+    INSUFFICIENT_THEME_STRUCTURE = "insufficient_theme_structure"
 
 
 @dataclass(frozen=True)
@@ -275,6 +285,12 @@ class ThemeQuality:
     theme_coverage: float
     #: Whether the day satisfies AC-4's shape for its story count.
     meets_ac4_shape: bool
+    #: Why, in one phrase.  A day that honestly produced no theme reads as
+    #: a stated degradation rather than an unexplained ``False``.
+    ac4_shape_detail: str = ""
+    #: Lowest ``min_pairwise_cohesion`` across the themes; ``None`` with no
+    #: themes.  The day's weakest link, which a mean cannot show.
+    min_pairwise_cohesion: float | None = None
 
 
 @dataclass(frozen=True)
@@ -303,6 +319,18 @@ class ThemeSet:
     #: What produced the input stories, when the caller came through the
     #: bridge.  ``None`` when stories were constructed directly.
     source_metadata: ThemeSourceMetadata | None = None
+    #: Every story key handed in, sorted.  Kept so the accounting below is
+    #: checkable against the input without the caller holding it.
+    input_story_keys: tuple[str, ...] = ()
+    #: Input keys nothing accounted for.  Non-empty means a story was lost.
+    missing_story_keys: tuple[str, ...] = ()
+    #: Accounted keys that were never handed in.  Non-empty means one was
+    #: invented, which a count of accounted stories could not distinguish
+    #: from a loss.
+    unexpected_story_keys: tuple[str, ...] = ()
+    #: Keys appearing in more than one theme.  Non-empty means a raw item
+    #: could be cited from two themes.
+    duplicate_membership_keys: tuple[str, ...] = ()
 
     @property
     def accounted_story_keys(self) -> tuple[str, ...]:
@@ -319,6 +347,21 @@ class ThemeSet:
                 + [entry.story_key for entry in self.other_coverage]
                 + [entry.story_key for entry in self.excluded]
             )
+        )
+
+    @property
+    def complete(self) -> bool:
+        """True only when the partition is exactly the input, once each.
+
+        The production path computes the three diagnostics above and this
+        reads them, so a result can never report itself complete while one
+        of them is non-empty.
+        """
+
+        return not (
+            self.missing_story_keys
+            or self.unexpected_story_keys
+            or self.duplicate_membership_keys
         )
 
     @property

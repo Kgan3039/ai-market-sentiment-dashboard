@@ -24,14 +24,19 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from nlp.dedup.structural import tokenize
+from nlp.dedup.text import display_text
 from nlp.embeddings import EmbeddingError, compose_embedding_text
 
 from .clustering import (
+    NO_STRUCTURE,
     NOISE,
     assign_clusters,
     centroid_of,
+    coherent_subset,
     mean_pairwise_similarity,
     min_pairwise_similarity,
+    surviving_themes,
 )
 from .compatibility import incompatible_members
 from .config import ALGORITHM_VERSION, THEME_NAMESPACE, ThemeConfig
@@ -39,6 +44,7 @@ from .errors import (
     ThemeCapacityError,
     ThemeEncodingError,
     ThemeInputError,
+    ThemePartitionError,
 )
 from .models import (
     ClusteringMethod,
@@ -113,14 +119,48 @@ def _validate(
     if not isinstance(trading_day, date) or isinstance(trading_day, datetime):
         raise ThemeInputError("trading_day must be a datetime.date, not a datetime")
     seen: set[str] = set()
+    duplicated: set[str] = set()
+    owner: dict[str, str] = {}
+    contested: dict[str, set[str]] = {}
     for index, story in enumerate(stories):
         if not isinstance(story, ThemeStory):
             raise ThemeInputError("stories must be ThemeStory instances")
         if not isinstance(story.story_key, str) or not story.story_key.strip():
             raise ThemeInputError(f"stories[{index}] has a blank story_key")
+        if story.story_key.strip() != story.story_key:
+            raise ThemeInputError(
+                f"stories[{index}] story_key is padded: {story.story_key!r}; a "
+                "fingerprint is compared verbatim and whitespace makes two "
+                "handles for one story"
+            )
         if story.story_key in seen:
-            raise ThemeInputError(f"duplicate story_key: {story.story_key}")
+            duplicated.add(story.story_key)
         seen.add(story.story_key)
+        # One raw item, one owning story.  Checked here rather than only in
+        # the bridge, because the guarantee is about what is citable and
+        # must not depend on which door the caller came through.
+        member_seen: set[str] = set()
+        for item_id in story.item_ids:
+            if not isinstance(item_id, str) or not item_id.strip():
+                raise ThemeInputError(
+                    f"stories[{index}] ({story.story_key}) has a blank member id"
+                )
+            if item_id.strip() != item_id:
+                raise ThemeInputError(
+                    f"stories[{index}] ({story.story_key}) member id is padded: "
+                    f"{item_id!r}"
+                )
+            if item_id in member_seen:
+                raise ThemePartitionError(
+                    f"story {story.story_key!r} lists member id {item_id!r} twice",
+                    overlapping_item_ids=(item_id,),
+                    affected_story_keys=(story.story_key,),
+                )
+            member_seen.add(item_id)
+            previous = owner.get(item_id)
+            if previous is not None and previous != story.story_key:
+                contested.setdefault(item_id, set()).update({previous, story.story_key})
+            owner.setdefault(item_id, story.story_key)
         if story.ticker != ticker:
             raise ThemeInputError(
                 f"stories[{index}] is for {story.ticker}, not the requested {ticker}; "
@@ -135,6 +175,38 @@ def _validate(
             raise ThemeInputError(
                 f"stories[{index}] published_at must be a timezone-aware datetime"
             )
+        count = story.outlet_count
+        if count is not None:
+            if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+                raise ThemeInputError(
+                    f"stories[{index}] ({story.story_key}) outlet_count must be a "
+                    "positive integer"
+                )
+            distinct = len({outlet for outlet in story.outlets if outlet})
+            if count < distinct:
+                raise ThemeInputError(
+                    f"stories[{index}] ({story.story_key}) declares outlet_count "
+                    f"{count} but lists {distinct} distinct outlets; the "
+                    "authoritative count may exceed the projected set, never "
+                    "fall below it"
+                )
+    if duplicated:
+        keys = tuple(sorted(duplicated))
+        raise ThemePartitionError(
+            f"story key(s) appear more than once: {list(keys)}",
+            overlapping_story_keys=keys,
+            affected_story_keys=keys,
+        )
+    if contested:
+        items = tuple(sorted(contested))
+        affected = tuple(sorted({key for keys in contested.values() for key in keys}))
+        raise ThemePartitionError(
+            f"raw item(s) {list(items)} are claimed by more than one story "
+            f"({list(affected)}); one raw item must be citable from exactly "
+            "one theme",
+            overlapping_item_ids=items,
+            affected_story_keys=affected,
+        )
 
 
 def _story_text(story: ThemeStory) -> str | None:
@@ -322,58 +394,73 @@ def cluster_themes(
 
     subset = vectors[clusterable]
     assignment = assign_clusters(subset, config)
-    grouped: dict[int, list[int]] = {}
     reasons = dict(held)
+    labels: list[int] = []
     for index, label in enumerate(assignment.labels):
         position = clusterable[index]
         if label == NOISE:
             reasons[position] = OtherCoverageReason.CLUSTERING_NOISE
-        else:
-            grouped.setdefault(label, []).append(position)
+        labels.append(label)
 
     notes: list[str] = [assignment.reason]
     groups: list[list[int]] = []
-    for label in sorted(grouped):
-        members = grouped[label]
-        if len(members) < config.min_theme_stories:
-            # A lone story is coverage, not a theme.  It stays visible under
-            # other coverage rather than padding the theme list.
-            notes.append(
-                f"moved a {len(members)}-story cluster to other coverage, "
-                f"below the {config.min_theme_stories}-story theme floor"
+    structureless = assignment.method == NO_STRUCTURE
+    if structureless:
+        degenerate = "degenerate-geometry" in assignment.reason
+        for position in clusterable:
+            reasons[position] = (
+                OtherCoverageReason.DEGENERATE_EMBEDDING_GEOMETRY
+                if degenerate
+                else OtherCoverageReason.INSUFFICIENT_THEME_STRUCTURE
             )
-            for position in members:
-                reasons[position] = OtherCoverageReason.BELOW_THEME_SIZE_FLOOR
-            continue
-        cohesion = mean_pairwise_similarity(vectors, members)
-        if cohesion < config.min_theme_cohesion:
-            # A cluster this loose is a catch-all, not a theme.  Its stories
-            # go to other coverage rather than being presented as a group a
-            # reader could not recognise.
-            notes.append(
-                f"dissolved a {len(members)}-story cluster with cohesion "
-                f"{cohesion:.4f} into other coverage"
-            )
-            for position in members:
+    else:
+        # The same function the fallback scored candidates with, so the day
+        # cannot be assembled into a shape the objective never evaluated.
+        # Positions here index ``clusterable``; map them back once.
+        kept, dissolved = surviving_themes(subset, labels, config)
+        for local in dissolved:
+            position = clusterable[local]
+            if position not in reasons:
                 reasons[position] = OtherCoverageReason.BELOW_COHESION_FLOOR
-            continue
-        ejected = incompatible_members(
-            usable, sorted(members, key=lambda p: -_position_salience(usable, p))
-        )
-        if ejected:
+        if dissolved:
             notes.append(
-                f"moved {len(ejected)} contradicting story(ies) out of a "
-                f"{len(members)}-story theme"
+                f"{len(dissolved)} story(ies) moved to other coverage: below a "
+                f"floor (mean {config.min_theme_cohesion}, weakest pair "
+                f"{config.min_theme_pairwise_cohesion}), below the "
+                f"{config.min_theme_stories}-story theme floor, or surplus to "
+                f"the {config.max_themes}-theme cap"
             )
-            for position in ejected:
-                reasons[position] = OtherCoverageReason.THEME_INCOMPATIBLE
-            members = [position for position in members if position not in set(ejected)]
-        if len(members) >= config.min_theme_stories:
-            groups.append(sorted(members))
-        else:
-            # Ejecting the contradiction left too few to be a theme.
+        for members_local in kept:
+            members = [clusterable[local] for local in members_local]
+            ejected = incompatible_members(
+                usable, sorted(members, key=lambda p: -_position_salience(usable, p))
+            )
+            if ejected:
+                notes.append(
+                    f"moved {len(ejected)} contradicting story(ies) out of a "
+                    f"{len(members)}-story theme"
+                )
+                for position in ejected:
+                    reasons[position] = OtherCoverageReason.THEME_INCOMPATIBLE
+                members = [
+                    position for position in members if position not in set(ejected)
+                ]
+            # Ejecting a contradiction can break the floors the subset cleared.
+            survivors = (
+                [
+                    members[local]
+                    for local in coherent_subset(
+                        vectors[members], range(len(members)), config
+                    )
+                ]
+                if members
+                else []
+            )
             for position in members:
-                reasons[position] = OtherCoverageReason.BELOW_THEME_SIZE_FLOOR
+                if position not in survivors and position not in reasons:
+                    reasons[position] = OtherCoverageReason.BELOW_COHESION_FLOOR
+            if survivors:
+                groups.append(sorted(survivors))
 
     return _assemble(
         symbol,
@@ -385,7 +472,9 @@ def cluster_themes(
         other_reasons=reasons,
         excluded=excluded,
         method=(
-            ClusteringMethod.HDBSCAN
+            ClusteringMethod.NO_SEPARABLE_STRUCTURE
+            if structureless
+            else ClusteringMethod.HDBSCAN
             if assignment.method == "hdbscan"
             else ClusteringMethod.AGGLOMERATIVE
         ),
@@ -412,12 +501,124 @@ def _with_held(note: str, held: dict[int, OtherCoverageReason]) -> str:
     return f"{note}; held out of clustering by upstream state: {detail}"
 
 
+def outlet_count_of(story: ThemeStory) -> int:
+    """Return the authoritative distinct-outlet count for one story.
+
+    M3's ``outlet_count`` wins when it is present: it counts the outlets the
+    dedup stage actually saw, which can exceed the outlets M5 was handed,
+    and substituting ``len(story.outlets)`` would silently under-rank a
+    widely syndicated story against a narrowly carried one.  The projected
+    set is the fallback, never a replacement.
+    """
+
+    if story.outlet_count is not None:
+        return int(story.outlet_count)
+    return len({outlet for outlet in story.outlets if outlet})
+
+
+def _distinct_outlets(stories: Sequence[ThemeStory]) -> int:
+    """Distinct outlets across a group, using each story's authoritative count.
+
+    Outlet names are only known for the projected set, so a union of names
+    would discard exactly the extra outlets ``outlet_count`` records.  Where
+    a story's authoritative count exceeds the names it carries, the excess
+    is added to the union of the names - which is the tightest number that
+    never claims fewer outlets than upstream counted.
+    """
+
+    named = {outlet for story in stories for outlet in story.outlets if outlet}
+    excess = sum(
+        max(0, outlet_count_of(story) - len({o for o in story.outlets if o}))
+        for story in stories
+    )
+    return len(named) + excess
+
+
 def _position_salience(usable: Sequence[ThemeStory], position: int) -> float:
     """A cheap within-cluster ordering: more outlets, then more recent."""
 
     story = usable[position]
     stamp = story.published_at or _EPOCH
-    return len(story.outlets) + stamp.timestamp() / 1e12
+    return outlet_count_of(story) + stamp.timestamp() / 1e12
+
+
+#: Words that carry no discriminating content in a market headline, so a
+#: title made mostly of them is not a label a reader learns anything from.
+_LOW_CONTENT_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "s",
+        "the",
+        "to",
+        "update",
+        "updates",
+        "news",
+        "report",
+        "reports",
+        "results",
+        "story",
+        "stories",
+    }
+)
+
+
+def title_informativeness(title: str) -> tuple[int, int, int]:
+    """Score a headline's usefulness as a label, extractively.
+
+    Returns ``(distinct content tokens, entity-or-numeral tokens, negative
+    repetition penalty)``.  Nothing is synthesized and nothing is dropped:
+    the label is still the member's own title, this only decides *which*
+    member's title represents the theme.  "results results results results"
+    scores one content token and a repetition penalty of -3; an informative
+    headline naming a company and a figure outscores it regardless of how
+    recent or widely carried the generic one is.
+    """
+
+    tokens = tokenize(display_text(title))
+    content = [token for token in tokens if token not in _LOW_CONTENT_TOKENS]
+    distinct = len(set(content))
+    specific = sum(
+        1
+        for token in set(content)
+        if any(character.isdigit() for character in token)
+        or (token and token not in _LOW_CONTENT_TOKENS and len(token) > 3)
+    )
+    repetition = distinct - len(content)
+    return distinct, specific, repetition
+
+
+def _label_rank(usable: Sequence[ThemeStory], position: int) -> tuple:
+    """Ordering for the member whose title labels the theme.
+
+    Informativeness first, then the upstream outlet count, then recency,
+    then the story key.  Ranking on outlets and recency alone let a generic
+    headline label a theme whose other members said something.
+    """
+
+    story = usable[position]
+    distinct, specific, repetition = title_informativeness(story.title)
+    stamp = story.published_at or _EPOCH
+    return (
+        distinct + specific + repetition,
+        specific,
+        outlet_count_of(story),
+        stamp,
+        story.story_key,
+    )
 
 
 def _assemble(
@@ -443,8 +644,7 @@ def _assemble(
     reference_time = _latest(usable)
     counts = [len(group) for group in groups]
     outlet_counts = [
-        len({outlet for position in group for outlet in usable[position].outlets})
-        for group in groups
+        _distinct_outlets([usable[position] for position in group]) for group in groups
     ]
     max_stories = max(counts) if counts else 0
     max_outlets = max(outlet_counts) if outlet_counts else 0
@@ -498,7 +698,7 @@ def _assemble(
         centroid,
         min_cohesion,
     ) in enumerate(drafts, 1):
-        leading = max(members, key=lambda p: _position_salience(usable, p))
+        leading = max(members, key=lambda p: _label_rank(usable, p))
         ordered_members = [leading] + sorted(
             (position for position in members if position != leading),
             key=lambda p: _order_key(usable[p]),
@@ -535,6 +735,13 @@ def _assemble(
         )
         for position in sorted(other_reasons, key=lambda p: _order_key(usable[p]))
     )
+    expected = tuple(sorted(story.story_key for story in ordered))
+    membership = [key for theme in themes for key in theme.member_story_keys]
+    accounted = sorted(
+        membership
+        + [entry.story_key for entry in other]
+        + [entry.story_key for entry in excluded]
+    )
     result = ThemeSet(
         ticker=ticker,
         trading_day=trading_day,
@@ -550,9 +757,14 @@ def _assemble(
         model_revision=model_revision,
         embedding_dimension=dimension,
         source_metadata=source_metadata,
+        input_story_keys=expected,
+        missing_story_keys=tuple(sorted(set(expected) - set(accounted))),
+        unexpected_story_keys=tuple(sorted(set(accounted) - set(expected))),
+        duplicate_membership_keys=tuple(
+            sorted({key for key in membership if membership.count(key) > 1})
+        ),
     )
-    expected = tuple(sorted(story.story_key for story in ordered))
-    if result.accounted_story_keys != expected:
+    if result.accounted_story_keys != expected or not result.complete:
         raise AssertionError(
             "theme assembly lost or duplicated a story; "
             f"{len(expected)} in, {len(result.accounted_story_keys)} accounted"
@@ -585,8 +797,26 @@ def _quality(
     # reported a correct degradation as a failure.
     if method is ClusteringMethod.SMALL_N_FALLBACK:
         meets = not themes and len(other) + len(excluded) == story_count
+        detail = (
+            "below the clustering floor; AC-4 asks for individual listing and "
+            "that is what happened"
+        )
+    elif method is ClusteringMethod.NO_SEPARABLE_STRUCTURE:
+        # Honestly false.  The day had enough stories for AC-4's band and
+        # produced no theme, and saying so is worth more than a split drawn
+        # to satisfy a count - AC-4's other half is that no story is
+        # dropped, and every one of them is listed.
+        meets = False
+        detail = (
+            "enough stories for AC-4's band but no partition cleared the "
+            "quality floors; no theme was invented and every story is listed"
+        )
     else:
         meets = config.min_themes <= len(themes) <= config.max_themes
+        detail = (
+            f"{len(themes)} theme(s) against the {config.min_themes}-"
+            f"{config.max_themes} band"
+        )
     return ThemeQuality(
         story_count=story_count,
         theme_count=len(themes),
@@ -599,4 +829,8 @@ def _quality(
         max_inter_theme_similarity=inter,
         theme_coverage=(in_themes / story_count) if story_count else 0.0,
         meets_ac4_shape=meets,
+        ac4_shape_detail=detail,
+        min_pairwise_cohesion=(
+            min(theme.min_pairwise_cohesion for theme in themes) if themes else None
+        ),
     )

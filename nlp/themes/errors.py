@@ -11,6 +11,32 @@ class ThemeInputError(ValueError, ThemeError):
     """A story is structurally invalid and cannot be clustered."""
 
 
+class ThemePartitionError(ThemeInputError):
+    """The stories handed in do not form a partition of the day's coverage.
+
+    Raised at the public boundary, before anything is clustered.  M5's
+    whole contract is that one raw item is citable from exactly one theme,
+    and that guarantee is only as good as the input: two canonical stories
+    claiming the same raw item make it citable from two themes no matter
+    how carefully the clustering behaves afterwards.  The bridge checks
+    this too, but a caller may build ``ThemeStory`` objects by hand and the
+    guarantee cannot depend on which door they came through.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        overlapping_story_keys: tuple[str, ...] = (),
+        overlapping_item_ids: tuple[str, ...] = (),
+        affected_story_keys: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.overlapping_story_keys = overlapping_story_keys
+        self.overlapping_item_ids = overlapping_item_ids
+        self.affected_story_keys = affected_story_keys
+
+
 class ThemeConfigError(ValueError, ThemeError):
     """The theme clustering configuration is not usable."""
 

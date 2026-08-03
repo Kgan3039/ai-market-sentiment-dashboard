@@ -28,7 +28,9 @@ evidence set the citation-safe summarizer (#65/#80) consumes — see
 from __future__ import annotations
 
 from .bridge import (
+    DESCRIPTION_SELECTION_POLICY,
     descriptions_from_semantic,
+    first_available_descriptions,
     source_metadata_from_exact,
     source_metadata_from_semantic,
     theme_stories_from_exact,
@@ -49,6 +51,7 @@ from .errors import (
     ThemeEncodingError,
     ThemeError,
     ThemeInputError,
+    ThemePartitionError,
 )
 from .models import (
     ClusteringMethod,
@@ -66,6 +69,12 @@ from .models import (
     ThemeStory,
 )
 from .service import cluster_themes, encoder_identity, theme_fingerprint_for
+from .summarization import (
+    summarizer_inputs,
+    theme_to_summarizer_input,
+    unresolved_citations,
+)
+from .trust import StageTrustSummary, derive_stage_trust_summary
 
 __all__ = [
     "ALGORITHM_VERSION",
@@ -75,7 +84,12 @@ __all__ = [
     "OtherCoverageReason",
     "ThemeClusteringError",
     "ThemeSourceMetadata",
+    "StageTrustSummary",
+    "derive_stage_trust_summary",
     "encoder_identity",
+    "summarizer_inputs",
+    "theme_to_summarizer_input",
+    "unresolved_citations",
     "incompatible_members",
     "source_metadata_from_exact",
     "source_metadata_from_semantic",
@@ -94,12 +108,15 @@ __all__ = [
     "ThemeError",
     "ThemeEvidence",
     "ThemeInputError",
+    "ThemePartitionError",
     "ThemeQuality",
     "ThemeSet",
     "ThemeStory",
     "assign_clusters",
     "cluster_themes",
+    "DESCRIPTION_SELECTION_POLICY",
     "descriptions_from_semantic",
+    "first_available_descriptions",
     "theme_fingerprint_for",
     "theme_stories_from_exact",
     "theme_stories_from_semantic",

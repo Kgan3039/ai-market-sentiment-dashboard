@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Sequence
 
 from nlp.dedup.structural import tokenize
@@ -49,7 +50,7 @@ from nlp.dedup.text import display_text
 from .models import ThemeStory
 
 #: Bumped when a family, a lexicon, or the comparison changes.
-COMPATIBILITY_POLICY_VERSION = "m5.compatibility.v1"
+COMPATIBILITY_POLICY_VERSION = "m5.compatibility.v2"
 
 #: The claim families a *theme* may not hold both sides of, as
 #: ``(family, positive terms, negative terms)``.  Small on purpose: each
@@ -292,8 +293,23 @@ OPPOSING_CLAIM_FAMILIES: tuple[tuple[str, frozenset[str], frozenset[str]], ...] 
 #: will not open the plant" makes a negative commitment claim out of a
 #: positive verb, and a theme holding it beside "Tesla opens the plant"
 #: contradicts itself just as plainly as one holding "opens"/"halts".
+#: "fails to raise guidance" negates the raise, and "did not fail to raise"
+#: negates the negation, which is why parity rather than presence is what
+#: the scan counts.
 NEGATION_MARKERS = frozenset(
-    {"not", "no", "never", "wont", "cannot", "denies", "denied"}
+    {
+        "not",
+        "no",
+        "never",
+        "wont",
+        "cannot",
+        "denies",
+        "denied",
+        "fail",
+        "fails",
+        "failed",
+        "nor",
+    }
 )
 
 #: Differences M5 deliberately allows inside one theme, with the reason.
@@ -335,40 +351,127 @@ PERMITTED_DIFFERENCES: tuple[tuple[str, str], ...] = (
 )
 
 
-def _claim_tokens(story: ThemeStory) -> tuple[str, ...]:
-    text = display_text(
+#: Boundaries that end one clause and start the next.  A claim on one side
+#: of these does not govern a claim on the other, which is the whole point:
+#: "will not open a new office, but raises guidance" makes a negative
+#: commitment claim and a *positive* direction claim, and reading the "not"
+#: across the comma inverted the guidance and split a theme that agreed.
+_CLAUSE_BOUNDARY = re.compile(
+    r"[,;:.!?()\[\]\u2013\u2014]|\b(?:but|while|whilst|although|though|however|"
+    r"whereas|yet|meanwhile|despite|and|as|after|before|then)\b",
+    re.IGNORECASE,
+)
+
+#: How many tokens before a claim word a negation may sit and still govern
+#: it.  Bounded so a negation early in a long clause cannot reach a claim at
+#: the end of it.
+NEGATION_WINDOW = 4
+
+#: "not only raised guidance but also..." is emphasis, not negation.  The
+#: bigram is skipped before parity is counted.
+_NON_NEGATING_BIGRAMS: tuple[tuple[str, str], ...] = (("not", "only"),)
+
+#: A family a single story asserts both ways.  It takes no side, so it can
+#: neither eject another member nor be ejected for disagreeing - "raises
+#: guidance and cuts spending" is one story about two things, not a story
+#: contradicting itself.
+MIXED = "mixed"
+
+
+def _clauses(text: str) -> tuple[str, ...]:
+    """Split one story's text into the clauses a claim is scoped to."""
+
+    parts = [part.strip() for part in _CLAUSE_BOUNDARY.split(text)]
+    return tuple(part for part in parts if part)
+
+
+def _claim_text(story: ThemeStory) -> str:
+    return display_text(
         " ".join(part for part in (story.title, story.description or "") if part)
     )
-    return tokenize(text)
+
+
+def _claim_tokens(story: ThemeStory) -> tuple[str, ...]:
+    return tokenize(_claim_text(story))
+
+
+def _negation_parity(tokens: Sequence[str], index: int) -> bool:
+    """True when an odd number of negations governs the token at ``index``.
+
+    Only markers **preceding** the claim inside the same clause and inside
+    :data:`NEGATION_WINDOW` count, so "beats expectations, and will not
+    open an office" leaves the beat alone.  Parity, not presence: "did not
+    fail to raise guidance" is a raise.
+    """
+
+    window = list(tokens[max(0, index - NEGATION_WINDOW) : index])
+    negations = 0
+    position = 0
+    while position < len(window):
+        token = window[position]
+        following = window[position + 1] if position + 1 < len(window) else ""
+        if (token, following) in _NON_NEGATING_BIGRAMS:
+            position += 2
+            continue
+        if token in NEGATION_MARKERS:
+            negations += 1
+        position += 1
+    return negations % 2 == 1
+
+
+def clause_claims(clause: str) -> set[tuple[str, str]]:
+    """Return the ``(family, polarity)`` claims one clause makes."""
+
+    tokens = tokenize(clause)
+    found: set[tuple[str, str]] = set()
+    for index, token in enumerate(tokens):
+        for family, positive, negative in OPPOSING_CLAIM_FAMILIES:
+            if token in positive:
+                side = "positive"
+            elif token in negative:
+                side = "negative"
+            else:
+                continue
+            if _negation_parity(tokens, index):
+                side = "negative" if side == "positive" else "positive"
+            found.add((family, side))
+    return found
 
 
 def story_claims(story: ThemeStory) -> frozenset[tuple[str, str]]:
     """Return the ``(family, polarity)`` claims one story makes.
 
-    A negation marker anywhere in the text inverts that story's polarity
-    for every family it asserts.  Blunt on purpose: scoping negation to a
-    clause is M3's problem, and getting it wrong here costs a theme member,
-    not a merge.
+    **Claim-scoped, not sentence-scoped.**  The text is segmented into
+    clauses and each claim takes its polarity from its own clause, so a
+    negation governs only what it is next to.  A family the story asserts
+    both ways in different clauses is reported once as :data:`MIXED`: the
+    story is about two things, and forcing it onto both sides of one family
+    made it contradict itself and eject itself from its own theme.
     """
 
-    tokens = set(_claim_tokens(story))
-    negated = bool(tokens & NEGATION_MARKERS)
-    found: set[tuple[str, str]] = set()
-    for family, positive, negative in OPPOSING_CLAIM_FAMILIES:
-        if tokens & positive:
-            found.add((family, "negative" if negated else "positive"))
-        if tokens & negative:
-            found.add((family, "positive" if negated else "negative"))
-    return frozenset(found)
+    by_family: dict[str, set[str]] = {}
+    for clause in _clauses(_claim_text(story)):
+        for family, polarity in clause_claims(clause):
+            by_family.setdefault(family, set()).add(polarity)
+    return frozenset(
+        (family, MIXED if len(sides) > 1 else next(iter(sides)))
+        for family, sides in by_family.items()
+    )
 
 
 def claims_conflict(
     left: frozenset[tuple[str, str]], right: frozenset[tuple[str, str]]
 ) -> bool:
-    """True when two claim sets take opposite sides of the same family."""
+    """True when two claim sets take opposite sides of the same family.
+
+    A :data:`MIXED` family takes no side and so conflicts with nothing.
+    """
 
     for family, polarity in left:
-        if (family, "positive" if polarity == "negative" else "negative") in right:
+        if polarity == MIXED:
+            continue
+        opposite = "positive" if polarity == "negative" else "negative"
+        if (family, opposite) in right:
             return True
     return False
 
@@ -396,6 +499,11 @@ def incompatible_members(
     families: dict[str, dict[str, list[int]]] = {}
     for position in ordered_positions:
         for family, polarity in sorted(claims[position]):
+            if polarity == MIXED:
+                # A story asserting both sides of one family is about two
+                # things.  It joins neither side, so it cannot eject a
+                # member and cannot be ejected for disagreeing.
+                continue
             families.setdefault(family, {}).setdefault(polarity, []).append(position)
 
     ejected: set[int] = set()
@@ -432,6 +540,14 @@ def policy_components() -> dict[str, str]:
         "negation_markers": ",".join(sorted(NEGATION_MARKERS)),
         "scope": "whole_prospective_theme",
         "text_scope": "title_and_description",
+        "claim_scope": "clause_local",
+        "clause_boundary": _CLAUSE_BOUNDARY.pattern,
+        "negation_window": str(NEGATION_WINDOW),
+        "negation_rule": "odd_parity_of_preceding_markers_in_the_same_clause",
+        "non_negating_bigrams": ";".join(
+            " ".join(pair) for pair in _NON_NEGATING_BIGRAMS
+        ),
+        "mixed_family_rule": "takes_no_side_and_conflicts_with_nothing",
         "tie_break": "majority_then_leading_story",
         "permitted_differences": ",".join(name for name, _ in PERMITTED_DIFFERENCES),
         "tokenizer": "nlp.dedup.structural.tokenize",

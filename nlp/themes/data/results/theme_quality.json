@@ -2,7 +2,7 @@
   "acceptance_criteria": "AC-4; gate G1",
   "algorithm_version": "m5.themes.v1",
   "case_count": 3,
-  "compatibility_policy_fingerprint": "5b2f5df530657a11c05ee4946ccebf6aa172b4ceffa20371260bf901591f2d09",
+  "compatibility_policy_fingerprint": "40da1d68b69a1faca4dc27fcdae7fb8af840879a5482cfd4eb3f3618e8091486",
   "complete": true,
   "dataset_id": "phase0-theme-ticker-days-v1",
   "dataset_version": "phase0.theme_eval.v1",
@@ -20,10 +20,24 @@
   "model_name": "sentence-transformers/all-MiniLM-L6-v2",
   "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
   "schema_version": "phase0.theme_eval.v1",
+  "score_precision": 6,
   "semantic_input_composition": "m1.compose_embedding_text(title, description)",
-  "theme_config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+  "stage_specific_trust_summary": {
+    "detail": "These ticker-days are an authored development fixture, not ingested coverage: no theme here was produced from a real trading day; the expected groupings have one author, no second reviewer and no adjudication, so a clustering that reproduces them has agreed with its author and nothing more; nothing here validates G1 (theme-assignment agreement) and AC-4, which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60.",
+    "gates": "G1 (theme-assignment agreement) and AC-4",
+    "headline": "Synthetic M5 development fixture: theme output is not AC-4 or G1 validation.",
+    "level": "WARNING",
+    "stage": "M5 theme clustering (issue #72)",
+    "text": "WARNING [M5 theme clustering (issue #72)]: Synthetic M5 development fixture: theme output is not AC-4 or G1 validation.\nThese ticker-days are an authored development fixture, not ingested coverage: no theme here was produced from a real trading day; the expected groupings have one author, no second reviewer and no adjudication, so a clustering that reproduces them has agreed with its author and nothing more; nothing here validates G1 (theme-assignment agreement) and AC-4, which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60.",
+    "version": "m5.stage_trust.v1"
+  },
+  "theme_config_fingerprint": "9fcbf80e2eea4d427764d6b4328cfafab0e5b05927d97618cfc8ba8bf3f2fa37",
   "theme_policy_components": {
+    "accounting_contract": "input == themes + other_coverage + excluded, exactly once each; complete is false when any diagnostic is non-empty",
     "algorithm_version": "m5.themes.v1",
+    "centroid_precision": 6,
+    "compatibility.claim_scope": "clause_local",
+    "compatibility.clause_boundary": "[,;:.!?()\\[\\]\\u2013\\u2014]|\\b(?:but|while|whilst|although|though|however|whereas|yet|meanwhile|despite|and|as|after|before|then)\\b",
     "compatibility.families": "direction,performance,decision,commitment",
     "compatibility.family.commitment.negative": "abandon,abandoned,abandons,cancel,canceled,cancelled,cancels,delay,delayed,delays,denied,denies,halt,halted,halts,postpone,postponed,postpones,scrap,scrapped,scraps,suspend,suspended,suspends",
     "compatibility.family.commitment.positive": "confirm,confirmed,confirms,launch,launched,launches,open,opened,opens,proceed,proceeding,proceeds,resume,resumed,resumes,sign,signed,signs,start,started,starts",
@@ -33,22 +47,36 @@
     "compatibility.family.direction.positive": "add,added,adds,boost,boosted,boosts,climb,climbed,climbs,expand,expanded,expands,grew,grow,grows,higher,increase,increased,increases,jump,jumped,jumps,lift,lifted,lifts,raise,raised,raises,rise,rises,rose,stronger,upgrade,upgraded,upgrades",
     "compatibility.family.performance.negative": "lag,lagged,lags,miss,missed,misses,trail,trailed,trails,underperform,underperforms",
     "compatibility.family.performance.positive": "beat,beats,exceed,exceeded,exceeds,outperform,outperforms,top,topped,tops",
-    "compatibility.negation_markers": "cannot,denied,denies,never,no,not,wont",
+    "compatibility.mixed_family_rule": "takes_no_side_and_conflicts_with_nothing",
+    "compatibility.negation_markers": "cannot,denied,denies,fail,failed,fails,never,no,nor,not,wont",
+    "compatibility.negation_rule": "odd_parity_of_preceding_markers_in_the_same_clause",
+    "compatibility.negation_window": "4",
+    "compatibility.non_negating_bigrams": "not only",
     "compatibility.permitted_differences": "reporting_period,named_entities,named_roles,article_type,quantities_and_units,repeated_distinct_events",
     "compatibility.scope": "whole_prospective_theme",
     "compatibility.text_scope": "title_and_description",
     "compatibility.tie_break": "majority_then_leading_story",
     "compatibility.tokenizer": "nlp.dedup.structural.tokenize",
-    "compatibility.version": "m5.compatibility.v1",
+    "compatibility.version": "m5.compatibility.v2",
+    "degenerate_geometry_epsilon": 0.0,
+    "degenerate_geometry_policy": "no_separable_structure_produces_no_theme; every story goes to other coverage with a stated reason; meets_ac4_shape reports false rather than inventing a split to satisfy the band",
+    "description_selection_policy": "first_non_empty_description_in_member_id_order; not canonical provenance, because M3 publishes no canonical raw member",
     "embedding_dimension": 384,
     "exclusion_reasons": "no_encodable_text",
-    "fallback.candidate_band": "min_themes..min(max_themes, n-1)",
+    "fallback.band_applies_to": "surviving_theme_count_not_dendrogram_cut",
+    "fallback.candidate_band": "min_themes..min(n-1, max_themes*cap_factor)",
+    "fallback.candidate_cap_factor": "2",
+    "fallback.coverage_rank": "5_of_6_never_outranks_coherence",
     "fallback.label_numbering": "renumbered_by_first_appearance",
     "fallback.linkage": "average",
     "fallback.metric": "precomputed_cosine_distance",
+    "fallback.no_valid_partition": "no_separable_structure_no_theme_invented",
     "fallback.objective": "max_stories_in_themes_clearing_size_and_cohesion_floors",
+    "fallback.objective_order": "1_mandatory_floors, 2_most_coherent_themes_in_band, 3_max_min_pairwise, 4_max_mean_cohesion, 5_max_coverage, 6_min_k",
+    "fallback.subset_extraction": "shed_least_central_until_both_floors_or_give_up",
     "fallback.tie_break": "higher_mean_cohesion, fewer_themes, smaller_k",
     "fallback.trigger": "cluster_count_outside_band_or_a_cluster_below_cohesion_floor",
+    "label_genericity_policy": "representative = member title scored by distinct informative tokens, entity and numeral evidence, and repetition penalty; then outlet_count, recency, story_key. Verbatim member title only; never synthesized",
     "label_policy": "leading_member_title; deterministic; no model call; label never participates in membership identity",
     "max_stories_per_day": 250,
     "max_themes": 6,
@@ -56,13 +84,18 @@
     "min_samples": 1,
     "min_stories_for_clustering": 4,
     "min_theme_cohesion": 0.4,
+    "min_theme_pairwise_cohesion": 0.3,
     "min_theme_stories": 2,
     "min_themes": 2,
     "model_name": "sentence-transformers/all-MiniLM-L6-v2",
     "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    "near_cohesion_floor_margin": 0.05,
     "other_coverage_policy": "explicit_entry_per_story_with_stated_reason; never a narrative theme",
-    "other_coverage_reasons": "below_clustering_floor,below_cohesion_floor,below_theme_size_floor,clustering_noise,provider_quarantine,semantic_skip,theme_incompatible",
+    "other_coverage_reasons": "below_clustering_floor,below_cohesion_floor,below_theme_size_floor,clustering_noise,degenerate_embedding_geometry,insufficient_theme_structure,provider_quarantine,semantic_skip,theme_incompatible",
+    "outlet_count_policy": "upstream ThemeStory.outlet_count is authoritative when present; len(outlets) is a fallback, never a substitute",
     "outlier_policy": "clustering_noise_to_other_coverage_never_dropped",
+    "permutation_selection_policy": "reverse_then_interleave_never_random",
+    "perturbation_selection_policy": "drop_the_least_recent_story",
     "quarantine_policy": "upstream_quarantined_and_semantically_skipped_stories_held_out_of _clustering_and_shown_under_other_coverage",
     "ranking_policy": "salience = weighted(story_count, outlet_diversity, recency)",
     "recency_half_life_hours": 6.0,
@@ -71,21 +104,41 @@
       0.3,
       0.3
     ],
+    "score_precision": 6,
     "semantic_input_composition": "m1.compose_embedding_text(title, description)",
+    "stability_identity_formula": "|baseline theme_keys carried into the new run| / |baseline theme count|",
+    "stability_matched_of_new_formula": "|new themes with any match| / |new theme count|  (the weak denominator)",
+    "stability_matching_algorithm": "greedy_one_to_one_centroid_cosine_descending_ties_by_previous_key",
+    "stability_membership_formula": "|exact member sets in both| / |baseline theme count|",
+    "stability_story_retention_formula": "|baseline in-theme stories still in a theme| / |baseline in-theme stories still present|",
     "stability_threshold": 0.9,
+    "stage_trust_version": "m5.stage_trust.v1",
     "story_ordering_policy": "undated_last, published_at_asc, story_key_asc",
+    "subset_extraction_policy": "a cluster failing a floor sheds its least-central member repeatedly, ties by story order, until both floors hold or it falls below the size floor; shed members go to other coverage with a stated reason",
+    "summarization_adapter.description": "story_description_or_empty_string",
+    "summarization_adapter.member_scope": "theme_membership_only",
+    "summarization_adapter.multi_outlet": "extra_outlets_appended_to_description_never_dropped",
+    "summarization_adapter.ordering": "theme_evidence_order_preserved",
+    "summarization_adapter.outlet": "single_lexicographically_first_of_the_story_outlets",
+    "summarization_adapter.published_at": "isoformat_utc",
+    "summarization_adapter.rejects": "other_coverage, excluded, unknown story keys, duplicates",
+    "summarization_adapter.story_id": "theme_evidence.story_key_verbatim",
+    "summarization_adapter.version": "m5.summarization_adapter.v1",
+    "summarization_adapter_policy": "theme members only; one MemberStory per member story_key; citations closed over theme membership; other coverage and excluded rejected",
     "supported_tickers": [
       "AAPL",
       "NVDA",
       "TSLA"
     ],
     "theme_namespace": "m5.theme.v1",
-    "tie_break_policy": "salience_desc, earliest_member, theme_fingerprint"
+    "tie_break_policy": "salience_desc, earliest_member, theme_fingerprint",
+    "vector_precision": 6
   },
   "ticker_days": [
     {
+      "ac4_shape_detail": "below the clustering floor; AC-4 asks for individual listing and that is what happened",
       "algorithm_version": "m5.themes.v1",
-      "config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+      "config_fingerprint": "9fcbf80e2eea4d427764d6b4328cfafab0e5b05927d97618cfc8ba8bf3f2fa37",
       "duplicate_membership_keys": [],
       "embedding_dimension": 384,
       "excluded_by_reason": {},
@@ -95,6 +148,7 @@
       "meets_ac4_shape": true,
       "method": "small_n_fallback",
       "method_reason": "3 clusterable stories, below the clustering floor of 4; listed individually",
+      "min_pairwise_cohesion": null,
       "missing_story_keys": [],
       "model_name": "sentence-transformers/all-MiniLM-L6-v2",
       "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
@@ -156,17 +210,19 @@
       "volume": "low"
     },
     {
+      "ac4_shape_detail": "3 theme(s) against the 2-6 band",
       "algorithm_version": "m5.themes.v1",
-      "config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+      "config_fingerprint": "9fcbf80e2eea4d427764d6b4328cfafab0e5b05927d97618cfc8ba8bf3f2fa37",
       "duplicate_membership_keys": [],
       "embedding_dimension": 384,
       "excluded_by_reason": {},
       "excluded_count": 0,
-      "max_inter_theme_similarity": 0.5824737467655388,
-      "mean_cohesion": 0.7287741369137682,
+      "max_inter_theme_similarity": 0.582473,
+      "mean_cohesion": 0.728774,
       "meets_ac4_shape": true,
       "method": "hdbscan",
       "method_reason": "hdbscan found 3 clusters inside the allowed band, loosest cohesion 0.6897",
+      "min_pairwise_cohesion": 0.689651,
       "missing_story_keys": [],
       "model_name": "sentence-transformers/all-MiniLM-L6-v2",
       "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
@@ -209,10 +265,10 @@
       },
       "permutation_stable": true,
       "perturbation": {
-        "identity_retained": 0.6666666666666666,
+        "identity_retained": 0.666667,
         "interpretation": "0.67 of the baseline's themes kept their exact membership.",
         "matched_fraction_of_new": 1.0,
-        "membership_retained": 0.6666666666666666,
+        "membership_retained": 0.666667,
         "stories_retained_in_themes": 0.8,
         "theme_count_after": 2,
         "theme_count_before": 3
@@ -232,13 +288,13 @@
       },
       "story_count": 9,
       "theme_count": 3,
-      "theme_coverage": 0.6666666666666666,
+      "theme_coverage": 0.666667,
       "theme_details": [
         {
           "cohesion": 0.719546,
           "cohesion_margin": 0.319546,
           "fingerprint": "d02333a575c129c56c5ed3f7d331ca47eabeb94870d3e4bdae104bf3fe3937c7",
-          "label": "Nvidia reports record data centre revenue",
+          "label": "Nvidia guides to higher data centre revenue next quarter",
           "label_source": "canonical_story_title",
           "matched_previous_key": null,
           "member_count": 2,
@@ -258,7 +314,7 @@
             "yahoo finance"
           ],
           "rank": 1,
-          "representative_story_key": "nvda-1",
+          "representative_story_key": "nvda-2",
           "salience": 0.983162,
           "theme_key": "d02333a575c129c56c5ed3f7d331ca47eabeb94870d3e4bdae104bf3fe3937c7"
         },
@@ -266,7 +322,7 @@
           "cohesion": 0.777126,
           "cohesion_margin": 0.377126,
           "fingerprint": "1334609ad9ca2c41404876f3e0e7e973b01ff7210fc66939f43be717a7e80675",
-          "label": "Nvidia unveils its next accelerator generation at GTC",
+          "label": "Nvidia opens accelerator orders to European cloud providers at GTC",
           "label_source": "canonical_story_title",
           "matched_previous_key": null,
           "member_count": 2,
@@ -283,13 +339,13 @@
             "the verge"
           ],
           "rank": 2,
-          "representative_story_key": "nvda-6",
+          "representative_story_key": "nvda-7",
           "salience": 0.710816,
           "theme_key": "1334609ad9ca2c41404876f3e0e7e973b01ff7210fc66939f43be717a7e80675"
         },
         {
-          "cohesion": 0.68965,
-          "cohesion_margin": 0.28965,
+          "cohesion": 0.689651,
+          "cohesion_margin": 0.289651,
           "fingerprint": "8bdd8acfe35f4d54ec69d09bebd0f64dca854093f0a0bcf9e8f7dec7bc0bd081",
           "label": "Washington clears Nvidia to ship a reduced-performance chip to China",
           "label_source": "canonical_story_title",
@@ -300,7 +356,7 @@
             "nvda-5"
           ],
           "method": "hdbscan",
-          "min_pairwise_cohesion": 0.68965,
+          "min_pairwise_cohesion": 0.689651,
           "near_cohesion_floor": false,
           "outlet_count": 3,
           "outlets": [
@@ -317,14 +373,14 @@
       "themes": [
         [
           1,
-          "Nvidia reports record data centre revenue",
+          "Nvidia guides to higher data centre revenue next quarter",
           2,
           5,
           0.9832
         ],
         [
           2,
-          "Nvidia unveils its next accelerator generation at GTC",
+          "Nvidia opens accelerator orders to European cloud providers at GTC",
           2,
           2,
           0.7108
@@ -343,38 +399,44 @@
       "volume": "medium"
     },
     {
+      "ac4_shape_detail": "6 theme(s) against the 2-6 band",
       "algorithm_version": "m5.themes.v1",
-      "config_fingerprint": "1fea7eaa9a66fdd848c36c6354347576482860a03d183986f32a35451971d8e3",
+      "config_fingerprint": "9fcbf80e2eea4d427764d6b4328cfafab0e5b05927d97618cfc8ba8bf3f2fa37",
       "duplicate_membership_keys": [],
       "embedding_dimension": 384,
       "excluded_by_reason": {},
       "excluded_count": 0,
-      "max_inter_theme_similarity": 0.6167591575864638,
-      "mean_cohesion": 0.4792599700127025,
+      "max_inter_theme_similarity": 0.528534,
+      "mean_cohesion": 0.499703,
       "meets_ac4_shape": true,
       "method": "agglomerative",
-      "method_reason": "hdbscan's loosest cluster has cohesion 0.3508, below 0.4; k=6 places 17 stories in 5 theme(s) clearing the floors, mean cohesion 0.4793; moved a 1-story cluster to other coverage, below the 2-story theme floor",
+      "method_reason": "hdbscan's loosest cluster has cohesion 0.3508, below 0.4; k=7 yields 6 theme(s) clearing both floors, weakest pair 0.3048, mean cohesion 0.4997, 16 stories covered; 2 story(ies) moved to other coverage: below a floor (mean 0.4, weakest pair 0.3), below the 2-story theme floor, or surplus to the 6-theme cap",
+      "min_pairwise_cohesion": 0.304832,
       "missing_story_keys": [],
       "model_name": "sentence-transformers/all-MiniLM-L6-v2",
       "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
       "no_story_lost": true,
       "other_coverage": [
+        "tsla-8",
         "tsla-16"
       ],
       "other_coverage_by_reason": {
-        "below_theme_size_floor": [
-          "tsla-16"
+        "below_cohesion_floor": [
+          "tsla-16",
+          "tsla-8"
         ]
       },
-      "other_coverage_count": 1,
+      "other_coverage_count": 2,
       "partition": [
         [
           "tsla-1",
-          "tsla-10",
           "tsla-14",
           "tsla-15",
-          "tsla-18",
           "tsla-2"
+        ],
+        [
+          "tsla-10",
+          "tsla-18"
         ],
         [
           "tsla-11",
@@ -383,7 +445,6 @@
         ],
         [
           "tsla-17",
-          "tsla-8",
           "tsla-9"
         ],
         [
@@ -402,18 +463,18 @@
         "matched_fraction_of_new": 1.0,
         "membership_retained": 1.0,
         "stories_retained_in_themes": 1.0,
-        "theme_count_after": 5,
-        "theme_count_before": 5
+        "theme_count_after": 6,
+        "theme_count_before": 6
       },
       "permutation_stable": true,
       "perturbation": {
-        "identity_retained": 0.8,
-        "interpretation": "only 0.60 of the baseline's themes kept their exact membership, while 0.80 kept an identifier; stable identifiers over restructured membership is not stable clustering.",
-        "matched_fraction_of_new": 0.8,
-        "membership_retained": 0.6,
+        "identity_retained": 1.0,
+        "interpretation": "1.00 of the baseline's themes kept their exact membership.",
+        "matched_fraction_of_new": 1.0,
+        "membership_retained": 1.0,
         "stories_retained_in_themes": 1.0,
-        "theme_count_after": 5,
-        "theme_count_before": 5
+        "theme_count_after": 6,
+        "theme_count_before": 6
       },
       "rerun_keeps_identity": true,
       "singleton_theme_count": 0,
@@ -422,35 +483,33 @@
         "complete": true,
         "duplicate_membership_keys": [],
         "excluded": 0,
-        "in_themes": 17,
+        "in_themes": 16,
         "input_story_count": 18,
         "missing_story_keys": [],
-        "other_coverage": 1,
+        "other_coverage": 2,
         "unexpected_story_keys": []
       },
       "story_count": 18,
-      "theme_count": 5,
-      "theme_coverage": 0.9444444444444444,
+      "theme_count": 6,
+      "theme_coverage": 0.888889,
       "theme_details": [
         {
-          "cohesion": 0.420504,
-          "cohesion_margin": 0.020504,
-          "fingerprint": "f20129319a6eecf7e8bf3a44c052b7d502a0749ea61bd6fc0173d0dcdb023d94",
-          "label": "Tesla delivers 495,000 vehicles in the first quarter",
+          "cohesion": 0.51072,
+          "cohesion_margin": 0.11072,
+          "fingerprint": "7c14df9452e8daa263eaf480c3462fca93146fa51998d7e752014e9c9d3d2e96",
+          "label": "Tesla signs a grid storage contract with a European utility",
           "label_source": "canonical_story_title",
           "matched_previous_key": null,
-          "member_count": 6,
+          "member_count": 4,
           "member_story_keys": [
             "tsla-1",
-            "tsla-10",
             "tsla-14",
             "tsla-15",
-            "tsla-18",
             "tsla-2"
           ],
           "method": "agglomerative",
-          "min_pairwise_cohesion": 0.267577,
-          "near_cohesion_floor": true,
+          "min_pairwise_cohesion": 0.390495,
+          "near_cohesion_floor": false,
           "outlet_count": 4,
           "outlets": [
             "bloomberg",
@@ -459,15 +518,15 @@
             "reuters"
           ],
           "rank": 1,
-          "representative_story_key": "tsla-1",
+          "representative_story_key": "tsla-15",
           "salience": 1.0,
-          "theme_key": "f20129319a6eecf7e8bf3a44c052b7d502a0749ea61bd6fc0173d0dcdb023d94"
+          "theme_key": "7c14df9452e8daa263eaf480c3462fca93146fa51998d7e752014e9c9d3d2e96"
         },
         {
           "cohesion": 0.472479,
           "cohesion_margin": 0.072479,
           "fingerprint": "1db2e6edca4199d41a9930d734974c6a64187ee7e604f12d4e422d9f61518e50",
-          "label": "Tesla applies for a robotaxi permit in Arizona",
+          "label": "Tesla expands its supervised self-driving trial to two more states",
           "label_source": "canonical_story_title",
           "matched_previous_key": null,
           "member_count": 3,
@@ -487,15 +546,15 @@
             "the verge"
           ],
           "rank": 2,
-          "representative_story_key": "tsla-11",
-          "salience": 0.655889,
+          "representative_story_key": "tsla-13",
+          "salience": 0.755889,
           "theme_key": "1db2e6edca4199d41a9930d734974c6a64187ee7e604f12d4e422d9f61518e50"
         },
         {
           "cohesion": 0.505574,
           "cohesion_margin": 0.105574,
           "fingerprint": "b7201a4bde44f7e44369c93c8019935d2fd3fa118d9cc34c3f3d837f33dc0f47",
-          "label": "Tesla recalls 12,000 Cybertrucks over a wiper fault",
+          "label": "Tesla recalls Model Y vehicles over a seatbelt anchor",
           "label_source": "canonical_story_title",
           "matched_previous_key": null,
           "member_count": 3,
@@ -505,7 +564,7 @@
             "tsla-7"
           ],
           "method": "agglomerative",
-          "min_pairwise_cohesion": 0.409937,
+          "min_pairwise_cohesion": 0.409936,
           "near_cohesion_floor": false,
           "outlet_count": 3,
           "outlets": [
@@ -514,43 +573,15 @@
             "reuters"
           ],
           "rank": 3,
-          "representative_story_key": "tsla-5",
-          "salience": 0.625226,
+          "representative_story_key": "tsla-7",
+          "salience": 0.725226,
           "theme_key": "b7201a4bde44f7e44369c93c8019935d2fd3fa118d9cc34c3f3d837f33dc0f47"
-        },
-        {
-          "cohesion": 0.416818,
-          "cohesion_margin": 0.016818,
-          "fingerprint": "c5567e8d27fe188e3e48568e5998232d463387dc2b6fc1251f0248c2c1fca2cd",
-          "label": "Tesla's Berlin plant resumes output after a grid fault",
-          "label_source": "canonical_story_title",
-          "matched_previous_key": null,
-          "member_count": 3,
-          "member_story_keys": [
-            "tsla-17",
-            "tsla-8",
-            "tsla-9"
-          ],
-          "method": "agglomerative",
-          "min_pairwise_cohesion": 0.271743,
-          "near_cohesion_floor": true,
-          "outlet_count": 4,
-          "outlets": [
-            "bloomberg",
-            "cnbc",
-            "marketwatch",
-            "reuters"
-          ],
-          "rank": 4,
-          "representative_story_key": "tsla-8",
-          "salience": 0.58749,
-          "theme_key": "c5567e8d27fe188e3e48568e5998232d463387dc2b6fc1251f0248c2c1fca2cd"
         },
         {
           "cohesion": 0.580924,
           "cohesion_margin": 0.180924,
           "fingerprint": "6b2000cddd2f0d77502d726fcae02ec6fb4c347ce10b7f1e9b37896225f703ea",
-          "label": "Tesla cuts Model 3 prices across Europe",
+          "label": "European Model Y buyers get a lower sticker price from Tesla",
           "label_source": "canonical_story_title",
           "matched_previous_key": null,
           "member_count": 2,
@@ -567,47 +598,103 @@
             "reuters",
             "yahoo finance"
           ],
-          "rank": 5,
-          "representative_story_key": "tsla-3",
-          "salience": 0.483259,
+          "rank": 4,
+          "representative_story_key": "tsla-4",
+          "salience": 0.549926,
           "theme_key": "6b2000cddd2f0d77502d726fcae02ec6fb4c347ce10b7f1e9b37896225f703ea"
+        },
+        {
+          "cohesion": 0.51425,
+          "cohesion_margin": 0.11425,
+          "fingerprint": "0f74931c349a4344e7ae61d72c2f2c97bf609abd0503796196baf79fa422171d",
+          "label": "Tesla adds a third shift at the Berlin factory",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 2,
+          "member_story_keys": [
+            "tsla-17",
+            "tsla-9"
+          ],
+          "method": "agglomerative",
+          "min_pairwise_cohesion": 0.51425,
+          "near_cohesion_floor": false,
+          "outlet_count": 2,
+          "outlets": [
+            "bloomberg",
+            "marketwatch"
+          ],
+          "rank": 5,
+          "representative_story_key": "tsla-9",
+          "salience": 0.43749,
+          "theme_key": "0f74931c349a4344e7ae61d72c2f2c97bf609abd0503796196baf79fa422171d"
+        },
+        {
+          "cohesion": 0.414269,
+          "cohesion_margin": 0.014269,
+          "fingerprint": "b9c77dbb05f624a24a23d8c9dd70c9cf289da19c94b65bb8d1662b2112a867ca",
+          "label": "Tesla opens a supercharger corridor across Norway",
+          "label_source": "canonical_story_title",
+          "matched_previous_key": null,
+          "member_count": 2,
+          "member_story_keys": [
+            "tsla-10",
+            "tsla-18"
+          ],
+          "method": "agglomerative",
+          "min_pairwise_cohesion": 0.414269,
+          "near_cohesion_floor": true,
+          "outlet_count": 1,
+          "outlets": [
+            "reuters"
+          ],
+          "rank": 6,
+          "representative_story_key": "tsla-18",
+          "salience": 0.364191,
+          "theme_key": "b9c77dbb05f624a24a23d8c9dd70c9cf289da19c94b65bb8d1662b2112a867ca"
         }
       ],
       "themes": [
         [
           1,
-          "Tesla delivers 495,000 vehicles in the first quarter",
-          6,
+          "Tesla signs a grid storage contract with a European utility",
+          4,
           4,
           1.0
         ],
         [
           2,
-          "Tesla applies for a robotaxi permit in Arizona",
+          "Tesla expands its supervised self-driving trial to two more states",
           3,
           4,
-          0.6559
+          0.7559
         ],
         [
           3,
-          "Tesla recalls 12,000 Cybertrucks over a wiper fault",
+          "Tesla recalls Model Y vehicles over a seatbelt anchor",
           3,
           3,
-          0.6252
+          0.7252
         ],
         [
           4,
-          "Tesla's Berlin plant resumes output after a grid fault",
+          "European Model Y buyers get a lower sticker price from Tesla",
+          2,
           3,
-          4,
-          0.5875
+          0.5499
         ],
         [
           5,
-          "Tesla cuts Model 3 prices across Europe",
+          "Tesla adds a third shift at the Berlin factory",
           2,
-          3,
-          0.4833
+          2,
+          0.4375
+        ],
+        [
+          6,
+          "Tesla opens a supercharger corridor across Norway",
+          2,
+          1,
+          0.3642
         ]
       ],
       "ticker": "TSLA",
@@ -631,5 +718,6 @@
     "headline": "Synthetic, single-author, unadjudicated development dataset.",
     "level": "WARNING",
     "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
-  }
+  },
+  "vector_source": "committed_vectors"
 }

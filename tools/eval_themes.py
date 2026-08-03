@@ -10,8 +10,15 @@ volume.  This runs that demonstration and writes a diffable record.
 Exit status is 0 when every day satisfies AC-4's shape and loses no story,
 1 when one does not, and 2 for a usage or fixture error.
 
-The numbers are produced with the real Phase 0 encoder, so this script
-loads a model; the unit tests do not.
+**Offline by default.**  The vectors come from the committed
+``nlp/themes/data/story_vectors.json``, produced once from the real Phase 0
+encoder and rounded to a documented precision.  That makes this script -
+and the test that regenerates its artifact - run with no model load and no
+network call, and makes the committed JSON byte-identical on any machine.
+
+``--real-model`` recomputes the vectors from the encoder instead; add
+``--write-vectors PATH`` to refresh the committed fixture.  That is the
+only path that loads a model, and it is not on the default test route.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from nlp.themes.compatibility import (
 )
 from nlp.themes.config import (
     ALGORITHM_VERSION,
+    SCORE_PRECISION,
     SEMANTIC_INPUT_COMPOSITION,
     ThemeConfig,
 )
@@ -38,15 +46,29 @@ from nlp.themes.dataset import (
     tickers_of,
 )
 from nlp.themes.errors import ThemeError
+from nlp.themes.trust import derive_stage_trust_summary
+from nlp.themes.vectors import (
+    DEFAULT_VECTOR_PATH,
+    FixtureEncoder,
+    load_story_vectors,
+    write_story_vectors,
+)
 from nlp.themes.quality import TickerDayReport, evaluate_ticker_day
 
 
 def _plain(value: Any) -> Any:
-    """Render tuples as lists so the committed JSON diffs cleanly."""
+    """Render tuples as lists and round every float, on one code path.
 
-    if isinstance(value, tuple):
-        return [_plain(item) for item in value]
-    if isinstance(value, list):
+    One path, one precision: a value rounded in three places eventually
+    gets rounded differently in one of them, and the committed artifact
+    stops being byte-stable without anything having changed.
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return round(value, SCORE_PRECISION)
+    if isinstance(value, (tuple, list)):
         return [_plain(item) for item in value]
     if isinstance(value, dict):
         return {key: _plain(item) for key, item in value.items()}
@@ -100,6 +122,13 @@ def _render(reports: Sequence[TickerDayReport]) -> str:
             f"  other coverage    {report.other_coverage_count}",
             f"  excluded          {report.excluded_count}",
             f"  theme coverage    {report.theme_coverage:.4f}",
+            "  min pairwise      "
+            + (
+                "n/a"
+                if report.min_pairwise_cohesion is None
+                else f"{report.min_pairwise_cohesion:.4f}"
+            ),
+            f"  AC-4 detail       {report.ac4_shape_detail}",
             "  mean cohesion     "
             + (
                 "n/a" if report.mean_cohesion is None else f"{report.mean_cohesion:.4f}"
@@ -146,6 +175,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Measure theme clustering on the committed ticker-days.",
     )
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE_PATH)
+    parser.add_argument("--vectors", type=Path, default=DEFAULT_VECTOR_PATH)
+    parser.add_argument(
+        "--real-model",
+        action="store_true",
+        help="encode with the real model instead of the committed vectors",
+    )
+    parser.add_argument(
+        "--write-vectors",
+        type=Path,
+        help="refresh the committed vector fixture (implies --real-model)",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--write", type=Path)
     args = parser.parse_args(argv)
@@ -156,9 +196,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"fixture error: {exc}", file=sys.stderr)
         return 2
 
-    from nlp.embeddings import EmbeddingService
+    if args.real_model or args.write_vectors:
+        from nlp.embeddings import EmbeddingService
 
-    encoder = EmbeddingService()
+        encoder: Any = EmbeddingService()
+        if args.write_vectors:
+            write_story_vectors(day_set, encoder, args.write_vectors)
+    else:
+        try:
+            fixture_encoder = FixtureEncoder(load_story_vectors(args.vectors))
+        except ThemeError as exc:
+            print(f"vector fixture error: {exc}", file=sys.stderr)
+            return 2
+        from nlp.embeddings import compose_embedding_text
+
+        fixture_encoder.bind(
+            {
+                story.story_key: compose_embedding_text(story.title, story.description)
+                for day in day_set.days
+                for story in day.stories
+            }
+        )
+        encoder = fixture_encoder
     config = ThemeConfig(supported_tickers=tickers_of(day_set))
     # One ticker-day that refuses to cluster must not erase the days that
     # did.  Each failure is named and counted; the run reports incomplete
@@ -192,6 +251,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "acceptance_criteria": day_set.metadata.get("acceptance_criteria"),
         "trust_contract": day_set.trust_contract.as_dict(),
         "trust_summary": day_set.trust_summary.as_dict(),
+        "stage_specific_trust_summary": derive_stage_trust_summary(
+            day_set.trust_contract
+        ).as_dict(),
+        "vector_source": getattr(encoder, "source", "real_model"),
         "known_limitations": list(day_set.known_limitations),
         "model_name": encoder.model_name,
         "model_revision": encoder.model_revision,
@@ -212,6 +275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "compatibility_policy_fingerprint": compatibility_policy_fingerprint(),
         "algorithm_version": ALGORITHM_VERSION,
+        "score_precision": SCORE_PRECISION,
         "case_count": len(day_set.days),
         "evaluated_case_count": len(evaluated),
         "failed_case_count": len(failed),
@@ -227,7 +291,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json:
         print(text, end="")
     else:
-        banner = day_set.trust_summary.text
+        banner = (
+            day_set.trust_summary.text
+            + "\n"
+            + derive_stage_trust_summary(day_set.trust_contract).text
+        )
         print(banner)
         print()
         print(_render(reports), end="")

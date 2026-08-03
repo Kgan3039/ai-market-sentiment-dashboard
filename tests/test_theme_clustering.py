@@ -11,6 +11,7 @@ coverage, or in the excluded list with a reason.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import date, datetime, timedelta, timezone
 import json
 import math
@@ -22,6 +23,7 @@ import pytest
 
 from nlp.themes import (
     ClusteringMethod,
+    ThemePartitionError,
     ExclusionReason,
     OtherCoverageReason,
     PreviousTheme,
@@ -287,13 +289,38 @@ def test_a_loose_catch_all_is_dissolved_rather_than_shown_as_a_theme():
     assert {"s1", "s2", "s3"} <= {entry.story_key for entry in result.other_coverage}
 
 
-def test_hdbscan_gives_way_to_agglomerative_when_a_cluster_is_too_loose():
+def test_hdbscan_gives_way_when_a_cluster_is_too_loose():
+    """A floor no candidate clears refuses the day rather than forcing it."""
+
     stories, encoder = three_strand_day()
     # The strands sit 8 degrees apart, so their cohesion is cos(8) = 0.9903.
-    result = run(stories, encoder, min_theme_cohesion=0.995)
+    result = run(
+        stories,
+        encoder,
+        min_theme_cohesion=0.995,
+        min_theme_pairwise_cohesion=0.995,
+    )
+
+    assert result.method is ClusteringMethod.NO_SEPARABLE_STRUCTURE
+    assert "below 0.995" in result.method_reason
+    assert not result.themes
+    assert len(result.accounted_story_keys) == len(stories)
+    assert {entry.reason for entry in result.other_coverage} == {
+        OtherCoverageReason.INSUFFICIENT_THEME_STRUCTURE
+    }
+
+
+def test_hdbscan_still_gives_way_to_a_workable_agglomerative_split():
+    """Three strands against a two-theme cap: the surplus is listed, not lost."""
+
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder, max_themes=2)
 
     assert result.method is ClusteringMethod.AGGLOMERATIVE
-    assert "below 0.995" in result.method_reason
+    assert "outside 2-2" in result.method_reason
+    assert len(result.themes) == 2
+    assert len(result.other_coverage) == 2
+    assert len(result.accounted_story_keys) == len(stories)
 
 
 # --------------------------------------------------------------------------
@@ -627,7 +654,7 @@ def test_the_defaults_are_the_ones_ac4_specifies():
 @pytest.mark.parametrize(
     "stories,message",
     [
-        ([story("a", "x"), story("a", "y")], "duplicate story_key"),
+        ([story("a", "x"), story("a", "y")], "appear more than once"),
         ([story("", "x")], "blank story_key"),
         ([story("a", "x", ticker="TSLA")], "not the requested NVDA"),
         (
@@ -1183,7 +1210,7 @@ def test_one_dominant_cluster_plus_outliers_keeps_the_outliers_visible():
 # --------------------------------------------------------------------------
 
 
-def test_the_fallback_prefers_the_k_that_places_the_most_stories_in_themes():
+def test_the_fallback_prefers_the_k_whose_themes_clear_both_floors():
     from nlp.themes.clustering import _best_agglomerative, cosine_distances
     import numpy as np
 
@@ -1198,7 +1225,7 @@ def test_the_fallback_prefers_the_k_that_places_the_most_stories_in_themes():
     )
 
     assert count >= 4
-    assert "clearing the floors" in detail
+    assert "clearing both floors" in detail
     assert "silhouette" not in detail
 
 
@@ -1505,14 +1532,19 @@ def test_a_label_change_alone_cannot_move_membership_identity():
 def test_a_label_is_a_member_headline_verbatim(title):
     """No model call, no paraphrase, so a label cannot overclaim."""
 
-    stories = [story("a", title, 0), story("b", title + " (update)", 1)]
-    encoder = AngleEncoder({title: 0.0, title + " (update)": 2.0})
-    result = run(stories, encoder, min_stories_for_clustering=2)
+    titles = [title, title + " (update)", "far one", "far two"]
+    stories = [
+        story(key, text, index) for index, (key, text) in enumerate(zip("abcd", titles))
+    ]
+    encoder = AngleEncoder(
+        {titles[0]: 0.0, titles[1]: 2.0, "far one": 90.0, "far two": 92.0}
+    )
+    result = run(stories, encoder, min_themes=2)
 
     assert result.themes
-    theme = result.themes[0]
-    assert theme.label in {entry.title for entry in stories}
-    assert theme.label_source == "canonical_story_title"
+    for theme in result.themes:
+        assert theme.label in set(titles)
+        assert theme.label_source == "canonical_story_title"
 
 
 def test_the_label_is_not_an_input_order_artifact():
@@ -1766,8 +1798,11 @@ def test_an_m3_guard_change_no_longer_invalidates_every_theme():
         model_name="m", model_revision="v1", embedding_dimension=3
     )
 
+    from nlp.semdedup.evidence import policy_fingerprint as m3_fingerprint
+
     assert "coherence_policy" not in components
-    assert not any("evidence" in str(value) for value in components.values())
+    digests = {str(value) for value in components.values()}
+    assert m3_fingerprint() not in digests
 
 
 # --------------------------------------------------------------------------
@@ -1785,8 +1820,10 @@ def test_stability_reports_membership_against_the_baseline_not_the_new_run():
 
     assert 0.0 <= report.membership_retained <= 1.0
     assert 0.0 <= report.identity_retained <= 1.0
-    # The weak denominator is kept, but it is not the headline number.
-    assert report.matched_fraction_of_new >= report.identity_retained or True
+    # The weak denominator is kept and is a real fraction, not a stand-in
+    # for the strong one.
+    assert 0.0 <= report.matched_fraction_of_new <= 1.0
+    assert report.identity_retained <= 1.0
     assert report.theme_count_before == len(baseline.themes)
     assert report.theme_count_after == len(collapsed.themes)
 
@@ -2016,3 +2053,998 @@ def test_no_model_is_loaded_by_the_unit_tests():
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "False"
+
+
+# --------------------------------------------------------------------------
+# Partition integrity at the public boundary
+# --------------------------------------------------------------------------
+
+
+def two_owners_of(item_id: str, **extra):
+    return [
+        story("one", "first headline", 0, item_ids=(item_id,), **extra),
+        story("two", "second headline", 1, item_ids=(item_id,), **extra),
+        story("three", "third headline", 2, item_ids=("three-a",)),
+        story("four", "fourth headline", 3, item_ids=("four-a",)),
+    ]
+
+
+def test_cluster_themes_itself_refuses_a_shared_raw_item():
+    """The guarantee cannot depend on the caller using the bridge."""
+
+    with pytest.raises(ThemePartitionError) as caught:
+        run(two_owners_of("shared"), AngleEncoder({}))
+
+    error = caught.value
+    assert error.overlapping_item_ids == ("shared",)
+    assert set(error.affected_story_keys) == {"one", "two"}
+    assert "citable from exactly one theme" in str(error)
+
+
+def test_cluster_themes_reports_every_overlapping_raw_item():
+    stories = [
+        story("one", "first", 0, item_ids=("a", "b")),
+        story("two", "second", 1, item_ids=("b", "c")),
+        story("three", "third", 2, item_ids=("c", "d")),
+        story("four", "fourth", 3, item_ids=("e",)),
+    ]
+
+    with pytest.raises(ThemePartitionError) as caught:
+        run(stories, AngleEncoder({}))
+
+    assert caught.value.overlapping_item_ids == ("b", "c")
+    assert set(caught.value.affected_story_keys) == {"one", "two", "three"}
+
+
+def test_an_overlap_across_would_be_different_themes_is_still_refused():
+    """Far apart in the space, so nothing would have merged them anyway."""
+
+    stories = [
+        story("a1", "earnings one", 0, item_ids=("shared",)),
+        story("a2", "earnings two", 1, item_ids=("a2-a",)),
+        story("b1", "recall one", 2, item_ids=("shared",)),
+        story("b2", "recall two", 3, item_ids=("b2-a",)),
+    ]
+    encoder = AngleEncoder(
+        {
+            "earnings one": 0.0,
+            "earnings two": 3.0,
+            "recall one": 90.0,
+            "recall two": 93.0,
+        }
+    )
+
+    with pytest.raises(ThemePartitionError) as caught:
+        run(stories, encoder)
+
+    assert caught.value.overlapping_item_ids == ("shared",)
+
+
+def test_cluster_themes_refuses_a_repeated_story_fingerprint():
+    stories = [
+        story("dup", "first", 0, item_ids=("x1",)),
+        story("dup", "second", 1, item_ids=("x2",)),
+        story("c", "third", 2, item_ids=("x3",)),
+        story("d", "fourth", 3, item_ids=("x4",)),
+    ]
+
+    with pytest.raises(ThemePartitionError) as caught:
+        run(stories, AngleEncoder({}))
+
+    assert caught.value.overlapping_story_keys == ("dup",)
+
+
+def test_one_story_may_not_list_a_member_id_twice():
+    stories = [story("a", "first", 0, item_ids=("x", "x"))]
+
+    with pytest.raises(ThemePartitionError, match="twice"):
+        run(stories, AngleEncoder({}))
+
+
+@pytest.mark.parametrize(
+    "story_key,item_ids,message",
+    [
+        ("  padded  ", ("x",), "padded"),
+        ("ok", ("",), "blank member id"),
+        ("ok", ("   ",), "blank member id"),
+        ("ok", (" padded ",), "member id is padded"),
+    ],
+)
+def test_a_malformed_fingerprint_or_member_id_is_refused(story_key, item_ids, message):
+    stories = [
+        ThemeStory(
+            story_key=story_key,
+            ticker="NVDA",
+            title="t",
+            published_at=BASE,
+            item_ids=item_ids,
+        )
+    ]
+
+    with pytest.raises(ThemeInputError, match=message):
+        run(stories, AngleEncoder({}))
+
+
+def test_valid_disjoint_input_is_accepted():
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+
+    assert result.complete
+    assert len(result.accounted_story_keys) == len(stories)
+
+
+def test_no_raw_item_is_citable_from_two_themes():
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+
+    seen: dict[str, str] = {}
+    for theme in result.themes:
+        for item_id in theme.citable_item_ids:
+            assert item_id not in seen, (item_id, seen[item_id], theme.fingerprint)
+            seen[item_id] = theme.fingerprint
+
+
+# --------------------------------------------------------------------------
+# Production accounting on ThemeSet itself
+# --------------------------------------------------------------------------
+
+
+def test_the_theme_set_exposes_its_own_accounting():
+    stories, encoder = three_strand_day()
+    stories.append(story("odd", "entirely unrelated market language", 6))
+    result = run(stories, encoder)
+
+    assert result.input_story_keys == tuple(
+        sorted(entry.story_key for entry in stories)
+    )
+    assert result.accounted_story_keys == result.input_story_keys
+    assert result.missing_story_keys == ()
+    assert result.unexpected_story_keys == ()
+    assert result.duplicate_membership_keys == ()
+    assert result.complete is True
+
+
+def test_a_result_is_not_complete_when_a_diagnostic_is_non_empty():
+    """`complete` reads the diagnostics; it is not a separately stored flag."""
+
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+    broken = dataclasses.replace(result, missing_story_keys=("ghost",))
+
+    assert broken.complete is False
+
+
+def test_the_production_path_raises_rather_than_returning_incomplete():
+    from nlp.themes import service
+
+    stories, encoder = three_strand_day()
+    original = service._evidence
+
+    def losing(story):
+        # Drop a story on the way into other coverage.
+        raise AssertionError("unused")
+
+    # Assemble with a deliberately short 'ordered' list: the accounting must
+    # notice the extra accounted key rather than shipping it.
+    with pytest.raises(AssertionError, match="lost or duplicated"):
+        service._assemble(
+            "NVDA",
+            DAY,
+            list(stories)[:2],
+            list(stories),
+            __import__("numpy").zeros((len(stories), 3)),
+            groups=[],
+            other_reasons={
+                index: OtherCoverageReason.CLUSTERING_NOISE
+                for index in range(len(stories))
+            },
+            excluded=(),
+            method=ClusteringMethod.SMALL_N_FALLBACK,
+            method_reason="test",
+            config=config(),
+            fingerprint="f",
+            previous_themes=(),
+            model_name="m",
+            model_revision="v1",
+            dimension=3,
+            source_metadata=None,
+        )
+    assert original is service._evidence
+
+
+# --------------------------------------------------------------------------
+# Claim-scoped compatibility
+# --------------------------------------------------------------------------
+
+
+CLAIM_SCOPE_CASES = [
+    (
+        "Nvidia will not open a new office, but raises guidance",
+        {("commitment", "negative"), ("direction", "positive")},
+    ),
+    ("Nvidia raises guidance and cuts spending", {("direction", "mixed")}),
+    (
+        "Nvidia will not miss estimates and beats expectations",
+        {("performance", "positive")},
+    ),
+    ("Nvidia did not fail to raise guidance", {("direction", "positive")}),
+    ("Nvidia did not miss estimates", {("performance", "positive")}),
+    (
+        "Nvidia not only raised guidance but also expanded capacity",
+        {("direction", "positive")},
+    ),
+    ("Nvidia cuts its full-year guidance", {("direction", "negative")}),
+    ("Regulators rejected the deal", {("decision", "negative")}),
+]
+
+
+@pytest.mark.parametrize("title,expected", CLAIM_SCOPE_CASES)
+def test_claims_are_scoped_to_their_own_clause(title, expected):
+    assert story_claims(story("a", title, 0)) == expected
+
+
+def test_a_story_making_both_claims_does_not_eject_itself():
+    """The sentence-wide rule ejected this story from its own theme."""
+
+    stories = [
+        story("a", "Nvidia raises guidance and cuts spending", 0),
+        story("b", "Nvidia lifts its full-year outlook", 1),
+        story("c", "Nvidia guides higher for the year", 2),
+    ]
+
+    assert incompatible_members(stories, [0, 1, 2]) == ()
+
+
+def test_unrelated_negation_does_not_invert_a_guidance_claim():
+    """The production path, not just the claim parser."""
+
+    stories = [
+        story("a", "Nvidia will not open a new office, but raises guidance", 0),
+        story("b", "Nvidia guidance was raised for the full year", 1),
+        story("c", "far one", 2),
+        story("d", "far two", 3),
+    ]
+    encoder = AngleEncoder(
+        {
+            "Nvidia will not open a new office, but raises guidance": 0.0,
+            "Nvidia guidance was raised for the full year": 3.0,
+            "far one": 90.0,
+            "far two": 93.0,
+        }
+    )
+    result = run(stories, encoder)
+
+    together = [
+        theme for theme in result.themes if {"a", "b"} <= set(theme.member_story_keys)
+    ]
+    assert together, "the unrelated negation split a theme that agreed"
+
+
+def test_a_genuine_negated_claim_still_conflicts():
+    stories = [
+        story("a", "Nvidia opens the Ohio plant", 0),
+        story("b", "Nvidia will not open the Ohio plant", 1),
+    ]
+
+    assert incompatible_members(stories, [0, 1]) == (1,)
+
+
+def test_a_mixed_family_cannot_eject_a_single_sided_member():
+    stories = [
+        story("a", "Nvidia raises guidance and cuts spending", 0),
+        story("b", "Nvidia cuts its full-year guidance", 1),
+        story("c", "Nvidia lowers its outlook", 2),
+    ]
+
+    assert incompatible_members(stories, [0, 1, 2]) == ()
+
+
+def test_the_cluster_wide_check_still_finds_a_one_versus_three_contradiction():
+    stories = [
+        story("a", "Nvidia raises its full-year guidance", 0),
+        story("b", "Nvidia lifts its outlook", 1),
+        story("c", "Nvidia guides higher", 2),
+        story("d", "Nvidia cuts its full-year guidance", 3),
+    ]
+
+    assert incompatible_members(stories, [0, 1, 2, 3]) == (3,)
+
+
+def test_double_negation_is_parity_not_presence():
+    from nlp.themes.compatibility import _negation_parity
+
+    assert _negation_parity(("did", "not", "fail", "to"), 4) is False
+    assert _negation_parity(("did", "not"), 2) is True
+    assert _negation_parity(("not", "only"), 2) is False
+    # Out of the window: four tokens back is the limit.
+    assert _negation_parity(("not", "a", "b", "c", "d"), 5) is False
+
+
+# --------------------------------------------------------------------------
+# Degenerate embedding geometry
+# --------------------------------------------------------------------------
+
+
+class ConstantEncoder(AngleEncoder):
+    """Every story lands on exactly the same point."""
+
+    def __init__(self, angle: float = 0.0) -> None:
+        super().__init__({})
+        self.angle = angle
+
+    def _vector(self, text: str):
+        radians = math.radians(self.angle)
+        return [math.cos(radians), math.sin(radians), 0.0]
+
+
+@pytest.mark.parametrize("count", [4, 5, 6])
+def test_identical_vectors_produce_no_theme_and_say_so(count):
+    stories = [story(f"s{index}", f"headline {index}", index) for index in range(count)]
+    result = run(stories, ConstantEncoder())
+
+    assert result.method is ClusteringMethod.NO_SEPARABLE_STRUCTURE
+    assert not result.themes
+    assert len(result.accounted_story_keys) == count
+    assert {entry.reason for entry in result.other_coverage} == {
+        OtherCoverageReason.DEGENERATE_EMBEDDING_GEOMETRY
+    }
+    assert result.quality.meets_ac4_shape is False
+    assert "no theme was invented" in result.quality.ac4_shape_detail
+    assert result.complete
+
+
+def test_nearly_identical_vectors_are_not_called_degenerate():
+    """A hair of structure is still structure; only exact identity is not."""
+
+    stories = [story(f"s{index}", f"headline {index}", index) for index in range(6)]
+    encoder = AngleEncoder({f"headline {index}": index * 0.001 for index in range(6)})
+    result = run(stories, encoder)
+
+    assert result.method is not ClusteringMethod.NO_SEPARABLE_STRUCTURE
+    assert len(result.accounted_story_keys) == 6
+
+
+def test_no_valid_partition_produces_no_theme_rather_than_a_forced_split():
+    stories, encoder = three_strand_day()
+    result = run(
+        stories, encoder, min_theme_cohesion=0.999, min_theme_pairwise_cohesion=0.999
+    )
+
+    assert result.method is ClusteringMethod.NO_SEPARABLE_STRUCTURE
+    assert not result.themes
+    assert {entry.reason for entry in result.other_coverage} == {
+        OtherCoverageReason.INSUFFICIENT_THEME_STRUCTURE
+    }
+    assert result.quality.meets_ac4_shape is False
+
+
+# --------------------------------------------------------------------------
+# The trust-first fallback objective
+# --------------------------------------------------------------------------
+
+
+def vectors_at(*angles: float):
+    import numpy as np
+
+    return np.array(
+        [[math.cos(math.radians(a)), math.sin(math.radians(a)), 0.0] for a in angles]
+    )
+
+
+def test_coverage_never_outranks_coherence_in_the_objective():
+    """A coverage-heavy candidate loses to a coherent, narrower one."""
+
+    from nlp.themes.clustering import _candidate_quality
+
+    # Two tight pairs and three stories strung out between them.  The
+    # coarse cut sweeps the stragglers in; the fine cut leaves them out.
+    vectors = vectors_at(0.0, 2.0, 30.0, 55.0, 80.0, 100.0, 102.0)
+    settings = config()
+    coarse = _candidate_quality(vectors, [0, 0, 0, 0, 0, 1, 1], settings)
+    fine = _candidate_quality(vectors, [0, 0, 2, 3, 4, 1, 1], settings)
+
+    coarse_key = (-coarse[0], -coarse[1], -coarse[2], -coarse[3])
+    fine_key = (-fine[0], -fine[1], -fine[2], -fine[3])
+
+    assert coarse[3] > fine[3], "the coarse cut really does cover more"
+    assert fine[1] > coarse[1], "the fine cut really is more coherent"
+    assert fine_key < coarse_key, "coherence must win"
+
+
+def test_the_shipped_themes_always_clear_both_floors():
+    from nlp.themes.clustering import _agglomerative, cosine_distances, surviving_themes
+
+    vectors = vectors_at(0.0, 2.0, 30.0, 55.0, 80.0, 100.0, 102.0)
+    settings = config()
+    kept, dissolved = surviving_themes(
+        vectors, _agglomerative(cosine_distances(vectors), 3), settings
+    )
+
+    for members in kept:
+        assert min_pairwise_of(vectors, members) >= settings.min_theme_pairwise_cohesion
+    assert len(kept) + len(dissolved) <= len(vectors)
+
+
+def min_pairwise_of(vectors, members):
+    from nlp.themes.clustering import min_pairwise_similarity
+
+    return min_pairwise_similarity(vectors, members)
+
+
+def test_one_giant_weak_cluster_is_dissolved_not_shipped():
+    from nlp.themes.clustering import surviving_themes
+
+    # Every pair is further apart than the pairwise floor allows.
+    vectors = vectors_at(0.0, 80.0, 160.0, 240.0)
+    kept, dissolved = surviving_themes(vectors, [0, 0, 0, 0], config())
+
+    assert kept == ()
+    assert dissolved == (0, 1, 2, 3)
+
+
+def test_many_tiny_strong_clusters_survive_up_to_the_cap():
+    from nlp.themes.clustering import surviving_themes
+
+    angles = []
+    for index in range(8):
+        angles += [index * 20.0, index * 20.0 + 2.0]
+    vectors = vectors_at(*angles)
+    labels = [index // 2 for index in range(16)]
+    kept, dissolved = surviving_themes(vectors, labels, config())
+
+    assert len(kept) == config().max_themes
+    assert len(dissolved) == 4, "the surplus is listed, not merged in"
+
+
+def test_a_candidate_failing_the_pairwise_floor_sheds_before_it_ships():
+    from nlp.themes.clustering import coherent_subset
+
+    # Three tight, one far: the far one leaves and the rest survive.
+    vectors = vectors_at(0.0, 2.0, 4.0, 85.0)
+    kept = coherent_subset(vectors, [0, 1, 2, 3], config())
+
+    assert kept == (0, 1, 2)
+
+
+def test_subset_extraction_gives_up_rather_than_shipping_a_pair_it_invented():
+    from nlp.themes.clustering import coherent_subset
+
+    vectors = vectors_at(0.0, 80.0, 160.0)
+
+    assert coherent_subset(vectors, [0, 1, 2], config()) == ()
+
+
+@pytest.mark.parametrize("themes", [2, 6])
+def test_the_theme_count_boundaries_are_reachable(themes):
+    stories = []
+    angles = {}
+    for group in range(themes):
+        for member in range(2):
+            key = f"g{group}m{member}"
+            title = f"strand {group} story {member}"
+            stories.append(story(key, title, group * 2 + member))
+            angles[title] = group * (170.0 / themes) + member * 1.5
+    result = run(stories, AngleEncoder(angles), min_themes=2, max_themes=themes)
+
+    assert len(result.themes) == themes
+    assert len(result.accounted_story_keys) == themes * 2
+
+
+def test_the_fallback_tie_break_is_a_total_order():
+    from nlp.themes.clustering import theme_rank_key
+
+    vectors = vectors_at(0.0, 2.0, 40.0, 42.0)
+    first = theme_rank_key(vectors, [0, 1])
+    second = theme_rank_key(vectors, [2, 3])
+
+    # Identical geometry, so the position decides - and it always can,
+    # because it is unique.
+    assert first[:3] == pytest.approx(second[:3])
+    assert first[3] < second[3]
+    assert min([second, first], key=lambda key: key[3]) is first
+
+
+def test_the_fallback_is_permutation_stable():
+    stories, encoder = three_strand_day()
+    forward = run(stories, encoder, max_themes=2)
+    backward = run(list(reversed(stories)), encoder, max_themes=2)
+
+    assert [t.fingerprint for t in forward.themes] == [
+        t.fingerprint for t in backward.themes
+    ]
+    assert forward.other_coverage_by_reason() == backward.other_coverage_by_reason()
+
+
+# --------------------------------------------------------------------------
+# Authoritative outlet count
+# --------------------------------------------------------------------------
+
+
+def test_the_upstream_outlet_count_wins_over_the_projected_names():
+    from nlp.themes.service import outlet_count_of
+
+    narrow = story("a", "t", 0, outlets=("reuters",), outlet_count=7)
+
+    assert outlet_count_of(narrow) == 7
+    assert outlet_count_of(story("b", "t", 0, outlets=("reuters", "ft"))) == 2
+
+
+def test_a_widely_syndicated_story_outranks_a_narrow_one_on_the_upstream_count():
+    """Both list one outlet name; only the upstream count separates them."""
+
+    stories = [
+        story("a1", "earnings one", 0, outlets=("reuters",), outlet_count=9),
+        story("a2", "earnings two", 1, outlets=("reuters",), outlet_count=9),
+        story("b1", "recall one", 2, outlets=("ft",), outlet_count=1),
+        story("b2", "recall two", 3, outlets=("ft",), outlet_count=1),
+    ]
+    encoder = AngleEncoder(
+        {
+            "earnings one": 0.0,
+            "earnings two": 3.0,
+            "recall one": 90.0,
+            "recall two": 93.0,
+        }
+    )
+    result = run(stories, encoder)
+
+    assert result.themes[0].member_story_keys[0].startswith("a")
+    assert result.themes[0].outlet_count > result.themes[1].outlet_count
+
+
+def test_an_outlet_count_below_the_named_outlets_is_refused():
+    stories = [story("a", "t", 0, outlets=("reuters", "ft"), outlet_count=1)]
+
+    with pytest.raises(ThemeInputError, match="never fall below"):
+        run(stories, AngleEncoder({}))
+
+
+@pytest.mark.parametrize("count", [0, -1, True, 1.5])
+def test_a_malformed_outlet_count_is_refused(count):
+    stories = [story("a", "t", 0, outlet_count=count)]
+
+    with pytest.raises(ThemeInputError, match="positive integer"):
+        run(stories, AngleEncoder({}))
+
+
+# --------------------------------------------------------------------------
+# Labels
+# --------------------------------------------------------------------------
+
+
+def test_a_generic_title_does_not_win_on_recency_and_outlets_alone():
+    """The exact failure: 'results results results results' labelling a theme."""
+
+    stories = [
+        story(
+            "informative",
+            "Tesla delivers 495,000 vehicles in Europe",
+            0,
+            outlets=("ft",),
+        ),
+        story(
+            "generic",
+            "results results results results",
+            5,
+            outlets=("reuters", "yahoo", "bloomberg"),
+            outlet_count=9,
+        ),
+        story("far1", "far one", 6),
+        story("far2", "far two", 7),
+    ]
+    encoder = AngleEncoder(
+        {
+            "Tesla delivers 495,000 vehicles in Europe": 0.0,
+            "results results results results": 2.0,
+            "far one": 90.0,
+            "far two": 92.0,
+        }
+    )
+    result = run(stories, encoder)
+    labelled = next(
+        theme for theme in result.themes if "informative" in theme.member_story_keys
+    )
+
+    assert labelled.label == "Tesla delivers 495,000 vehicles in Europe"
+
+
+def test_informativeness_prefers_entities_and_numerals():
+    from nlp.themes.service import title_informativeness
+
+    generic = title_informativeness("results results results results")
+    repetitive = title_informativeness("chips chips chips chips")
+    informative = title_informativeness("Tesla delivers 495,000 vehicles")
+
+    assert sum(informative) > sum(generic)
+    assert sum(informative) > sum(repetitive)
+    assert repetitive[2] < 0, "repetition is penalised"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Nvidia Reports Record Data Centre Revenue",
+        "エヌビディア、四半期決算で過去最高の売上高",
+        "Nvidia meldet Rekordumsatz im Rechenzentrumsgeschäft",
+    ],
+)
+def test_labelling_handles_title_case_and_non_english(title):
+    from nlp.themes.service import title_informativeness
+
+    distinct, specific, repetition = title_informativeness(title)
+
+    assert distinct >= 1
+    assert repetition <= 0
+    assert isinstance(specific, int)
+
+
+def test_the_label_choice_is_permutation_stable():
+    stories = [
+        story("a", "Tesla delivers 495,000 vehicles in Europe", 0),
+        story("b", "results results results results", 1),
+        story("c", "far one", 2),
+        story("d", "far two", 3),
+    ]
+    encoder = AngleEncoder(
+        {
+            "Tesla delivers 495,000 vehicles in Europe": 0.0,
+            "results results results results": 2.0,
+            "far one": 90.0,
+            "far two": 92.0,
+        }
+    )
+
+    assert [t.label for t in run(stories, encoder).themes] == [
+        t.label for t in run(list(reversed(stories)), encoder).themes
+    ]
+
+
+# --------------------------------------------------------------------------
+# The summarization adapter
+# --------------------------------------------------------------------------
+
+
+def test_a_theme_converts_to_the_summarizer_contract():
+    from ai.summarization import MemberStory, ThemeInput, build_user_prompt
+    from nlp.themes import theme_to_summarizer_input
+
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+    theme = result.themes[0]
+    adapted = theme_to_summarizer_input(theme)
+
+    assert isinstance(adapted, ThemeInput)
+    assert adapted.ticker == theme.ticker
+    assert adapted.trading_day == theme.trading_day.isoformat()
+    assert [entry.id for entry in adapted.member_stories] == list(
+        theme.member_story_keys
+    )
+    for member in adapted.member_stories:
+        assert isinstance(member, MemberStory)
+        assert isinstance(member.description, str)
+        assert isinstance(member.published_at, str)
+        assert member.published_at
+    # The existing summarizer can consume it without any change.
+    assert theme.ticker in build_user_prompt(adapted)
+
+
+def test_every_citation_the_adapter_permits_resolves():
+    from ai.summarization import Sentence, ThemeSummary, resolve_citations
+    from nlp.themes import theme_to_summarizer_input
+
+    stories, encoder = three_strand_day()
+    theme = run(stories, encoder).themes[0]
+    adapted = theme_to_summarizer_input(theme)
+    summary = ThemeSummary(
+        label="a label",
+        sentences=[
+            Sentence(
+                text="A cited sentence.",
+                citation_ids=list(theme.member_story_keys),
+            ),
+            Sentence(
+                text="Another cited sentence.",
+                citation_ids=[theme.member_story_keys[0]],
+            ),
+        ],
+    )
+
+    assert resolve_citations(adapted, summary) == set()
+
+
+def test_a_citation_outside_the_theme_is_reported():
+    from nlp.themes import theme_to_summarizer_input, unresolved_citations
+
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+    first, second = result.themes[0], result.themes[1]
+    theme_to_summarizer_input(first)
+
+    assert unresolved_citations(first, second.member_story_keys) == tuple(
+        sorted(second.member_story_keys)
+    )
+    assert unresolved_citations(first, first.member_story_keys) == ()
+
+
+def test_other_coverage_never_reaches_the_summarizer():
+    from nlp.themes import summarizer_inputs
+
+    stories, encoder = three_strand_day()
+    stories.append(story("odd", "entirely unrelated market language", 6))
+    result = run(stories, encoder)
+    adapted = summarizer_inputs(result)
+
+    assert set(adapted) == {theme.theme_key for theme in result.themes}
+    reachable = {
+        member.id for theme in adapted.values() for member in theme.member_stories
+    }
+    assert not reachable & {entry.story_key for entry in result.other_coverage}
+    assert not reachable & {entry.story_key for entry in result.excluded}
+
+
+def test_no_summarizer_story_id_appears_in_two_adapted_themes():
+    from nlp.themes import summarizer_inputs
+
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+    seen: set[str] = set()
+
+    for adapted in summarizer_inputs(result).values():
+        ids = {member.id for member in adapted.member_stories}
+        assert not ids & seen
+        seen |= ids
+
+
+def test_a_multi_outlet_story_keeps_every_outlet_visible():
+    from nlp.themes.summarization import MULTI_OUTLET_PREFIX, theme_to_summarizer_input
+
+    stories = [
+        story("a", "earnings one", 0, outlets=("reuters", "yahoo", "ft")),
+        story("b", "earnings two", 1, outlets=("bloomberg",)),
+        story("c", "far one", 2),
+        story("d", "far two", 3),
+    ]
+    encoder = AngleEncoder(
+        {"earnings one": 0.0, "earnings two": 2.0, "far one": 90.0, "far two": 92.0}
+    )
+    result = run(stories, encoder)
+    theme = next(t for t in result.themes if "a" in t.member_story_keys)
+    adapted = theme_to_summarizer_input(theme)
+    record = next(m for m in adapted.member_stories if m.id == "a")
+
+    assert record.outlet == "ft"
+    assert MULTI_OUTLET_PREFIX in record.description
+    assert "reuters" in record.description and "yahoo" in record.description
+
+
+def test_the_adapter_makes_no_model_or_network_call():
+    script = (
+        "import sys; sys.path.insert(0, '.');"
+        "import nlp.themes.summarization;"
+        "print(sorted(m for m in sys.modules if m.split('.')[0] in "
+        "{'sentence_transformers','httpx','requests','google'}))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "[]"
+
+
+# --------------------------------------------------------------------------
+# Offline, deterministic artifacts
+# --------------------------------------------------------------------------
+
+
+def test_the_committed_vectors_cover_every_fixture_story():
+    from nlp.themes.dataset import load_ticker_days as load_days
+    from nlp.themes.vectors import load_story_vectors
+
+    day_set = load_days()
+    store = load_story_vectors()
+    expected = {story.story_key for day in day_set.days for story in day.stories}
+
+    assert set(store.vectors) == expected
+    assert store.dimension > 0
+    assert all(len(vector) == store.dimension for vector in store.vectors.values())
+    assert store.dataset_id == day_set.dataset_id
+
+
+def test_the_fixture_encoder_refuses_text_it_has_no_vector_for():
+    from nlp.themes.vectors import FixtureEncoder, load_story_vectors
+
+    encoder = FixtureEncoder(load_story_vectors())
+
+    with pytest.raises(ThemeEncodingError, match="no committed vector"):
+        encoder.embed_batch(["a headline the fixture never had"])
+
+
+def test_the_evaluation_runs_without_loading_a_model():
+    script = (
+        "import sys; sys.path.insert(0, '.');"
+        "from tools.eval_themes import main;"
+        "code = main(['--json']);"
+        "print('sentence_transformers' in sys.modules, code)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=REPO_ROOT, capture_output=True, text=True
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip().splitlines()[-1] == "False 0"
+
+
+def test_the_artifact_carries_the_stage_specific_trust_notice():
+    from nlp.themes.trust import STAGE_GATES, derive_stage_trust_summary
+    from nlp.themes.dataset import load_ticker_days as load_days
+
+    payload = theme_quality_payload()
+    notice = payload["stage_specific_trust_summary"]
+
+    assert notice == derive_stage_trust_summary(load_days().trust_contract).as_dict()
+    assert notice["level"] == "WARNING"
+    assert "M5" in notice["stage"]
+    assert notice["gates"] == STAGE_GATES
+    assert "G1" in notice["text"] and "AC-4" in notice["text"]
+    assert "development fixture" in notice["text"]
+    assert "no theme here was produced from a real trading day" in notice["text"]
+    # The shared summary is still there, and still speaks for the dataset.
+    assert payload["trust_summary"]["text"].startswith("WARNING:")
+
+
+def test_every_committed_theme_clears_both_cohesion_floors():
+    settings = config()
+    for day in theme_quality_payload()["ticker_days"]:
+        for detail in day["theme_details"]:
+            assert detail["cohesion"] >= settings.min_theme_cohesion
+            assert (
+                detail["min_pairwise_cohesion"] >= settings.min_theme_pairwise_cohesion
+            )
+
+
+def test_the_committed_days_record_their_vector_source():
+    assert theme_quality_payload()["vector_source"] == "committed_vectors"
+
+
+# --------------------------------------------------------------------------
+# Fingerprint coverage
+# --------------------------------------------------------------------------
+
+
+REQUIRED_FINGERPRINT_COMPONENTS = [
+    "centroid_precision",
+    "score_precision",
+    "vector_precision",
+    "near_cohesion_floor_margin",
+    "min_theme_pairwise_cohesion",
+    "degenerate_geometry_policy",
+    "degenerate_geometry_epsilon",
+    "subset_extraction_policy",
+    "perturbation_selection_policy",
+    "permutation_selection_policy",
+    "stability_matching_algorithm",
+    "stability_membership_formula",
+    "stability_identity_formula",
+    "stability_matched_of_new_formula",
+    "stability_story_retention_formula",
+    "label_genericity_policy",
+    "summarization_adapter_policy",
+    "accounting_contract",
+    "outlet_count_policy",
+    "description_selection_policy",
+    "stage_trust_version",
+    "fallback.objective_order",
+    "fallback.coverage_rank",
+    "fallback.no_valid_partition",
+    "fallback.subset_extraction",
+    "compatibility.claim_scope",
+    "compatibility.negation_window",
+    "compatibility.mixed_family_rule",
+    "summarization_adapter.story_id",
+]
+
+
+@pytest.mark.parametrize("name", REQUIRED_FINGERPRINT_COMPONENTS)
+def test_the_named_policy_is_a_fingerprint_component(name):
+    components = config().fingerprint_components(
+        model_name="m", model_revision="v1", embedding_dimension=3
+    )
+
+    assert name in components
+
+
+MUTABLE_POLICIES = [
+    ("nlp.themes.config", "SCORE_PRECISION", 4),
+    ("nlp.themes.config", "CENTROID_PRECISION", 4),
+    ("nlp.themes.config", "VECTOR_PRECISION", 4),
+    ("nlp.themes.config", "DEGENERATE_GEOMETRY_POLICY", "invent a split"),
+    ("nlp.themes.config", "SUBSET_EXTRACTION_POLICY", "keep everything"),
+    ("nlp.themes.config", "LABEL_GENERICITY_POLICY", "first title wins"),
+    ("nlp.themes.config", "ACCOUNTING_CONTRACT", "trust the count"),
+    ("nlp.themes.config", "OUTLET_COUNT_POLICY", "len(outlets)"),
+    ("nlp.themes.config", "PERTURBATION_SELECTION_POLICY", "drop the newest"),
+    ("nlp.themes.config", "PERMUTATION_SELECTION_POLICY", "shuffle"),
+    ("nlp.themes.config", "STABILITY_MATCHING_ALGORITHM", "first match wins"),
+    ("nlp.themes.config", "STABILITY_MEMBERSHIP_FORMULA", "always 1.0"),
+    ("nlp.themes.config", "STABILITY_IDENTITY_FORMULA", "over the new run"),
+    ("nlp.themes.config", "STABILITY_MATCHED_OF_NEW_FORMULA", "over the baseline"),
+    ("nlp.themes.config", "STABILITY_STORY_RETENTION_FORMULA", "always 1.0"),
+    ("nlp.themes.config", "SUMMARIZATION_ADAPTER_POLICY", "everything is citable"),
+    ("nlp.themes.bridge", "DESCRIPTION_SELECTION_POLICY", "canonical member"),
+    ("nlp.themes.trust", "STAGE_TRUST_VERSION", "m5.stage_trust.v99"),
+]
+
+
+@pytest.mark.parametrize("module,attribute,value", MUTABLE_POLICIES)
+def test_changing_a_named_policy_moves_the_digest(
+    monkeypatch, module, attribute, value
+):
+    """Without touching ALGORITHM_VERSION."""
+
+    import importlib
+
+    from nlp.themes.config import ALGORITHM_VERSION
+
+    settings = config()
+    baseline = settings.fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=3
+    )
+    monkeypatch.setattr(importlib.import_module(module), attribute, value)
+
+    assert (
+        settings.fingerprint(model_name="m", model_revision="v1", embedding_dimension=3)
+        != baseline
+    )
+    assert ALGORITHM_VERSION == "m5.themes.v1"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("min_theme_pairwise_cohesion", 0.2),
+        ("near_cohesion_floor_margin", 0.1),
+        ("degenerate_geometry_epsilon", 1e-6),
+    ],
+)
+def test_the_new_settings_move_the_fingerprint(field, value):
+    baseline = config().fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=3
+    )
+
+    assert (
+        config(**{field: value}).fingerprint(
+            model_name="m", model_revision="v1", embedding_dimension=3
+        )
+        != baseline
+    )
+
+
+def test_a_mean_floor_below_the_pairwise_floor_is_refused():
+    with pytest.raises(ThemeConfigError, match="cannot be below its own minimum"):
+        config(min_theme_cohesion=0.2, min_theme_pairwise_cohesion=0.5)
+
+
+def test_the_adapter_policy_change_moves_the_digest(monkeypatch):
+    from nlp.themes import summarization
+
+    settings = config()
+    baseline = settings.fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=3
+    )
+    monkeypatch.setitem(summarization.ADAPTER_POLICY, "story_id", "row_number")
+
+    assert (
+        settings.fingerprint(model_name="m", model_revision="v1", embedding_dimension=3)
+        != baseline
+    )
+
+
+def test_the_description_helper_no_longer_claims_canonical_provenance():
+    from nlp.themes.bridge import first_available_descriptions
+
+    assert (
+        "canonical"
+        not in (first_available_descriptions.__doc__ or "").split("**This is not")[0]
+    )
+    assert "not the canonical member" in (first_available_descriptions.__doc__ or "")
