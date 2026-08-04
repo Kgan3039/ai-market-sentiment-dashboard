@@ -24,11 +24,17 @@ from typing import Sequence
 
 import numpy as np
 
-from .config import ThemeConfig
+from .config import ThemeConfig, clears
 from .errors import ThemeClusteringError
 
 #: Label for stories HDBSCAN considers noise; they become "Other coverage".
 NOISE = -1
+
+#: What :func:`coherent_subset` actually does, named so no report can imply
+#: more.  It walks **one** greedy removal path; it does not search the
+#: subset lattice, and a subset it did not find may still exist.
+SUBSET_EXTRACTION_METHOD = "greedy_least_central_removal_single_path"
+
 
 #: How much finer than AC-4's theme cap the fallback may cut the
 #: dendrogram.  A larger k is not a larger theme count: the surplus
@@ -38,23 +44,33 @@ FALLBACK_CANDIDATE_CAP_FACTOR = 2
 #: How the fallback picks its cluster count, and when the fallback engages.
 #: Stated here so both reach the configuration fingerprint: changing either
 #: changes the themes produced from identical input.
+#: The objective, in order, as ``_best_agglomerative`` actually applies it.
+#: One list, serialized straight into the fingerprint and the artifact, so
+#: there is no second description to drift: the previous ``objective`` and
+#: ``tie_break`` keys still named the superseded coverage-first rule while
+#: ``objective_order`` named the current one.
+FALLBACK_OBJECTIVE_ORDER: tuple[str, ...] = (
+    "1_reject_candidate_themes_failing_the_mandatory_floors",
+    "2_max_coherent_theme_count_within_the_allowed_band",
+    "3_max_minimum_pairwise_cohesion",
+    "4_max_mean_cohesion",
+    "5_max_covered_stories",
+    "6_min_k_deterministic_final_tie_break",
+)
+
 FALLBACK_SELECTION_POLICY: dict[str, str] = {
     "trigger": "cluster_count_outside_band_or_a_cluster_below_cohesion_floor",
-    "objective": "max_stories_in_themes_clearing_size_and_cohesion_floors",
-    "tie_break": "higher_mean_cohesion, fewer_themes, smaller_k",
+    "objective_order": ", ".join(FALLBACK_OBJECTIVE_ORDER),
     "linkage": "average",
     "metric": "precomputed_cosine_distance",
     "label_numbering": "renumbered_by_first_appearance",
     "candidate_band": "min_themes..min(n-1, max_themes*cap_factor)",
     "candidate_cap_factor": str(FALLBACK_CANDIDATE_CAP_FACTOR),
     "band_applies_to": "surviving_theme_count_not_dendrogram_cut",
-    "objective_order": (
-        "1_mandatory_floors, 2_most_coherent_themes_in_band, "
-        "3_max_min_pairwise, 4_max_mean_cohesion, 5_max_coverage, 6_min_k"
-    ),
     "coverage_rank": "5_of_6_never_outranks_coherence",
     "no_valid_partition": "no_separable_structure_no_theme_invented",
-    "subset_extraction": "shed_least_central_until_both_floors_or_give_up",
+    "subset_extraction": SUBSET_EXTRACTION_METHOD,
+    "narrative_gate": "applied_after_geometric_extraction_before_scoring",
 }
 
 
@@ -154,28 +170,64 @@ def theme_quality_holds(
 
     return (
         len(members) >= config.min_theme_stories
-        and mean_pairwise_similarity(vectors, members) >= config.min_theme_cohesion
-        and min_pairwise_similarity(vectors, members)
-        >= config.min_theme_pairwise_cohesion
+        and clears(
+            mean_pairwise_similarity(vectors, members), config.min_theme_cohesion
+        )
+        and clears(
+            min_pairwise_similarity(vectors, members),
+            config.min_theme_pairwise_cohesion,
+        )
     )
 
 
-def coherent_subset(
+@dataclass(frozen=True)
+class SubsetExtraction:
+    """What the extraction did to one candidate cluster, and what it did not.
+
+    Reported rather than reduced to a survivor list, because "no qualifying
+    subset exists" and "no qualifying subset was found by this policy" are
+    different claims and only the second one is true.
+    """
+
+    method: str
+    original_cluster_members: tuple[int, ...]
+    surviving_subset: tuple[int, ...]
+    removed: tuple[int, ...]
+    failure_reason: str | None
+
+    @property
+    def succeeded(self) -> bool:
+        return bool(self.surviving_subset)
+
+
+def extract_coherent_subset(
     vectors: np.ndarray, members: Sequence[int], config: ThemeConfig
-) -> tuple[int, ...]:
-    """Shed the least-central members until both floors hold, or give up.
+) -> SubsetExtraction:
+    """Shed the least-central member until both floors hold, or report why not.
 
     Deterministic: at each step the member with the lowest mean similarity
     to the rest leaves, ties broken by position, and the loop stops the
-    moment the group qualifies.  Returns ``()`` when no subset of at least
-    ``min_theme_stories`` qualifies, in which case the caller dissolves the
-    whole cluster rather than shipping the least bad part of it.
+    moment the group qualifies.
+
+    **Not exhaustive.**  This is one greedy path through the subset
+    lattice, and the failure reason says so: another subset may qualify and
+    this policy would not have found it.  The caller dissolves the cluster
+    rather than shipping the least bad part of it.
     """
 
-    remaining = sorted(members)
+    original = tuple(sorted(members))
+    remaining = list(original)
     while len(remaining) >= config.min_theme_stories:
         if theme_quality_holds(vectors, remaining, config):
-            return tuple(remaining)
+            return SubsetExtraction(
+                method=SUBSET_EXTRACTION_METHOD,
+                original_cluster_members=original,
+                surviving_subset=tuple(remaining),
+                removed=tuple(
+                    position for position in original if position not in set(remaining)
+                ),
+                failure_reason=None,
+            )
         subset = vectors[remaining]
         similarity = 1.0 - cosine_distances(subset)
         np.fill_diagonal(similarity, 0.0)
@@ -184,7 +236,26 @@ def coherent_subset(
             range(len(remaining)), key=lambda index: (centrality[index], index)
         )
         remaining.pop(weakest)
-    return ()
+    return SubsetExtraction(
+        method=SUBSET_EXTRACTION_METHOD,
+        original_cluster_members=original,
+        surviving_subset=(),
+        removed=original,
+        failure_reason=(
+            f"no qualifying subset was found by the {SUBSET_EXTRACTION_METHOD} "
+            f"policy at or above {config.min_theme_stories} stories; the "
+            "subset lattice was not searched exhaustively, so a qualifying "
+            "subset may exist that this policy does not reach"
+        ),
+    )
+
+
+def coherent_subset(
+    vectors: np.ndarray, members: Sequence[int], config: ThemeConfig
+) -> tuple[int, ...]:
+    """The surviving subset alone, for callers that need nothing else."""
+
+    return extract_coherent_subset(vectors, members, config).surviving_subset
 
 
 def theme_rank_key(
@@ -200,10 +271,21 @@ def theme_rank_key(
     )
 
 
+#: Why a position left a candidate theme.  Named so other coverage can say
+#: which of three quite different things happened to a story rather than
+#: filing all of them under one reason.
+BELOW_FLOOR = "below_cohesion_floor"
+NARRATIVE_MISMATCH = "narrative_mismatch"
+SURPLUS_TO_CAP = "surplus_to_theme_cap"
+
+
 def surviving_themes(
-    vectors: np.ndarray, labels: Sequence[int], config: ThemeConfig
-) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]:
-    """Return ``(themes to ship, positions dissolved to other coverage)``.
+    vectors: np.ndarray,
+    labels: Sequence[int],
+    config: ThemeConfig,
+    stories: Sequence[object] | None = None,
+) -> tuple[tuple[tuple[int, ...], ...], dict[int, str]]:
+    """Return ``(themes to ship, {position: why it was dissolved})``.
 
     One function, two callers: the fallback scores candidates with it and
     the service assembles the winner with it, so a candidate can never be
@@ -222,25 +304,65 @@ def surviving_themes(
     for position, label in enumerate(labels):
         if label != NOISE:
             groups.setdefault(label, []).append(position)
-    dissolved: list[int] = []
+    dissolved: dict[int, str] = {}
     kept: list[tuple[int, ...]] = []
     for label in sorted(groups):
         members = groups[label]
-        subset = coherent_subset(vectors, members, config)
-        kept.append(subset) if subset else None
-        dissolved.extend(
-            position for position in members if position not in set(subset)
-        )
+        geometric = coherent_subset(vectors, members, config)
+        for position in members:
+            if position not in set(geometric):
+                dissolved[position] = BELOW_FLOOR
+        subset = geometric
+        if geometric and stories is not None:
+            subset = _narratively_coherent(vectors, geometric, config, stories)
+            for position in geometric:
+                if position not in set(subset):
+                    dissolved[position] = NARRATIVE_MISMATCH
+        if subset:
+            kept.append(subset)
     kept.sort(key=lambda members: theme_rank_key(vectors, members))
     if len(kept) > config.max_themes:
         for surplus in kept[config.max_themes :]:
-            dissolved.extend(surplus)
+            for position in surplus:
+                dissolved[position] = SURPLUS_TO_CAP
         kept = kept[: config.max_themes]
-    return tuple(kept), tuple(sorted(dissolved))
+    return tuple(kept), dict(sorted(dissolved.items()))
+
+
+def _narratively_coherent(
+    vectors: np.ndarray,
+    members: Sequence[int],
+    config: ThemeConfig,
+    stories: Sequence[object],
+) -> tuple[int, ...]:
+    """Keep only the members that are about one subject, then re-check the floors.
+
+    Applied **after** geometric extraction and before the theme is scored,
+    so the objective sees the shape that would actually ship.  Ejecting
+    members can break the floors the geometry cleared, so the survivors go
+    back through extraction; a group that cannot clear both afterwards is
+    dissolved.
+    """
+
+    from .narrative import narratively_incompatible
+
+    ordered = sorted(
+        members, key=lambda position: (-len(stories[position].outlets), position)
+    )
+    ejected = set(narratively_incompatible(stories, ordered))
+    if not ejected:
+        return tuple(sorted(members))
+    survivors = [position for position in members if position not in ejected]
+    if len(survivors) < config.min_theme_stories:
+        return ()
+    return coherent_subset(vectors, survivors, config)
 
 
 def _candidate_quality(
-    vectors: np.ndarray, labels: Sequence[int], config: ThemeConfig
+    vectors: np.ndarray,
+    labels: Sequence[int],
+    config: ThemeConfig,
+    stories: Sequence[object] | None = None,
 ) -> tuple[int, float, float, int]:
     """Score one candidate clustering, quality first.
 
@@ -248,7 +370,7 @@ def _candidate_quality(
     and the surplus rule.
     """
 
-    kept, _ = surviving_themes(vectors, labels, config)
+    kept, _unused = surviving_themes(vectors, labels, config, stories)
     if not kept or len(kept) < config.min_themes:
         return 0, 0.0, 0.0, 0
     weakest = min(min_pairwise_similarity(vectors, subset) for subset in kept)
@@ -258,7 +380,10 @@ def _candidate_quality(
 
 
 def _best_agglomerative(
-    vectors: np.ndarray, distance: np.ndarray, config: ThemeConfig
+    vectors: np.ndarray,
+    distance: np.ndarray,
+    config: ThemeConfig,
+    stories: Sequence[object] | None = None,
 ) -> tuple[int, str]:
     """Choose a cluster count in the allowed band, **quality before coverage**.
 
@@ -302,7 +427,9 @@ def _best_agglomerative(
         labels = _agglomerative(distance, count)
         if len(set(labels)) < 2:
             continue
-        themes, weakest, mean, covered = _candidate_quality(vectors, labels, config)
+        themes, weakest, mean, covered = _candidate_quality(
+            vectors, labels, config, stories
+        )
         if not themes:
             continue
         candidate = (-themes, -weakest, -mean, -covered, count)
@@ -360,7 +487,11 @@ def is_degenerate(vectors: np.ndarray, config: ThemeConfig) -> bool:
     return bool(np.max(cosine_distances(vectors)) <= config.degenerate_geometry_epsilon)
 
 
-def assign_clusters(vectors: np.ndarray, config: ThemeConfig) -> ClusterAssignment:
+def assign_clusters(
+    vectors: np.ndarray,
+    config: ThemeConfig,
+    stories: Sequence[object] | None = None,
+) -> ClusterAssignment:
     """Cluster a ticker-day's story vectors into AC-4's 2-6 theme band.
 
     HDBSCAN is treated as **unstable at this n** — and the agglomerative
@@ -396,7 +527,7 @@ def assign_clusters(vectors: np.ndarray, config: ThemeConfig) -> ClusterAssignme
             f"hdbscan found {found} clusters, outside "
             f"{config.min_themes}-{config.max_themes}"
         )
-    elif weakest is not None and weakest < config.min_theme_cohesion:
+    elif weakest is not None and not clears(weakest, config.min_theme_cohesion):
         objection = (
             f"hdbscan's loosest cluster has cohesion {weakest:.4f}, below "
             f"{config.min_theme_cohesion}"
@@ -412,7 +543,7 @@ def assign_clusters(vectors: np.ndarray, config: ThemeConfig) -> ClusterAssignme
                 else f"hdbscan found {found} clusters inside the allowed band"
             ),
         )
-    count, detail = _best_agglomerative(vectors, distance, config)
+    count, detail = _best_agglomerative(vectors, distance, config, stories)
     if not count:
         # No partition anywhere in the band ships a theme a reader could
         # recognise.  Saying so is the honest outcome; forcing a split to

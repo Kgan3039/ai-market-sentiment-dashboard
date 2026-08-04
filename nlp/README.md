@@ -811,6 +811,32 @@ merge by default — without a timestamp the window cannot be enforced.
 No durable story id is invented: `story_fingerprint` is a change-detection
 digest over the ticker and the sorted member set, exactly as M2 does.
 
+### The accounting cannot be talked into agreeing
+
+`ThemeSet.__post_init__` derives `missing_story_keys`,
+`unexpected_story_keys`, `duplicate_membership_keys` and therefore
+`complete` from the themes, other coverage and exclusions actually present.
+`input_story_keys` is the only accounting field a caller supplies; anything
+passed for the other three is discarded. `dataclasses.replace` re-runs the
+derivation, so there is no way in through it either.
+
+The structural failures no diagnostic could describe are refused outright by
+`validate_theme_set_invariants`: an empty theme, a member listed twice,
+evidence that does not match membership, one raw item citable from two
+themes, a story in both a theme and Other coverage. `summarizer_inputs`
+calls the **same** validator before adapting anything, because a set can
+reach it unpickled or rebuilt field by field and the citation contract
+cannot assume it was validated on the way in.
+
+### Configuration is serialized losslessly
+
+Display rounding and configuration serialization are separate paths.
+Observed metrics round to `SCORE_PRECISION`; behaviour-changing values go
+through `serialize_config_value`, which renders floats as `repr` — exact,
+stable, round-tripping. `degenerate_geometry_epsilon = 1e-9` used to reach
+the artifact and the fingerprint payload as `0.0`, describing the stage as
+having a behaviour it does not have.
+
 ### Trust wording is stage-specific
 
 The dataset contract is M4's, shared with M3, and its derived banner names
@@ -835,12 +861,25 @@ byte-identical on re-run.
 
 `nlp/themes/summarization.py` converts a `Theme` into `ai.summarization`'s
 public `ThemeInput`. `story_key` becomes the summarizer's story `id`
-verbatim, so a citation resolves to exactly one member story; `published_at`
-becomes an ISO string; a story carrying several outlets keeps them all —
-the extras travel in the description rather than being dropped to fit a
-single-outlet field. Other-coverage and excluded stories are not convertible.
-Tests drive the real summarizer's `build_user_prompt` and
-`resolve_citations` over adapted output, with no model call.
+verbatim, so a citation resolves to exactly one member story.
+
+**Publisher text is never modified.** Title and description travel verbatim.
+An earlier adapter appended "Also carried by: …" to the description so the
+extra outlets survived — which made adapter metadata indistinguishable from
+something a publisher wrote, in the one place whose whole job is quoting
+publishers faithfully. `MemberStory.outlet` now names one deterministic
+primary outlet and the full carrier list travels beside the records on
+`AdaptedTheme.carriers`, where nothing can mistake it for evidence.
+
+**Timestamps are normalized to UTC.** The adapter advertises UTC and
+`isoformat` renders whatever offset the value carries, so a +05:00 story went
+out labelled UTC and five hours wrong. Aware values are converted; naive ones
+are refused, because guessing a zone here would file a story under the wrong
+trading day silently.
+
+Other-coverage and excluded stories are not convertible. Tests drive the real
+summarizer's `build_user_prompt` and `resolve_citations` over adapted output,
+with no model call.
 
 ### Boundaries
 
@@ -991,6 +1030,13 @@ is **quality first, coverage fifth**:
    equally coherent, never a reason to prefer a looser one;
 6. smallest k.
 
+**Every threshold comparison uses one documented tolerance.**
+`clears(value, floor)` is `value >= floor - COHESION_DECISION_TOLERANCE`
+(1e-9), applied identically to the mean floor, the pairwise floor, the
+near-floor flag, the degenerate-geometry test and the fallback ranking, and
+it is a fingerprint component. A theme's fate no longer turns on whether a
+cosine landed a representation artefact under a threshold.
+
 **Two floors, not one.** `min_theme_cohesion` (0.40) is the mean;
 `min_theme_pairwise_cohesion` (0.30) is the weakest pair a theme may
 contain. A mean hides its worst link, and the worst link is what a reader
@@ -1001,9 +1047,13 @@ fixture: M4's labelled pair set measured that genuine rewrites of one
 event, so its weakest link belongs below that range.
 
 A cluster failing either floor **sheds its least-central member** — lowest
-mean similarity to the rest, ties by position — until both hold, and is
-dissolved whole if no subset of at least `min_theme_stories` qualifies. Shed
-stories go to Other coverage with a reason.
+mean similarity to the rest, ties by position — until both hold.
+`extract_coherent_subset` reports its method, the original members, the
+survivors, the removals and, on failure, that *no qualifying subset was
+found by this policy*: it walks one greedy path and does not search the
+subset lattice, so claiming none exists would be claiming more than it
+checked. A cluster it cannot rescue is dissolved whole. Shed stories go to
+Other coverage with a reason.
 
 **AC-4's band bounds the themes shipped, not the cut of the dendrogram.**
 Capping k at `max_themes` conflated the two and forced unrelated strands
@@ -1014,6 +1064,42 @@ candidate being discarded.
 
 The effect on the same perturbation: 5 themes → 1 became **6 themes → 6**,
 and membership retention rose from 0.20 to **1.00**.
+
+### The narrative layer: what a theme is *about*
+
+Cosine floors answer "are these written similarly". They do not answer
+"would a reader call these one narrative", and on the committed
+eighteen-story day that was the whole problem: the quarterly delivery number
+and the quarterly grid-storage contract score 0.39 against each other —
+above any floor a theme could carry — because both are quarterly-record
+stories. A reader separates them instantly.
+
+`nlp/themes/narrative.py` reads a second, coarse signal off the public story
+text: `vehicle_deliveries`, `energy_storage`, `charging_infrastructure`,
+`battery_manufacturing`, `factory_operations`, `investor_event`,
+`regulatory_permit`, `product_trial`, `pricing`, and `recall:<product>` —
+recalls carry their product, because two recalls in one day are two events.
+
+Three rules, all trust-first:
+
+- a family is assigned only on **explicit** phrasing a newsroom wrote on
+  purpose, never a bare noun in passing;
+- **two different explicit families cannot share a normal theme**, and
+  `COMPATIBLE_FAMILY_PAIRS` is deliberately empty — every candidate
+  exception reads plausibly on one day and wrongly on the next;
+- **missing evidence is unknown**, and unknown blocks nothing, so a story
+  the phrase lists cannot read still clusters on geometry alone.
+
+The gate runs **after** geometric subset extraction and **before** the
+candidate is scored, so the fallback objective sees the shape that would
+actually ship. Ejected stories go to Other coverage tagged
+`narrative_mismatch` — distinct from `below_cohesion_floor` and
+`surplus_to_theme_cap`, because a reviewer asking why a story is not in a
+theme is asking which of those happened.
+
+This is not a reimplementation of M3's guards. M3 asks whether two records
+are the same *story*; this asks whether two stories are the same *subject*.
+It uses no ticker, no item id and no per-fixture exception.
 
 ### When no partition is worth shipping
 
@@ -1102,20 +1188,20 @@ signal a reconciler needs. A genuinely new theme gets a new key.
 |---|---|---|---|
 | stories | 3 | 9 | 18 |
 | method | small n fallback | hdbscan | agglomerative |
-| themes | 0 | 3 | 6 |
-| other coverage | 3 | 3 | 2 |
+| themes | 0 | 3 | 4 |
+| other coverage | 3 | 3 | 10 |
 | excluded | 0 | 0 | 0 |
-| theme coverage | 0.000 | 0.667 | 0.889 |
-| mean cohesion | n/a | 0.729 | 0.500 |
-| **weakest pair in any theme** | n/a | 0.6897 | 0.3048 |
-| max inter-theme similarity | n/a | 0.582 | 0.529 |
+| theme coverage | 0.000 | 0.667 | 0.444 |
+| mean cohesion | n/a | 0.729 | 0.575 |
+| **weakest pair in any theme** | n/a | 0.6897 | 0.5461 |
+| max inter-theme similarity | n/a | 0.582 | 0.414 |
 | AC-4 shape | yes | yes | yes |
 | accounting complete | yes | yes | yes |
 | permutation stable | yes | yes | yes |
 | re-run keeps identities | yes | yes | yes |
 | perturbation: membership | 1.00 | 0.67 | 1.00 |
 | perturbation: identity | 1.00 | 0.67 | 1.00 |
-| perturbation: themes | 0 -> 0 | 3 -> 2 | 6 -> 6 |
+| perturbation: themes | 0 -> 0 | 3 -> 2 | 4 -> 4 |
 
 ### Honest limitations
 
@@ -1124,24 +1210,21 @@ signal a reconciler needs. A genuinely new theme gets a new key.
   cohesion versus separation, stability. A day can score perfectly here and
   still group two stories a reader would separate — which is what the K3
   (#60) human review exists for, and it is not written yet.
-- **One TSLA theme still mixes two strands, and it survives on the encoder,
-  not on a threshold.** Theme 1 (cohesion 0.5107, weakest pair 0.3905) holds
-  the quarterly delivery number and the China delivery story *together with*
-  the energy-storage record and the grid-storage contract. The Nevada battery
-  line and the Norwegian supercharger corridor separated into their own theme,
-  the Berlin factory restart moved to Other coverage, and the investor-day
-  notice paired with the Berlin third shift — all of which the previous
-  six-story grab-bag held. Deliveries and storage did not separate at **any**
-  k from 2 to 12: average-linkage never splits them, because the encoder
-  places "record quarterly deliveries" and "record quarterly storage
-  deployments" close together. That is a property of the representation, not
-  of the policy, and forcing the split with a hand-picked parameter would be
-  fitting to a fixture with one author. It is reported with its exact
-  membership and its weakest pair instead.
-- **Coverage fell and that is the point.** TSLA's theme coverage went from
-  0.944 to 0.889: two stories that used to be inside a theme are now listed
-  plainly. A coverage number that goes up because a theme got broader is not
-  an improvement, and the objective no longer treats it as one.
+- **TSLA now ships four themes and lists ten stories, and that is the
+  honest shape.** Every remaining theme is a single narrative family —
+  energy storage, the Cybertruck recall, the robotaxi permit, European
+  pricing — with weakest pairs of 0.55–0.62. All five reported mixtures are
+  gone: deliveries no longer sit with grid storage, the permit no longer
+  sits with the supervised-driving trial, the two recalls are separate
+  products, the Berlin shift no longer sits with the investor day, and the
+  battery line no longer sits with the supercharger corridor.
+- **Coverage fell to 0.444 and that is the point.** Ten of eighteen stories
+  are listed plainly rather than swept into a theme. Deliveries and storage
+  never separate as two themes at any k from 2 to 12 — average linkage keeps
+  merging them because the encoder places two "record quarterly" stories
+  together — so the narrative gate ejects one strand rather than shipping a
+  mixed theme. A coverage number that goes up because a theme got broader is
+  not an improvement.
 - **Membership stability and identity stability are different properties and
   the weaker one is not evidence for the stronger.** `membership_retained` is
   the fraction of the *baseline's* themes whose exact member set survives;

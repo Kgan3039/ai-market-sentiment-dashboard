@@ -40,6 +40,8 @@ _MANIFEST_KEYS = frozenset(
         "issue",
         "acceptance_criteria",
         "trust_contract",
+        "trust_summary",
+        "stage_specific_trust_summary",
         "known_limitations",
         "provenance",
         "shape_notes",

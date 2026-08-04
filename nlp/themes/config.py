@@ -59,9 +59,57 @@ QUARANTINE_POLICY = (
     "_clustering_and_shown_under_other_coverage"
 )
 
-#: Decimal places every reported score is rounded to, on one code path, so
-#: a committed artifact is byte-stable across machines.
+#: Decimal places every **observed metric** is rounded to for display, on
+#: one code path, so a committed artifact is byte-stable across machines.
+#: Configuration and policy values never take this path: rounding
+#: ``1e-9`` to six places wrote ``0.0`` into the artifact and into the
+#: fingerprint payload, which described the stage as having a behaviour it
+#: does not have.
 SCORE_PRECISION = 6
+
+#: How a behaviour-changing float is written down.  ``repr`` round-trips
+#: exactly for every IEEE double, which is what a configuration value needs
+#: and what a display rounding cannot give.
+CONFIG_SERIALIZATION = "repr_round_trip_exact"
+
+#: Similarity comparisons are made against a floor with this tolerance, so
+#: a value that is a floating-point hair under a threshold does not decide
+#: a theme's fate on a representation artefact.  Applied identically to the
+#: mean floor, the pairwise floor, the near-floor flag, the degenerate
+#: geometry test and the fallback ranking.
+COHESION_DECISION_TOLERANCE = 1e-9
+COHESION_DECISION_POLICY = (
+    "value >= floor - tolerance; one tolerance for the mean floor, the "
+    "pairwise floor, near-floor flags, degenerate geometry and fallback "
+    "ranking; never applied to reported metrics"
+)
+
+
+def serialize_config_value(value: object) -> object:
+    """Render a behaviour-changing value without losing it.
+
+    Floats become their ``repr``: exact, stable across platforms, and
+    readable.  Everything else passes through, so the fingerprint payload
+    and the artifact agree on what the configuration was.
+    """
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return [serialize_config_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: serialize_config_value(item) for key, item in value.items()}
+    return value
+
+
+def clears(value: float, floor: float) -> bool:
+    """True when ``value`` meets ``floor`` under the decision tolerance."""
+
+    return value >= floor - COHESION_DECISION_TOLERANCE
+
+
 #: Centroids round to the same precision, so a stored centroid read back
 #: matches the one the next run computes - which theme identity depends on.
 CENTROID_PRECISION = 6
@@ -98,6 +146,27 @@ ACCOUNTING_CONTRACT = (
 OUTLET_COUNT_POLICY = (
     "upstream ThemeStory.outlet_count is authoritative when present; "
     "len(outlets) is a fallback, never a substitute"
+)
+OUTLET_AGGREGATION_POLICY = (
+    "named outlets unioned exactly; unnamed excess never summed across "
+    "stories because unknown carriers may be shared; ranking uses "
+    "max(named union, largest per-story authoritative count) as a lower "
+    "bound, with has_unresolved_outlet_count stating that it is one"
+)
+THEME_SET_INVARIANT_CONTRACT = (
+    "input_story_keys is the only supplied accounting field; missing, "
+    "unexpected, duplicate and complete are derived at construction; empty "
+    "themes, repeated members, evidence/membership mismatch, cross-theme "
+    "raw-item citation and theme/other overlap are refused outright"
+)
+SUBSET_EXTRACTION_SEMANTICS = (
+    "one greedy removal path, not an exhaustive search; a failure means no "
+    "qualifying subset was FOUND by this policy, never that none exists"
+)
+LABEL_ADEQUACY_POLICY = (
+    "label is a verbatim title of a member of the FINAL subset; generic "
+    "titles are penalised; a theme whose members share no readable subject "
+    "with the label is dissolved rather than labelled misleadingly"
 )
 PERTURBATION_SELECTION_POLICY = "drop_the_least_recent_story"
 PERMUTATION_SELECTION_POLICY = "reverse_then_interleave_never_random"
@@ -338,8 +407,11 @@ class ThemeConfig:
         # Imported here rather than at module scope: both import config.
         from .bridge import DESCRIPTION_SELECTION_POLICY
         from .clustering import FALLBACK_SELECTION_POLICY
+        from .clustering import SUBSET_EXTRACTION_METHOD
+        from .narrative import policy_components as narrative_components
         from .summarization import adapter_policy_components
         from .trust import STAGE_TRUST_VERSION
+        from .vectors import TRUST_MANIFEST_POLICY
         from .compatibility import policy_components as compatibility_components
         from .models import ExclusionReason, OtherCoverageReason
 
@@ -378,6 +450,9 @@ class ThemeConfig:
             "theme_namespace": THEME_NAMESPACE,
             "quarantine_policy": QUARANTINE_POLICY,
             "score_precision": SCORE_PRECISION,
+            "config_serialization": CONFIG_SERIALIZATION,
+            "cohesion_decision_tolerance": COHESION_DECISION_TOLERANCE,
+            "cohesion_decision_policy": COHESION_DECISION_POLICY,
             "centroid_precision": CENTROID_PRECISION,
             "vector_precision": VECTOR_PRECISION,
             "degenerate_geometry_policy": DEGENERATE_GEOMETRY_POLICY,
@@ -386,9 +461,15 @@ class ThemeConfig:
             "label_genericity_policy": LABEL_GENERICITY_POLICY,
             "summarization_adapter_policy": SUMMARIZATION_ADAPTER_POLICY,
             "stage_trust_version": STAGE_TRUST_VERSION,
+            "trust_manifest_policy": TRUST_MANIFEST_POLICY,
+            "theme_set_invariant_contract": THEME_SET_INVARIANT_CONTRACT,
+            "subset_extraction_method": SUBSET_EXTRACTION_METHOD,
+            "subset_extraction_semantics": SUBSET_EXTRACTION_SEMANTICS,
+            "label_adequacy_policy": LABEL_ADEQUACY_POLICY,
             "accounting_contract": ACCOUNTING_CONTRACT,
             "description_selection_policy": DESCRIPTION_SELECTION_POLICY,
             "outlet_count_policy": OUTLET_COUNT_POLICY,
+            "outlet_aggregation_policy": OUTLET_AGGREGATION_POLICY,
             "perturbation_selection_policy": PERTURBATION_SELECTION_POLICY,
             "permutation_selection_policy": PERMUTATION_SELECTION_POLICY,
             "stability_matching_algorithm": STABILITY_MATCHING_ALGORITHM,
@@ -401,6 +482,12 @@ class ThemeConfig:
             {
                 f"fallback.{name}": value
                 for name, value in FALLBACK_SELECTION_POLICY.items()
+            }
+        )
+        components.update(
+            {
+                f"narrative.{name}": value
+                for name, value in narrative_components().items()
             }
         )
         components.update(
@@ -426,10 +513,12 @@ class ThemeConfig:
     ) -> str:
         """Return a stable digest of the settings, policies, and encoder."""
 
-        payload = self.fingerprint_components(
-            model_name=model_name,
-            model_revision=model_revision,
-            embedding_dimension=embedding_dimension,
+        payload = serialize_config_value(
+            self.fingerprint_components(
+                model_name=model_name,
+                model_revision=model_revision,
+                embedding_dimension=embedding_dimension,
+            )
         )
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

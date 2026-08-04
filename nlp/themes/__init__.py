@@ -51,6 +51,7 @@ from .errors import (
     ThemeEncodingError,
     ThemeError,
     ThemeInputError,
+    ThemeInvariantError,
     ThemePartitionError,
 )
 from .models import (
@@ -67,10 +68,16 @@ from .models import (
     ThemeSet,
     ThemeSourceMetadata,
     ThemeStory,
+    validate_theme_set_invariants,
 )
 from .service import cluster_themes, encoder_identity, theme_fingerprint_for
+from .narrative import narrative_families, narratively_incompatible
 from .summarization import (
+    AdaptedTheme,
+    adapt_theme,
+    adapt_theme_set,
     summarizer_inputs,
+    validate_theme_set,
     theme_to_summarizer_input,
     unresolved_citations,
 )
@@ -86,7 +93,15 @@ __all__ = [
     "ThemeSourceMetadata",
     "StageTrustSummary",
     "derive_stage_trust_summary",
+    "AdaptedTheme",
+    "ThemeInvariantError",
+    "adapt_theme",
+    "adapt_theme_set",
     "encoder_identity",
+    "narrative_families",
+    "narratively_incompatible",
+    "validate_theme_set",
+    "validate_theme_set_invariants",
     "summarizer_inputs",
     "theme_to_summarizer_input",
     "unresolved_citations",

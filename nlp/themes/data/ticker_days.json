@@ -13,6 +13,22 @@
     "metrics_purpose": "development_regression_only",
     "why": "Every headline, standfirst, outlet and timestamp in this fixture was written for it. The theme groupings it is expected to produce were chosen by the same person who wrote the stories, so a clustering that reproduces them has agreed with its author and nothing more. No number derived from this file measures whether a reader would accept the themes, and none of them can clear G1: that needs real ingested days (#57/#68) and the two-reviewer adjudicated assignment review in #60."
   },
+  "trust_summary": {
+    "level": "WARNING",
+    "headline": "Synthetic, single-author, unadjudicated development dataset.",
+    "detail": "Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  },
+  "stage_specific_trust_summary": {
+    "level": "WARNING",
+    "stage": "M5 theme clustering (issue #72)",
+    "issue": "#72",
+    "headline": "Issue #72 (M5 theme clustering) on a synthetic authored development fixture: not AC-4 or G1 validation.",
+    "detail": "These are synthetic authored ticker-days, not ingested coverage: no theme here was produced from a real trading day, so there is no real ticker-day validation of AC-4 behind any number in this file; the expected groupings are single-author, unadjudicated and have no second reviewer, so a clustering that reproduces them has agreed with its author and nothing more; the dataset is non-gate-eligible and nothing here validates AC-4 (clustering) and G1 (theme-assignment agreement), which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60.",
+    "gates": "AC-4 (clustering) and G1 (theme-assignment agreement)",
+    "version": "m5.stage_trust.v2",
+    "text": "WARNING [M5 theme clustering (issue #72)]: Issue #72 (M5 theme clustering) on a synthetic authored development fixture: not AC-4 or G1 validation.\nThese are synthetic authored ticker-days, not ingested coverage: no theme here was produced from a real trading day, so there is no real ticker-day validation of AC-4 behind any number in this file; the expected groupings are single-author, unadjudicated and have no second reviewer, so a clustering that reproduces them has agreed with its author and nothing more; the dataset is non-gate-eligible and nothing here validates AC-4 (clustering) and G1 (theme-assignment agreement), which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60."
+  },
   "known_limitations": [
     "Authored, not sampled: the day shapes were chosen to exercise the small-n, HDBSCAN and fallback paths, not observed in the wild.",
     "min_theme_cohesion was chosen by looking at these same days, so cohesion figures here are partly a restatement of the threshold.",

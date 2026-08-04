@@ -21,11 +21,11 @@ from typing import Any
 from nlp.eval.trust import TrustContract
 
 #: Bumped when the notice's wording contract changes.
-STAGE_TRUST_VERSION = "m5.stage_trust.v1"
+STAGE_TRUST_VERSION = "m5.stage_trust.v2"
 
 #: What M5's numbers are measured against, named so the notice cannot drift
 #: onto another stage's gates.
-STAGE_GATES = "G1 (theme-assignment agreement) and AC-4"
+STAGE_GATES = "AC-4 (clustering) and G1 (theme-assignment agreement)"
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,7 @@ class StageTrustSummary:
 
     level: str
     stage: str
+    issue: str
     headline: str
     detail: str
     gates: str
@@ -47,6 +48,7 @@ class StageTrustSummary:
         return {
             "level": self.level,
             "stage": self.stage,
+            "issue": self.issue,
             "headline": self.headline,
             "detail": self.detail,
             "gates": self.gates,
@@ -63,34 +65,36 @@ def derive_stage_trust_summary(contract: TrustContract) -> StageTrustSummary:
     parts: list[str] = []
     if synthetic:
         parts.append(
-            "These ticker-days are an authored development fixture, not "
-            "ingested coverage: no theme here was produced from a real "
-            "trading day"
+            "These are synthetic authored ticker-days, not ingested "
+            "coverage: no theme here was produced from a real trading day, "
+            "so there is no real ticker-day validation of AC-4 behind any "
+            "number in this file"
         )
     else:
         parts.append("These ticker-days carry real ingested evidence")
     if single_author:
         parts.append(
-            "the expected groupings have one author, no second reviewer and "
-            "no adjudication, so a clustering that reproduces them has "
-            "agreed with its author and nothing more"
+            "the expected groupings are single-author, unadjudicated and "
+            "have no second reviewer, so a clustering that reproduces them "
+            "has agreed with its author and nothing more"
         )
     if not contract.gate_eligible:
         parts.append(
-            f"nothing here validates {STAGE_GATES}, which need real ingested "
-            "ticker-days (#57/#61/#62) and the two-reviewer assignment "
-            "review in #60"
+            f"the dataset is non-gate-eligible and nothing here validates "
+            f"{STAGE_GATES}, which need real ingested ticker-days "
+            "(#57/#61/#62) and the two-reviewer assignment review in #60"
         )
     level = "WARNING" if (synthetic or not contract.gate_eligible) else "NOTICE"
     headline = (
-        "Synthetic M5 development fixture: theme output is not AC-4 or G1 "
-        "validation."
+        "Issue #72 (M5 theme clustering) on a synthetic authored development "
+        "fixture: not AC-4 or G1 validation."
         if synthetic
-        else "M5 theme output measured on real ingested ticker-days."
+        else "Issue #72 (M5 theme clustering) on real ingested ticker-days."
     )
     return StageTrustSummary(
         level=level,
         stage="M5 theme clustering (issue #72)",
+        issue="#72",
         headline=headline,
         detail="; ".join(parts) + ".",
         gates=STAGE_GATES,

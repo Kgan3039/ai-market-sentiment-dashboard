@@ -38,6 +38,7 @@ from nlp.themes.config import (
     SCORE_PRECISION,
     SEMANTIC_INPUT_COMPOSITION,
     ThemeConfig,
+    serialize_config_value,
 )
 from nlp.themes.dataset import (
     DEFAULT_FIXTURE_PATH,
@@ -265,14 +266,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_revision=encoder.model_revision,
             embedding_dimension=getattr(encoder, "dimension", None),
         ),
-        "theme_policy_components": {
-            key: _plain(value)
-            for key, value in config.fingerprint_components(
+        # Configuration takes the lossless path, never the display one:
+        # rounding 1e-9 to six places wrote 0.0 and described the stage as
+        # having a behaviour it does not have.
+        "theme_policy_components": serialize_config_value(
+            config.fingerprint_components(
                 model_name=encoder.model_name,
                 model_revision=encoder.model_revision,
                 embedding_dimension=getattr(encoder, "dimension", None),
-            ).items()
-        },
+            )
+        ),
         "compatibility_policy_fingerprint": compatibility_policy_fingerprint(),
         "algorithm_version": ALGORITHM_VERSION,
         "score_precision": SCORE_PRECISION,

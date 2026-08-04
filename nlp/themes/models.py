@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 
+from .errors import ThemeInvariantError
+
 
 class ClusteringMethod(str, Enum):
     """How a ticker-day's themes were produced."""
@@ -60,6 +62,12 @@ class OtherCoverageReason(str, Enum):
     BELOW_THEME_SIZE_FLOOR = "below_theme_size_floor"
     #: Its cluster was looser than a theme may be, so it was dissolved.
     BELOW_COHESION_FLOOR = "below_cohesion_floor"
+    #: It is about a different subject from the rest of the theme: two
+    #: explicit narrative families cannot share one narrative.
+    NARRATIVE_MISMATCH = "narrative_mismatch"
+    #: Its theme was the weakest beyond AC-4's cap, so it is listed rather
+    #: than merged into one that survived.
+    SURPLUS_TO_THEME_CAP = "surplus_to_theme_cap"
     #: It contradicted the theme it would otherwise have joined.
     THEME_INCOMPATIBLE = "theme_incompatible"
     #: M2 could not settle which article this feed identity described, and
@@ -319,18 +327,58 @@ class ThemeSet:
     #: What produced the input stories, when the caller came through the
     #: bridge.  ``None`` when stories were constructed directly.
     source_metadata: ThemeSourceMetadata | None = None
-    #: Every story key handed in, sorted.  Kept so the accounting below is
-    #: checkable against the input without the caller holding it.
+    #: The declared input universe: every story key handed in, sorted.  The
+    #: **only** accounting field a caller supplies; the three below are
+    #: derived from actual membership in ``__post_init__`` and whatever a
+    #: caller passes for them is discarded.
     input_story_keys: tuple[str, ...] = ()
-    #: Input keys nothing accounted for.  Non-empty means a story was lost.
+    #: Input keys nothing accounted for.  Derived.
     missing_story_keys: tuple[str, ...] = ()
-    #: Accounted keys that were never handed in.  Non-empty means one was
-    #: invented, which a count of accounted stories could not distinguish
-    #: from a loss.
+    #: Accounted keys that were never handed in.  Derived.
     unexpected_story_keys: tuple[str, ...] = ()
-    #: Keys appearing in more than one theme.  Non-empty means a raw item
-    #: could be cited from two themes.
+    #: Keys appearing in more than one place.  Derived.
     duplicate_membership_keys: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Derive the accounting, and refuse a set that cannot be honest.
+
+        The structural checks live in
+        :func:`validate_theme_set_invariants` so construction and the
+        summarization boundary run the *same* validator rather than two
+        that can drift.
+
+        ``complete`` used to read three fields a caller supplied, so a
+        ``ThemeSet`` could be constructed with contradictory membership and
+        empty diagnostics and would report itself complete.  The
+        diagnostics are now computed from the themes, other coverage and
+        exclusions actually present, and the structural failures that no
+        diagnostic could describe are refused outright.
+
+        ``dataclasses.replace`` re-runs ``__init__`` and therefore this, so
+        there is no supported way to derive a dishonest set from an honest
+        one either.
+        """
+
+        validate_theme_set_invariants(self)
+        membership = [key for theme in self.themes for key in theme.member_story_keys]
+        accounted = (
+            membership
+            + [entry.story_key for entry in self.other_coverage]
+            + [entry.story_key for entry in self.excluded]
+        )
+        object.__setattr__(
+            self,
+            "duplicate_membership_keys",
+            tuple(sorted({key for key in accounted if accounted.count(key) > 1})),
+        )
+        declared = set(self.input_story_keys)
+        object.__setattr__(self, "input_story_keys", tuple(sorted(declared)))
+        object.__setattr__(
+            self, "missing_story_keys", tuple(sorted(declared - set(accounted)))
+        )
+        object.__setattr__(
+            self, "unexpected_story_keys", tuple(sorted(set(accounted) - declared))
+        )
 
     @property
     def accounted_story_keys(self) -> tuple[str, ...]:
@@ -353,9 +401,8 @@ class ThemeSet:
     def complete(self) -> bool:
         """True only when the partition is exactly the input, once each.
 
-        The production path computes the three diagnostics above and this
-        reads them, so a result can never report itself complete while one
-        of them is non-empty.
+        Reads the three fields ``__post_init__`` derived from actual
+        membership, so it cannot be talked into agreeing with a caller.
         """
 
         return not (
@@ -396,3 +443,58 @@ class PreviousTheme:
 
     theme_key: str
     centroid: tuple[float, ...]
+
+
+def validate_theme_set_invariants(theme_set: "ThemeSet") -> None:
+    """Refuse a theme set that cannot describe its own membership.
+
+    The structural failures no diagnostic could express: an empty theme, a
+    member listed twice, evidence that does not match membership, one raw
+    item citable from two themes, a story in both a theme and other
+    coverage.  Called from ``ThemeSet.__post_init__`` and again at the
+    summarization boundary, so both use one definition of "valid".
+    """
+
+    for index, theme in enumerate(theme_set.themes):
+        if not theme.member_story_keys:
+            raise ThemeInvariantError(f"themes[{index}] has no members")
+        keys = list(theme.member_story_keys)
+        if len(keys) != len(set(keys)):
+            raise ThemeInvariantError(
+                f"themes[{index}] ({theme.fingerprint}) lists a member twice: "
+                f"{sorted({key for key in keys if keys.count(key) > 1})}"
+            )
+        evidence_keys = sorted(entry.story_key for entry in theme.evidence)
+        if evidence_keys != sorted(keys):
+            raise ThemeInvariantError(
+                f"themes[{index}] ({theme.fingerprint}) evidence does not "
+                "match its membership"
+            )
+
+    owner: dict[str, int] = {}
+    for index, theme in enumerate(theme_set.themes):
+        for item_id in theme.citable_item_ids:
+            previous = owner.get(item_id)
+            if previous is not None and previous != index:
+                raise ThemeInvariantError(
+                    f"raw item {item_id!r} is citable from themes {previous} "
+                    f"and {index}; a citation must resolve to exactly one theme"
+                )
+            owner[item_id] = index
+
+    membership = {key for theme in theme_set.themes for key in theme.member_story_keys}
+    counted = [key for theme in theme_set.themes for key in theme.member_story_keys]
+    repeated = {key for key in counted if counted.count(key) > 1}
+    if repeated:
+        raise ThemeInvariantError(
+            f"story key(s) {sorted(repeated)} appear in more than one theme"
+        )
+    elsewhere = {entry.story_key for entry in theme_set.other_coverage} | {
+        entry.story_key for entry in theme_set.excluded
+    }
+    overlap = membership & elsewhere
+    if overlap:
+        raise ThemeInvariantError(
+            f"story key(s) {sorted(overlap)} are in a theme and also in other "
+            "coverage or exclusions"
+        )

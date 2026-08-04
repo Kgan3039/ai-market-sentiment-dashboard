@@ -1,11 +1,39 @@
 {
   "composition": "m1.compose_embedding_text(title, description)",
   "dataset_id": "phase0-theme-ticker-days-v1",
+  "dataset_version": "phase0.theme_eval.v1",
   "dimension": 384,
+  "issue": "#72",
   "model_name": "sentence-transformers/all-MiniLM-L6-v2",
   "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
   "note": "Produced once from the real Phase 0 encoder and committed so the evaluation, and the test that regenerates its artifact, run offline and byte-identically. Rounded to vector_precision, so cohesion figures derived from these vectors are reproducible rather than hardware-dependent. Regenerate with tools.eval_themes --real-model --write-vectors.",
   "schema_version": "phase0.theme_vectors.v1",
+  "stage_specific_trust_summary": {
+    "detail": "These are synthetic authored ticker-days, not ingested coverage: no theme here was produced from a real trading day, so there is no real ticker-day validation of AC-4 behind any number in this file; the expected groupings are single-author, unadjudicated and have no second reviewer, so a clustering that reproduces them has agreed with its author and nothing more; the dataset is non-gate-eligible and nothing here validates AC-4 (clustering) and G1 (theme-assignment agreement), which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60.",
+    "gates": "AC-4 (clustering) and G1 (theme-assignment agreement)",
+    "headline": "Issue #72 (M5 theme clustering) on a synthetic authored development fixture: not AC-4 or G1 validation.",
+    "issue": "#72",
+    "level": "WARNING",
+    "stage": "M5 theme clustering (issue #72)",
+    "text": "WARNING [M5 theme clustering (issue #72)]: Issue #72 (M5 theme clustering) on a synthetic authored development fixture: not AC-4 or G1 validation.\nThese are synthetic authored ticker-days, not ingested coverage: no theme here was produced from a real trading day, so there is no real ticker-day validation of AC-4 behind any number in this file; the expected groupings are single-author, unadjudicated and have no second reviewer, so a clustering that reproduces them has agreed with its author and nothing more; the dataset is non-gate-eligible and nothing here validates AC-4 (clustering) and G1 (theme-assignment agreement), which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60.",
+    "version": "m5.stage_trust.v2"
+  },
+  "trust_contract": {
+    "adjudicated": false,
+    "dataset_kind": "synthetic_development",
+    "gate_eligible": false,
+    "labeling_status": "single_author_unadjudicated",
+    "metrics_purpose": "development_regression_only",
+    "real_ingested_evidence": false,
+    "reviewer_count": 1,
+    "why": "Every headline, standfirst, outlet and timestamp in this fixture was written for it. The theme groupings it is expected to produce were chosen by the same person who wrote the stories, so a clustering that reproduces them has agreed with its author and nothing more. No number derived from this file measures whether a reader would accept the themes, and none of them can clear G1: that needs real ingested days (#57/#68) and the two-reviewer adjudicated assignment review in #60."
+  },
+  "trust_summary": {
+    "detail": "Metrics are not valid for K3/G4 or final AC-3 acceptance.",
+    "headline": "Synthetic, single-author, unadjudicated development dataset.",
+    "level": "WARNING",
+    "text": "WARNING: Synthetic, single-author, unadjudicated development dataset.\nMetrics are not valid for K3/G4 or final AC-3 acceptance."
+  },
   "vector_precision": 6,
   "vectors": {
     "aapl-1": [

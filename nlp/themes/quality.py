@@ -25,15 +25,9 @@ from datetime import date
 import time
 from typing import Any, Sequence
 
-from .config import ThemeConfig
+from .config import ThemeConfig, clears
 from .models import PreviousTheme, ThemeSet, ThemeStory
 from .service import cluster_themes
-
-#: A theme within this much of the cohesion floor survives only because of
-#: a threshold that has not been calibrated against anything but the days it
-#: is measured on.  Flagged rather than dropped: the honest report is "this
-#: one is unadjudicated", not a quiet pass.
-_NEAR_FLOOR_MARGIN = 0.05
 
 
 @dataclass(frozen=True)
@@ -309,8 +303,9 @@ def evaluate_ticker_day(
             cohesion=round(theme.cohesion, 6),
             min_pairwise_cohesion=round(theme.min_pairwise_cohesion, 6),
             cohesion_margin=round(theme.cohesion - config.min_theme_cohesion, 6),
-            near_cohesion_floor=(
-                theme.cohesion - config.min_theme_cohesion < _NEAR_FLOOR_MARGIN
+            near_cohesion_floor=not clears(
+                theme.cohesion - config.min_theme_cohesion,
+                config.near_cohesion_floor_margin,
             ),
             method=theme.method.value,
             matched_previous_key=theme.matched_previous_key,

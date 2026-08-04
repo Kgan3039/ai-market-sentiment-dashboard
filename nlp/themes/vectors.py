@@ -24,6 +24,14 @@ from .config import VECTOR_PRECISION
 from .errors import ThemeEncodingError, ThemeInputError
 
 SUPPORTED_VECTOR_SCHEMA = "phase0.theme_vectors.v1"
+
+#: Every M5 JSON asset carries its own trust manifest, so none of them is
+#: interpretable without knowing what it is worth.  A vector file looks like
+#: neutral numbers; it is the evidence three ticker-days of themes rest on.
+TRUST_MANIFEST_POLICY = (
+    "every_m5_json_asset_carries_trust_contract_shared_summary_and_stage_"
+    "summary; a vector or fixture file is not interpretable without it"
+)
 DEFAULT_VECTOR_PATH = Path(__file__).resolve().parent / "data" / "story_vectors.json"
 
 
@@ -60,6 +68,11 @@ def load_story_vectors(path: str | Path = DEFAULT_VECTOR_PATH) -> StoryVectors:
         - {
             "schema_version",
             "dataset_id",
+            "dataset_version",
+            "issue",
+            "trust_contract",
+            "trust_summary",
+            "stage_specific_trust_summary",
             "model_name",
             "model_revision",
             "dimension",
@@ -83,6 +96,17 @@ def load_story_vectors(path: str | Path = DEFAULT_VECTOR_PATH) -> StoryVectors:
                 f"not the declared {dimension}"
             )
         vectors[key] = tuple(float(value) for value in values)
+    for field in ("trust_contract", "trust_summary", "stage_specific_trust_summary"):
+        if field not in payload:
+            raise ThemeInputError(
+                f"{location}: vector fixture has no {field}; an M5 asset must "
+                "state what it is worth"
+            )
+    if payload["trust_contract"].get("gate_eligible") is not False:
+        raise ThemeInputError(
+            f"{location}: vector fixture claims gate eligibility; these "
+            "vectors come from an authored development fixture"
+        )
     return StoryVectors(
         dataset_id=str(payload.get("dataset_id", "")),
         model_name=str(payload["model_name"]),

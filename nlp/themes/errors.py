@@ -11,6 +11,17 @@ class ThemeInputError(ValueError, ThemeError):
     """A story is structurally invalid and cannot be clustered."""
 
 
+class ThemeInvariantError(ThemeInputError):
+    """A theme set cannot describe its own membership honestly.
+
+    Raised at construction rather than reported as a diagnostic, because
+    these are the failures no diagnostic could describe: a story in two
+    themes, an empty theme, evidence that does not match membership, one
+    raw item citable from two themes.  A ``ThemeSet`` that got past this is
+    one whose ``complete`` can be believed.
+    """
+
+
 class ThemePartitionError(ThemeInputError):
     """The stories handed in do not form a partition of the day's coverage.
 

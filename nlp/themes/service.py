@@ -18,6 +18,7 @@ asserts that partition before returning.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 import hashlib
 from typing import Any, Sequence
@@ -29,7 +30,10 @@ from nlp.dedup.text import display_text
 from nlp.embeddings import EmbeddingError, compose_embedding_text
 
 from .clustering import (
+    BELOW_FLOOR,
+    NARRATIVE_MISMATCH,
     NO_STRUCTURE,
+    SURPLUS_TO_CAP,
     NOISE,
     assign_clusters,
     centroid_of,
@@ -64,6 +68,15 @@ from .models import (
 from .salience import match_previous_themes, salience_features, salience_of
 
 _EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
+
+#: The clustering layer's dissolution reasons, mapped onto the reasons a
+#: reader sees.  One table, so a new reason cannot reach other coverage
+#: wearing another one's name.
+_DISSOLUTION_REASONS = {
+    BELOW_FLOOR: OtherCoverageReason.BELOW_COHESION_FLOOR,
+    NARRATIVE_MISMATCH: OtherCoverageReason.NARRATIVE_MISMATCH,
+    SURPLUS_TO_CAP: OtherCoverageReason.SURPLUS_TO_THEME_CAP,
+}
 
 
 def _encode_fields(fields: Sequence[str]) -> bytes:
@@ -393,7 +406,8 @@ def cluster_themes(
         )
 
     subset = vectors[clusterable]
-    assignment = assign_clusters(subset, config)
+    clusterable_stories = [usable[position] for position in clusterable]
+    assignment = assign_clusters(subset, config, clusterable_stories)
     reasons = dict(held)
     labels: list[int] = []
     for index, label in enumerate(assignment.labels):
@@ -417,18 +431,20 @@ def cluster_themes(
         # The same function the fallback scored candidates with, so the day
         # cannot be assembled into a shape the objective never evaluated.
         # Positions here index ``clusterable``; map them back once.
-        kept, dissolved = surviving_themes(subset, labels, config)
-        for local in dissolved:
+        kept, dissolved = surviving_themes(subset, labels, config, clusterable_stories)
+        for local, why in dissolved.items():
             position = clusterable[local]
             if position not in reasons:
-                reasons[position] = OtherCoverageReason.BELOW_COHESION_FLOOR
+                reasons[position] = _DISSOLUTION_REASONS[why]
         if dissolved:
+            counts: dict[str, int] = {}
+            for why in dissolved.values():
+                counts[why] = counts.get(why, 0) + 1
+            detail = ", ".join(
+                f"{count} {why}" for why, count in sorted(counts.items())
+            )
             notes.append(
-                f"{len(dissolved)} story(ies) moved to other coverage: below a "
-                f"floor (mean {config.min_theme_cohesion}, weakest pair "
-                f"{config.min_theme_pairwise_cohesion}), below the "
-                f"{config.min_theme_stories}-story theme floor, or surplus to "
-                f"the {config.max_themes}-theme cap"
+                f"{len(dissolved)} story(ies) moved to other coverage: {detail}"
             )
         for members_local in kept:
             members = [clusterable[local] for local in members_local]
@@ -516,22 +532,57 @@ def outlet_count_of(story: ThemeStory) -> int:
     return len({outlet for outlet in story.outlets if outlet})
 
 
-def _distinct_outlets(stories: Sequence[ThemeStory]) -> int:
-    """Distinct outlets across a group, using each story's authoritative count.
+@dataclass(frozen=True)
+class OutletCoverage:
+    """What is actually known about how widely a theme was carried.
 
-    Outlet names are only known for the projected set, so a union of names
-    would discard exactly the extra outlets ``outlet_count`` records.  Where
-    a story's authoritative count exceeds the names it carries, the excess
-    is added to the union of the names - which is the tightest number that
-    never claims fewer outlets than upstream counted.
+    Three numbers instead of one, because one number had to lie.  Summing
+    each story's unnamed excess treated every unknown carrier as distinct -
+    two stories each syndicated to eight unnamed outlets became sixteen,
+    when they may well have been the same eight - and that inflated
+    salience for whichever theme happened to hold the most unnamed
+    coverage.
+    """
+
+    #: Outlets named explicitly by at least one member.  Exact.
+    named_outlet_count: int
+    #: The largest authoritative per-story count in the theme.  A lower
+    #: bound on the theme's true distinct outlets, and the number used for
+    #: ranking: it cannot double-count carriers that may be shared.
+    bounded_outlet_count: int
+    #: Whether any member's authoritative count exceeded the names it
+    #: carried, so the true distinct total is unknown and at least this.
+    has_unresolved_outlet_count: bool
+
+    @property
+    def ranking_count(self) -> int:
+        """The number salience uses: never an estimate, never a sum."""
+
+        return max(self.named_outlet_count, self.bounded_outlet_count)
+
+
+def outlet_coverage(stories: Sequence[ThemeStory]) -> OutletCoverage:
+    """Summarize a group's outlet coverage without inventing distinctness.
+
+    Named outlets are unioned, which is exact.  Unnamed excess is *not*
+    summed across stories: nothing in the projection says two stories'
+    unnamed carriers are different outlets, and assuming they are inflates
+    every theme that holds syndicated coverage.  What can be asserted is a
+    lower bound - the theme has at least as many distinct outlets as its
+    most widely carried member - and that is what ranking uses.
     """
 
     named = {outlet for story in stories for outlet in story.outlets if outlet}
-    excess = sum(
-        max(0, outlet_count_of(story) - len({o for o in story.outlets if o}))
+    counts = [outlet_count_of(story) for story in stories]
+    unresolved = any(
+        outlet_count_of(story) > len({o for o in story.outlets if o})
         for story in stories
     )
-    return len(named) + excess
+    return OutletCoverage(
+        named_outlet_count=len(named),
+        bounded_outlet_count=max(counts) if counts else 0,
+        has_unresolved_outlet_count=unresolved,
+    )
 
 
 def _position_salience(usable: Sequence[ThemeStory], position: int) -> float:
@@ -601,6 +652,29 @@ def title_informativeness(title: str) -> tuple[int, int, int]:
     return distinct, specific, repetition
 
 
+def _representative_of(usable: Sequence[ThemeStory], members: Sequence[int]) -> int:
+    """The member whose title labels the theme.
+
+    Chosen from the theme's **final** membership, so a story ejected by the
+    cohesion or narrative gate can never label the theme it left.  Among
+    members carrying the theme's dominant narrative family, the most
+    informative title wins; a theme whose family is unknown falls back to
+    informativeness over all its members.  A label that named a family the
+    rest of the theme is not about would imply a narrower story than the
+    evidence supports.
+    """
+
+    from .narrative import dominant_family, narrative_families
+
+    family = dominant_family(usable, members)
+    candidates = [
+        position
+        for position in members
+        if family is not None and family in narrative_families(usable[position])
+    ]
+    return max(candidates or list(members), key=lambda p: _label_rank(usable, p))
+
+
 def _label_rank(usable: Sequence[ThemeStory], position: int) -> tuple:
     """Ordering for the member whose title labels the theme.
 
@@ -643,9 +717,10 @@ def _assemble(
 ) -> ThemeSet:
     reference_time = _latest(usable)
     counts = [len(group) for group in groups]
-    outlet_counts = [
-        _distinct_outlets([usable[position] for position in group]) for group in groups
+    coverages = [
+        outlet_coverage([usable[position] for position in group]) for group in groups
     ]
+    outlet_counts = [coverage.ranking_count for coverage in coverages]
     max_stories = max(counts) if counts else 0
     max_outlets = max(outlet_counts) if outlet_counts else 0
 
@@ -698,7 +773,7 @@ def _assemble(
         centroid,
         min_cohesion,
     ) in enumerate(drafts, 1):
-        leading = max(members, key=lambda p: _label_rank(usable, p))
+        leading = _representative_of(usable, members)
         ordered_members = [leading] + sorted(
             (position for position in members if position != leading),
             key=lambda p: _order_key(usable[p]),

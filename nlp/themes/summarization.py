@@ -20,10 +20,12 @@ asking for a citation the theme cannot support.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from .errors import ThemeInputError
-from .models import Theme, ThemeSet
+from .models import Theme, ThemeSet, validate_theme_set_invariants
 
 if TYPE_CHECKING:  # pragma: no cover - import only for type checking
     from ai.summarization import MemberStory, ThemeInput
@@ -31,20 +33,25 @@ if TYPE_CHECKING:  # pragma: no cover - import only for type checking
 #: How a member story becomes a summarizer record.  Fingerprinted, so a
 #: change to the mapping invalidates cached summaries.
 ADAPTER_POLICY: dict[str, str] = {
-    "version": "m5.summarization_adapter.v1",
+    "version": "m5.summarization_adapter.v2",
     "story_id": "theme_evidence.story_key_verbatim",
-    "outlet": "single_lexicographically_first_of_the_story_outlets",
-    "multi_outlet": "extra_outlets_appended_to_description_never_dropped",
-    "published_at": "isoformat_utc",
-    "description": "story_description_or_empty_string",
+    "outlet": "single_deterministic_primary_lexicographically_first",
+    "carrier_metadata": (
+        "full outlet list travels in AdaptedTheme.carriers, outside "
+        "MemberStory; never inserted into title or description"
+    ),
+    "publisher_text": "title_and_description_verbatim_never_modified",
+    "published_at": "utc_normalized_isoformat",
+    "naive_timestamp": "rejected",
+    "description": "story_description_verbatim_or_empty_string",
     "member_scope": "theme_membership_only",
-    "rejects": "other_coverage, excluded, unknown story keys, duplicates",
+    "rejects": (
+        "other_coverage, excluded, unknown story keys, duplicates, "
+        "incomplete_or_contradictory_theme_sets"
+    ),
     "ordering": "theme_evidence_order_preserved",
+    "validation": "central_theme_set_invariants_revalidated_before_adapting",
 }
-
-#: Written into the description when a story carries more than one outlet,
-#: so the summarizer sees every carrier even though its record holds one.
-MULTI_OUTLET_PREFIX = "Also carried by: "
 
 
 def adapter_policy_components() -> dict[str, str]:
@@ -53,40 +60,76 @@ def adapter_policy_components() -> dict[str, str]:
     return dict(sorted(ADAPTER_POLICY.items()))
 
 
-def _member_story(entry, ticker: str) -> "MemberStory":
+def utc_isoformat(stamp: datetime | None) -> str:
+    """Render a timestamp in UTC, or refuse it.
+
+    The adapter advertises UTC.  ``datetime.isoformat`` renders whatever
+    offset the value carries, so a +05:00 story went out labelled UTC and
+    five hours wrong.  Aware values are converted; naive ones are refused,
+    because the upstream contract requires awareness and guessing a zone
+    here would put a story on the wrong trading day silently.
+    """
+
+    if stamp is None:
+        return ""
+    if stamp.tzinfo is None or stamp.tzinfo.utcoffset(stamp) is None:
+        raise ThemeInputError(
+            "the summarization adapter needs timezone-aware timestamps; "
+            f"{stamp!r} is naive and its UTC instant cannot be recovered"
+        )
+    return stamp.astimezone(timezone.utc).isoformat()
+
+
+def primary_outlet(outlets: Sequence[str]) -> str:
+    """The one outlet the summarizer record names, chosen deterministically."""
+
+    named = sorted({outlet for outlet in outlets if outlet})
+    return named[0] if named else ""
+
+
+def _member_story(entry) -> "MemberStory":
+    """Project one member story, **without touching publisher text**.
+
+    Title and description travel verbatim.  The earlier adapter appended
+    "Also carried by: …" to the description so the extra outlets survived,
+    which made adapter metadata indistinguishable from something a
+    publisher wrote — and the summarizer's whole job is to quote publisher
+    text faithfully.  The carrier list now travels beside the records, in
+    :class:`AdaptedTheme`, where nothing can mistake it for evidence.
+    """
+
     from ai.summarization import MemberStory
 
-    outlets = tuple(sorted({outlet for outlet in entry.outlets if outlet}))
-    description = entry.description or ""
-    if len(outlets) > 1:
-        # The summarizer's record holds one outlet.  Dropping the rest would
-        # lose exactly the syndication evidence a reader uses to judge how
-        # widely a story was carried, so they travel in the description
-        # rather than disappearing.
-        extra = ", ".join(outlets[1:])
-        description = (
-            f"{description} {MULTI_OUTLET_PREFIX}{extra}."
-            if description
-            else f"{MULTI_OUTLET_PREFIX}{extra}."
-        ).strip()
     return MemberStory(
         id=entry.story_key,
         title=entry.title,
-        description=description,
-        outlet=outlets[0] if outlets else "",
-        published_at=(
-            entry.published_at.isoformat() if entry.published_at is not None else ""
-        ),
+        description=entry.description or "",
+        outlet=primary_outlet(entry.outlets),
+        published_at=utc_isoformat(entry.published_at),
     )
 
 
-def theme_to_summarizer_input(theme: Theme) -> "ThemeInput":
-    """Convert one theme into the summarizer's public input.
+@dataclass(frozen=True)
+class AdaptedTheme:
+    """One theme in the summarizer's shape, plus the metadata it cannot hold.
 
-    Raises :class:`~nlp.themes.errors.ThemeInputError` when the theme's own
-    evidence is not a clean set — a duplicate member would give the model
-    two records with one id, and every citation to it would be ambiguous.
+    ``theme_input`` is exactly what :func:`ai.summarization.summarize`
+    consumes.  Everything else is M5's own record, kept outside the model's
+    text so it can never be quoted back as though a publisher had written
+    it.
     """
+
+    theme_key: str
+    fingerprint: str
+    theme_input: "ThemeInput"
+    #: ``story_key -> every outlet that carried it``, sorted.
+    carriers: Mapping[str, tuple[str, ...]]
+    #: ``story_key -> the raw items a citation may resolve to``, sorted.
+    citable_items: Mapping[str, tuple[str, ...]]
+
+
+def adapt_theme(theme: Theme) -> AdaptedTheme:
+    """Convert one theme, with its carrier and citation metadata."""
 
     from ai.summarization import ThemeInput
 
@@ -101,23 +144,69 @@ def theme_to_summarizer_input(theme: Theme) -> "ThemeInput":
             f"theme {theme.fingerprint} evidence does not match its membership; "
             "the summarizer may only see what the theme is made of"
         )
-    return ThemeInput(
-        ticker=theme.ticker,
-        member_stories=[_member_story(entry, theme.ticker) for entry in theme.evidence],
-        trading_day=theme.trading_day.isoformat(),
+    return AdaptedTheme(
+        theme_key=theme.theme_key,
+        fingerprint=theme.fingerprint,
+        theme_input=ThemeInput(
+            ticker=theme.ticker,
+            member_stories=[_member_story(entry) for entry in theme.evidence],
+            trading_day=theme.trading_day.isoformat(),
+        ),
+        carriers={
+            entry.story_key: tuple(sorted({o for o in entry.outlets if o}))
+            for entry in theme.evidence
+        },
+        citable_items={
+            entry.story_key: tuple(sorted(set(entry.item_ids)))
+            for entry in theme.evidence
+        },
     )
+
+
+def theme_to_summarizer_input(theme: Theme) -> "ThemeInput":
+    """Convert one theme into the summarizer's public input alone."""
+
+    return adapt_theme(theme).theme_input
+
+
+def validate_theme_set(theme_set: ThemeSet) -> None:
+    """Re-check a theme set's partition before anything is adapted.
+
+    ``ThemeSet.__post_init__`` enforces these too, and this calls the same
+    validator: a set can reach here having been unpickled, reconstructed
+    field by field, or built by a future caller, and "it must have been
+    validated on the way in" is not something the citation contract can
+    afford to assume.
+    """
+
+    validate_theme_set_invariants(theme_set)
+    if not theme_set.complete:
+        raise ThemeInputError(
+            f"theme set for {theme_set.ticker} {theme_set.trading_day} is not "
+            f"complete: missing={list(theme_set.missing_story_keys)}, "
+            f"unexpected={list(theme_set.unexpected_story_keys)}, "
+            f"duplicated={list(theme_set.duplicate_membership_keys)}"
+        )
+
+
+def adapt_theme_set(theme_set: ThemeSet) -> dict[str, AdaptedTheme]:
+    """Adapt every *normal* theme, keyed by ``theme_key``, after validating."""
+
+    validate_theme_set(theme_set)
+    return {theme.theme_key: adapt_theme(theme) for theme in theme_set.themes}
 
 
 def summarizer_inputs(theme_set: ThemeSet) -> dict[str, "ThemeInput"]:
     """Convert every *normal* theme, keyed by ``theme_key``.
 
-    Other coverage and excluded stories are absent by construction: they are
-    not themes, and there is nothing for a summarizer to say about them that
-    a citation could support.
+    Validates the set first rather than trusting it.  Other coverage and
+    excluded stories are absent by construction: they are not themes, and
+    there is nothing for a summarizer to say about them that a citation
+    could support.
     """
 
     return {
-        theme.theme_key: theme_to_summarizer_input(theme) for theme in theme_set.themes
+        key: adapted.theme_input for key, adapted in adapt_theme_set(theme_set).items()
     }
 
 

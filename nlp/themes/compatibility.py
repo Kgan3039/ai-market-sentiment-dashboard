@@ -50,7 +50,7 @@ from nlp.dedup.text import display_text
 from .models import ThemeStory
 
 #: Bumped when a family, a lexicon, or the comparison changes.
-COMPATIBILITY_POLICY_VERSION = "m5.compatibility.v2"
+COMPATIBILITY_POLICY_VERSION = "m5.compatibility.v3"
 
 #: The claim families a *theme* may not hold both sides of, as
 #: ``(family, positive terms, negative terms)``.  Small on purpose: each
@@ -356,26 +356,46 @@ PERMITTED_DIFFERENCES: tuple[tuple[str, str], ...] = (
 #: "will not open a new office, but raises guidance" makes a negative
 #: commitment claim and a *positive* direction claim, and reading the "not"
 #: across the comma inverted the guidance and split a theme that agreed.
+#: **Contrast** boundaries only.  Coordination is deliberately absent:
+#: splitting on "and" made "will not open offices and launch products" two
+#: clauses, negated the first and left the second positive, and reported one
+#: story as asserting both sides of one family.  A negation governs its
+#: whole clause, and only a contrast resets it.
 _CLAUSE_BOUNDARY = re.compile(
-    r"[,;:.!?()\[\]\u2013\u2014]|\b(?:but|while|whilst|although|though|however|"
-    r"whereas|yet|meanwhile|despite|and|as|after|before|then)\b",
+    r"[,;:.!?()\[\]\u2013\u2014]|\b(?:but|while|whilst|although|though|"
+    r"however|whereas|yet|meanwhile|despite)\b",
     re.IGNORECASE,
 )
 
-#: How many tokens before a claim word a negation may sit and still govern
-#: it.  Bounded so a negation early in a long clause cannot reach a claim at
-#: the end of it.
-NEGATION_WINDOW = 4
+#: Coordinators that join claims *inside* one negation's scope.  Recorded
+#: for the fingerprint; the parser needs no separate handling for them,
+#: because not splitting on them is exactly what gives them shared scope.
+_COORDINATORS = ("and", "or", "nor", "plus", "as well as")
+
+#: Negation scope is the **clause**, not a token window.  A four-token
+#: window could not reach "launch" in "will not open offices and launch
+#: products", which is precisely the coordinated phrase the negation
+#: governs.  A contrast boundary ends the scope; nothing else does.
+NEGATION_SCOPE = "clause"
 
 #: "not only raised guidance but also..." is emphasis, not negation.  The
 #: bigram is skipped before parity is counted.
 _NON_NEGATING_BIGRAMS: tuple[tuple[str, str], ...] = (("not", "only"),)
 
-#: A family a single story asserts both ways.  It takes no side, so it can
-#: neither eject another member nor be ejected for disagreeing - "raises
-#: guidance and cuts spending" is one story about two things, not a story
-#: contradicting itself.
+#: A family a single story genuinely asserts both ways, about different
+#: objects: "raises guidance and cuts spending" is one story about two
+#: things, not a story contradicting itself.
 MIXED = "mixed"
+
+#: A family the parse could not resolve to a side.  Reached when a negation
+#: governs a coordination holding both polarities - "does not approve or
+#: reject the deal" reports that neither happened, and reading it as
+#: simultaneous approval and rejection would be inventing evidence.
+#: Preferred over guessing: like MIXED it takes no side.
+UNKNOWN = "unknown"
+
+#: Neither of the two takes a side, so neither blocks or is blocked.
+UNDECIDED = frozenset({MIXED, UNKNOWN})
 
 
 def _clauses(text: str) -> tuple[str, ...]:
@@ -395,17 +415,36 @@ def _claim_tokens(story: ThemeStory) -> tuple[str, ...]:
     return tokenize(_claim_text(story))
 
 
+def _is_base_form(token: str) -> bool:
+    """True when a claim verb is an infinitive rather than a finite form.
+
+    The distinction is what separates the two coordinations that must not
+    behave alike.  After a modal, coordinated **bare infinitives** share the
+    negation - "will not open offices and launch products" negates both.  A
+    coordinated **finite** verb starts its own predicate and the negation
+    stops there - "will not miss estimates and beats expectations" negates
+    the miss and leaves the beat alone.  Approximated by inflection, which
+    is what the lexicons already carry.
+    """
+
+    if token.endswith("ed"):
+        return False
+    return not (token.endswith("s") and not token.endswith("ss"))
+
+
 def _negation_parity(tokens: Sequence[str], index: int) -> bool:
     """True when an odd number of negations governs the token at ``index``.
 
-    Only markers **preceding** the claim inside the same clause and inside
-    :data:`NEGATION_WINDOW` count, so "beats expectations, and will not
-    open an office" leaves the beat alone.  Parity, not presence: "did not
-    fail to raise guidance" is a raise.
+    Scope is the clause: every marker **preceding** the claim in the same
+    clause counts, so one negation reaches every claim in a coordinated
+    phrase after it.  A contrast boundary already ended the clause, so
+    "will not open an office, but raises guidance" leaves the raise alone.
+    Parity, not presence: "did not fail to raise guidance" is a raise.
     """
 
-    window = list(tokens[max(0, index - NEGATION_WINDOW) : index])
+    window = list(tokens[:index])
     negations = 0
+    last_negation = -1
     position = 0
     while position < len(window):
         token = window[position]
@@ -415,15 +454,31 @@ def _negation_parity(tokens: Sequence[str], index: int) -> bool:
             continue
         if token in NEGATION_MARKERS:
             negations += 1
+            last_negation = position
         position += 1
+    if not negations:
+        return False
+    # A coordinator between the negation and a *finite* claim ends the
+    # scope: the conjunct is a new predicate, not another infinitive under
+    # the same modal.
+    coordinated = any(token in _COORDINATORS for token in window[last_negation + 1 :])
+    if coordinated and not _is_base_form(tokens[index]):
+        return False
     return negations % 2 == 1
 
 
-def clause_claims(clause: str) -> set[tuple[str, str]]:
-    """Return the ``(family, polarity)`` claims one clause makes."""
+def clause_claims(clause: str) -> set[tuple[str, str, bool]]:
+    """Return the ``(family, polarity, was_negated)`` claims of one clause.
+
+    The negation flag travels with the claim because it changes what a
+    disagreement *means*: two polarities that arrived by negating one
+    coordination ("not approve or reject") report that neither happened,
+    while two that arrived unnegated ("raises guidance and cuts spending")
+    are a story about two things.
+    """
 
     tokens = tokenize(clause)
-    found: set[tuple[str, str]] = set()
+    found: set[tuple[str, str, bool]] = set()
     for index, token in enumerate(tokens):
         for family, positive, negative in OPPOSING_CLAIM_FAMILIES:
             if token in positive:
@@ -432,9 +487,10 @@ def clause_claims(clause: str) -> set[tuple[str, str]]:
                 side = "negative"
             else:
                 continue
-            if _negation_parity(tokens, index):
+            negated = _negation_parity(tokens, index)
+            if negated:
                 side = "negative" if side == "positive" else "positive"
-            found.add((family, side))
+            found.add((family, side, negated))
     return found
 
 
@@ -450,13 +506,23 @@ def story_claims(story: ThemeStory) -> frozenset[tuple[str, str]]:
     """
 
     by_family: dict[str, set[str]] = {}
+    negated_family: dict[str, bool] = {}
     for clause in _clauses(_claim_text(story)):
-        for family, polarity in clause_claims(clause):
+        for family, polarity, negated in clause_claims(clause):
             by_family.setdefault(family, set()).add(polarity)
-    return frozenset(
-        (family, MIXED if len(sides) > 1 else next(iter(sides)))
-        for family, sides in by_family.items()
-    )
+            negated_family[family] = negated_family.get(family, False) or negated
+    resolved: set[tuple[str, str]] = set()
+    for family, sides in by_family.items():
+        if len(sides) == 1:
+            resolved.add((family, next(iter(sides))))
+        elif negated_family[family]:
+            # Both sides, and a negation produced at least one of them:
+            # "does not approve or reject" says neither happened.  Asserting
+            # both would be inventing evidence the sentence denies.
+            resolved.add((family, UNKNOWN))
+        else:
+            resolved.add((family, MIXED))
+    return frozenset(resolved)
 
 
 def claims_conflict(
@@ -468,7 +534,7 @@ def claims_conflict(
     """
 
     for family, polarity in left:
-        if polarity == MIXED:
+        if polarity in UNDECIDED:
             continue
         opposite = "positive" if polarity == "negative" else "negative"
         if (family, opposite) in right:
@@ -499,10 +565,10 @@ def incompatible_members(
     families: dict[str, dict[str, list[int]]] = {}
     for position in ordered_positions:
         for family, polarity in sorted(claims[position]):
-            if polarity == MIXED:
-                # A story asserting both sides of one family is about two
-                # things.  It joins neither side, so it cannot eject a
-                # member and cannot be ejected for disagreeing.
+            if polarity in UNDECIDED:
+                # A story that asserts both sides, or whose side the parse
+                # could not settle, joins neither: it cannot eject a member
+                # and cannot be ejected for disagreeing.
                 continue
             families.setdefault(family, {}).setdefault(polarity, []).append(position)
 
@@ -542,8 +608,19 @@ def policy_components() -> dict[str, str]:
         "text_scope": "title_and_description",
         "claim_scope": "clause_local",
         "clause_boundary": _CLAUSE_BOUNDARY.pattern,
-        "negation_window": str(NEGATION_WINDOW),
+        "negation_scope": NEGATION_SCOPE,
+        "coordinators": ",".join(_COORDINATORS),
+        "coordination_rule": (
+            "coordinators_do_not_end_a_clause_so_one_negation_governs_every_"
+            "coordinated_bare_infinitive; a_coordinated_finite_verb_ends_the_"
+            "scope"
+        ),
+        "finite_form_rule": "inflected_by_trailing_s_or_ed_excluding_ss",
         "negation_rule": "odd_parity_of_preceding_markers_in_the_same_clause",
+        "undecided_rule": (
+            "both_sides_with_a_negation_is_unknown; both_sides_without_one_"
+            "is_mixed; neither_takes_a_side"
+        ),
         "non_negating_bigrams": ";".join(
             " ".join(pair) for pair in _NON_NEGATING_BIGRAMS
         ),
