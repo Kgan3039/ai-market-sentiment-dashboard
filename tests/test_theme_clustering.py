@@ -4163,8 +4163,13 @@ def test_a_compatible_trio_beats_a_compatible_pair():
     assert len(narratively_incompatible(stories, list(range(6)))) == 3
 
 
-def test_the_greedy_path_really_would_have_kept_a_pair():
-    """Guards the test above: the case has to be a case."""
+def test_a_per_anchor_greedy_really_would_have_kept_a_pair():
+    """Guards the test above: the case has to be a case.
+
+    Runs the superseded per-anchor procedure inline - it is no longer in
+    the codebase - to show that the six-story fixture still defeats it and
+    the exact search still beats it.
+    """
 
     from nlp.themes.narrative import families_compatible, narrative_families
 
@@ -4332,18 +4337,14 @@ def test_ejected_stories_receive_narrative_mismatch_through_the_stage():
 
 
 def test_the_selection_bound_is_documented_and_fingerprinted():
-    from nlp.themes.narrative import (
-        MAX_EXACT_SUBSET_SEARCH,
-        MAX_SUBSET_ENUMERATIONS,
-        policy_components,
-    )
+    from nlp.themes.narrative import policy_components
 
     components = policy_components()
 
-    assert MAX_EXACT_SUBSET_SEARCH > 0 and MAX_SUBSET_ENUMERATIONS > 0
     assert "exact_largest" in components["selection"]
-    assert str(MAX_EXACT_SUBSET_SEARCH) in components["selection_bound"]
-    assert "greedy" in components["selection_bound"]
+    assert "branch_and_bound" in components["selection"]
+    assert "exact_or_raise" in components["selection_bound"]
+    assert "no approximate fallback" in components["selection_bound"]
     assert "never_len_outlets" in components["ranking_evidence"]
     assert "narrative.selection_bound" in config().fingerprint_components(
         model_name="m", model_revision="v1", embedding_dimension=3
@@ -4507,3 +4508,219 @@ def test_the_write_vectors_cli_path_uses_the_same_writer():
 
     assert "write_story_vectors(" in source
     assert eval_themes.write_story_vectors is write_story_vectors
+
+
+# --------------------------------------------------------------------------
+# The exact-search contract
+# --------------------------------------------------------------------------
+
+
+def hostile_twenty_five():
+    """Twenty-two stories sharing one family, and three that share none.
+
+    The maximum compatible subset is the twenty-two; every greedy that can
+    be diverted onto one of the three loses ground it cannot recover.
+    """
+
+    shared = [
+        story(
+            f"p{index:02d}",
+            "Tesla cuts Model 3 prices across Europe",
+            index,
+            outlets=("reuters",),
+        )
+        for index in range(22)
+    ]
+    return shared + [
+        story("x1", "Tesla energy storage deployments set a quarterly record", 22),
+        story("x2", "Tesla opens a supercharger corridor across Norway", 23),
+        story("x3", "Tesla schedules its investor day for 2026-05-14", 24),
+    ]
+
+
+def test_the_twenty_five_story_case_returns_the_twenty_two_story_subset():
+    from nlp.themes import largest_compatible_group
+
+    stories = hostile_twenty_five()
+    kept = largest_compatible_group(stories, list(range(25)))
+
+    assert len(kept) == 22
+    assert all(stories[position].story_key.startswith("p") for position in kept)
+    assert config().max_narrative_selection_items >= 25, "within the supported limit"
+
+
+def test_the_twenty_five_story_case_ejects_exactly_the_three_outsiders():
+    from nlp.themes import narratively_incompatible
+
+    stories = hostile_twenty_five()
+    ejected = narratively_incompatible(stories, list(range(25)))
+
+    assert {stories[position].story_key for position in ejected} == {"x1", "x2", "x3"}
+
+
+def test_exceeding_the_item_limit_raises_before_any_subset_is_returned():
+    from nlp.themes import ThemeNarrativeCapacityError, largest_compatible_group
+
+    stories = hostile_twenty_five()
+    settings = config(max_narrative_selection_items=10)
+
+    with pytest.raises(ThemeNarrativeCapacityError) as caught:
+        largest_compatible_group(stories, list(range(25)), settings)
+
+    error = caught.value
+    assert error.item_count == 25
+    assert error.limit == 10
+    assert len(error.story_keys) == 25
+    assert "p00" in error.story_keys
+    assert "max_narrative_selection_items" in str(error)
+    assert "To proceed:" in str(error)
+    assert "no approximate subset is returned" in str(error)
+
+
+def test_exceeding_the_state_budget_raises_rather_than_returning_the_incumbent():
+    from nlp.themes import ThemeNarrativeCapacityError, largest_compatible_group
+
+    stories = hostile_twenty_five()
+    settings = config(max_narrative_search_states=3)
+
+    with pytest.raises(ThemeNarrativeCapacityError) as caught:
+        largest_compatible_group(stories, list(range(25)), settings)
+
+    error = caught.value
+    assert error.budget == 3
+    assert error.states is not None and error.states > 3
+    assert error.limit is None
+    assert "max_narrative_search_states" in str(error)
+    assert "To proceed:" in str(error)
+
+
+def test_a_narrative_capacity_failure_is_a_theme_capacity_error():
+    from nlp.themes import ThemeCapacityError, ThemeNarrativeCapacityError
+
+    assert issubclass(ThemeNarrativeCapacityError, ThemeCapacityError)
+
+
+def test_a_capacity_failure_propagates_out_of_the_stage_with_no_partial_result():
+    from nlp.themes import ThemeNarrativeCapacityError
+
+    stories = [
+        story("a", "Tesla delivers 495,000 vehicles in the first quarter", 0),
+        story("b", "Tesla quarterly deliveries top analyst estimates", 1),
+        story("c", "Tesla energy storage deployments set a quarterly record", 2),
+        story("d", "Tesla signs a grid storage contract with a European utility", 3),
+    ]
+    encoder = AngleEncoder(
+        {entry.title: index * 2.0 for index, entry in enumerate(stories)}
+    )
+
+    with pytest.raises(ThemeNarrativeCapacityError):
+        run(stories, encoder, max_narrative_search_states=1)
+
+
+def test_no_approximate_fallback_survives_in_the_selection_code():
+    """The contract is exact-or-raise; the word must not be a claim only."""
+
+    import io
+    import tokenize as tokenizer
+
+    path = REPO_ROOT / "nlp" / "themes" / "narrative.py"
+    source = path.read_text(encoding="utf-8")
+
+    assert "MAX_EXACT_SUBSET_SEARCH" not in source
+    assert "MAX_SUBSET_ENUMERATIONS" not in source
+
+    # Executable code only: comments and docstrings are where the removed
+    # algorithm is *described*, which is the point of keeping them.
+    code = [
+        token.string
+        for token in tokenizer.generate_tokens(io.StringIO(source).readline)
+        if token.type not in (tokenizer.COMMENT, tokenizer.STRING)
+    ]
+    joined = " ".join(code).lower()
+
+    assert "greedy" not in joined
+    assert "fallback" not in joined
+
+
+def test_no_document_still_promises_a_greedy_fallback():
+    readme = (REPO_ROOT / "nlp" / "README.md").read_text(encoding="utf-8")
+    payload = json.dumps(theme_quality_payload())
+
+    for text in (readme, payload):
+        assert "greedy per-anchor" not in text
+        assert "greedy fallback" not in text
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_narrative_selection_items", 32),
+        ("max_narrative_search_states", 500),
+    ],
+)
+def test_the_exact_search_limits_move_the_fingerprint(field, value):
+    baseline = config().fingerprint(
+        model_name="m", model_revision="v1", embedding_dimension=3
+    )
+
+    assert (
+        config(**{field: value}).fingerprint(
+            model_name="m", model_revision="v1", embedding_dimension=3
+        )
+        != baseline
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("max_narrative_selection_items", 0),
+        ("max_narrative_selection_items", -1),
+        ("max_narrative_selection_items", True),
+        ("max_narrative_search_states", 0),
+        ("max_narrative_search_states", 1.5),
+    ],
+)
+def test_a_malformed_exact_search_limit_is_refused(field, value):
+    with pytest.raises(ThemeConfigError, match="positive integer"):
+        config(**{field: value})
+
+
+def test_an_item_limit_below_the_theme_floor_is_refused():
+    with pytest.raises(ThemeConfigError, match="at least"):
+        config(max_narrative_selection_items=1, min_theme_stories=2)
+
+
+def test_the_artifact_describes_the_exact_search_contract():
+    components = theme_quality_payload()["theme_policy_components"]
+
+    assert components["max_narrative_selection_items"] == (
+        config().max_narrative_selection_items
+    )
+    assert components["max_narrative_search_states"] == (
+        config().max_narrative_search_states
+    )
+    assert "exact_or_raise" in components["narrative.selection_bound"]
+    assert "branch_and_bound" in components["narrative.selection"]
+
+
+def test_the_exact_search_finishes_well_inside_its_budget():
+    """The budget is a guard, not a routine constraint."""
+
+    from nlp.themes.narrative import _search_exact, families_compatible
+    from nlp.themes import narrative_families
+
+    stories = hostile_twenty_five()
+    positions = list(range(25))
+    families = {index: narrative_families(stories[index]) for index in positions}
+    compatible = {
+        index: {
+            other
+            for other in positions
+            if other != index and families_compatible(families[index], families[other])
+        }
+        for index in positions
+    }
+
+    # A budget far under the configured one still completes.
+    assert len(_search_exact(stories, positions, compatible, 5000)) == 22

@@ -52,6 +52,7 @@ from .errors import (
     ThemeError,
     ThemeInputError,
     ThemeInvariantError,
+    ThemeNarrativeCapacityError,
     ThemePartitionError,
 )
 from .models import (
@@ -71,7 +72,11 @@ from .models import (
     validate_theme_set_invariants,
 )
 from .service import cluster_themes, encoder_identity, theme_fingerprint_for
-from .narrative import narrative_families, narratively_incompatible
+from .narrative import (
+    largest_compatible_group,
+    narrative_families,
+    narratively_incompatible,
+)
 from .summarization import (
     AdaptedTheme,
     adapt_theme,
@@ -98,6 +103,8 @@ __all__ = [
     "adapt_theme",
     "adapt_theme_set",
     "encoder_identity",
+    "ThemeNarrativeCapacityError",
+    "largest_compatible_group",
     "narrative_families",
     "narratively_incompatible",
     "validate_theme_set",

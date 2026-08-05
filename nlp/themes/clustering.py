@@ -353,7 +353,7 @@ def _narratively_coherent(
             position,
         ),
     )
-    ejected = set(narratively_incompatible(stories, ordered))
+    ejected = set(narratively_incompatible(stories, ordered, config))
     if not ejected:
         return tuple(sorted(members))
     survivors = [position for position in members if position not in ejected]

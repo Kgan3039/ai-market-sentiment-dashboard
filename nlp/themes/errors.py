@@ -93,3 +93,58 @@ class ThemeCapacityError(ThemeError):
         self.ticker = ticker
         self.story_count = story_count
         self.limit = limit
+
+
+class ThemeNarrativeCapacityError(ThemeCapacityError):
+    """A candidate cluster is larger than the exact narrative search allows.
+
+    Raised *before* any theme is returned, and never softened into an
+    approximate answer.  The selection contract is "the largest mutually
+    compatible subset"; a search that ran out of budget does not know
+    whether what it found is the largest, and returning it anyway would
+    make the contract a claim nobody checked.
+
+    Carries what a caller needs to act: which stories were involved, how
+    many there were, which limit was hit, and what to do about it.
+    """
+
+    def __init__(
+        self,
+        story_keys: tuple[str, ...],
+        item_count: int,
+        *,
+        limit: int | None = None,
+        budget: int | None = None,
+        states: int | None = None,
+    ) -> None:
+        if limit is not None:
+            detail = (
+                f"{item_count} stories exceed max_narrative_selection_items=" f"{limit}"
+            )
+            guidance = (
+                "raise max_narrative_selection_items, or split the ticker-day "
+                "so no candidate cluster is this large"
+            )
+        else:
+            detail = (
+                f"the exact search over {item_count} stories passed "
+                f"max_narrative_search_states={budget} after {states} states"
+            )
+            guidance = (
+                "raise max_narrative_search_states, or lower "
+                "max_narrative_selection_items so this cluster is refused "
+                "before the search rather than during it"
+            )
+        ThemeError.__init__(
+            self,
+            f"narrative selection refused: {detail}; no approximate subset is "
+            f"returned because the contract is the largest compatible subset. "
+            f"To proceed: {guidance}. Stories: {list(story_keys)}",
+        )
+        self.story_keys = story_keys
+        self.item_count = item_count
+        self.story_count = item_count
+        self.limit = limit
+        self.budget = budget
+        self.states = states
+        self.ticker = None

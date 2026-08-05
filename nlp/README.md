@@ -1090,6 +1090,26 @@ Three rules, all trust-first:
 - **missing evidence is unknown**, and unknown blocks nothing, so a story
   the phrase lists cannot read still clusters on geometry alone.
 
+**Selection is exact, or it raises.** Among all mutually compatible subsets
+the layer takes the largest, then the highest aggregate
+`ThemeStory.outlet_count` (never the projected `len(outlets)`), then
+recency, then the sorted story keys. It is a deterministic branch-and-bound
+with a greedy-colouring upper bound; stories carrying no explicit family are
+compatible with everything and are lifted out of the search first, which is
+an exact reduction. There is **no approximate path**: an earlier version
+grew one subset per anchor and called the result the largest when it was
+not, and the version after that fixed the common case but fell back to the
+same procedure above an internal limit — the same defect wearing a bound,
+because a caller could not tell the approximate answer from the exact one.
+
+The limits are now a contract. A candidate cluster above
+`max_narrative_selection_items` (250, the day cap, so any cluster M5 accepts
+is one it can search) or a search past `max_narrative_search_states`
+(200,000) raises `ThemeNarrativeCapacityError` — a `ThemeCapacityError` —
+**before any theme exists**, carrying the story keys, the item count, the
+limit or budget that was hit, and what to change. Both limits are validated,
+fingerprinted, and written into the artifact metadata.
+
 The gate runs **after** geometric subset extraction and **before** the
 candidate is scored, so the fallback objective sees the shape that would
 actually ship. Ejected stories go to Other coverage tagged

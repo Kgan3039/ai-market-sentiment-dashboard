@@ -37,14 +37,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 from nlp.dedup.text import display_text
 
+from .errors import ThemeNarrativeCapacityError
 from .models import ThemeStory
 
+if TYPE_CHECKING:  # pragma: no cover - import only for type checking
+    from .config import ThemeConfig
+
 #: Bumped when a family, a phrase list, or the comparison changes.
-NARRATIVE_POLICY_VERSION = "m5.narrative.v2"
+NARRATIVE_POLICY_VERSION = "m5.narrative.v3"
 
 #: ``(family, pattern)``.  Every pattern is a phrase a newsroom writes on
 #: purpose; none is a bare noun that could appear in passing.  Ordered only
@@ -213,25 +217,14 @@ def families_compatible(left: frozenset[str], right: frozenset[str]) -> bool:
     )
 
 
-#: Largest candidate cluster the exact search is run on.  Above it the
-#: search is abandoned rather than allowed to run unbounded, and the greedy
-#: path is used with that stated.  A candidate cluster this large cannot
-#: survive the cohesion floors in practice, so the bound is a guard rather
-#: than a routine path.
-MAX_EXACT_SUBSET_SEARCH = 24
-
-#: Hard ceiling on maximal groups enumerated before the search gives up.
-MAX_SUBSET_ENUMERATIONS = 20000
-
-
 def _selection_key(
     stories: Sequence[ThemeStory], group: Sequence[int]
 ) -> tuple[int, int, float, tuple[str, ...]]:
-    """Order candidate groups best-first, on authoritative evidence.
+    """Order candidate subsets best-first, on authoritative evidence.
 
-    Size first, because the policy is the largest compatible subset.  Then
-    the authoritative salience evidence - ``ThemeStory.outlet_count`` as
-    upstream counted it, never the projected ``len(outlets)``, which
+    Size first, because the contract is the largest compatible subset.
+    Then the authoritative salience evidence - ``ThemeStory.outlet_count``
+    as upstream counted it, never the projected ``len(outlets)``, which
     under-ranks a widely syndicated story whose carriers M5 cannot name.
     Then recency, then the sorted story keys, which is a total order on
     data and settles a complete tie the same way every run.
@@ -250,109 +243,173 @@ def _selection_key(
     return (len(group), outlets, latest, keys)
 
 
-def _maximal_groups(
-    positions: Sequence[int], compatible: dict[int, set[int]]
-) -> list[list[int]]:
-    """Every maximal mutually-compatible group, by Bron-Kerbosch with a pivot.
+def _colour_bound(candidates: Sequence[int], compatible: dict[int, set[int]]) -> int:
+    """An upper bound on the largest subset available among ``candidates``.
 
-    Bounded twice: the caller only reaches here below
-    :data:`MAX_EXACT_SUBSET_SEARCH` members, and the enumeration stops at
-    :data:`MAX_SUBSET_ENUMERATIONS`.  Returns ``[]`` when the ceiling is
-    hit, which the caller reads as "fall back and say so".
+    Greedy colouring: vertices sharing a colour are mutually incompatible,
+    so a compatible subset takes at most one from each colour class and the
+    number of classes bounds it.  Cheap, deterministic, and the only reason
+    the exact search finishes quickly on the graphs this layer produces -
+    compatibility here is "share a family", so the classes are close to the
+    families themselves.
     """
 
-    found: list[list[int]] = []
-    overflowed = False
+    classes: list[set[int]] = []
+    for node in candidates:
+        for members in classes:
+            if not members & compatible[node]:
+                members.add(node)
+                break
+        else:
+            classes.append({node})
+    return len(classes)
 
-    def expand(clique: list[int], candidates: set[int], excluded: set[int]) -> None:
-        nonlocal overflowed
-        if overflowed:
+
+def _search_exact(
+    stories: Sequence[ThemeStory],
+    positions: Sequence[int],
+    compatible: dict[int, set[int]],
+    budget: int,
+) -> tuple[int, ...]:
+    """Deterministic branch-and-bound for the best compatible subset.
+
+    Exact, or it raises.  There is no path here that returns something it
+    cannot show is optimal: the bound prunes only branches that *cannot*
+    reach the incumbent's size, equal-size branches are explored so the
+    salience and key tie-breaks are decided over every optimum, and running
+    past ``budget`` states raises
+    :class:`~nlp.themes.errors.ThemeNarrativeCapacityError` rather than
+    returning the incumbent.
+    """
+
+    best: list[int] = []
+    best_key: tuple[int, int, float, tuple[str, ...]] | None = None
+    states = 0
+
+    def consider(clique: list[int]) -> None:
+        nonlocal best, best_key
+        if not clique:
             return
-        if not candidates and not excluded:
-            found.append(sorted(clique))
-            if len(found) >= MAX_SUBSET_ENUMERATIONS:
-                overflowed = True
-            return
-        pivot = max(
-            candidates | excluded, key=lambda node: len(candidates & compatible[node])
-        )
-        for node in sorted(candidates - compatible[pivot]):
-            expand(
-                clique + [node],
-                candidates & compatible[node],
-                excluded & compatible[node],
+        key = _selection_key(stories, clique)
+        if best_key is None or key > best_key:
+            best, best_key = list(clique), key
+
+    def expand(clique: list[int], candidates: list[int]) -> None:
+        nonlocal states
+        states += 1
+        if states > budget:
+            raise ThemeNarrativeCapacityError(
+                tuple(sorted(stories[position].story_key for position in positions)),
+                len(positions),
+                budget=budget,
+                states=states,
             )
-            candidates = candidates - {node}
-            excluded = excluded | {node}
-            if overflowed:
-                return
+        consider(clique)
+        if not candidates:
+            return
+        # Prune only what cannot match the incumbent's size.  An equal-size
+        # branch still has to run: the tie-breaks are part of the contract.
+        if len(clique) + _colour_bound(candidates, compatible) < len(best):
+            return
+        for index, node in enumerate(candidates):
+            remaining = [
+                other for other in candidates[index + 1 :] if other in compatible[node]
+            ]
+            if len(clique) + 1 + len(remaining) < len(best):
+                continue
+            expand(clique + [node], remaining)
 
-    expand([], set(positions), set())
-    return [] if overflowed else found
+    expand([], sorted(positions))
+    return tuple(sorted(best))
 
 
 def largest_compatible_group(
-    stories: Sequence[ThemeStory], ordered_positions: Sequence[int]
+    stories: Sequence[ThemeStory],
+    ordered_positions: Sequence[int],
+    config: "ThemeConfig | None" = None,
 ) -> tuple[int, ...]:
-    """Return the largest mutually compatible group, exactly.
+    """Return the largest mutually compatible subset, exactly.
 
-    The previous greedy grew one group per anchor in list order, which is
-    not "the largest": an anchor could be diverted by an earlier-ordered
-    neighbour that conflicts with the rest of a bigger group, and every
-    member of that bigger group could be diverted the same way, so a
-    compatible pair survived while a compatible trio was available.  This
-    enumerates the maximal groups and picks by :func:`_selection_key`, so
-    the implementation and the stated policy are the same thing.
+    **Exact or nothing.**  An earlier version grew one subset per anchor in
+    list order and called the result the largest, which it was not: an
+    anchor could be diverted by an earlier-ordered neighbour that conflicts
+    with the rest of a bigger subset, and every member of that bigger
+    subset could be diverted the same way, so a compatible pair survived
+    while a compatible trio was available.  The version after that fixed
+    the common case but fell back to the same greedy above its internal
+    limits - which is the same defect wearing a bound, because a caller
+    cannot tell the approximate answer from the exact one.
+
+    Now the limits are a *contract*: a cluster larger than
+    ``max_narrative_selection_items``, or a search that passes
+    ``max_narrative_search_states``, raises
+    :class:`~nlp.themes.errors.ThemeNarrativeCapacityError` before any
+    theme exists.  Nothing approximate escapes under the name "largest".
+
+    Stories carrying no explicit family are compatible with everything, so
+    they join whatever the search finds and are lifted out of it first -
+    an exact reduction, and the one that keeps the search small in practice.
     """
 
+    from .config import ThemeConfig
+
+    settings = config if config is not None else None
+    limit = (
+        settings.max_narrative_selection_items
+        if settings is not None
+        else ThemeConfig.max_narrative_selection_items
+    )
+    budget = (
+        settings.max_narrative_search_states
+        if settings is not None
+        else ThemeConfig.max_narrative_search_states
+    )
+
     positions = list(ordered_positions)
+    if len(positions) > limit:
+        raise ThemeNarrativeCapacityError(
+            tuple(sorted(stories[position].story_key for position in positions)),
+            len(positions),
+            limit=limit,
+        )
     if len(positions) <= 1:
         return tuple(positions)
+
     families = {
         position: narrative_families(stories[position]) for position in positions
     }
+    universal = [position for position in positions if not families[position]]
+    explicit = [position for position in positions if families[position]]
+    if not explicit:
+        return tuple(sorted(positions))
+
     compatible = {
         position: {
             other
-            for other in positions
+            for other in explicit
             if other != position
             and families_compatible(families[position], families[other])
         }
-        for position in positions
+        for position in explicit
     }
-    groups = (
-        _maximal_groups(positions, compatible)
-        if len(positions) <= MAX_EXACT_SUBSET_SEARCH
-        else []
-    )
-    if not groups:
-        # Bounded out: grow one group per anchor in the caller's order.
-        # Never larger than the exact answer, and reported as the fallback
-        # it is rather than described as a maximum.
-        for anchor in positions:
-            group = [anchor]
-            for position in positions:
-                if position != anchor and all(
-                    families_compatible(families[position], families[member])
-                    for member in group
-                ):
-                    group.append(position)
-            groups.append(sorted(group))
-    return tuple(max(groups, key=lambda group: _selection_key(stories, group)))
+    chosen = _search_exact(stories, explicit, compatible, budget)
+    return tuple(sorted(list(chosen) + universal))
 
 
 def narratively_incompatible(
-    stories: Sequence[ThemeStory], ordered_positions: Sequence[int]
+    stories: Sequence[ThemeStory],
+    ordered_positions: Sequence[int],
+    config: "ThemeConfig | None" = None,
 ) -> tuple[int, ...]:
     """Return the positions to move out so a theme is about one subject.
 
     Cluster-wide, exact and deterministic: the theme keeps the largest
-    mutually compatible group, ties settled by authoritative salience and
-    then by story key.  Everything outside that group leaves together, and
-    the caller records it as ``narrative_mismatch``.
+    mutually compatible subset, ties settled by authoritative salience and
+    then by story key.  Everything outside it leaves together, and the
+    caller records it as ``narrative_mismatch``.
     """
 
-    keep = set(largest_compatible_group(stories, ordered_positions))
+    keep = set(largest_compatible_group(stories, ordered_positions, config))
     return tuple(
         sorted(position for position in ordered_positions if position not in keep)
     )
@@ -386,14 +443,17 @@ def policy_components() -> dict[str, str]:
         "default_rule": "two_distinct_explicit_families_cannot_share_a_theme",
         "scope": "whole_prospective_theme_after_subset_extraction",
         "selection": (
-            "exact_largest_mutually_compatible_group_by_bron_kerbosch; ties by "
+            "exact_largest_mutually_compatible_subset_by_deterministic_branch_"
+            "and_bound_with_greedy_colour_bound; ties by "
             "authoritative_outlet_count_sum, then recency, then sorted story keys"
         ),
         "selection_bound": (
-            f"exact below {MAX_EXACT_SUBSET_SEARCH} members and "
-            f"{MAX_SUBSET_ENUMERATIONS} maximal groups; greedy per-anchor "
-            "fallback above either, never described as a maximum"
+            "exact_or_raise; a cluster above max_narrative_selection_items or "
+            "a search above max_narrative_search_states raises "
+            "ThemeNarrativeCapacityError before any theme is returned; there "
+            "is no approximate fallback"
         ),
+        "selection_reduction": "stories_without_an_explicit_family_join_any_subset",
         "ranking_evidence": "ThemeStory.authoritative_outlet_count_never_len_outlets",
         "recall_key": "recall:<product>_or_recall:unspecified",
         "recall_pattern": _RECALL.pattern,

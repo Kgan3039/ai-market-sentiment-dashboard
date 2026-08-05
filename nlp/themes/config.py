@@ -287,6 +287,18 @@ class ThemeConfig:
     #: replaying a stored day (AC-8) ranks it the same way next year.
     recency_half_life_hours: float = 6.0
     max_stories_per_day: int = DEFAULT_MAX_STORIES_PER_DAY
+    #: Largest candidate cluster the exact narrative selection will search.
+    #: Set to the day cap on purpose: any cluster M5 accepts is one it can
+    #: search, so this is a guard against a future caller raising
+    #: ``max_stories_per_day`` without thinking about the search, not a
+    #: routine refusal.
+    max_narrative_selection_items: int = DEFAULT_MAX_STORIES_PER_DAY
+    #: Deterministic budget for that search, in explored states.  The real
+    #: guard: compatibility here is "share a narrative family" over about a
+    #: dozen families, so the branch-and-bound closes in thousands of states
+    #: on any realistic cluster.  A graph that needs more is one the stage
+    #: does not understand, and it fails loudly rather than approximately.
+    max_narrative_search_states: int = 200_000
     #: A theme whose cohesion clears the floor by less than this is reported
     #: ``near_cohesion_floor``: it survives on a threshold that is not
     #: independently calibrated, and saying so is more use than a pass.
@@ -304,12 +316,20 @@ class ThemeConfig:
             "min_samples",
             "min_theme_stories",
             "max_stories_per_day",
+            "max_narrative_selection_items",
+            "max_narrative_search_states",
         ):
             _positive_int(getattr(self, field), field)
         if self.min_themes > self.max_themes:
             raise ThemeConfigError("min_themes must not exceed max_themes")
         if self.min_cluster_size < 2:
             raise ThemeConfigError("min_cluster_size must be at least 2")
+        if self.max_narrative_selection_items < self.min_theme_stories:
+            raise ThemeConfigError(
+                "max_narrative_selection_items must be at least "
+                "min_theme_stories; a limit below the theme floor would "
+                "refuse every cluster the stage could ship"
+            )
         object.__setattr__(
             self,
             "min_theme_cohesion",
@@ -431,6 +451,8 @@ class ThemeConfig:
             "salience_weights": list(self.salience_weights),
             "recency_half_life_hours": self.recency_half_life_hours,
             "max_stories_per_day": self.max_stories_per_day,
+            "max_narrative_selection_items": self.max_narrative_selection_items,
+            "max_narrative_search_states": self.max_narrative_search_states,
             "supported_tickers": sorted(self.ticker_universe),
             "model_name": model_name,
             "model_revision": model_revision,
