@@ -45,19 +45,25 @@ _AUTHORIZATION_HEADER_PATTERN = re.compile(
 )
 
 #: A credential introduced by its scheme anywhere else in a string —
-#: ``Bearer abc123`` and ``Basic dXNlcjpwYXNz`` standing on their own, with
-#: no ``Authorization:`` in front of them.
+#: ``Bearer abc``, ``Basic a``, ``Basic dXNlcjpwYXNz`` standing on their
+#: own, with no ``Authorization:`` in front of them.
 _SCHEME_CREDENTIAL_PATTERN = re.compile(
     r"(?i)\b(Bearer|Basic|Digest)\s+"
-    # A credential, not the next English word.  Ordinary prose after the
-    # scheme word is either all lower-case ("Basic understanding") or
-    # capitalized ("Basic Auth"); a credential is neither, because base64
-    # and opaque tokens mix case and digits.  Three characters is the floor
-    # so short tokens such as ``Bearer abc123`` are still caught.
-    # The two lookaheads must stay case-*sensitive* while the scheme word
-    # above is matched case-insensitively, hence the explicit ``(?-i:…)``.
-    r"(?-i:(?![a-z]+\b)(?![A-Z][a-z]*\b))"
-    r"[A-Za-z0-9._~+/=-]{3,}"
+    # Redact the token unless it is confidently ordinary prose.  "Prose"
+    # is narrow on purpose: an all-lower-case or Capitalized run of at
+    # least four letters, which is what "basic understanding" and "bearer
+    # instrument" look like.  Everything else goes, including one-character
+    # tokens — `Bearer a` is a credential, `bearer instrument` is not, and
+    # nothing in between is worth leaking to find out.
+    #
+    # The lookaheads must stay case-*sensitive* while the scheme word above
+    # is matched case-insensitively, hence the explicit ``(?-i:…)``: with
+    # the outer flag applied, ``[A-Z][a-z]*`` would happily match base64
+    # such as ``dXNlcjpwYXNz``.
+    r"(?-i:(?![a-z]{4,}\b)(?![A-Z][a-z]{3,}\b))"
+    # A token, not its trailing punctuation: end on something that can end
+    # a credential so `Bearer abc.` keeps its sentence-ending period.
+    r"[A-Za-z0-9._~+/=:-]*[A-Za-z0-9=]"
 )
 
 #: ``"api_key": "abc"`` and ``'password' = 'abc'`` keep their quoting so a
