@@ -9,13 +9,20 @@ actually disappear.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import inspect
 import itertools
 import json
+import pickle
+import re
 import shutil
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -30,6 +37,7 @@ from nlp.embeddings import (
 )
 from phase0.embeddings import EmbeddingPersistenceError
 from phase0.errors import (
+    Phase0Error,
     Phase0IntegrityError,
     Phase0MigrationError,
     Phase0RunContextError,
@@ -48,7 +56,14 @@ from phase0.models import (
     ThemeSetRecord,
 )
 from phase0.redaction import redact_secrets, redact_text
-from phase0.repository import MIGRATIONS_PATH, Phase0Repository
+from phase0.repository import (
+    MIGRATIONS_PATH,
+    Phase0Admin,
+    Phase0Repository,
+    StageRunContext,
+    serialize_operational_metadata,
+    serialize_raw_evidence,
+)
 from phase0.schema import load_migrations
 from phase0.tickers import SUPPORTED_TICKERS
 
@@ -336,7 +351,7 @@ def test_failed_migration_rolls_back_and_leaves_version_and_data_intact(tmp_path
     before = schema_snapshot(repository)
     before_history = repository.applied_migrations()
 
-    (directory / "009_broken.sql").write_text(
+    (directory / "011_broken.sql").write_text(
         "CREATE TABLE half_applied (id INTEGER PRIMARY KEY);\n"
         "CREATE TABLE half_applied_two (id INTEGER REFERENCES nope(id));\n"
         "INSERT INTO half_applied SELECT missing_column FROM raw_items;\n",
@@ -678,7 +693,7 @@ def test_nested_metadata_and_sequences_are_redacted():
 def test_stored_run_log_errors_are_redacted(tmp_path, text, credential):
     repository = migrated(tmp_path)
 
-    repository.log_stage(
+    repository.admin.log_stage(
         run_id="run-secret",
         stage="fetch",
         counts={"items": 1},
@@ -870,7 +885,7 @@ def build_day(repository: Phase0Repository) -> dict:
 def test_direct_sql_cannot_cite_a_non_member_raw_item(tmp_path):
     repository = migrated(tmp_path)
     day = build_day(repository)
-    theme_id = repository.insert_theme(
+    theme_id = repository.admin.insert_theme(
         ticker="NVDA",
         trading_day=DAY,
         label="Theme",
@@ -893,7 +908,7 @@ def test_direct_sql_cannot_cite_a_non_member_raw_item(tmp_path):
 def test_a_raw_item_cannot_be_citable_from_two_themes_in_one_ticker_day(tmp_path):
     repository = migrated(tmp_path)
     day = build_day(repository)
-    first = repository.insert_theme(
+    first = repository.admin.insert_theme(
         ticker="NVDA",
         trading_day=DAY,
         label="First",
@@ -904,7 +919,7 @@ def test_a_raw_item_cannot_be_citable_from_two_themes_in_one_ticker_day(tmp_path
         content_hash="h1",
         pipeline_version="v1",
     )
-    second = repository.insert_theme(
+    second = repository.admin.insert_theme(
         ticker="NVDA",
         trading_day=DAY,
         label="Second",
@@ -946,7 +961,7 @@ def test_theme_cannot_group_a_story_from_another_ticker_or_day(tmp_path):
         stories=[story("amd1", other_items)],
     )
     foreign_story = repository.stories_for_day(DAY, "AMD")[0]["id"]
-    theme_id = repository.insert_theme(
+    theme_id = repository.admin.insert_theme(
         ticker="NVDA",
         trading_day=DAY,
         label="Theme",
@@ -959,7 +974,9 @@ def test_theme_cannot_group_a_story_from_another_ticker_or_day(tmp_path):
     )
 
     with repository.connect() as connection:
-        with pytest.raises(sqlite3.IntegrityError, match="ticker and day"):
+        with pytest.raises(
+            sqlite3.IntegrityError, match="ticker, day, and pipeline version"
+        ):
             connection.execute(
                 "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
                 (theme_id, foreign_story),
@@ -969,7 +986,7 @@ def test_theme_cannot_group_a_story_from_another_ticker_or_day(tmp_path):
 def test_citation_lifecycle_deletions_follow_a_valid_order(tmp_path):
     repository = migrated(tmp_path)
     day = build_day(repository)
-    theme_id = repository.insert_theme(
+    theme_id = repository.admin.insert_theme(
         ticker="NVDA",
         trading_day=DAY,
         label="Theme",
@@ -1025,7 +1042,7 @@ def test_canonical_member_cannot_leave_its_story(tmp_path):
 def test_raw_item_associations_and_labels_follow_their_parent(tmp_path):
     repository = migrated(tmp_path)
     item_ids = seed_raw_items(repository, 2)
-    repository.insert_eval_label(
+    repository.admin.insert_eval_label(
         label_type="dedup",
         item_a_id=item_ids[0],
         item_b_id=item_ids[1],
@@ -1077,7 +1094,7 @@ def test_run_log_cannot_reference_a_stage_key_that_does_not_exist(tmp_path):
     repository = migrated(tmp_path)
 
     with pytest.raises(Phase0IntegrityError, match="stage key"):
-        repository.log_stage(
+        repository.admin.log_stage(
             run_id="run-1",
             stage="cluster",
             counts={},
@@ -1097,7 +1114,7 @@ def test_run_log_links_to_a_claimed_stage_key(tmp_path):
     repository = migrated(tmp_path)
     repository.claim_stage_key(**STAGE_KEY, run_id="run-1")
 
-    repository.log_stage(
+    repository.admin.log_stage(
         run_id="run-1",
         stage="cluster",
         counts={},
@@ -1112,7 +1129,7 @@ def test_run_log_links_to_a_claimed_stage_key(tmp_path):
     )
 
     assert repository.count("run_log_stage_keys") == 1
-    repository.clear_derived_for_day(DAY)
+    repository.admin.clear_derived_for_day(DAY)
     assert repository.count("run_log_stage_keys") == 0
 
 
@@ -1768,7 +1785,9 @@ def test_theme_membership_cannot_be_updated_across_ticker_or_day(tmp_path):
     day = populated_theme_set(repository)
 
     with repository.connect() as connection:
-        with pytest.raises(sqlite3.IntegrityError, match="ticker and day"):
+        with pytest.raises(
+            sqlite3.IntegrityError, match="ticker, day, and pipeline version"
+        ):
             connection.execute(
                 "UPDATE theme_stories SET story_id = ? WHERE theme_id = ?",
                 (day["foreign_story"], day["theme_id"]),
@@ -1806,11 +1825,191 @@ def test_a_parent_cannot_be_relocated_out_from_under_its_children(tmp_path):
                 "UPDATE theme_sets SET trading_day = '2026-07-24' WHERE id = ?",
                 (day["set_id"],),
             )
-        with pytest.raises(sqlite3.IntegrityError, match="cannot change ticker or day"):
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="cannot change ticker, day, or pipeline version",
+        ):
             connection.execute(
                 "UPDATE stories SET trading_day = '2026-07-24' WHERE id = ?",
                 (day["stories"]["cf1"],),
             )
+
+
+def cross_version_day(repository: Phase0Repository) -> dict:
+    """One NVDA day reconciled under v1 and, separately, under v2.
+
+    Gives the probes below a genuine v2 story to try to smuggle into a v1
+    theme — the defect migration 010 exists to close.
+    """
+
+    day = populated_theme_set(repository)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v2",
+        stories=[story("v2-cf1", day["items"][:2])],
+    )
+    with repository.connect() as connection:
+        v2_story = int(
+            connection.execute(
+                "SELECT id FROM stories WHERE pipeline_version = 'v2'"
+            ).fetchone()["id"]
+        )
+    day["v2_story"] = v2_story
+    return day
+
+
+def test_a_v1_theme_cannot_accept_a_v2_story_on_insert(tmp_path):
+    repository = migrated(tmp_path)
+    day = cross_version_day(repository)
+
+    with repository.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
+            connection.execute(
+                "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
+                (day["theme_id"], day["v2_story"]),
+            )
+
+
+def test_a_v1_theme_cannot_accept_a_v2_story_on_update(tmp_path):
+    repository = migrated(tmp_path)
+    day = cross_version_day(repository)
+
+    with repository.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
+            connection.execute(
+                "UPDATE theme_stories SET story_id = ? WHERE theme_id = ?",
+                (day["v2_story"], day["theme_id"]),
+            )
+
+
+@pytest.mark.parametrize("table", ["theme_other_coverage", "theme_excluded_stories"])
+def test_coverage_and_exclusions_reject_a_cross_version_story(tmp_path, table):
+    repository = migrated(tmp_path)
+    day = cross_version_day(repository)
+
+    with repository.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="ticker/day/version"):
+            connection.execute(
+                f"INSERT INTO {table} (theme_set_id, story_id, reason) "
+                "VALUES (?, ?, ?)",
+                (
+                    day["set_id"],
+                    day["v2_story"],
+                    (
+                        "clustering_noise"
+                        if table == "theme_other_coverage"
+                        else "no_encodable_text"
+                    ),
+                ),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="ticker/day/version"):
+            connection.execute(
+                f"UPDATE {table} SET story_id = ? WHERE theme_set_id = ?",
+                (day["v2_story"], day["set_id"]),
+            )
+
+
+def test_a_referenced_story_cannot_change_pipeline_version(tmp_path):
+    repository = migrated(tmp_path)
+    day = cross_version_day(repository)
+
+    with repository.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
+            connection.execute(
+                "UPDATE stories SET pipeline_version = 'v9' WHERE id = ?",
+                (day["stories"]["cf1"],),
+            )
+        # A story nothing references may still be re-versioned.
+        connection.execute(
+            "UPDATE stories SET pipeline_version = 'v9' WHERE id = ?",
+            (day["v2_story"],),
+        )
+
+
+def test_a_populated_theme_set_cannot_change_version_even_with_only_themes(tmp_path):
+    """009 only counted coverage and exclusions, so a theme-only set slipped."""
+
+    repository = migrated(tmp_path)
+    day = populated_theme_set(repository)
+    with repository.connect() as connection:
+        connection.execute(
+            "DELETE FROM theme_other_coverage WHERE theme_set_id = ?", (day["set_id"],)
+        )
+        connection.execute(
+            "DELETE FROM theme_excluded_stories WHERE theme_set_id = ?",
+            (day["set_id"],),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="populated theme set"):
+            connection.execute(
+                "UPDATE theme_sets SET pipeline_version = 'v2' WHERE id = ?",
+                (day["set_id"],),
+            )
+
+
+def test_a_populated_theme_cannot_change_version(tmp_path):
+    repository = migrated(tmp_path)
+    day = populated_theme_set(repository)
+
+    with repository.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="populated theme"):
+            connection.execute(
+                "UPDATE themes SET pipeline_version = 'v2' WHERE id = ?",
+                (day["theme_id"],),
+            )
+
+
+def test_metadata_only_updates_are_still_allowed(tmp_path):
+    repository = migrated(tmp_path)
+    day = populated_theme_set(repository)
+
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE themes SET label = 'Renamed', salience = 0.42 WHERE id = ?",
+            (day["theme_id"],),
+        )
+        connection.execute(
+            "UPDATE theme_sets SET method_reason = 'recomputed' WHERE id = ?",
+            (day["set_id"],),
+        )
+        connection.execute(
+            "UPDATE stories SET canonical_title = 'Retitled' WHERE id = ?",
+            (day["stories"]["cf1"],),
+        )
+
+    stored = repository.theme_set(ticker="NVDA", trading_day=DAY, pipeline_version="v1")
+    assert stored["themes"][0]["label"] == "Renamed"
+    assert stored["method_reason"] == "recomputed"
+
+
+def test_a_whole_ticker_day_version_can_be_rebuilt(tmp_path):
+    repository = migrated(tmp_path)
+    day = cross_version_day(repository)
+
+    report = reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v2",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint="v2-tf1",
+                label="V2 theme",
+                story_ids=(day["v2_story"],),
+                citation_item_ids=(day["items"][0],),
+                salience_rank=1,
+                status="ready",
+                method="hdbscan",
+            )
+        ],
+    )
+
+    assert report.counts["inserted"] == 1
+    # The v1 set is untouched: versions are separate partitions.
+    v1 = repository.theme_set(ticker="NVDA", trading_day=DAY, pipeline_version="v1")
+    assert len(v1["themes"]) == 1
 
 
 def test_valid_theme_set_updates_and_deletion_order_still_work(tmp_path):
@@ -1887,19 +2086,43 @@ CREDENTIAL_PAYLOADS = [
 ]
 
 
+def database_bytes(repository: Phase0Repository) -> bytes:
+    """The database *and* its WAL sidecar.
+
+    WAL mode keeps recent pages out of the main file, so reading only
+    ``phase0.sqlite3`` would make every byte-level assertion below pass
+    vacuously.
+    """
+
+    return b"".join(
+        path.read_bytes()
+        for suffix in ("", "-wal", "-shm")
+        if (
+            path := repository.database_path.with_name(
+                repository.database_path.name + suffix
+            )
+        ).exists()
+    )
+
+
 @pytest.mark.parametrize(
     "label, payload, secret",
     CREDENTIAL_PAYLOADS,
     ids=[row[0] for row in CREDENTIAL_PAYLOADS],
 )
-def test_no_persisted_surface_retains_the_original_credential(
+def test_no_operational_surface_retains_the_original_credential(
     tmp_path, label, payload, secret
 ):
-    """Write the credential into every JSON/text column, then grep the file.
+    """Put the credential through every *operational* surface, then grep.
 
-    Reading the columns back would only prove the accessors are clean; this
-    reads the SQLite file itself, so a credential surviving anywhere in a
-    page — including in a column this test forgot — still fails.
+    The contract is not "no credential byte exists anywhere in the file" —
+    that would be a promise to corrupt publisher evidence, which
+    ``test_raw_provider_evidence_is_preserved_byte_for_byte`` shows Phase 0
+    deliberately does not do.  The contract is: no operational credential
+    supplied through a diagnostic or configuration surface reaches
+    persistence.  Every such surface is exercised here, and then the
+    SQLite files are read as bytes so a column this test forgot still
+    fails it.
     """
 
     repository = migrated(tmp_path)
@@ -1912,8 +2135,6 @@ def test_no_persisted_surface_retains_the_original_credential(
         pipeline_version="v1",
         ticker="NVDA",
     ) as run:
-        run.update_counts({"upstream": payload})
-        run.record_error(payload)
         repository.record_source_state(
             "rss:test",
             run=run,
@@ -1923,13 +2144,27 @@ def test_no_persisted_surface_retains_the_original_credential(
             error=payload,
         )
 
+    # A failing stage: the exception message is the other way operational
+    # text reaches run_log.errors, and it is redacted on the way in.
+    with pytest.raises(RuntimeError):
+        with repository.stage_run(
+            run_id="run-secret-fail",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ):
+            raise RuntimeError(f"upstream rejected {payload}")
+
     reconcile_themes(
         repository,
         ticker="NVDA",
         trading_day=DAY,
         pipeline_version="v1",
         theme_set=theme_set(
-            source_metadata={"feed": payload}, trust_metadata={"upstream": payload}
+            source_metadata={"feed": payload},
+            trust_metadata={"upstream": payload},
+            method_reason=str(payload),
         ),
         themes=[
             ThemeRecord(
@@ -1953,34 +2188,36 @@ def test_no_persisted_surface_retains_the_original_credential(
             story(
                 "cf9",
                 day["items"][:1],
-                provider_conflicts=(
-                    ProviderConflictRecord(
-                        provider_namespace="yahoo",
-                        provider_item_id="1",
-                        item_ids=(payload,),
-                        fields=(payload,),
+                semantic_skip_reason=str(payload),
+                semantic_merges=(
+                    SemanticMergeRecord(
+                        left_story_key="a",
+                        right_story_key="b",
+                        similarity=0.9,
+                        reason=str(payload),
                     ),
                 ),
+                members=(
+                    StoryMemberRecord(
+                        raw_item_id=day["items"][0],
+                        position=0,
+                        outlet="O",
+                        match_reason=str(payload),
+                    ),
+                ),
+                canonical_item_id=day["items"][0],
             )
         ],
     )
 
-    # WAL mode keeps recent pages in the -wal sidecar, so all three files
-    # have to be read or this assertion would pass vacuously.
-    stored = b"".join(
-        path.read_bytes()
-        for suffix in ("", "-wal", "-shm")
-        if (
-            path := repository.database_path.with_name(
-                repository.database_path.name + suffix
-            )
-        ).exists()
-    )
+    stored = database_bytes(repository)
     assert secret.encode() not in stored, f"{label} survived in the database files"
 
     entry = repository.run_log_entries(run_id="run-secret")[0]
     assert secret not in json.dumps(entry["counts"])
     assert secret not in json.dumps(entry["errors"])
+    failed = repository.run_log_entries(run_id="run-secret-fail")[0]
+    assert secret not in json.dumps(failed["errors"])
     state = repository.source_state("rss:test")
     assert secret not in json.dumps(state)
     theme_row = repository.theme_set(
@@ -1989,12 +2226,192 @@ def test_no_persisted_surface_retains_the_original_credential(
     assert secret not in json.dumps(theme_row)
 
 
+#: Scalar columns that carry *identity*.  A credential in one of these is
+#: refused outright, because redacting an identifier silently repoints the
+#: row it names rather than protecting anything.
+IDENTITY_SCALARS = [
+    "provider_namespace",
+    "provider_item_id",
+    "left_story_key",
+    "right_story_key",
+    "model_name",
+    "model_revision",
+    "algorithm_version",
+    "config_fingerprint",
+]
+
+
+@pytest.mark.parametrize(
+    "label, payload, secret",
+    CREDENTIAL_PAYLOADS,
+    ids=[row[0] for row in CREDENTIAL_PAYLOADS],
+)
+@pytest.mark.parametrize("column", IDENTITY_SCALARS)
+def test_identity_scalars_reject_credentials_rather_than_redacting_them(
+    tmp_path, column, label, payload, secret
+):
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+    if not isinstance(payload, str):
+        pytest.skip("identity scalars are text columns")
+
+    overrides: dict = {}
+    if column in {"provider_namespace", "provider_item_id"}:
+        conflict = {
+            "provider_namespace": "yahoo",
+            "provider_item_id": "1",
+            "item_ids": ("1",),
+            "fields": ("title",),
+        }
+        conflict[column] = payload
+        overrides["provider_conflicts"] = (ProviderConflictRecord(**conflict),)
+    elif column in {"left_story_key", "right_story_key"}:
+        merge = {
+            "left_story_key": "a",
+            "right_story_key": "b",
+            "similarity": 0.5,
+            "reason": "near-duplicate",
+        }
+        merge[column] = payload
+        overrides["semantic_merges"] = (SemanticMergeRecord(**merge),)
+    else:
+        overrides[column] = payload
+
+    with pytest.raises(Phase0ValidationError, match="credential material"):
+        reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", item_ids, **overrides)],
+        )
+
+    assert repository.count("stories") == 0
+    assert secret.encode() not in database_bytes(repository)
+
+
+@pytest.mark.parametrize(
+    "label, payload, secret",
+    CREDENTIAL_PAYLOADS,
+    ids=[row[0] for row in CREDENTIAL_PAYLOADS],
+)
+def test_embedding_identity_scalars_reject_credentials(
+    tmp_path, label, payload, secret
+):
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+    if not isinstance(payload, str):
+        pytest.skip("identity scalars are text columns")
+    vector = np.ones(4, dtype=EMBEDDING_DTYPE)
+
+    for field in ("model_name", "model_revision"):
+        values = {
+            "source_kind": "raw_item",
+            "source_id": str(item_ids[0]),
+            "model_name": "fake",
+            "model_revision": "r1",
+            "dimension": 4,
+            "dtype": str(EMBEDDING_DTYPE),
+            "input_fingerprint": "a" * 64,
+            "vector_blob": serialize_vector(vector),
+        }
+        values[field] = payload
+        with pytest.raises(Phase0ValidationError, match="credential material"):
+            repository.upsert_embedding(PersistedEmbedding(**values))
+
+    assert repository.count("embeddings") == 0
+    assert secret.encode() not in database_bytes(repository)
+
+
+# ----------------------------------------------------------------------
+# Raw provider evidence is preserved; operational metadata is not
+# ----------------------------------------------------------------------
+
+
+def test_raw_provider_evidence_is_preserved_byte_for_byte(tmp_path):
+    """A publisher's payload is evidence, not a leak.
+
+    AC-8 replay is only worth something if ``raw_json`` is what the feed
+    actually sent.  A string in publisher content that happens to look
+    like a credential stays put — rewriting it would corrupt the evidence
+    *and* hide the real bug, which is a fetcher that put a transport
+    credential into the payload. That is I2/I3's boundary to enforce, not
+    something I1 papers over after the fact.
+    """
+
+    repository = migrated(tmp_path)
+    payload = {
+        "headline": "Leaked API key api_key=SEKRET123 found in vendor repo",
+        "body": "The commit contained Authorization: Bearer abc123XYZ verbatim.",
+        "nested": {"quote": "password: hunter2secret"},
+    }
+    item = raw_item(1)
+    item["raw_json"] = payload
+
+    item_id = repository.admin.insert_raw_item(item).item_id
+
+    stored = repository.raw_items_for_day(DAY)[0]
+    assert json.loads(stored["raw_json"]) == payload
+    assert b"SEKRET123" in database_bytes(repository)
+    assert repository.raw_item_tickers(item_id) == ["NVDA"]
+
+
+def test_the_same_string_is_evidence_in_raw_json_and_a_secret_in_metadata(tmp_path):
+    """One string, two columns, two outcomes — that is the whole boundary."""
+
+    repository = migrated(tmp_path)
+    secret_text = "Authorization: Bearer abc123XYZ"
+    item = raw_item(1)
+    item["raw_json"] = {"body": secret_text}
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items(
+            [item],
+            run=run,
+            source_state={
+                "source": "rss:test",
+                "etag": None,
+                "last_modified": None,
+                "checked_at": f"{DAY}T12:00:00+00:00",
+                "successful": True,
+                "metadata": {"request_header": secret_text},
+            },
+        )
+
+    stored = repository.raw_items_for_day(DAY)[0]
+    assert json.loads(stored["raw_json"])["body"] == secret_text
+    state = repository.source_state("rss:test")
+    assert "abc123XYZ" not in json.dumps(state["metadata"])
+
+
+def test_the_two_serializers_state_their_policy_in_their_names(tmp_path):
+    payload = {"header": "Authorization: Bearer abc123XYZ"}
+
+    evidence = serialize_raw_evidence(payload, "raw_json")
+    operational = serialize_operational_metadata(payload, "metadata", dict)
+
+    assert json.loads(evidence) == payload
+    assert "abc123XYZ" not in operational
+    # No boolean anywhere: the policy is the function you call.
+    for serializer in (serialize_raw_evidence, serialize_operational_metadata):
+        parameters = inspect.signature(serializer).parameters
+        assert not any(
+            isinstance(p.default, bool) for p in parameters.values()
+        ), f"{serializer.__name__} takes a policy flag"
+
+
 # ----------------------------------------------------------------------
 # Run logs and source state
 # ----------------------------------------------------------------------
 
 
-def test_stage_run_logs_success_and_counts(tmp_path):
+def test_stage_run_logs_counts_derived_from_the_operations(tmp_path):
     repository = migrated(tmp_path)
 
     with repository.stage_run(
@@ -2003,17 +2420,88 @@ def test_stage_run_logs_success_and_counts(tmp_path):
         trading_day=DAY,
         pipeline_version="v1",
         ticker="NVDA",
-    ) as recorder:
-        recorder.record_success(3)
-        recorder.record_partial(1)
-        recorder.update_counts({"inserted": 3})
+    ) as run:
+        repository.ingest_raw_items([raw_item(1), raw_item(2)], run=run)
+        # The second batch re-sends one item, so it lands as partial.
+        repository.ingest_raw_items([raw_item(2), raw_item(3)], run=run)
 
     entry = repository.run_log_entries(run_id="run-1")[0]
     assert entry["status"] == "degraded"
     assert entry["success_count"] == 3
     assert entry["partial_count"] == 1
-    assert entry["counts"] == {"inserted": 3}
+    assert entry["counts"] == {"raw_items_seen": 4, "raw_items_inserted": 3}
     assert entry["ticker"] == "NVDA"
+
+
+COUNT_MUTATORS = [
+    "record_success",
+    "record_partial",
+    "record_failure",
+    "record_error",
+    "update_counts",
+    "resolved_status",
+]
+
+
+@pytest.mark.parametrize("name", COUNT_MUTATORS)
+def test_a_caller_has_no_way_to_write_run_counts(tmp_path, name):
+    """Counts describe what an operation did, so only operations write them."""
+
+    repository = migrated(tmp_path)
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="fetch",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        assert not hasattr(run, name), f"{name} is still caller-reachable"
+
+
+def test_counts_read_from_a_context_are_a_copy(tmp_path):
+    repository = migrated(tmp_path)
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="fetch",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run)
+        run.counts["raw_items_inserted"] = 9_999
+        run.counts["injected"] = "Authorization: Bearer abc123XYZ"
+        run.errors.append("injected error")
+
+    entry = repository.run_log_entries(run_id="run-1")[0]
+    assert entry["counts"] == {"raw_items_seen": 1, "raw_items_inserted": 1}
+    assert entry["errors"] == []
+    assert entry["status"] == "success"
+
+
+def test_a_caller_cannot_pre_seed_counts_through_the_context(tmp_path):
+    repository = migrated(tmp_path)
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="fetch",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        # Read-only after construction, private counters included, and
+        # __slots__ refuses new attributes outright.
+        for attribute in ("_success_count", "counts", "_counts", "anything"):
+            with pytest.raises((AttributeError, Phase0Error)):
+                setattr(run, attribute, 5)
+            with pytest.raises((AttributeError, Phase0Error)):
+                delattr(run, attribute)
+        repository.ingest_raw_items([raw_item(1)], run=run)
+
+    entry = repository.run_log_entries(run_id="run-1")[0]
+    assert entry["success_count"] == 1
+    assert entry["counts"] == {"raw_items_seen": 1, "raw_items_inserted": 1}
 
 
 def test_stage_run_logs_even_when_the_stage_raises(tmp_path):
@@ -2061,41 +2549,130 @@ LOGGED_ENTRYPOINTS = [
 ]
 
 
-def test_no_unlogged_batch_writer_is_reachable_from_the_public_surface(tmp_path):
-    """The blocker in one assertion: no public mutation writes without a run.
+#: Public methods that write but legitimately cannot take a run, each with
+#: the reason.  The audit below forces every future public writer into
+#: either this table or the logged contract — nothing gets to be neither.
+UNLOGGED_BY_DESIGN = {
+    "migrate": "schema DDL; runs before any run can exist",
+    "stage_run": "the run factory itself; it writes the run log",
+    "claim_stage_key": "claims the lease a run is later opened against",
+    "heartbeat_stage_key": "extends the lease of an in-flight run",
+    "complete_stage_key": "releases a lease after its run has ended",
+    "recover_expired_leases": "operator/crash sweep; by definition has no run",
+    "upsert_embedding": (
+        "nlp.embeddings.EmbeddingRepository protocol; a single recomputable "
+        "cache vector, whose identity scalars are validated. The logged "
+        "stage entrypoint is persist_embeddings"
+    ),
+    "delete_embedding": "drops one recomputable cache vector; changes nothing else",
+}
 
-    Every public method that mutates pipeline data must take ``run``.  The
-    unlogged helpers still exist for fixtures and backfills, but only
-    behind ``repository.admin``, which is impossible to call by accident.
+#: A write verb *in SQL position*, so a docstring that merely says "update"
+#: does not read as a mutation.
+_WRITE_SQL = re.compile(
+    r"\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE\s+\w+\s+SET"
+    r"|DELETE\s+FROM|CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)"
+    r"|DROP\s+(?:TABLE|INDEX|TRIGGER|VIEW)|ALTER\s+TABLE)\b",
+    re.IGNORECASE,
+)
+
+
+def _method_writes(name: str, seen: set[str] | None = None) -> bool:
+    """True when a method issues write SQL, directly or through a helper.
+
+    Follows ``self.<helper>(`` one level at a time until the closure is
+    exhausted, so a public method that only *delegates* its writes is still
+    caught.
     """
 
-    mutating = {
-        "ingest_raw_items",
+    seen = seen if seen is not None else set()
+    if name in seen:
+        return False
+    seen.add(name)
+    member = getattr(Phase0Repository, name, None)
+    if member is None or not callable(member):
+        return False
+    try:
+        source = inspect.getsource(member)
+    except (OSError, TypeError) as exc:  # pragma: no cover - defensive
+        # Never treat "could not read it" as "does not write": that is how
+        # an audit like this quietly stops auditing anything.
+        raise AssertionError(
+            f"cannot read the source of {name}; the write audit cannot "
+            f"classify it ({exc})"
+        ) from exc
+    body = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#")
+    )
+    if _WRITE_SQL.search(body):
+        return True
+    return any(
+        _method_writes(callee, seen)
+        for callee in set(re.findall(r"self\.(\w+)\(", body))
+    )
+
+
+def test_every_public_writer_is_either_logged_or_declared_a_lease_operation():
+    """Enumerate the whole public surface, not a subset anyone curated.
+
+    A new public method that writes has to end up in one of three places:
+    it takes ``run``, it is named in :data:`LEASE_OPERATIONS` with a
+    reason, or it is not public.  Nothing is allowed to be none of those.
+    """
+
+    public = [
+        name
+        for name, member in inspect.getmembers(Phase0Repository, inspect.isfunction)
+        if not name.startswith("_") and name not in {"connect"}
+    ]
+    assert public, "reflection found no public methods; the audit is broken"
+
+    unclassified = []
+    for name in public:
+        if not _method_writes(name):
+            continue
+        parameters = inspect.signature(getattr(Phase0Repository, name)).parameters
+        if "run" in parameters:
+            continue
+        if name in UNLOGGED_BY_DESIGN:
+            assert UNLOGGED_BY_DESIGN[name].strip(), f"{name} needs a stated reason"
+            continue
+        unclassified.append(name)
+
+    assert not unclassified, (
+        "these public methods mutate without a run and are not declared in "
+        f"UNLOGGED_BY_DESIGN: {sorted(unclassified)}"
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
         "insert_raw_item",
         "insert_raw_items",
-        "reconcile_stories",
-        "reconcile_themes",
-        "persist_embeddings",
-        "record_source_state",
         "set_source_state",
-    }
-    public = {
-        name
-        for name, _ in inspect.getmembers(Phase0Repository, inspect.isfunction)
-        if not name.startswith("_")
-    }
+        "insert_story",
+        "insert_theme",
+        "insert_eval_label",
+        "update_raw_item_ticker",
+        "clear_derived_for_day",
+        "log_stage",
+    ],
+)
+def test_unlogged_writers_live_only_behind_admin(tmp_path, name):
+    repository = Phase0Repository(tmp_path / "phase0.sqlite3")
 
-    for name in mutating & public:
-        parameters = inspect.signature(getattr(Phase0Repository, name)).parameters
-        assert "run" in parameters, f"{name} mutates pipeline data without a run"
+    assert not hasattr(repository, name), f"{name} is still a public repository method"
+    assert hasattr(repository.admin, name), f"{name} is missing from admin"
 
-    # And the unlogged names are genuinely gone from the repository itself.
-    assert not {"insert_raw_item", "insert_raw_items", "set_source_state"} & public
-    admin = Phase0Repository(tmp_path / "phase0.sqlite3").admin
-    assert all(
-        hasattr(admin, name)
-        for name in ("insert_raw_item", "insert_raw_items", "set_source_state")
-    )
+
+def test_admin_documents_that_the_pipeline_must_not_use_it():
+    doc = (Phase0Admin.__doc__ or "").lower()
+
+    assert "not the pipeline" in doc
+    assert "must never use it" in doc
+    for entrypoint in LOGGED_ENTRYPOINTS:
+        assert entrypoint in doc, f"admin docs should point at {entrypoint}"
 
 
 @pytest.mark.parametrize("name", LOGGED_ENTRYPOINTS)
@@ -2129,7 +2706,7 @@ def test_a_completed_run_handle_is_rejected(tmp_path):
     ) as run:
         pass
 
-    with pytest.raises(Phase0RunContextError, match="already completed"):
+    with pytest.raises(Phase0RunContextError, match="no longer active"):
         repository.ingest_raw_items([raw_item(1)], run=run)
 
     assert repository.count("raw_items") == 0
@@ -2173,6 +2750,421 @@ def test_a_run_covering_a_different_partition_is_rejected(tmp_path):
             )
 
     assert repository.count("stories") == 0
+
+
+# ----------------------------------------------------------------------
+# A run capability cannot be forged
+# ----------------------------------------------------------------------
+
+
+def open_run(repository: Phase0Repository, **overrides):
+    defaults = {
+        "run_id": "run-1",
+        "stage": "ingest",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "ticker": "NVDA",
+    }
+    defaults.update(overrides)
+    return repository.stage_run(**defaults)
+
+
+def test_a_context_cannot_be_constructed_directly(tmp_path):
+    repository = migrated(tmp_path)
+
+    with pytest.raises(Phase0RunContextError, match="cannot be constructed directly"):
+        StageRunContext(
+            repository=repository,
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            attempt=1,
+            replay=False,
+            stage_key=None,
+        )
+    # Nor by guessing at a positional key.
+    for guess in (None, object(), repository, "key", 0):
+        with pytest.raises(Phase0RunContextError):
+            StageRunContext(guess)
+
+
+def test_a_bare_shell_authorizes_nothing(tmp_path):
+    """``object.__new__`` skips ``__init__``, so it skips the key check too.
+
+    Identity registration is what stops it: the shell was never registered,
+    so it is not a live run no matter what is written into its slots.
+    """
+
+    repository = migrated(tmp_path)
+    shell = object.__new__(StageRunContext)
+
+    with pytest.raises(Phase0RunContextError):
+        repository.ingest_raw_items([raw_item(1)], run=shell)
+    assert repository.count("raw_items") == 0
+
+
+def test_a_forged_look_alike_with_matching_fields_authorizes_nothing(tmp_path):
+    """Knowing the repository, run id, stage, and partition is not enough."""
+
+    repository = migrated(tmp_path)
+
+    class ForgedContext:
+        repository = None
+        run_id = "run-1"
+        stage = "ingest"
+        trading_day = DAY
+        pipeline_version = "v1"
+        ticker = "NVDA"
+        attempt = 1
+        replay = False
+        stage_key = None
+        closed = False
+        active = True
+        counts: dict = {}
+        errors: list = []
+        success_count = 0
+        partial_count = 0
+        failure_count = 0
+
+    forged = ForgedContext()
+    forged.repository = repository
+
+    with pytest.raises(Phase0RunContextError, match="requires an active stage run"):
+        repository.ingest_raw_items([raw_item(1)], run=forged)
+
+    # Even a real context's fields, copied onto a shell of the right class.
+    with open_run(repository) as real:
+        impostor = object.__new__(StageRunContext)
+        for slot in StageRunContext.__slots__:
+            object.__setattr__(impostor, slot, getattr(real, slot))
+        with pytest.raises(Phase0RunContextError):
+            repository.ingest_raw_items([raw_item(1)], run=impostor)
+
+    assert repository.count("raw_items") == 0
+
+
+@pytest.mark.parametrize("clone", ["copy", "deepcopy", "pickle", "replace"])
+def test_a_copied_or_serialized_context_is_refused(tmp_path, clone):
+    repository = migrated(tmp_path)
+
+    with open_run(repository) as run:
+        if clone == "copy":
+            with pytest.raises(Phase0RunContextError, match="cannot be copied"):
+                copy.copy(run)
+        elif clone == "deepcopy":
+            with pytest.raises(Phase0RunContextError, match="cannot be copied"):
+                copy.deepcopy(run)
+        elif clone == "pickle":
+            with pytest.raises(Phase0RunContextError, match="cannot be copied"):
+                pickle.dumps(run)
+        else:
+            # Not a dataclass, so dataclasses.replace cannot even try — and
+            # the direct-construction guard is what it would hit if it did.
+            with pytest.raises((TypeError, Phase0RunContextError)):
+                dataclasses.replace(run)
+
+    assert repository.count("raw_items") == 0
+
+
+def test_the_capability_is_not_visible_in_repr_or_public_fields(tmp_path):
+    repository = migrated(tmp_path)
+
+    with open_run(repository) as run:
+        text = repr(run)
+        assert "run-1" in text and "NVDA" in text
+        # The capability is object identity plus a module-private key;
+        # neither is a field, so there is nothing here to lift.
+        public = [name for name in dir(run) if not name.startswith("_")]
+        assert "token" not in " ".join(public)
+        assert "capability" not in " ".join(public)
+        assert "key" not in " ".join(name for name in public if name != "stage_key")
+
+
+def test_a_context_is_dead_after_its_block_exits(tmp_path):
+    repository = migrated(tmp_path)
+
+    with open_run(repository) as run:
+        assert run.active
+    assert not run.active and run.closed
+
+    with pytest.raises(Phase0RunContextError, match="no longer active"):
+        repository.ingest_raw_items([raw_item(1)], run=run)
+    assert repository.count("raw_items") == 0
+
+
+def test_a_context_is_dead_after_its_run_failed(tmp_path):
+    repository = migrated(tmp_path)
+    escaped = {}
+
+    with pytest.raises(RuntimeError):
+        with open_run(repository) as run:
+            escaped["run"] = run
+            raise RuntimeError("stage blew up")
+
+    with pytest.raises(Phase0RunContextError, match="no longer active"):
+        repository.ingest_raw_items([raw_item(1)], run=escaped["run"])
+    assert repository.count("raw_items") == 0
+
+
+def test_a_context_from_a_second_repository_on_the_same_file_is_refused(tmp_path):
+    """Same database, different instance: the registry is per-instance."""
+
+    repository = migrated(tmp_path)
+    twin = Phase0Repository(repository.database_path)
+
+    with twin.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as foreign:
+        with pytest.raises(Phase0RunContextError, match="another repository"):
+            repository.ingest_raw_items([raw_item(1)], run=foreign)
+
+    assert repository.count("raw_items") == 0
+
+
+# ----------------------------------------------------------------------
+# Stage-key ownership is transactional, and its partition must match
+# ----------------------------------------------------------------------
+
+
+STAGE_KEY_FIELDS = ["stage", "ticker", "trading_day", "pipeline_version"]
+
+
+@pytest.mark.parametrize("field", STAGE_KEY_FIELDS)
+def test_a_stage_key_from_another_partition_cannot_open_a_run(tmp_path, field):
+    """An AMD stage key must not authorize an NVDA run — nor any other axis."""
+
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    mismatched = dict(key)
+    mismatched[field] = {
+        "stage": "cluster",
+        "ticker": "AMD",
+        "trading_day": "2026-07-24",
+        "pipeline_version": "v2",
+    }[field]
+    assert repository.claim_stage_key(**mismatched, run_id="run-1")
+
+    with pytest.raises(Phase0RunContextError, match=f"stage key covers {field}"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage=key["stage"],
+            trading_day=key["trading_day"],
+            pipeline_version=key["pipeline_version"],
+            ticker=key["ticker"],
+            stage_key=mismatched,
+        ):
+            pass
+
+    assert repository.run_log_entries() == []
+
+
+def test_a_stage_key_owned_by_another_run_id_is_refused(tmp_path):
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    assert repository.claim_stage_key(**key, run_id="run-owner")
+
+    with repository.stage_run(
+        run_id="run-impostor",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        with pytest.raises(StageKeyError, match="owned by another run"):
+            repository.ingest_raw_items([raw_item(1)], run=run)
+
+    assert repository.count("raw_items") == 0
+    assert repository.stage_key_state(**key)["run_id"] == "run-owner"
+
+
+def test_a_lease_cannot_be_reclaimed_between_validation_and_commit(tmp_path):
+    """The TOCTOU probe: A validates, the lease expires, B tries to reclaim.
+
+    A holds the write lock from before it validates until after it
+    commits, so B blocks rather than stealing the key mid-transaction.  The
+    assertion that matters is the last one: the data and the stage key
+    cannot end up telling different stories.
+    """
+
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    # A one-second lease, so wall-clock expiry passes while A is paused.
+    assert repository.claim_stage_key(**key, run_id="run-A", lease_seconds=1)
+
+    validated = threading.Event()
+    b_finished = threading.Event()
+    outcome: dict = {}
+
+    original = Phase0Repository._assert_lease_held
+
+    def paused_lease_check(self, connection, run, *, operation):
+        """Pause in the exact window the old TOCTOU bug lived in.
+
+        This is *immediately after* ownership and expiry are checked and
+        before the mutation runs.  Under the old design the check happened
+        on a separate connection before the write transaction opened, so
+        this window was unlocked and B could reclaim the key while A went
+        on to commit anyway.  Now the check reads through ``connection``,
+        which already holds the write lock, so the window is sealed.
+        """
+
+        original(self, connection, run, operation=operation)
+        if not validated.is_set():
+            validated.set()
+            # Wall-clock expiry of A's one-second lease passes here, and B
+            # makes its entire attempt inside this window.
+            time.sleep(1.5)
+            b_finished.wait(timeout=10)
+
+    class ImpatientRepository(Phase0Repository):
+        """B, with a short busy timeout.
+
+        Without this B would simply *wait* for A's write lock and the test
+        would only prove SQLite blocks. With it, B fails fast, which is the
+        sharper statement: during A's transaction the key was not
+        acquirable at all.
+        """
+
+        def _open_connection(self):
+            connection = super()._open_connection()
+            connection.execute("PRAGMA busy_timeout = 250")
+            return connection
+
+    def writer_a():
+        try:
+            with repository.stage_run(
+                run_id="run-A",
+                stage="ingest",
+                trading_day=DAY,
+                pipeline_version="v1",
+                ticker="NVDA",
+                stage_key=key,
+            ) as run:
+                repository.ingest_raw_items([raw_item(1)], run=run)
+            outcome["a"] = "committed"
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assert
+            outcome["a"] = f"{type(exc).__name__}: {exc}"
+
+    def reclaimer_b():
+        validated.wait(timeout=10)
+        time.sleep(1.1)  # A's lease is now genuinely expired.
+        reclaimer = ImpatientRepository(repository.database_path)
+        started = time.monotonic()
+        try:
+            outcome["b_claimed"] = reclaimer.claim_stage_key(
+                **key, run_id="run-B", lease_seconds=60
+            )
+        except sqlite3.OperationalError as exc:
+            outcome["b_claimed"] = f"blocked: {exc}"
+        outcome["b_elapsed"] = time.monotonic() - started
+        outcome["b_owner_during"] = reclaimer.stage_key_state(**key)["run_id"]
+        b_finished.set()
+
+    with mock.patch.object(Phase0Repository, "_assert_lease_held", paused_lease_check):
+        threads = [
+            threading.Thread(target=writer_a),
+            threading.Thread(target=reclaimer_b),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(thread.is_alive() for thread in threads), "deadlock"
+
+    # B tried after the lease had expired and still could not take the key,
+    # because A held the write lock across validation and mutation.
+    assert outcome["b_claimed"] != True  # noqa: E712 - False or "blocked: ..."
+    assert outcome["b_owner_during"] == "run-A"
+
+    # A finished under the lock it validated against.
+    assert outcome["a"] == "committed"
+    state = repository.stage_key_state(**key)
+    assert state["run_id"] == "run-A"
+    assert state["status"] == "success"
+
+    # The invariant the whole design exists for: the data and the stage
+    # key cannot end up telling different stories.
+    assert repository.count("raw_items") == 1
+    entry = repository.run_log_entries(run_id="run-A")[0]
+    assert entry["status"] == "success"
+    assert entry["success_count"] == 1
+
+
+def test_a_run_that_ends_marks_its_stage_key_in_the_same_transaction(tmp_path):
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run)
+
+    state = repository.stage_key_state(**key)
+    assert state["status"] == "success"
+    assert state["lease_expires_at"] is None
+    assert state["completed_at"] is not None
+
+
+def test_a_failed_run_does_not_mark_its_stage_key_successful(tmp_path):
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with pytest.raises(RuntimeError):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            repository.ingest_raw_items([raw_item(1)], run=run)
+            raise RuntimeError("stage failed after writing")
+
+    state = repository.stage_key_state(**key)
+    assert state["status"] == "failed"
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+    # The key is reclaimable again, and the retry is deterministic.
+    assert repository.claim_stage_key(**key, run_id="run-2")
 
 
 def test_an_expired_stage_lease_rejects_the_mutation(tmp_path):
@@ -2244,7 +3236,6 @@ def test_a_failed_mutation_rolls_back_data_and_keeps_a_redacted_failed_log(tmp_p
             pipeline_version="v1",
             ticker="NVDA",
         ) as run:
-            run.record_error("upstream said Authorization: Bearer abc123XYZ")
             repository.reconcile_stories(
                 run=run,
                 ticker="NVDA",
@@ -2288,18 +3279,191 @@ def test_counts_cannot_carry_a_credential_into_the_run_log(tmp_path):
         pipeline_version="v1",
         ticker="NVDA",
     ) as run:
-        run.update_counts(
-            {
+        # Counts are derived, so the only operational text a caller can
+        # steer into the run log is what an operation itself reports.
+        repository.record_source_state(
+            "rss:test",
+            run=run,
+            successful=False,
+            status="failed",
+            metadata={
                 "upstream": "Authorization: Basic dXNlcjpwYXNz",
                 "retry_url": "https://api.test/v1?api_key=SEKRET123",
                 "headers": [{"x-api-key": "SEKRET123"}],
-            }
+            },
+            error="x-api-key: SEKRET123",
         )
         repository.ingest_raw_items([raw_item(1)], run=run)
 
     stored = json.dumps(repository.run_log_entries(run_id="run-counts")[0])
     assert "dXNlcjpwYXNz" not in stored
     assert "SEKRET123" not in stored
+    assert "SEKRET123".encode() not in database_bytes(repository)
+
+
+def sample_embedding(source_id: str, **overrides) -> PersistedEmbedding:
+    values = {
+        "source_kind": "raw_item",
+        "source_id": str(source_id),
+        "model_name": "fake",
+        "model_revision": "r1",
+        "dimension": 4,
+        "dtype": str(EMBEDDING_DTYPE),
+        "input_fingerprint": "a" * 64,
+        "vector_blob": serialize_vector(np.ones(4, dtype=EMBEDDING_DTYPE)),
+    }
+    values.update(overrides)
+    return PersistedEmbedding(**values)
+
+
+def _entrypoint_cases(repository: Phase0Repository) -> dict:
+    """For each logged entrypoint: a good batch, and one poisoned mid-way.
+
+    The poison always sits *after* at least one valid element, so a
+    non-atomic implementation would leave the earlier work committed.
+    """
+
+    item_ids = seed_raw_items(repository, 2)
+    return {
+        "ingest_raw_items": (
+            lambda run: repository.ingest_raw_items(
+                [raw_item(10), {"source": "", "canonical_url": ""}], run=run
+            ),
+            ("raw_items", 2),
+        ),
+        "reconcile_stories": (
+            lambda run: repository.reconcile_stories(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                stories=[story("cf1", item_ids), story("cf2", [999_999])],
+            ),
+            ("stories", 0),
+        ),
+        "persist_embeddings": (
+            lambda run: repository.persist_embeddings(
+                [
+                    sample_embedding(item_ids[0]),
+                    sample_embedding("999999"),
+                ],
+                run=run,
+            ),
+            ("embeddings", 0),
+        ),
+        "record_source_state": (
+            lambda run: repository.record_source_state(
+                "rss:test", run=run, successful=True, status="not-a-status"
+            ),
+            ("raw_items", 2),
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        "ingest_raw_items",
+        "reconcile_stories",
+        "persist_embeddings",
+        "record_source_state",
+    ],
+)
+def test_a_failed_entrypoint_rolls_back_and_records_an_authoritative_failure(
+    tmp_path, entrypoint
+):
+    repository = migrated(tmp_path)
+    call, (table, expected) = _entrypoint_cases(repository)[entrypoint]
+
+    with pytest.raises(Exception):
+        with repository.stage_run(
+            run_id="run-fail",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            call(run)
+
+    assert repository.count(table) == expected, f"{entrypoint} left partial data"
+    entry = repository.run_log_entries(run_id="run-fail")[0]
+    assert entry["status"] == "failed"
+    assert entry["failure_count"] >= 1
+    assert "Bearer" not in json.dumps(entry["errors"])
+
+
+def test_a_failed_theme_reconciliation_leaves_no_partial_membership(tmp_path):
+    repository = migrated(tmp_path)
+    day = build_day(repository)
+
+    with pytest.raises(Exception):
+        with repository.stage_run(
+            run_id="run-fail",
+            stage="m5.themes",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.reconcile_themes(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                theme_set=theme_set(),
+                themes=[
+                    ThemeRecord(
+                        fingerprint="tf1",
+                        label="Good",
+                        story_ids=(day["stories"]["cf1"],),
+                        citation_item_ids=(day["items"][0],),
+                        salience_rank=1,
+                        status="ready",
+                        method="hdbscan",
+                    ),
+                    ThemeRecord(
+                        fingerprint="tf2",
+                        label="Bad",
+                        story_ids=(day["stories"]["cf2"],),
+                        # Cites a raw item that is not in its member story.
+                        citation_item_ids=(day["items"][3],),
+                        salience_rank=2,
+                        status="ready",
+                        method="hdbscan",
+                    ),
+                ],
+            )
+
+    assert repository.count("themes") == 0
+    assert repository.count("theme_stories") == 0
+    assert repository.count("theme_citations") == 0
+    assert repository.count("theme_sets") == 0
+    assert repository.run_log_entries(run_id="run-fail")[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["ingest_raw_items", "reconcile_stories", "persist_embeddings"],
+)
+def test_a_retry_after_a_failure_is_deterministic(tmp_path, entrypoint):
+    """The same failure twice, then a clean run: no residue in between."""
+
+    repository = migrated(tmp_path)
+    for attempt in (1, 2):
+        call, (table, expected) = _entrypoint_cases(repository)[entrypoint]
+        with pytest.raises(Exception):
+            with repository.stage_run(
+                run_id=f"run-{attempt}",
+                stage="ingest",
+                trading_day=DAY,
+                pipeline_version="v1",
+                ticker="NVDA",
+                attempt=attempt,
+            ) as run:
+                call(run)
+        assert repository.count(table) == expected
+
+    assert len(repository.run_log_entries()) == 2
+    assert all(entry["status"] == "failed" for entry in repository.run_log_entries())
 
 
 def test_embedding_batches_and_source_state_carry_their_run(tmp_path):
@@ -2389,7 +3553,7 @@ def test_run_log_serialization_is_deterministic(tmp_path):
     payload = {"b": 1, "a": {"d": 2, "c": 3}}
 
     for run_id in ("run-a", "run-b"):
-        repository.log_stage(
+        repository.admin.log_stage(
             run_id=run_id,
             stage="fetch",
             counts=payload,
@@ -2435,3 +3599,25 @@ def test_count_refuses_arbitrary_table_names(tmp_path):
 def test_unsupported_ticker_error_is_a_value_error():
     assert issubclass(UnsupportedTickerError, ValueError)
     assert issubclass(Phase0ValidationError, ValueError)
+
+
+@pytest.mark.parametrize("version", PRIOR_VERSIONS)
+def test_cross_version_theme_membership_is_refused_after_any_upgrade(tmp_path, version):
+    """Migration 010's guarantee has to survive every upgrade path, not
+    only a fresh database."""
+
+    directory = partial_migrations(tmp_path, version)
+    seeded = Phase0Repository(tmp_path / "phase0.sqlite3", migrations_path=directory)
+    seeded.migrate()
+
+    upgraded = Phase0Repository(tmp_path / "phase0.sqlite3")
+    upgraded.migrate()
+    assert upgraded.schema_version() == LATEST_VERSION
+
+    day = cross_version_day(upgraded)
+    with upgraded.connect() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
+            connection.execute(
+                "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
+                (day["theme_id"], day["v2_story"]),
+            )

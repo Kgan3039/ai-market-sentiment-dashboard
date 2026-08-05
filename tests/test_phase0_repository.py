@@ -120,7 +120,7 @@ def test_concurrent_duplicate_inserts_remain_idempotent(tmp_path):
 def test_stage_status_decodes_structured_fields(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    repository.log_stage(
+    repository.admin.log_stage(
         run_id="run-1",
         stage="fetch_yahoo",
         counts={"inserted": 2},
@@ -282,7 +282,7 @@ def test_replay_cleanup_removes_stage_keys_but_keeps_raw_evidence(tmp_path):
         run_id="run-1",
     )
 
-    repository.clear_derived_for_day("2026-07-23")
+    repository.admin.clear_derived_for_day("2026-07-23")
 
     assert repository.count("raw_items") == 1
     assert repository.count("pipeline_stage_keys") == 0
@@ -329,14 +329,14 @@ def test_story_theme_and_label_references_are_foreign_key_enforced(tmp_path):
     second_item = sample_item("https://example.com/second")
     second_item["canonical_url"] = "https://example.com/second"
     second = repository.admin.insert_raw_item(second_item).item_id
-    story_id = repository.insert_story(
+    story_id = repository.admin.insert_story(
         ticker="NVDA",
         trading_day="2026-07-23",
         canonical_title="NVIDIA story",
         member_ids=[first, second],
         outlet_count=2,
     )
-    theme_id = repository.insert_theme(
+    theme_id = repository.admin.insert_theme(
         ticker="NVDA",
         trading_day="2026-07-23",
         label="Product coverage",
@@ -347,7 +347,7 @@ def test_story_theme_and_label_references_are_foreign_key_enforced(tmp_path):
         content_hash="hash-1",
         pipeline_version="v1",
     )
-    label_id = repository.insert_eval_label(
+    label_id = repository.admin.insert_eval_label(
         label_type="dedup",
         item_a_id=first,
         item_b_id=second,
@@ -375,7 +375,7 @@ def test_invalid_relationships_roll_back_parent_rows(tmp_path):
     repository.migrate()
 
     with pytest.raises(sqlite3.IntegrityError):
-        repository.insert_story(
+        repository.admin.insert_story(
             ticker="NVDA",
             trading_day="2026-07-23",
             canonical_title="Missing member",
@@ -387,14 +387,14 @@ def test_invalid_relationships_roll_back_parent_rows(tmp_path):
     second_item = sample_item("https://example.com/second")
     second_item["canonical_url"] = "https://example.com/second"
     second = repository.admin.insert_raw_item(second_item).item_id
-    story_id = repository.insert_story(
+    story_id = repository.admin.insert_story(
         ticker="NVDA",
         trading_day="2026-07-23",
         canonical_title="NVIDIA story",
         member_ids=[first],
     )
     with pytest.raises(ValueError, match="citations"):
-        repository.insert_theme(
+        repository.admin.insert_theme(
             ticker="NVDA",
             trading_day="2026-07-23",
             label="Invalid citation",
@@ -415,13 +415,13 @@ def test_database_rejects_citation_outside_theme_member_stories(tmp_path):
     other_item = sample_item("https://example.com/other")
     other_item["canonical_url"] = "https://example.com/other"
     non_member = repository.admin.insert_raw_item(other_item).item_id
-    story_id = repository.insert_story(
+    story_id = repository.admin.insert_story(
         ticker="NVDA",
         trading_day="2026-07-23",
         canonical_title="Member story",
         member_ids=[member],
     )
-    theme_id = repository.insert_theme(
+    theme_id = repository.admin.insert_theme(
         ticker="NVDA",
         trading_day="2026-07-23",
         label="Coverage",
@@ -511,7 +511,7 @@ def test_invalid_raw_json_timestamp_and_status_are_rejected(tmp_path):
         repository.admin.insert_raw_item(invalid_time)
 
     with pytest.raises(ValueError, match="run status"):
-        repository.log_stage(
+        repository.admin.log_stage(
             run_id="run",
             stage="fetch",
             counts={},
@@ -525,7 +525,7 @@ def test_invalid_raw_json_timestamp_and_status_are_rejected(tmp_path):
         )
 
     with pytest.raises(ValueError, match="negative"):
-        repository.log_stage(
+        repository.admin.log_stage(
             run_id="run",
             stage="fetch",
             counts={},
@@ -612,7 +612,7 @@ def test_invalid_raw_evidence_is_preserved_without_required_display_fields(tmp_p
 def test_secret_bearing_error_fields_are_redacted(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    repository.log_stage(
+    repository.admin.log_stage(
         run_id="run",
         stage="fetch",
         counts={},

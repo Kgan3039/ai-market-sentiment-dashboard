@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -67,6 +68,11 @@ from .models import (
     ThemeSetRecord,
 )
 from .redaction import SECRET_KEY_PATTERN, redact_secrets, redact_text
+from .scalars import (
+    require_safe_identifier_scalar,
+    sanitize_diagnostic_scalar,
+    validate_safe_identifier_scalar,
+)
 from .schema import apply_migrations, load_migrations, split_statements
 from .tickers import SUPPORTED_TICKERS, TICKER_UNIVERSE, normalize_ticker
 
@@ -207,17 +213,7 @@ def _optional_float(
     return result
 
 
-def _serialize_json(value: Any, field: str, expected_type: type) -> str:
-    """Serialize caller-supplied JSON, with credentials removed.
-
-    Every JSON column Phase 0 persists goes through here — run-log counts
-    and errors, source-state metadata, theme-set source/trust metadata and
-    quality, provider-conflict fields.  Redacting at this one choke point
-    is what makes "no credential is ever written to disk" checkable rather
-    than a promise repeated at each call site.  ``redact_secrets`` builds
-    new containers, so the caller's own structure is never mutated.
-    """
-
+def _parse_json(value: Any, field: str, expected_type: type) -> Any:
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
@@ -227,12 +223,51 @@ def _serialize_json(value: Any, field: str, expected_type: type) -> str:
         parsed = value
     if not isinstance(parsed, expected_type):
         raise Phase0ValidationError(f"{field} must be a {expected_type.__name__}")
-    return json.dumps(
-        redact_secrets(parsed),
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    return parsed
+
+
+def _dump_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def serialize_raw_evidence(value: Any, field: str, expected_type: type = dict) -> str:
+    """Serialize immutable provider evidence — **never redacted**.
+
+    ``raw_items.raw_json`` is what the publisher actually sent.  Phase 0's
+    replay guarantee (AC-8) is only worth something if that payload is
+    preserved exactly, so this serializer normalizes and validates the
+    JSON and changes nothing else.  A string that *looks* like a
+    credential inside publisher content is evidence, not a leak, and a
+    downstream reader comparing against the upstream feed must find it
+    unchanged.
+
+    Transport credentials are the fetcher's problem: I2/I3 must not put an
+    ``Authorization`` header into the evidence payload in the first place.
+    Silently rewriting it here would hide that bug *and* corrupt the
+    evidence.  See :func:`serialize_operational_metadata` for the other
+    side of the boundary.
+    """
+
+    return _dump_json(_parse_json(value, field, expected_type))
+
+
+def serialize_operational_metadata(value: Any, field: str, expected_type: type) -> str:
+    """Serialize Phase 0's own diagnostics — **always redacted**.
+
+    Run-log counts and errors, source-state metadata, theme-set source and
+    trust metadata, reconciliation diagnostics: everything the pipeline
+    says *about* a fetch rather than everything the publisher said.  These
+    are the surfaces a credential actually reaches, and nothing keys off
+    them, so redaction is free here.  ``redact_secrets`` builds new
+    containers, so the caller's own structure is never mutated.
+    """
+
+    return _dump_json(redact_secrets(_parse_json(value, field, expected_type)))
+
+
+#: Kept as the operational spelling: every existing call site is
+#: operational metadata, and the evidence path names itself explicitly.
+_serialize_json = serialize_operational_metadata
 
 
 def _optional_blob(value: Any, field: str) -> bytes | None:
@@ -256,100 +291,236 @@ class InsertResult:
     inserted: bool
 
 
+#: Module-private construction key.  It is never exported, never stored on
+#: an instance, and never reachable from the public API, so a caller cannot
+#: build a :class:`StageRunContext` even by copying every visible field.
+_CONTEXT_KEY = object()
+
+
 class StageRunContext:
-    """The handle a logged pipeline mutation has to present.
+    """Proof that a mutation belongs to a claimed, still-live run.
 
-    It is two things at once, deliberately.  It is the counter sheet a stage
-    body fills in while :meth:`Phase0Repository.stage_run` watches, and it
-    is the *proof* that a mutation belongs to a claimed, still-live run: it
-    names the repository, the run, the stage, and the ticker/day/version
-    partition being written, and it goes dead when the run ends.
+    A handle is only worth something if it cannot be manufactured.  Two
+    independent things make this one unforgeable:
 
-    A pipeline mutation validates the handle before it writes anything, so
-    "this row exists but no run produced it" is not a reachable state.
+    * construction requires ``_CONTEXT_KEY``, which lives in this module
+      and is not exported, so ``StageRunContext(...)`` from outside fails;
+    * authorization is by **object identity** against a registry the owning
+      repository keeps.  A copy, a pickle, an ``object.__new__`` shell, or
+      a hand-built look-alike with every field matching is a different
+      object, so none of them authorize anything.
+
+    Identity is also what makes expiry total: leaving the ``stage_run``
+    block unregisters the object, and no later reconstruction can
+    re-register it.
+
+    The counts are derived, not reported.  There is deliberately no public
+    way to add to them — see :meth:`Phase0Repository.stage_run`.
     """
 
-    def __init__(
-        self,
-        repository: "Phase0Repository | None" = None,
-        *,
-        run_id: str = "",
-        stage: str = "",
-        trading_day: str | None = None,
-        pipeline_version: str | None = None,
-        ticker: str | None = None,
-        attempt: int = 1,
-        replay: bool = False,
-        stage_key: Mapping[str, Any] | None = None,
+    __slots__ = (
+        "_repository",
+        "_run_id",
+        "_stage",
+        "_trading_day",
+        "_pipeline_version",
+        "_ticker",
+        "_attempt",
+        "_replay",
+        "_stage_key",
+        "_counts",
+        "_errors",
+        "_success_count",
+        "_partial_count",
+        "_failure_count",
+    )
+
+    def __init__(self, _key: Any = None, **kwargs: Any) -> None:
+        if _key is not _CONTEXT_KEY:
+            raise Phase0RunContextError(
+                "StageRunContext cannot be constructed directly; obtain one "
+                "from Phase0Repository.stage_run(...)"
+            )
+        setter = object.__setattr__
+        setter(self, "_repository", kwargs["repository"])
+        setter(self, "_run_id", kwargs["run_id"])
+        setter(self, "_stage", kwargs["stage"])
+        setter(self, "_trading_day", kwargs["trading_day"])
+        setter(self, "_pipeline_version", kwargs["pipeline_version"])
+        setter(self, "_ticker", kwargs["ticker"])
+        setter(self, "_attempt", kwargs["attempt"])
+        setter(self, "_replay", kwargs["replay"])
+        setter(self, "_stage_key", kwargs["stage_key"])
+        setter(self, "_counts", {})
+        setter(self, "_errors", [])
+        setter(self, "_success_count", 0)
+        setter(self, "_partial_count", 0)
+        setter(self, "_failure_count", 0)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Read-only after construction, including the private counters.
+
+        Counts describe what an operation did; a caller who could pre-seed
+        or overwrite them could make the run log say anything.  The
+        repository accumulates through :meth:`_record_outcome` and friends,
+        which go around this on purpose.
+        """
+
+        raise Phase0RunContextError(
+            "a StageRunContext is read-only; its counts are derived by the "
+            "operations that run under it"
+        )
+
+    def __delattr__(self, name: str) -> None:
+        raise Phase0RunContextError("a StageRunContext is read-only")
+
+    # -- Read-only view of the partition this run covers ----------------
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def stage(self) -> str:
+        return self._stage
+
+    @property
+    def trading_day(self) -> str:
+        return self._trading_day
+
+    @property
+    def pipeline_version(self) -> str:
+        return self._pipeline_version
+
+    @property
+    def ticker(self) -> str | None:
+        return self._ticker
+
+    @property
+    def attempt(self) -> int:
+        return self._attempt
+
+    @property
+    def replay(self) -> bool:
+        return self._replay
+
+    @property
+    def stage_key(self) -> dict[str, Any] | None:
+        return dict(self._stage_key) if self._stage_key is not None else None
+
+    @property
+    def counts(self) -> dict[str, Any]:
+        """A copy: mutating the result cannot reach what gets persisted."""
+
+        return dict(self._counts)
+
+    @property
+    def errors(self) -> list[Any]:
+        return list(self._errors)
+
+    @property
+    def success_count(self) -> int:
+        return self._success_count
+
+    @property
+    def partial_count(self) -> int:
+        return self._partial_count
+
+    @property
+    def failure_count(self) -> int:
+        return self._failure_count
+
+    @property
+    def active(self) -> bool:
+        return self._repository._is_active_run(self)
+
+    @property
+    def closed(self) -> bool:
+        return not self.active
+
+    # -- Repository-private accumulation --------------------------------
+    #
+    # Named with a leading underscore and absent from the public surface on
+    # purpose: counts describe what an operation *did*, so only the
+    # operations may write them.
+
+    def _record_outcome(
+        self, *, success: int = 0, partial: int = 0, failure: int = 0
     ) -> None:
-        self.repository = repository
-        self.run_id = run_id
-        self.stage = stage
-        self.trading_day = trading_day
-        self.pipeline_version = pipeline_version
-        self.ticker = ticker
-        self.attempt = attempt
-        self.replay = replay
-        self.stage_key = dict(stage_key) if stage_key is not None else None
-        self.closed = False
-        self.counts: dict[str, Any] = {}
-        self.errors: list[Any] = []
-        self.success_count = 0
-        self.partial_count = 0
-        self.failure_count = 0
+        setter = object.__setattr__
+        setter(self, "_success_count", self._success_count + int(success))
+        setter(self, "_partial_count", self._partial_count + int(partial))
+        setter(self, "_failure_count", self._failure_count + int(failure))
 
-    def record_success(self, count: int = 1) -> None:
-        self.success_count += _require_int(count, "count", minimum=0)
+    def _record_error(self, error: Mapping[str, Any] | str) -> None:
+        self._errors.append(error)
 
-    def record_partial(self, count: int = 1) -> None:
-        self.partial_count += _require_int(count, "count", minimum=0)
+    def _merge_counts(self, counts: Mapping[str, Any]) -> None:
+        for key, value in counts.items():
+            self._counts[str(key)] = (
+                self._counts.get(str(key), 0) + value
+                if isinstance(value, int)
+                and isinstance(self._counts.get(str(key)), int)
+                else value
+            )
 
-    def record_failure(
-        self, error: Mapping[str, Any] | str | None = None, count: int = 1
-    ) -> None:
-        self.failure_count += _require_int(count, "count", minimum=0)
-        if error is not None:
-            self.errors.append(error)
-
-    def record_error(self, error: Mapping[str, Any] | str) -> None:
-        """Record a non-fatal error; the run degrades rather than fails."""
-
-        self.errors.append(error)
-
-    def update_counts(self, counts: Mapping[str, Any]) -> None:
-        if not isinstance(counts, Mapping):
-            raise Phase0ValidationError("counts must be a mapping")
-        self.counts.update(dict(counts))
-
-    def resolved_status(self) -> str:
-        if self.failure_count:
+    def _resolved_status(self) -> str:
+        if self._failure_count:
             return "failed"
-        if self.errors or self.partial_count:
+        if self._errors or self._partial_count:
             return "degraded"
         return "success"
 
+    # -- Nothing about this object may be copied or serialized ----------
 
-#: The counter-sheet half of :class:`StageRunContext` used to be its own
-#: class; the name is kept so existing stage bodies still type-check.
+    def __repr__(self) -> str:
+        return (
+            f"<StageRunContext run_id={self._run_id!r} stage={self._stage!r} "
+            f"ticker={self._ticker!r} trading_day={self._trading_day!r} "
+            f"pipeline_version={self._pipeline_version!r} active={self.active}>"
+        )
+
+    def _refuse(self, *args: Any, **kwargs: Any) -> Any:
+        raise Phase0RunContextError(
+            "a StageRunContext cannot be copied or serialized; a duplicate "
+            "would outlive the run it authorizes"
+        )
+
+    __copy__ = _refuse
+    __deepcopy__ = _refuse
+    __reduce__ = _refuse
+    __reduce_ex__ = _refuse
+    __getstate__ = _refuse
+
+
+#: Older stage bodies referred to the counter sheet by this name.
 StageRunRecorder = StageRunContext
 
 
 class Phase0Admin:
-    """Unlogged row helpers: fixtures, backfills, and repair — not pipeline.
+    """Migration, test-fixture, and manual-repair writes. **Not the pipeline.**
 
-    Everything here writes without a run and therefore without a ``run_log``
-    row.  That is legitimate for a test fixture seeding a day, a one-off
-    backfill, or an operator repairing a bad row; it is *not* legitimate for
-    issue #68's runner, which must use the logged operations on
-    :class:`Phase0Repository` itself.
+    Everything here mutates without a run and therefore without a
+    ``run_log`` row.  That is legitimate for a migration backfilling a
+    column, a test fixture seeding a day, or an operator repairing one bad
+    row by hand.
 
-    Keeping these behind ``repository.admin`` is the whole point: a caller
-    cannot reach an unlogged write without naming it as administrative, and
-    a reviewer can grep for ``.admin.`` to find every such site.
+    **Normal ingestion and orchestration must never use it.**  Issue #68's
+    runner, and issues #82 and #83, use the logged entrypoints on
+    :class:`Phase0Repository` — ``ingest_raw_items``, ``reconcile_stories``,
+    ``reconcile_themes``, ``persist_embeddings``, ``record_source_state`` —
+    each of which requires the :class:`StageRunContext` from ``stage_run``
+    and writes its run-log row in the same transaction as the data.
+
+    Keeping these behind ``repository.admin`` is the whole point: an
+    unlogged write cannot happen without the call site saying so, and a
+    reviewer greps ``.admin.`` to find every one of them.
     """
 
     def __init__(self, repository: "Phase0Repository") -> None:
         self._repository = repository
+
+    # -- Raw evidence ---------------------------------------------------
 
     def insert_raw_item(self, item: Mapping[str, Any]) -> InsertResult:
         return self._repository._insert_raw_items_unlogged([item])[0]
@@ -364,14 +535,44 @@ class Phase0Admin:
             items, source_state=source_state
         )
 
+    def update_raw_item_ticker(self, item_id: int, ticker: str | None) -> None:
+        return self._repository._update_raw_item_ticker_unlogged(item_id, ticker)
+
+    # -- Source state ---------------------------------------------------
+
     def set_source_state(self, source: str, **kwargs: Any) -> None:
         return self._repository._set_source_state_unlogged(source, **kwargs)
+
+    # -- Derived output -------------------------------------------------
 
     def reconcile_stories(self, **kwargs: Any) -> ReconciliationReport:
         return self._repository._reconcile_stories_unlogged(**kwargs)
 
     def reconcile_themes(self, **kwargs: Any) -> ReconciliationReport:
         return self._repository._reconcile_themes_unlogged(**kwargs)
+
+    def insert_story(self, **kwargs: Any) -> int:
+        return self._repository._insert_story_unlogged(**kwargs)
+
+    def insert_theme(self, **kwargs: Any) -> int:
+        return self._repository._insert_theme_unlogged(**kwargs)
+
+    def insert_eval_label(self, **kwargs: Any) -> int:
+        return self._repository._insert_eval_label_unlogged(**kwargs)
+
+    def clear_derived_for_day(self, trading_day: str | date) -> None:
+        return self._repository._clear_derived_for_day_unlogged(trading_day)
+
+    # -- Run log ---------------------------------------------------------
+
+    def log_stage(self, **kwargs: Any) -> int:
+        """Write a run-log row directly, with no mutation attached.
+
+        For repairing or backfilling history only.  A stage records itself
+        through ``stage_run``.
+        """
+
+        return self._repository._log_stage_unlogged(**kwargs)
 
 
 class Phase0Repository:
@@ -386,6 +587,11 @@ class Phase0Repository:
         self.database_path = Path(database_path)
         self.migrations_path = Path(migrations_path)
         self.admin = Phase0Admin(self)
+        # Identity registry of live run contexts.  A context authorizes a
+        # write only while it is in here, and only the object itself does —
+        # never a copy carrying the same fields.
+        self._active_runs: dict[int, StageRunContext] = {}
+        self._run_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Connections and migrations
@@ -859,8 +1065,10 @@ class Phase0Repository:
         if ingest_status == "valid" and (title is None or url is None):
             raise Phase0ValidationError("valid raw items require title and url")
         raw_payload = item.get("raw_json", item)
-        raw_json = _serialize_json(raw_payload, "raw_json", dict)
-        validation_errors = _serialize_json(
+        # Publisher evidence, stored exactly as supplied; see
+        # serialize_raw_evidence for why this one is not redacted.
+        raw_json = serialize_raw_evidence(raw_payload, "raw_json")
+        validation_errors = serialize_operational_metadata(
             list(item.get("validation_errors") or []), "validation_errors", list
         )
         return {
@@ -992,7 +1200,9 @@ class Phase0Repository:
         with self.connect() as connection:
             return [dict(row) for row in connection.execute(query, parameters)]
 
-    def update_raw_item_ticker(self, item_id: int, ticker: str | None) -> None:
+    def _update_raw_item_ticker_unlogged(
+        self, item_id: int, ticker: str | None
+    ) -> None:
         normalized = normalize_ticker(ticker, optional=True)
         with self.connect() as connection:
             cursor = connection.execute(
@@ -1233,7 +1443,7 @@ class Phase0Repository:
     # Stories
     # ------------------------------------------------------------------
 
-    def insert_story(
+    def _insert_story_unlogged(
         self,
         *,
         ticker: str,
@@ -1311,7 +1521,9 @@ class Phase0Repository:
                     "outlet": _optional_text(member.outlet),
                     "url": _optional_text(member.url),
                     "canonical_url": _optional_text(member.canonical_url),
-                    "match_reason": _optional_text(member.match_reason),
+                    "match_reason": sanitize_diagnostic_scalar(
+                        _optional_text(member.match_reason), "match_reason"
+                    ),
                     "quarantined": 1 if member.quarantined else 0,
                 }
             )
@@ -1335,19 +1547,35 @@ class Phase0Repository:
                 )
             conflicts.append(
                 {
-                    "provider_namespace": _require_text(
-                        conflict.provider_namespace, "provider_namespace"
+                    # Identity — policy B: refused, never rewritten, because
+                    # these are what a conflict is looked up by.
+                    "provider_namespace": require_safe_identifier_scalar(
+                        _require_text(
+                            conflict.provider_namespace, "provider_namespace"
+                        ),
+                        "provider_namespace",
                     ),
-                    "provider_item_id": _require_text(
-                        conflict.provider_item_id, "provider_item_id"
+                    "provider_item_id": require_safe_identifier_scalar(
+                        _require_text(conflict.provider_item_id, "provider_item_id"),
+                        "provider_item_id",
                     ),
-                    "item_ids": _serialize_json(
-                        [str(value) for value in conflict.item_ids],
+                    "item_ids": serialize_operational_metadata(
+                        [
+                            require_safe_identifier_scalar(
+                                value, "provider conflict item id"
+                            )
+                            for value in conflict.item_ids
+                        ],
                         "provider conflict item_ids",
                         list,
                     ),
-                    "fields": _serialize_json(
-                        [str(value) for value in conflict.fields],
+                    "fields": serialize_operational_metadata(
+                        [
+                            require_safe_identifier_scalar(
+                                value, "provider conflict field"
+                            )
+                            for value in conflict.fields
+                        ],
                         "provider conflict fields",
                         list,
                     ),
@@ -1361,16 +1589,22 @@ class Phase0Repository:
                 )
             merges.append(
                 {
-                    "left_story_key": _require_text(
-                        merge.left_story_key, "left_story_key"
+                    # Story keys are identity (policy B); the reason is
+                    # free-form diagnostics (policy A) and is redacted.
+                    "left_story_key": require_safe_identifier_scalar(
+                        _require_text(merge.left_story_key, "left_story_key"),
+                        "left_story_key",
                     ),
-                    "right_story_key": _require_text(
-                        merge.right_story_key, "right_story_key"
+                    "right_story_key": require_safe_identifier_scalar(
+                        _require_text(merge.right_story_key, "right_story_key"),
+                        "right_story_key",
                     ),
                     "similarity": _optional_float(
                         merge.similarity, "similarity", low=-1.0, high=1.0
                     ),
-                    "reason": _require_text(merge.reason, "merge reason"),
+                    "reason": sanitize_diagnostic_scalar(
+                        _require_text(merge.reason, "merge reason"), "merge reason"
+                    ),
                 }
             )
         return {
@@ -1389,11 +1623,20 @@ class Phase0Repository:
             "source": _optional_text(record.source),
             "outlet": _optional_text(record.outlet),
             "content_hash": _optional_text(record.content_hash) or fingerprint,
-            "algorithm_version": _optional_text(record.algorithm_version),
-            "config_fingerprint": _optional_text(record.config_fingerprint),
+            # Algorithm/config/model identity keys replayability (policy B).
+            "algorithm_version": validate_safe_identifier_scalar(
+                _optional_text(record.algorithm_version), "algorithm_version"
+            ),
+            "config_fingerprint": validate_safe_identifier_scalar(
+                _optional_text(record.config_fingerprint), "config_fingerprint"
+            ),
             "stage": stage,
-            "model_name": _optional_text(record.model_name),
-            "model_revision": _optional_text(record.model_revision),
+            "model_name": validate_safe_identifier_scalar(
+                _optional_text(record.model_name), "model_name"
+            ),
+            "model_revision": validate_safe_identifier_scalar(
+                _optional_text(record.model_revision), "model_revision"
+            ),
             "embedding_dimension": (
                 None
                 if record.embedding_dimension is None
@@ -1402,9 +1645,15 @@ class Phase0Repository:
                 )
             ),
             "quarantined": 1 if record.quarantined else 0,
-            "semantic_skip_reason": _optional_text(record.semantic_skip_reason),
-            "member_story_keys": _serialize_json(
-                [str(key) for key in record.member_story_keys],
+            # Free-form explanation (policy A).
+            "semantic_skip_reason": sanitize_diagnostic_scalar(
+                _optional_text(record.semantic_skip_reason), "semantic_skip_reason"
+            ),
+            "member_story_keys": serialize_operational_metadata(
+                [
+                    require_safe_identifier_scalar(key, "member story key")
+                    for key in record.member_story_keys
+                ],
                 "member_story_keys",
                 list,
             ),
@@ -1476,9 +1725,11 @@ class Phase0Repository:
                 delete_obsolete=delete_obsolete,
                 connection=connection,
             )
-            context.record_success(len(report.inserted) + len(report.updated))
-            context.record_partial(len(report.unchanged))
-            context.update_counts(report.counts)
+            context._record_outcome(
+                success=len(report.inserted) + len(report.updated),
+                partial=len(report.unchanged),
+            )
+            context._merge_counts(report.counts)
             return report
 
     def _reconcile_stories_unlogged(
@@ -1908,7 +2159,7 @@ class Phase0Repository:
     # Themes
     # ------------------------------------------------------------------
 
-    def insert_theme(
+    def _insert_theme_unlogged(
         self,
         *,
         ticker: str,
@@ -2027,9 +2278,13 @@ class Phase0Repository:
         ]
         return {
             "fingerprint": fingerprint,
-            "theme_key": _optional_text(record.theme_key) or fingerprint,
+            "theme_key": require_safe_identifier_scalar(
+                _optional_text(record.theme_key) or fingerprint, "theme_key"
+            ),
             "label": label,
-            "label_source": _optional_text(record.label_source),
+            "label_source": validate_safe_identifier_scalar(
+                _optional_text(record.label_source), "label_source"
+            ),
             "summary": _optional_text(record.summary),
             "status": status,
             "story_ids": story_ids,
@@ -2079,13 +2334,23 @@ class Phase0Repository:
                 high=1.0,
             ),
             "centroid": _optional_blob(record.centroid, "centroid"),
-            "matched_previous_key": _optional_text(record.matched_previous_key),
+            "matched_previous_key": validate_safe_identifier_scalar(
+                _optional_text(record.matched_previous_key), "matched_previous_key"
+            ),
             "method": method,
             "content_hash": _optional_text(record.content_hash) or fingerprint,
-            "algorithm_version": _optional_text(record.algorithm_version),
-            "config_fingerprint": _optional_text(record.config_fingerprint),
-            "model_name": _optional_text(record.model_name),
-            "model_revision": _optional_text(record.model_revision),
+            "algorithm_version": validate_safe_identifier_scalar(
+                _optional_text(record.algorithm_version), "algorithm_version"
+            ),
+            "config_fingerprint": validate_safe_identifier_scalar(
+                _optional_text(record.config_fingerprint), "config_fingerprint"
+            ),
+            "model_name": validate_safe_identifier_scalar(
+                _optional_text(record.model_name), "model_name"
+            ),
+            "model_revision": validate_safe_identifier_scalar(
+                _optional_text(record.model_revision), "model_revision"
+            ),
             "embedding_dimension": (
                 None
                 if record.embedding_dimension is None
@@ -2104,22 +2369,34 @@ class Phase0Repository:
             raise Phase0ValidationError(f"unsupported clustering method: {method}")
         return {
             "method": method,
-            "method_reason": str(record.method_reason or ""),
-            "quality": _serialize_json(dict(record.quality or {}), "quality", dict),
+            "method_reason": sanitize_diagnostic_scalar(
+                str(record.method_reason or ""), "method_reason"
+            ),
+            "quality": serialize_operational_metadata(
+                dict(record.quality or {}), "quality", dict
+            ),
             "source_metadata": (
                 None
                 if record.source_metadata is None
-                else _serialize_json(
+                else serialize_operational_metadata(
                     dict(record.source_metadata), "source_metadata", dict
                 )
             ),
-            "trust_metadata": _serialize_json(
+            "trust_metadata": serialize_operational_metadata(
                 dict(record.trust_metadata or {}), "trust_metadata", dict
             ),
-            "config_fingerprint": str(record.config_fingerprint or ""),
-            "algorithm_version": str(record.algorithm_version or ""),
-            "model_name": _optional_text(record.model_name),
-            "model_revision": _optional_text(record.model_revision),
+            "config_fingerprint": validate_safe_identifier_scalar(
+                str(record.config_fingerprint or ""), "config_fingerprint"
+            ),
+            "algorithm_version": validate_safe_identifier_scalar(
+                str(record.algorithm_version or ""), "algorithm_version"
+            ),
+            "model_name": validate_safe_identifier_scalar(
+                _optional_text(record.model_name), "model_name"
+            ),
+            "model_revision": validate_safe_identifier_scalar(
+                _optional_text(record.model_revision), "model_revision"
+            ),
             "embedding_dimension": (
                 None
                 if record.embedding_dimension is None
@@ -2171,9 +2448,11 @@ class Phase0Repository:
                 excluded=excluded,
                 connection=connection,
             )
-            context.record_success(len(report.inserted) + len(report.updated))
-            context.record_partial(len(report.unchanged))
-            context.update_counts(report.counts)
+            context._record_outcome(
+                success=len(report.inserted) + len(report.updated),
+                partial=len(report.unchanged),
+            )
+            context._merge_counts(report.counts)
             return report
 
     def _reconcile_themes_unlogged(
@@ -2676,7 +2955,7 @@ class Phase0Repository:
     # Evaluation labels
     # ------------------------------------------------------------------
 
-    def insert_eval_label(
+    def _insert_eval_label_unlogged(
         self,
         *,
         label_type: str,
@@ -2947,7 +3226,7 @@ class Phase0Repository:
                 )
             ]
 
-    def clear_derived_for_day(self, trading_day: str | date) -> None:
+    def _clear_derived_for_day_unlogged(self, trading_day: str | date) -> None:
         """Delete derived rows and their idempotency keys, retaining raw input."""
         day = _normalize_day(trading_day)
         with self.connect(immediate=True) as connection:
@@ -2977,7 +3256,7 @@ class Phase0Repository:
     # Run log
     # ------------------------------------------------------------------
 
-    def log_stage(
+    def _log_stage_unlogged(
         self,
         *,
         run_id: str,
@@ -3161,59 +3440,190 @@ class Phase0Repository:
         ``persist_run_log=False``-style flag anywhere in this class.
 
         The yielded :class:`StageRunContext` is also the handle the logged
-        pipeline mutations require, and it stops being usable the moment
-        this block exits.
+        pipeline mutations require.  It is registered as live for exactly
+        the duration of this block; on exit it is unregistered and can
+        never authorize anything again, whatever a caller kept a reference
+        to.  Counts are derived by the operations, never reported.
         """
 
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        normalized_ticker = normalize_ticker(ticker, optional=True)
+        normalized_stage = _require_text(stage, "stage")
+        key = self._normalize_stage_key(stage_key) if stage_key is not None else None
+        if key is not None:
+            # The stage key and the run must describe the same work, or the
+            # lease being held is a lease on something else entirely.
+            self._assert_stage_key_matches(
+                key,
+                operation="stage_run",
+                stage=normalized_stage,
+                ticker=normalized_ticker,
+                trading_day=day,
+                pipeline_version=version,
+            )
+
         context = StageRunContext(
-            self,
+            _CONTEXT_KEY,
+            repository=self,
             run_id=_require_text(run_id, "run_id"),
-            stage=_require_text(stage, "stage"),
-            trading_day=_normalize_day(trading_day),
-            pipeline_version=_require_text(pipeline_version, "pipeline_version"),
-            ticker=normalize_ticker(ticker, optional=True),
+            stage=normalized_stage,
+            trading_day=day,
+            pipeline_version=version,
+            ticker=normalized_ticker,
             attempt=_require_int(attempt, "attempt", minimum=1),
             replay=bool(replay),
-            stage_key=stage_key,
+            stage_key=key,
         )
+        self._register_run(context)
         started = datetime.now(timezone.utc)
         failure: BaseException | None = None
         try:
             yield context
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             failure = exc
-            context.record_failure({"error": f"{type(exc).__name__}: {exc}"})
+            context._record_outcome(failure=1)
+            context._record_error({"error": f"{type(exc).__name__}: {exc}"})
             raise
         finally:
-            context.closed = True
+            self._unregister_run(context)
             completed = datetime.now(timezone.utc)
-            status = "failed" if failure is not None else context.resolved_status()
-            self.log_stage(
-                run_id=context.run_id,
-                stage=context.stage,
-                counts=context.counts,
-                duration_ms=int((completed - started).total_seconds() * 1000),
-                errors=context.errors,
-                started_at=started.isoformat(),
-                completed_at=completed.isoformat(),
-                trading_day=context.trading_day or _normalize_day(trading_day),
-                pipeline_version=context.pipeline_version or pipeline_version,
-                status=status,
-                ticker=context.ticker,
-                success_count=context.success_count,
-                partial_count=context.partial_count,
-                failure_count=context.failure_count,
-                attempt=context.attempt,
-                replay=context.replay,
-                stage_key=stage_key,
-            )
+            status = "failed" if failure is not None else context._resolved_status()
+            # The run log and the stage key's terminal state land in one
+            # transaction, so "the data says success, the key says running"
+            # is not a state a crash can leave behind.
+            with self.connect(immediate=True) as connection:
+                self._write_run_log(
+                    connection,
+                    run_id=context.run_id,
+                    stage=context.stage,
+                    counts=context.counts,
+                    duration_ms=int((completed - started).total_seconds() * 1000),
+                    errors=context.errors,
+                    started_at=started.isoformat(),
+                    completed_at=completed.isoformat(),
+                    trading_day=context.trading_day,
+                    pipeline_version=context.pipeline_version,
+                    status=status,
+                    ticker=context.ticker,
+                    success_count=context.success_count,
+                    partial_count=context.partial_count,
+                    failure_count=context.failure_count,
+                    attempt=context.attempt,
+                    replay=context.replay,
+                    stage_key=key,
+                )
+                if key is not None:
+                    self._finish_stage_key(connection, context, status)
+
+    # -- The run registry: identity is the capability -------------------
+
+    def _register_run(self, context: StageRunContext) -> None:
+        with self._run_lock:
+            # Held strongly, so no other object can reuse this id() while
+            # the run is live.
+            self._active_runs[id(context)] = context
+
+    def _unregister_run(self, context: StageRunContext) -> None:
+        with self._run_lock:
+            self._active_runs.pop(id(context), None)
+
+    def _is_active_run(self, context: StageRunContext) -> bool:
+        with self._run_lock:
+            return self._active_runs.get(id(context)) is context
+
+    def _finish_stage_key(
+        self,
+        connection: sqlite3.Connection,
+        context: StageRunContext,
+        status: str,
+    ) -> None:
+        """Release the run's stage key on the run's own transaction."""
+
+        key = context._stage_key
+        if key is None:
+            return
+        terminal = "success" if status == "success" else status
+        if terminal not in STAGE_KEY_STATUSES:
+            terminal = "failed"
+        error = None
+        if context.errors:
+            error = redact_text(str(context.errors[-1]))
+        now = utc_now()
+        connection.execute(
+            """
+            UPDATE pipeline_stage_keys
+            SET status = ?, updated_at = ?, lease_expires_at = NULL,
+                completed_at = ?, last_error = ?
+            WHERE stage = ? AND ticker = ? AND trading_day = ?
+              AND pipeline_version = ? AND run_id = ? AND status = 'running'
+            """,
+            (
+                terminal,
+                now,
+                now,
+                error,
+                key["stage"],
+                key["ticker"],
+                key["trading_day"],
+                key["pipeline_version"],
+                context.run_id,
+            ),
+        )
 
     # ------------------------------------------------------------------
     # The logged pipeline contract (issue #68)
     # ------------------------------------------------------------------
 
-    def _require_run_context(
+    @staticmethod
+    def _normalize_stage_key(stage_key: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(stage_key, Mapping):
+            raise Phase0ValidationError("stage_key must be a mapping")
+        return {
+            "stage": _require_text(stage_key.get("stage"), "stage_key stage"),
+            "ticker": normalize_ticker(stage_key.get("ticker")),
+            "trading_day": _normalize_day(stage_key.get("trading_day")),
+            "pipeline_version": _require_text(
+                stage_key.get("pipeline_version"), "stage_key pipeline_version"
+            ),
+        }
+
+    @staticmethod
+    def _assert_stage_key_matches(
+        key: Mapping[str, Any],
+        *,
+        operation: str,
+        stage: str,
+        ticker: str | None,
+        trading_day: str,
+        pipeline_version: str,
+    ) -> None:
+        """A lease on one partition never authorizes work on another.
+
+        Checked field by field so the error names the one that is wrong —
+        an AMD stage key silently authorizing an NVDA run is exactly the
+        class of bug this exists to make impossible.
+        """
+
+        expected = {
+            "stage": stage,
+            "ticker": ticker,
+            "trading_day": trading_day,
+            "pipeline_version": pipeline_version,
+        }
+        for field, want in expected.items():
+            if want is None:
+                continue
+            got = key.get(field)
+            if got != want:
+                raise Phase0RunContextError(
+                    f"{operation}: the stage key covers {field}={got!r} but the "
+                    f"run covers {field}={want!r}"
+                )
+
+    def _authorize_run(
         self,
+        connection: sqlite3.Connection,
         run: Any,
         *,
         operation: str,
@@ -3221,20 +3631,33 @@ class Phase0Repository:
         trading_day: str | None = None,
         pipeline_version: str | None = None,
     ) -> StageRunContext:
-        """Reject an unusable run handle *before* the caller writes anything."""
+        """Authorize a mutation **on the transaction that will perform it**.
+
+        Everything here reads through ``connection``, which already holds
+        the write lock.  That is the whole point: checking the lease on a
+        second connection first would leave a window in which it expires
+        and is reclaimed while this transaction still commits.  Holding the
+        write lock across validation *and* mutation means a concurrent
+        reclaimer cannot get in between them — it blocks until this
+        transaction ends, and then sees the finished state.
+        """
 
         if not isinstance(run, StageRunContext):
             raise Phase0RunContextError(
                 f"{operation} requires an active stage run; open one with "
                 "Phase0Repository.stage_run(...) and pass run=<context>"
             )
-        if run.repository is not self:
+        # Identity, not field equality: a copy, a pickle, an
+        # ``object.__new__`` shell, or a look-alike with every attribute
+        # matching is a different object and authorizes nothing.
+        if not self._is_active_run(run):
+            if getattr(run, "_repository", None) is not self:
+                raise Phase0RunContextError(
+                    f"{operation} was given a stage run from another repository"
+                )
             raise Phase0RunContextError(
-                f"{operation} was given a stage run from another repository"
-            )
-        if run.closed:
-            raise Phase0RunContextError(
-                f"{operation} was given a stage run that has already completed"
+                f"{operation} was given a stage run that is no longer active; "
+                "a run authorizes writes only inside its stage_run block"
             )
         if trading_day is not None and run.trading_day != trading_day:
             raise Phase0RunContextError(
@@ -3250,36 +3673,52 @@ class Phase0Repository:
             raise Phase0RunContextError(
                 f"{operation} targets {ticker} but the run covers {run.ticker}"
             )
-        self._assert_lease_held(run, operation=operation)
+        self._assert_lease_held(connection, run, operation=operation)
         return run
 
-    def _assert_lease_held(self, run: StageRunContext, *, operation: str) -> None:
-        """A run that claimed a stage key must still own an unexpired lease."""
+    def _assert_lease_held(
+        self,
+        connection: sqlite3.Connection,
+        run: StageRunContext,
+        *,
+        operation: str,
+    ) -> None:
+        """Ownership, expiry, and partition, read inside the write lock."""
 
-        if run.stage_key is None:
+        key = run._stage_key
+        if key is None:
             return
-        key = run.stage_key
-        with self.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT run_id, status, lease_expires_at
-                FROM pipeline_stage_keys
-                WHERE stage = ? AND ticker = ? AND trading_day = ?
-                  AND pipeline_version = ?
-                """,
-                (
-                    _require_text(key.get("stage"), "stage_key stage"),
-                    normalize_ticker(key.get("ticker")),
-                    _normalize_day(key.get("trading_day")),
-                    _require_text(
-                        key.get("pipeline_version"), "stage_key pipeline_version"
-                    ),
-                ),
-            ).fetchone()
+        self._assert_stage_key_matches(
+            key,
+            operation=operation,
+            stage=run.stage,
+            ticker=run.ticker,
+            trading_day=run.trading_day,
+            pipeline_version=run.pipeline_version,
+        )
+        row = connection.execute(
+            """
+            SELECT run_id, status, lease_expires_at
+            FROM pipeline_stage_keys
+            WHERE stage = ? AND ticker = ? AND trading_day = ?
+              AND pipeline_version = ?
+            """,
+            (
+                key["stage"],
+                key["ticker"],
+                key["trading_day"],
+                key["pipeline_version"],
+            ),
+        ).fetchone()
         if row is None:
             raise StageKeyError(f"{operation}: the run's stage key no longer exists")
-        if str(row["run_id"]) != run.run_id or str(row["status"]) != "running":
+        if str(row["run_id"]) != run.run_id:
             raise StageKeyError(f"{operation}: the stage key is owned by another run")
+        if str(row["status"]) != "running":
+            raise StageKeyError(
+                f"{operation}: the stage key is no longer running "
+                f"(status={row['status']!r})"
+            )
         expires = row["lease_expires_at"]
         if expires is not None and str(expires) <= utc_now():
             raise StageKeyError(f"{operation}: the stage lease has expired")
@@ -3294,32 +3733,47 @@ class Phase0Repository:
         trading_day: str | None = None,
         pipeline_version: str | None = None,
     ) -> Iterator[tuple[sqlite3.Connection, StageRunContext]]:
-        """One transaction holding both a pipeline mutation and its run log.
+        """One transaction holding authorization, mutation, and run log.
 
-        On success the data and the ``run_log`` row commit together, so a
-        reader can never see one without the other.  On failure the data
-        rolls back and a redacted ``failed`` row is written afterwards, so
-        the attempt is still on the record.
+        The order matters and is the fix for the previous TOCTOU hole:
+
+        1. take the write lock (``BEGIN IMMEDIATE``);
+        2. authorize the run and its lease *on that connection*;
+        3. mutate;
+        4. write the derived counts and the run-log row;
+        5. commit, releasing the lock.
+
+        A concurrent reclaimer blocks at step 1 and cannot take the stage
+        key between step 2 and step 5, so the data and the key's ownership
+        cannot end up disagreeing.
+
+        On failure the data rolls back and a redacted ``failed`` row is
+        written afterwards, so the attempt is still on the record.
         """
 
-        context = self._require_run_context(
-            run,
-            operation=operation,
-            ticker=ticker,
-            trading_day=trading_day,
-            pipeline_version=pipeline_version,
-        )
         started = datetime.now(timezone.utc)
         try:
             with self.connect(immediate=True) as connection:
+                context = self._authorize_run(
+                    connection,
+                    run,
+                    operation=operation,
+                    ticker=ticker,
+                    trading_day=trading_day,
+                    pipeline_version=pipeline_version,
+                )
                 yield connection, context
                 self._log_context(connection, context, started)
         except BaseException as exc:  # noqa: BLE001 - re-raised below
-            context.record_failure(
-                {"operation": operation, "error": f"{type(exc).__name__}: {exc}"}
-            )
-            with self.connect() as connection:
-                self._log_context(connection, context, started, status="failed")
+            # Only a run that was genuinely authorized gets a failed record;
+            # a rejected forgery has no run to write against.
+            if isinstance(run, StageRunContext) and self._is_active_run(run):
+                run._record_outcome(failure=1)
+                run._record_error(
+                    {"operation": operation, "error": f"{type(exc).__name__}: {exc}"}
+                )
+                with self.connect() as connection:
+                    self._log_context(connection, run, started, status="failed")
             raise
 
     def _log_context(
@@ -3342,7 +3796,7 @@ class Phase0Repository:
             completed_at=completed.isoformat(),
             trading_day=context.trading_day or "",
             pipeline_version=context.pipeline_version or "",
-            status=status or context.resolved_status(),
+            status=status or context._resolved_status(),
             ticker=context.ticker,
             success_count=context.success_count,
             partial_count=context.partial_count,
@@ -3370,9 +3824,8 @@ class Phase0Repository:
             if source_state is not None:
                 self._set_source_state(connection, source_state)
             inserted = sum(1 for result in results if result.inserted)
-            context.record_success(inserted)
-            context.record_partial(len(results) - inserted)
-            context.update_counts(
+            context._record_outcome(success=inserted, partial=len(results) - inserted)
+            context._merge_counts(
                 {"raw_items_seen": len(results), "raw_items_inserted": inserted}
             )
             return results
@@ -3392,8 +3845,8 @@ class Phase0Repository:
         ):
             for values in prepared:
                 self._write_embedding(connection, values)
-            context.record_success(len(prepared))
-            context.update_counts({"embeddings_written": len(prepared)})
+            context._record_outcome(success=len(prepared))
+            context._merge_counts({"embeddings_written": len(prepared)})
             return len(prepared)
 
     def record_source_state(
@@ -3428,10 +3881,11 @@ class Phase0Repository:
             context,
         ):
             self._set_source_state(connection, state)
-            if successful:
-                context.record_success()
-            else:
-                context.record_failure()
+            context._record_outcome(
+                success=1 if successful else 0,
+                partial=0 if successful else 1,
+            )
+            context._merge_counts({"source_states_recorded": 1})
 
     def run_log_entries(
         self,
@@ -3537,5 +3991,10 @@ __all__ = [
     "normalize_ticker",
     "redact_secrets",
     "redact_text",
+    "require_safe_identifier_scalar",
+    "sanitize_diagnostic_scalar",
+    "serialize_operational_metadata",
+    "serialize_raw_evidence",
     "utc_now",
+    "validate_safe_identifier_scalar",
 ]

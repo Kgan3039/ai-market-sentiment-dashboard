@@ -20,8 +20,19 @@ from .models import (
     ThemeRecord,
     ThemeSetRecord,
 )
-from .redaction import redact_secrets, redact_text
-from .repository import Phase0Admin, Phase0Repository, StageRunContext
+from .redaction import contains_credential, redact_secrets, redact_text
+from .scalars import (
+    require_safe_identifier_scalar,
+    sanitize_diagnostic_scalar,
+    validate_safe_identifier_scalar,
+)
+from .repository import (
+    Phase0Admin,
+    Phase0Repository,
+    StageRunContext,
+    serialize_operational_metadata,
+    serialize_raw_evidence,
+)
 from .tickers import SUPPORTED_TICKERS, TICKER_UNIVERSE, normalize_ticker
 
 __all__ = [
@@ -46,7 +57,13 @@ __all__ = [
     "ThemeRecord",
     "ThemeSetRecord",
     "UnsupportedTickerError",
+    "contains_credential",
     "normalize_ticker",
     "redact_secrets",
     "redact_text",
+    "require_safe_identifier_scalar",
+    "sanitize_diagnostic_scalar",
+    "serialize_operational_metadata",
+    "serialize_raw_evidence",
+    "validate_safe_identifier_scalar",
 ]
