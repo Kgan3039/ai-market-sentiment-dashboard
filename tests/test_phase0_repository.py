@@ -5,7 +5,13 @@ import sqlite3
 
 import pytest
 
-from phase0.repository import Phase0Repository
+from phase0.repository import MIGRATIONS_PATH, Phase0Repository
+from phase0.schema import load_migrations
+
+
+LATEST_SCHEMA_VERSION = max(
+    migration.version for migration in load_migrations(MIGRATIONS_PATH)
+)
 
 
 def sample_item(url="https://example.com/story?utm_source=test"):
@@ -51,7 +57,10 @@ def test_migration_enables_wal_and_creates_expected_tables(tmp_path):
     } <= tables
     assert journal_mode == "wal"
     with repository.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -656,6 +665,10 @@ def test_actual_legacy_v2_database_upgrades_to_latest_without_data_loss(tmp_path
     legacy = Phase0Repository(database, migrations_path=legacy_migrations)
     legacy.migrate()
     with legacy.connect() as connection:
+        # Databases published at v2 predate the migration ledger, so the
+        # fixture drops it to reproduce one faithfully.
+        connection.execute("DROP TABLE IF EXISTS schema_migrations")
+    with legacy.connect() as connection:
         connection.executemany(
             """
             INSERT INTO raw_items (
@@ -770,7 +783,10 @@ def test_actual_legacy_v2_database_upgrades_to_latest_without_data_loss(tmp_path
     assert upgraded.count("run_log") == 1
     assert upgraded.count("source_state") == 1
     with upgraded.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == LATEST_SCHEMA_VERSION
+        )
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         lease = connection.execute(
