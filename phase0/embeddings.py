@@ -20,6 +20,7 @@ from nlp.embeddings import (
 )
 
 from .errors import Phase0Error, Phase0ValidationError
+from .scalars import require_safe_identifier_scalar
 
 
 class EmbeddingPersistenceError(Phase0Error, EmbeddingStorageError):
@@ -77,12 +78,22 @@ def validate_embedding(embedding: Any) -> dict[str, Any]:
             "embedding must be an nlp.embeddings.PersistedEmbedding"
         )
     source_kind = normalize_source_kind(embedding.source_kind)
-    source_id = normalize_source_id(embedding.source_id)
-    model_name = _required_text(embedding.model_name, "model_name")
+    # The source id and the model identity together key the cache, so both
+    # follow policy B: a credential-bearing value is refused, not redacted,
+    # because a rewritten key silently returns the wrong vector forever.
+    source_id = require_safe_identifier_scalar(
+        normalize_source_id(embedding.source_id), "embedding source_id"
+    )
+    model_name = require_safe_identifier_scalar(
+        _required_text(embedding.model_name, "model_name"), "embedding model_name"
+    )
     if embedding.model_revision is None:
         model_revision: str | None = None
     else:
-        model_revision = _required_text(embedding.model_revision, "model_revision")
+        model_revision = require_safe_identifier_scalar(
+            _required_text(embedding.model_revision, "model_revision"),
+            "embedding model_revision",
+        )
     if isinstance(embedding.dimension, bool) or not isinstance(
         embedding.dimension, int
     ):

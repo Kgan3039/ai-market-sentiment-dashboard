@@ -96,6 +96,19 @@ def redact_text(value: str) -> str:
     return redacted
 
 
+def contains_credential(value: Any) -> bool:
+    """True when redaction would change ``value``.
+
+    Used where replacing a credential would be *worse* than refusing it:
+    an identifier silently rewritten to ``[REDACTED]`` still names a row,
+    a cache entry, or a model — just the wrong one, and permanently.
+    """
+
+    if not isinstance(value, str):
+        return False
+    return redact_text(value) != value
+
+
 def redact_secrets(value: Any) -> Any:
     """Recursively redact credentials in strings, mappings, and sequences."""
 
