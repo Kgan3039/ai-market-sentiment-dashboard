@@ -90,8 +90,8 @@ def test_raw_item_insert_is_idempotent(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
 
-    first = repository.insert_raw_item(sample_item())
-    second = repository.insert_raw_item(sample_item("https://example.com/story"))
+    first = repository.admin.insert_raw_item(sample_item())
+    second = repository.admin.insert_raw_item(sample_item("https://example.com/story"))
 
     assert first.inserted is True
     assert second.inserted is False
@@ -105,7 +105,9 @@ def test_concurrent_duplicate_inserts_remain_idempotent(tmp_path):
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         results = list(
-            executor.map(lambda _: repository.insert_raw_item(sample_item()), range(40))
+            executor.map(
+                lambda _: repository.admin.insert_raw_item(sample_item()), range(40)
+            )
         )
 
     assert sum(result.inserted for result in results) == 1
@@ -141,7 +143,7 @@ def test_stage_status_decodes_structured_fields(tmp_path):
 def test_source_state_persists_conditional_request_metadata(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    repository.set_source_state(
+    repository.admin.set_source_state(
         "rss:test",
         etag='"abc"',
         last_modified="Thu, 23 Jul 2026 12:00:00 GMT",
@@ -264,7 +266,7 @@ def test_running_stage_claim_uses_lease_and_only_expires_at_boundary(tmp_path):
 def test_replay_cleanup_removes_stage_keys_but_keeps_raw_evidence(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    repository.insert_raw_item(sample_item())
+    repository.admin.insert_raw_item(sample_item())
     assert repository.claim_stage_key(
         stage="cluster",
         ticker="NVDA",
@@ -323,10 +325,10 @@ def test_failed_migration_rolls_back_schema_and_version(tmp_path):
 def test_story_theme_and_label_references_are_foreign_key_enforced(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    first = repository.insert_raw_item(sample_item()).item_id
+    first = repository.admin.insert_raw_item(sample_item()).item_id
     second_item = sample_item("https://example.com/second")
     second_item["canonical_url"] = "https://example.com/second"
-    second = repository.insert_raw_item(second_item).item_id
+    second = repository.admin.insert_raw_item(second_item).item_id
     story_id = repository.insert_story(
         ticker="NVDA",
         trading_day="2026-07-23",
@@ -381,10 +383,10 @@ def test_invalid_relationships_roll_back_parent_rows(tmp_path):
         )
     assert repository.count("stories") == 0
 
-    first = repository.insert_raw_item(sample_item()).item_id
+    first = repository.admin.insert_raw_item(sample_item()).item_id
     second_item = sample_item("https://example.com/second")
     second_item["canonical_url"] = "https://example.com/second"
-    second = repository.insert_raw_item(second_item).item_id
+    second = repository.admin.insert_raw_item(second_item).item_id
     story_id = repository.insert_story(
         ticker="NVDA",
         trading_day="2026-07-23",
@@ -409,10 +411,10 @@ def test_invalid_relationships_roll_back_parent_rows(tmp_path):
 def test_database_rejects_citation_outside_theme_member_stories(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    member = repository.insert_raw_item(sample_item()).item_id
+    member = repository.admin.insert_raw_item(sample_item()).item_id
     other_item = sample_item("https://example.com/other")
     other_item["canonical_url"] = "https://example.com/other"
-    non_member = repository.insert_raw_item(other_item).item_id
+    non_member = repository.admin.insert_raw_item(other_item).item_id
     story_id = repository.insert_story(
         ticker="NVDA",
         trading_day="2026-07-23",
@@ -482,7 +484,7 @@ def test_raw_evidence_and_associations_survive_reconnect(tmp_path):
             ],
         }
     )
-    item_id = repository.insert_raw_item(evidence).item_id
+    item_id = repository.admin.insert_raw_item(evidence).item_id
 
     reopened = Phase0Repository(database)
     assert reopened.count("raw_items") == 1
@@ -501,12 +503,12 @@ def test_invalid_raw_json_timestamp_and_status_are_rejected(tmp_path):
     invalid_json = sample_item()
     invalid_json["raw_json"] = "{not-json"
     with pytest.raises(ValueError, match="valid JSON"):
-        repository.insert_raw_item(invalid_json)
+        repository.admin.insert_raw_item(invalid_json)
 
     invalid_time = sample_item()
     invalid_time["published_at"] = "not-a-timestamp"
     with pytest.raises(ValueError, match="ISO-8601"):
-        repository.insert_raw_item(invalid_time)
+        repository.admin.insert_raw_item(invalid_time)
 
     with pytest.raises(ValueError, match="run status"):
         repository.log_stage(
@@ -587,7 +589,7 @@ def test_database_constraints_reject_invalid_status_json_and_timestamps(tmp_path
 def test_invalid_raw_evidence_is_preserved_without_required_display_fields(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    result = repository.insert_raw_item(
+    result = repository.admin.insert_raw_item(
         {
             "source": "rss:test",
             "canonical_url": "urn:rss:test:entry-1",
@@ -639,7 +641,7 @@ def test_secret_bearing_error_fields_are_redacted(tmp_path):
 def test_nested_source_metadata_is_redacted(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    repository.set_source_state(
+    repository.admin.set_source_state(
         "rss:test",
         etag=None,
         last_modified=None,

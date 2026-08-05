@@ -44,13 +44,20 @@ _AUTHORIZATION_HEADER_PATTERN = re.compile(
     r"(?:\"[^\"]*\"|'[^']*'|[^\r\n,;}\]]+)"
 )
 
-#: A credential introduced by its scheme anywhere else in a string.
+#: A credential introduced by its scheme anywhere else in a string —
+#: ``Bearer abc123`` and ``Basic dXNlcjpwYXNz`` standing on their own, with
+#: no ``Authorization:`` in front of them.
 _SCHEME_CREDENTIAL_PATTERN = re.compile(
     r"(?i)\b(Bearer|Basic|Digest)\s+"
-    # A credential, not the next English word: at least eight characters
-    # that are not all lower-case letters.  ``Basic understanding`` stays
-    # readable; ``Basic dXNlcjpwYXNz`` does not survive.
-    r"(?![a-z]+\b)[A-Za-z0-9._~+/=-]{8,}"
+    # A credential, not the next English word.  Ordinary prose after the
+    # scheme word is either all lower-case ("Basic understanding") or
+    # capitalized ("Basic Auth"); a credential is neither, because base64
+    # and opaque tokens mix case and digits.  Three characters is the floor
+    # so short tokens such as ``Bearer abc123`` are still caught.
+    # The two lookaheads must stay case-*sensitive* while the scheme word
+    # above is matched case-insensitively, hence the explicit ``(?-i:…)``.
+    r"(?-i:(?![a-z]+\b)(?![A-Z][a-z]*\b))"
+    r"[A-Za-z0-9._~+/=-]{3,}"
 )
 
 #: ``"api_key": "abc"`` and ``'password' = 'abc'`` keep their quoting so a

@@ -40,10 +40,19 @@ class StageKeyError(Phase0Error):
     """A stage key was not owned by the caller, or does not exist."""
 
 
+class Phase0RunContextError(Phase0ValidationError):
+    """A logged pipeline mutation was attempted without a usable run.
+
+    Raised before anything is written, so a rejected call leaves the
+    database exactly as it was.
+    """
+
+
 __all__ = [
     "Phase0Error",
     "Phase0IntegrityError",
     "Phase0MigrationError",
+    "Phase0RunContextError",
     "Phase0ValidationError",
     "StageKeyError",
     "UnsupportedTickerError",

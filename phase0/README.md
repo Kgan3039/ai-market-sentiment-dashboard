@@ -37,10 +37,28 @@ leaves the schema, the ledger, and `user_version` untouched.
 cannot store an unsupported ticker, cite a raw item that is not in one of
 the theme's member stories, cite one raw item from two themes in the same
 ticker-day, group a story from another ticker-day, or orphan an embedding.
+Each of those holds on `UPDATE` as well as on `INSERT`, and a parent row
+cannot be relocated out from under the children that reference it.
+
+**The approved universe is a constant, not a table.** The five symbols are
+written as a literal into every ticker trigger, so nothing that ordinary
+SQL can write changes what is accepted. `supported_tickers` remains as a
+readable projection of that constant and is sealed against insert, update,
+and delete — inserting `GOOG` there no longer widens anything, because
+nothing consults it.
 
 **Stage logging cannot be switched off.** `stage_run()` writes a `run_log`
 row in a `finally` block, including when the stage body raises. No public
 method takes a `persist_run_log`-style flag.
+
+**Pipeline mutations carry their run.** `ingest_raw_items`,
+`reconcile_stories`, `reconcile_themes`, `persist_embeddings`, and
+`record_source_state` all require the `StageRunContext` that `stage_run()`
+yields, and write their `run_log` row in the same transaction as the data.
+A missing, completed, foreign, or lease-expired handle raises before
+anything is written. The unlogged row helpers live on `repository.admin`,
+where they are labelled administrative rather than presented as pipeline
+entrypoints.
 
 **Fingerprints are not identifiers.** M2's `cluster_fingerprint`, M3's
 `story_fingerprint`, and M5's `fingerprint` / `theme_key` are stored beside
@@ -51,30 +69,36 @@ the durable row ids as change-detection handles, never instead of them.
 ```python
 repository.migrate()
 
-# Ingestion (#61, #62)
-repository.insert_raw_items(items, source_state=state)
+# Everything a stage writes happens inside its run (#68).
+with repository.stage_run(
+    run_id=run_id, stage="m3.semantic", trading_day="2026-07-23",
+    pipeline_version="v1", ticker="NVDA", stage_key=key,
+) as run:
+    # Ingestion (#61, #62)
+    repository.ingest_raw_items(items, run=run, source_state=state)
 
-# M1 — implements nlp.embeddings.EmbeddingRepository
+    # M2/M3 — one ticker/trading-day, atomically
+    report = repository.reconcile_stories(
+        run=run, ticker="NVDA", trading_day="2026-07-23",
+        pipeline_version="v1", stories=[StoryRecord(...)],
+    )
+
+    # M5 — one ticker/trading-day theme set, atomically
+    repository.reconcile_themes(
+        run=run, ticker="NVDA", trading_day="2026-07-23",
+        pipeline_version="v1", theme_set=ThemeSetRecord(...),
+        themes=[ThemeRecord(...)],
+        other_coverage=[OtherCoverageRecord(...)],
+        excluded=[ExcludedStoryRecord(...)],
+    )
+
+# M1 — implements nlp.embeddings.EmbeddingRepository, so its single-vector
+# cache reads and writes need no run; the batch (persist_embeddings) does.
 service.embed_targets(targets, repository)
 
-# M2/M3 — one ticker/trading-day, atomically (#68)
-report = repository.reconcile_stories(
-    ticker="NVDA", trading_day="2026-07-23", pipeline_version="v1",
-    stories=[StoryRecord(...)],
-)
-
-# M5 — one ticker/trading-day theme set, atomically
-repository.reconcile_themes(
-    ticker="NVDA", trading_day="2026-07-23", pipeline_version="v1",
-    theme_set=ThemeSetRecord(...), themes=[ThemeRecord(...)],
-    other_coverage=[OtherCoverageRecord(...)],
-    excluded=[ExcludedStoryRecord(...)],
-)
-
-# Runner (#68)
-with repository.stage_run(run_id=..., stage=..., trading_day=...,
-                          pipeline_version=..., stage_key=key) as run:
-    run.record_success(len(items))
+# Fixtures, backfills, and repair — deliberately unlogged, deliberately
+# named as such.
+repository.admin.insert_raw_items(items)
 ```
 
 `reconcile_stories` and `reconcile_themes` report

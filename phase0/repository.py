@@ -17,6 +17,14 @@ them:
 * **Stage logging is not optional.**  There is no flag that turns
   ``run_log`` writes off; :meth:`Phase0Repository.stage_run` records a row
   even when the stage body raises.
+* **Pipeline mutations carry their run.**  The operations issue #68 drives
+  — raw-item ingestion, story and theme reconciliation, embedding batches,
+  ingestion-coupled source state — take a ``run`` handle from
+  :meth:`Phase0Repository.stage_run` and write their ``run_log`` row in the
+  *same* transaction as the data.  Calling one without a usable run raises
+  before anything is written.  The unlogged row helpers still exist for
+  fixtures and backfills, but only behind :attr:`Phase0Repository.admin`,
+  where nothing can mistake them for the pipeline API.
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ from .errors import (
     Phase0Error,
     Phase0IntegrityError,
     Phase0MigrationError,
+    Phase0RunContextError,
     Phase0ValidationError,
     StageKeyError,
     UnsupportedTickerError,
@@ -199,6 +208,16 @@ def _optional_float(
 
 
 def _serialize_json(value: Any, field: str, expected_type: type) -> str:
+    """Serialize caller-supplied JSON, with credentials removed.
+
+    Every JSON column Phase 0 persists goes through here — run-log counts
+    and errors, source-state metadata, theme-set source/trust metadata and
+    quality, provider-conflict fields.  Redacting at this one choke point
+    is what makes "no credential is ever written to disk" checkable rather
+    than a promise repeated at each call site.  ``redact_secrets`` builds
+    new containers, so the caller's own structure is never mutated.
+    """
+
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
@@ -208,7 +227,12 @@ def _serialize_json(value: Any, field: str, expected_type: type) -> str:
         parsed = value
     if not isinstance(parsed, expected_type):
         raise Phase0ValidationError(f"{field} must be a {expected_type.__name__}")
-    return json.dumps(parsed, sort_keys=True, separators=(",", ":"), default=str)
+    return json.dumps(
+        redact_secrets(parsed),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _optional_blob(value: Any, field: str) -> bytes | None:
@@ -232,10 +256,42 @@ class InsertResult:
     inserted: bool
 
 
-class StageRunRecorder:
-    """Counters a stage body fills in while :meth:`stage_run` watches."""
+class StageRunContext:
+    """The handle a logged pipeline mutation has to present.
 
-    def __init__(self) -> None:
+    It is two things at once, deliberately.  It is the counter sheet a stage
+    body fills in while :meth:`Phase0Repository.stage_run` watches, and it
+    is the *proof* that a mutation belongs to a claimed, still-live run: it
+    names the repository, the run, the stage, and the ticker/day/version
+    partition being written, and it goes dead when the run ends.
+
+    A pipeline mutation validates the handle before it writes anything, so
+    "this row exists but no run produced it" is not a reachable state.
+    """
+
+    def __init__(
+        self,
+        repository: "Phase0Repository | None" = None,
+        *,
+        run_id: str = "",
+        stage: str = "",
+        trading_day: str | None = None,
+        pipeline_version: str | None = None,
+        ticker: str | None = None,
+        attempt: int = 1,
+        replay: bool = False,
+        stage_key: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.repository = repository
+        self.run_id = run_id
+        self.stage = stage
+        self.trading_day = trading_day
+        self.pipeline_version = pipeline_version
+        self.ticker = ticker
+        self.attempt = attempt
+        self.replay = replay
+        self.stage_key = dict(stage_key) if stage_key is not None else None
+        self.closed = False
         self.counts: dict[str, Any] = {}
         self.errors: list[Any] = []
         self.success_count = 0
@@ -273,6 +329,51 @@ class StageRunRecorder:
         return "success"
 
 
+#: The counter-sheet half of :class:`StageRunContext` used to be its own
+#: class; the name is kept so existing stage bodies still type-check.
+StageRunRecorder = StageRunContext
+
+
+class Phase0Admin:
+    """Unlogged row helpers: fixtures, backfills, and repair — not pipeline.
+
+    Everything here writes without a run and therefore without a ``run_log``
+    row.  That is legitimate for a test fixture seeding a day, a one-off
+    backfill, or an operator repairing a bad row; it is *not* legitimate for
+    issue #68's runner, which must use the logged operations on
+    :class:`Phase0Repository` itself.
+
+    Keeping these behind ``repository.admin`` is the whole point: a caller
+    cannot reach an unlogged write without naming it as administrative, and
+    a reviewer can grep for ``.admin.`` to find every such site.
+    """
+
+    def __init__(self, repository: "Phase0Repository") -> None:
+        self._repository = repository
+
+    def insert_raw_item(self, item: Mapping[str, Any]) -> InsertResult:
+        return self._repository._insert_raw_items_unlogged([item])[0]
+
+    def insert_raw_items(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        source_state: Mapping[str, Any] | None = None,
+    ) -> list[InsertResult]:
+        return self._repository._insert_raw_items_unlogged(
+            items, source_state=source_state
+        )
+
+    def set_source_state(self, source: str, **kwargs: Any) -> None:
+        return self._repository._set_source_state_unlogged(source, **kwargs)
+
+    def reconcile_stories(self, **kwargs: Any) -> ReconciliationReport:
+        return self._repository._reconcile_stories_unlogged(**kwargs)
+
+    def reconcile_themes(self, **kwargs: Any) -> ReconciliationReport:
+        return self._repository._reconcile_themes_unlogged(**kwargs)
+
+
 class Phase0Repository:
     """Repository contract shared by the scheduled writer and API readers."""
 
@@ -284,6 +385,7 @@ class Phase0Repository:
     ) -> None:
         self.database_path = Path(database_path)
         self.migrations_path = Path(migrations_path)
+        self.admin = Phase0Admin(self)
 
     # ------------------------------------------------------------------
     # Connections and migrations
@@ -302,6 +404,23 @@ class Phase0Repository:
                 "SQLite refused to enable foreign-key enforcement"
             )
         return connection
+
+    @contextmanager
+    def _write_scope(
+        self, connection: sqlite3.Connection | None
+    ) -> Iterator[sqlite3.Connection]:
+        """Join the caller's transaction, or open one when there is none.
+
+        Lets a reconciler run either on its own (administrative use) or
+        inside the transaction that also writes the run log, without the
+        body needing two versions.
+        """
+
+        if connection is not None:
+            yield connection
+        else:
+            with self.connect(immediate=True) as owned:
+                yield owned
 
     @contextmanager
     def connect(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -833,16 +952,19 @@ class Phase0Repository:
             )
         return InsertResult(item_id, inserted)
 
-    def insert_raw_item(self, item: Mapping[str, Any]) -> InsertResult:
-        return self.insert_raw_items([item])[0]
-
-    def insert_raw_items(
+    def _insert_raw_items_unlogged(
         self,
         items: Sequence[Mapping[str, Any]],
         *,
         source_state: Mapping[str, Any] | None = None,
     ) -> list[InsertResult]:
-        """Persist a batch and optional source state in one transaction."""
+        """Persist a batch and optional source state in one transaction.
+
+        Private on purpose: it writes without a run, so it is reachable only
+        through :attr:`Phase0Repository.admin`.  The pipeline entrypoint is
+        :meth:`ingest_raw_items`.
+        """
+
         prepared = [self._prepare_raw_item(item) for item in items]
         with self.connect() as connection:
             results = [self._insert_raw_item(connection, values) for values in prepared]
@@ -1001,7 +1123,7 @@ class Phase0Repository:
             values,
         )
 
-    def set_source_state(
+    def _set_source_state_unlogged(
         self,
         source: str,
         *,
@@ -1014,6 +1136,8 @@ class Phase0Repository:
         error: Any = None,
         retry_after: str | None = None,
     ) -> None:
+        """Write source state with no run attached; see :attr:`admin`."""
+
         with self.connect() as connection:
             self._set_source_state(
                 connection,
@@ -1051,36 +1175,47 @@ class Phase0Repository:
         return embedding_from_row(row)
 
     def upsert_embedding(self, embedding: PersistedEmbedding) -> None:
-        """Atomically insert or replace one source's embedding."""
+        """Atomically insert or replace one source's embedding.
+
+        This is M1's cache protocol (``nlp.embeddings.EmbeddingRepository``),
+        not a pipeline stage: it writes a single derived vector that can be
+        recomputed from the raw item at any time.  The batch that *is* a
+        pipeline stage is :meth:`persist_embeddings`, which carries a run.
+        """
 
         values = validate_embedding(embedding)
-        now = utc_now()
         with self.connect() as connection:
-            try:
-                connection.execute(
-                    """
-                    INSERT INTO embeddings (
-                        source_kind, source_id, model_name, model_revision,
-                        dimension, dtype, input_fingerprint, vector_blob,
-                        created_at, updated_at
-                    ) VALUES (
-                        :source_kind, :source_id, :model_name, :model_revision,
-                        :dimension, :dtype, :input_fingerprint, :vector_blob,
-                        :now, :now
-                    )
-                    ON CONFLICT(source_kind, source_id) DO UPDATE SET
-                        model_name = excluded.model_name,
-                        model_revision = excluded.model_revision,
-                        dimension = excluded.dimension,
-                        dtype = excluded.dtype,
-                        input_fingerprint = excluded.input_fingerprint,
-                        vector_blob = excluded.vector_blob,
-                        updated_at = excluded.updated_at
-                    """,
-                    {**values, "now": now},
+            self._write_embedding(connection, values)
+
+    @staticmethod
+    def _write_embedding(
+        connection: sqlite3.Connection, values: Mapping[str, Any]
+    ) -> None:
+        try:
+            connection.execute(
+                """
+                INSERT INTO embeddings (
+                    source_kind, source_id, model_name, model_revision,
+                    dimension, dtype, input_fingerprint, vector_blob,
+                    created_at, updated_at
+                ) VALUES (
+                    :source_kind, :source_id, :model_name, :model_revision,
+                    :dimension, :dtype, :input_fingerprint, :vector_blob,
+                    :now, :now
                 )
-            except sqlite3.IntegrityError as exc:
-                raise EmbeddingPersistenceError(str(exc)) from exc
+                ON CONFLICT(source_kind, source_id) DO UPDATE SET
+                    model_name = excluded.model_name,
+                    model_revision = excluded.model_revision,
+                    dimension = excluded.dimension,
+                    dtype = excluded.dtype,
+                    input_fingerprint = excluded.input_fingerprint,
+                    vector_blob = excluded.vector_blob,
+                    updated_at = excluded.updated_at
+                """,
+                {**values, "now": utc_now()},
+            )
+        except sqlite3.IntegrityError as exc:
+            raise EmbeddingPersistenceError(str(exc)) from exc
 
     def delete_embedding(self, source_kind: str, source_id: str) -> bool:
         """Drop one source's embedding; ``True`` when a row was removed."""
@@ -1304,6 +1439,7 @@ class Phase0Repository:
     def reconcile_stories(
         self,
         *,
+        run: Any,
         ticker: str,
         trading_day: str | date,
         pipeline_version: str,
@@ -1316,6 +1452,46 @@ class Phase0Repository:
         goes in, and what actually changed comes back.  It is deliberately
         not a loop of independent upserts — a partial rewrite of a day is
         exactly the state AC-8's replay guarantee cannot tolerate.
+
+        ``run`` is the :class:`StageRunContext` from :meth:`stage_run`.  The
+        stories and the ``run_log`` row commit in one transaction, and the
+        counts are derived here rather than supplied by the caller.
+        """
+
+        normalized_ticker = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        with self._logged_mutation(
+            run,
+            operation="reconcile_stories",
+            ticker=normalized_ticker,
+            trading_day=day,
+            pipeline_version=version,
+        ) as (connection, context):
+            report = self._reconcile_stories_unlogged(
+                ticker=normalized_ticker,
+                trading_day=day,
+                pipeline_version=version,
+                stories=stories,
+                delete_obsolete=delete_obsolete,
+                connection=connection,
+            )
+            context.record_success(len(report.inserted) + len(report.updated))
+            context.record_partial(len(report.unchanged))
+            context.update_counts(report.counts)
+            return report
+
+    def _reconcile_stories_unlogged(
+        self,
+        *,
+        ticker: str,
+        trading_day: str | date,
+        pipeline_version: str,
+        stories: Sequence[StoryRecord],
+        delete_obsolete: bool = True,
+        connection: sqlite3.Connection | None = None,
+    ) -> ReconciliationReport:
+        """Reconcile stories with no run attached; see :attr:`admin`.
 
         Themes are derived from stories, so a structural change (a story
         inserted, removed, or re-membered) invalidates the day's theme set
@@ -1335,7 +1511,7 @@ class Phase0Repository:
             )
         incoming = dict(zip(fingerprints, prepared))
 
-        with self.connect(immediate=True) as connection:
+        with self._write_scope(connection) as connection:
             existing = {
                 str(row["cluster_fingerprint"]): row
                 for row in connection.execute(
@@ -1956,6 +2132,7 @@ class Phase0Repository:
     def reconcile_themes(
         self,
         *,
+        run: Any,
         ticker: str,
         trading_day: str | date,
         pipeline_version: str,
@@ -1968,10 +2145,50 @@ class Phase0Repository:
 
         Membership, evidence, "Other coverage" reasons, ranking, cohesion,
         and the run's algorithm/config/model fingerprints all land together
-        or not at all.  Citation membership is enforced by the database as
-        well as here, so a direct-SQL writer cannot produce a theme that
-        cites a story it does not contain.
+        or not at all — together with the ``run_log`` row for ``run``.
+        Citation membership is enforced by the database as well as here, so
+        a direct-SQL writer cannot produce a theme that cites a story it
+        does not contain.
         """
+
+        normalized_ticker = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        with self._logged_mutation(
+            run,
+            operation="reconcile_themes",
+            ticker=normalized_ticker,
+            trading_day=day,
+            pipeline_version=version,
+        ) as (connection, context):
+            report = self._reconcile_themes_unlogged(
+                ticker=normalized_ticker,
+                trading_day=day,
+                pipeline_version=version,
+                theme_set=theme_set,
+                themes=themes,
+                other_coverage=other_coverage,
+                excluded=excluded,
+                connection=connection,
+            )
+            context.record_success(len(report.inserted) + len(report.updated))
+            context.record_partial(len(report.unchanged))
+            context.update_counts(report.counts)
+            return report
+
+    def _reconcile_themes_unlogged(
+        self,
+        *,
+        ticker: str,
+        trading_day: str | date,
+        pipeline_version: str,
+        theme_set: ThemeSetRecord,
+        themes: Sequence[ThemeRecord] = (),
+        other_coverage: Sequence[OtherCoverageRecord] = (),
+        excluded: Sequence[ExcludedStoryRecord] = (),
+        connection: sqlite3.Connection | None = None,
+    ) -> ReconciliationReport:
+        """Reconcile a theme set with no run attached; see :attr:`admin`."""
 
         normalized_ticker = normalize_ticker(ticker)
         day = _normalize_day(trading_day)
@@ -1993,7 +2210,7 @@ class Phase0Repository:
         coverage = self._prepare_coverage(other_coverage, excluded, prepared)
         incoming = dict(zip(fingerprints, prepared))
 
-        with self.connect(immediate=True) as connection:
+        with self._write_scope(connection) as connection:
             existing = {
                 str(row["fingerprint"]): row
                 for row in connection.execute(
@@ -2783,6 +3000,56 @@ class Phase0Repository:
     ) -> int:
         """Record one stage of one run.  There is no way to skip this."""
 
+        with self.connect() as connection:
+            return self._write_run_log(
+                connection,
+                run_id=run_id,
+                stage=stage,
+                counts=counts,
+                duration_ms=duration_ms,
+                errors=errors,
+                started_at=started_at,
+                completed_at=completed_at,
+                trading_day=trading_day,
+                pipeline_version=pipeline_version,
+                status=status,
+                ticker=ticker,
+                success_count=success_count,
+                partial_count=partial_count,
+                failure_count=failure_count,
+                attempt=attempt,
+                replay=replay,
+                stage_key=stage_key,
+            )
+
+    def _write_run_log(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        stage: str,
+        counts: Mapping[str, Any],
+        duration_ms: int,
+        errors: Sequence[Mapping[str, Any] | str],
+        started_at: str,
+        completed_at: str,
+        trading_day: str,
+        pipeline_version: str,
+        status: str | None = None,
+        ticker: str | None = None,
+        success_count: int = 0,
+        partial_count: int = 0,
+        failure_count: int = 0,
+        attempt: int = 1,
+        replay: bool = False,
+        stage_key: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Write the run-log row on an existing transaction.
+
+        Logged pipeline mutations call this *inside* their own write
+        transaction so the row and the data it describes commit together.
+        """
+
         resolved_status = status or ("degraded" if errors else "success")
         if resolved_status not in RUN_STATUSES:
             raise Phase0ValidationError("invalid run status")
@@ -2795,55 +3062,54 @@ class Phase0Repository:
         normalized_ticker = normalize_ticker(ticker, optional=True)
         day = _normalize_day(trading_day)
         version = _require_text(pipeline_version, "pipeline_version")
-        with self.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO run_log (
-                    run_id, stage, counts, duration_ms, errors, started_at,
-                    completed_at, status, trading_day, pipeline_version,
-                    ticker, success_count, partial_count, failure_count,
-                    attempt, replay
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id, stage) DO UPDATE SET
-                    counts = excluded.counts,
-                    duration_ms = excluded.duration_ms,
-                    errors = excluded.errors,
-                    completed_at = excluded.completed_at,
-                    status = excluded.status,
-                    ticker = excluded.ticker,
-                    success_count = excluded.success_count,
-                    partial_count = excluded.partial_count,
-                    failure_count = excluded.failure_count,
-                    attempt = excluded.attempt,
-                    replay = excluded.replay
-                """,
-                (
-                    _require_text(run_id, "run_id"),
-                    _require_text(stage, "stage"),
-                    _serialize_json(dict(counts), "counts", dict),
-                    int(duration_ms),
-                    _serialize_json(redact_secrets(list(errors)), "errors", list),
-                    normalized_started,
-                    normalized_completed,
-                    resolved_status,
-                    day,
-                    version,
-                    normalized_ticker,
-                    _require_int(success_count, "success_count", minimum=0),
-                    _require_int(partial_count, "partial_count", minimum=0),
-                    _require_int(failure_count, "failure_count", minimum=0),
-                    _require_int(attempt, "attempt", minimum=1),
-                    1 if replay else 0,
-                ),
-            )
-            row = connection.execute(
-                "SELECT id FROM run_log WHERE run_id = ? AND stage = ?",
-                (run_id, stage),
-            ).fetchone()
-            run_log_id = int(row["id"])
-            if stage_key is not None:
-                self._link_stage_key(connection, run_log_id, stage_key)
-            return run_log_id
+        connection.execute(
+            """
+            INSERT INTO run_log (
+                run_id, stage, counts, duration_ms, errors, started_at,
+                completed_at, status, trading_day, pipeline_version,
+                ticker, success_count, partial_count, failure_count,
+                attempt, replay
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, stage) DO UPDATE SET
+                counts = excluded.counts,
+                duration_ms = excluded.duration_ms,
+                errors = excluded.errors,
+                completed_at = excluded.completed_at,
+                status = excluded.status,
+                ticker = excluded.ticker,
+                success_count = excluded.success_count,
+                partial_count = excluded.partial_count,
+                failure_count = excluded.failure_count,
+                attempt = excluded.attempt,
+                replay = excluded.replay
+            """,
+            (
+                _require_text(run_id, "run_id"),
+                _require_text(stage, "stage"),
+                _serialize_json(dict(counts), "counts", dict),
+                int(duration_ms),
+                _serialize_json(list(errors), "errors", list),
+                normalized_started,
+                normalized_completed,
+                resolved_status,
+                day,
+                version,
+                normalized_ticker,
+                _require_int(success_count, "success_count", minimum=0),
+                _require_int(partial_count, "partial_count", minimum=0),
+                _require_int(failure_count, "failure_count", minimum=0),
+                _require_int(attempt, "attempt", minimum=1),
+                1 if replay else 0,
+            ),
+        )
+        row = connection.execute(
+            "SELECT id FROM run_log WHERE run_id = ? AND stage = ?",
+            (run_id, stage),
+        ).fetchone()
+        run_log_id = int(row["id"])
+        if stage_key is not None:
+            self._link_stage_key(connection, run_log_id, stage_key)
+        return run_log_id
 
     @staticmethod
     def _link_stage_key(
@@ -2886,46 +3152,286 @@ class Phase0Repository:
         attempt: int = 1,
         replay: bool = False,
         stage_key: Mapping[str, Any] | None = None,
-    ) -> Iterator[StageRunRecorder]:
+    ) -> Iterator[StageRunContext]:
         """Run one stage and record it, whatever happens inside.
 
         Mandatory by construction: the ``run_log`` row is written in a
         ``finally`` block, so an exception in the stage body produces a
         ``failed`` row and then propagates.  There is deliberately no
         ``persist_run_log=False``-style flag anywhere in this class.
+
+        The yielded :class:`StageRunContext` is also the handle the logged
+        pipeline mutations require, and it stops being usable the moment
+        this block exits.
         """
 
-        recorder = StageRunRecorder()
+        context = StageRunContext(
+            self,
+            run_id=_require_text(run_id, "run_id"),
+            stage=_require_text(stage, "stage"),
+            trading_day=_normalize_day(trading_day),
+            pipeline_version=_require_text(pipeline_version, "pipeline_version"),
+            ticker=normalize_ticker(ticker, optional=True),
+            attempt=_require_int(attempt, "attempt", minimum=1),
+            replay=bool(replay),
+            stage_key=stage_key,
+        )
         started = datetime.now(timezone.utc)
         failure: BaseException | None = None
         try:
-            yield recorder
+            yield context
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             failure = exc
-            recorder.record_failure({"error": f"{type(exc).__name__}: {exc}"})
+            context.record_failure({"error": f"{type(exc).__name__}: {exc}"})
             raise
         finally:
+            context.closed = True
             completed = datetime.now(timezone.utc)
-            status = "failed" if failure is not None else recorder.resolved_status()
+            status = "failed" if failure is not None else context.resolved_status()
             self.log_stage(
-                run_id=run_id,
-                stage=stage,
-                counts=recorder.counts,
+                run_id=context.run_id,
+                stage=context.stage,
+                counts=context.counts,
                 duration_ms=int((completed - started).total_seconds() * 1000),
-                errors=recorder.errors,
+                errors=context.errors,
                 started_at=started.isoformat(),
                 completed_at=completed.isoformat(),
-                trading_day=_normalize_day(trading_day),
-                pipeline_version=pipeline_version,
+                trading_day=context.trading_day or _normalize_day(trading_day),
+                pipeline_version=context.pipeline_version or pipeline_version,
                 status=status,
-                ticker=ticker,
-                success_count=recorder.success_count,
-                partial_count=recorder.partial_count,
-                failure_count=recorder.failure_count,
-                attempt=attempt,
-                replay=replay,
+                ticker=context.ticker,
+                success_count=context.success_count,
+                partial_count=context.partial_count,
+                failure_count=context.failure_count,
+                attempt=context.attempt,
+                replay=context.replay,
                 stage_key=stage_key,
             )
+
+    # ------------------------------------------------------------------
+    # The logged pipeline contract (issue #68)
+    # ------------------------------------------------------------------
+
+    def _require_run_context(
+        self,
+        run: Any,
+        *,
+        operation: str,
+        ticker: str | None = None,
+        trading_day: str | None = None,
+        pipeline_version: str | None = None,
+    ) -> StageRunContext:
+        """Reject an unusable run handle *before* the caller writes anything."""
+
+        if not isinstance(run, StageRunContext):
+            raise Phase0RunContextError(
+                f"{operation} requires an active stage run; open one with "
+                "Phase0Repository.stage_run(...) and pass run=<context>"
+            )
+        if run.repository is not self:
+            raise Phase0RunContextError(
+                f"{operation} was given a stage run from another repository"
+            )
+        if run.closed:
+            raise Phase0RunContextError(
+                f"{operation} was given a stage run that has already completed"
+            )
+        if trading_day is not None and run.trading_day != trading_day:
+            raise Phase0RunContextError(
+                f"{operation} targets {trading_day} but the run covers "
+                f"{run.trading_day}"
+            )
+        if pipeline_version is not None and run.pipeline_version != pipeline_version:
+            raise Phase0RunContextError(
+                f"{operation} targets pipeline version {pipeline_version} but the "
+                f"run covers {run.pipeline_version}"
+            )
+        if ticker is not None and run.ticker is not None and run.ticker != ticker:
+            raise Phase0RunContextError(
+                f"{operation} targets {ticker} but the run covers {run.ticker}"
+            )
+        self._assert_lease_held(run, operation=operation)
+        return run
+
+    def _assert_lease_held(self, run: StageRunContext, *, operation: str) -> None:
+        """A run that claimed a stage key must still own an unexpired lease."""
+
+        if run.stage_key is None:
+            return
+        key = run.stage_key
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT run_id, status, lease_expires_at
+                FROM pipeline_stage_keys
+                WHERE stage = ? AND ticker = ? AND trading_day = ?
+                  AND pipeline_version = ?
+                """,
+                (
+                    _require_text(key.get("stage"), "stage_key stage"),
+                    normalize_ticker(key.get("ticker")),
+                    _normalize_day(key.get("trading_day")),
+                    _require_text(
+                        key.get("pipeline_version"), "stage_key pipeline_version"
+                    ),
+                ),
+            ).fetchone()
+        if row is None:
+            raise StageKeyError(f"{operation}: the run's stage key no longer exists")
+        if str(row["run_id"]) != run.run_id or str(row["status"]) != "running":
+            raise StageKeyError(f"{operation}: the stage key is owned by another run")
+        expires = row["lease_expires_at"]
+        if expires is not None and str(expires) <= utc_now():
+            raise StageKeyError(f"{operation}: the stage lease has expired")
+
+    @contextmanager
+    def _logged_mutation(
+        self,
+        run: Any,
+        *,
+        operation: str,
+        ticker: str | None = None,
+        trading_day: str | None = None,
+        pipeline_version: str | None = None,
+    ) -> Iterator[tuple[sqlite3.Connection, StageRunContext]]:
+        """One transaction holding both a pipeline mutation and its run log.
+
+        On success the data and the ``run_log`` row commit together, so a
+        reader can never see one without the other.  On failure the data
+        rolls back and a redacted ``failed`` row is written afterwards, so
+        the attempt is still on the record.
+        """
+
+        context = self._require_run_context(
+            run,
+            operation=operation,
+            ticker=ticker,
+            trading_day=trading_day,
+            pipeline_version=pipeline_version,
+        )
+        started = datetime.now(timezone.utc)
+        try:
+            with self.connect(immediate=True) as connection:
+                yield connection, context
+                self._log_context(connection, context, started)
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            context.record_failure(
+                {"operation": operation, "error": f"{type(exc).__name__}: {exc}"}
+            )
+            with self.connect() as connection:
+                self._log_context(connection, context, started, status="failed")
+            raise
+
+    def _log_context(
+        self,
+        connection: sqlite3.Connection,
+        context: StageRunContext,
+        started: datetime,
+        *,
+        status: str | None = None,
+    ) -> None:
+        completed = datetime.now(timezone.utc)
+        self._write_run_log(
+            connection,
+            run_id=context.run_id,
+            stage=context.stage,
+            counts=context.counts,
+            duration_ms=int((completed - started).total_seconds() * 1000),
+            errors=context.errors,
+            started_at=started.isoformat(),
+            completed_at=completed.isoformat(),
+            trading_day=context.trading_day or "",
+            pipeline_version=context.pipeline_version or "",
+            status=status or context.resolved_status(),
+            ticker=context.ticker,
+            success_count=context.success_count,
+            partial_count=context.partial_count,
+            failure_count=context.failure_count,
+            attempt=context.attempt,
+            replay=context.replay,
+            stage_key=context.stage_key,
+        )
+
+    def ingest_raw_items(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        run: Any,
+        source_state: Mapping[str, Any] | None = None,
+    ) -> list[InsertResult]:
+        """Persist an ingestion batch and its run log in one transaction."""
+
+        prepared = [self._prepare_raw_item(item) for item in items]
+        with self._logged_mutation(run, operation="ingest_raw_items") as (
+            connection,
+            context,
+        ):
+            results = [self._insert_raw_item(connection, values) for values in prepared]
+            if source_state is not None:
+                self._set_source_state(connection, source_state)
+            inserted = sum(1 for result in results if result.inserted)
+            context.record_success(inserted)
+            context.record_partial(len(results) - inserted)
+            context.update_counts(
+                {"raw_items_seen": len(results), "raw_items_inserted": inserted}
+            )
+            return results
+
+    def persist_embeddings(
+        self,
+        embeddings: Sequence[PersistedEmbedding],
+        *,
+        run: Any,
+    ) -> int:
+        """Persist an M1 embedding batch and its run log in one transaction."""
+
+        prepared = [validate_embedding(embedding) for embedding in embeddings]
+        with self._logged_mutation(run, operation="persist_embeddings") as (
+            connection,
+            context,
+        ):
+            for values in prepared:
+                self._write_embedding(connection, values)
+            context.record_success(len(prepared))
+            context.update_counts({"embeddings_written": len(prepared)})
+            return len(prepared)
+
+    def record_source_state(
+        self,
+        source: str,
+        *,
+        run: Any,
+        etag: str | None = None,
+        last_modified: str | None = None,
+        checked_at: str | None = None,
+        successful: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+        status: str | None = None,
+        error: Any = None,
+        retry_after: str | None = None,
+    ) -> None:
+        """Record ingestion-coupled source state and its run log together."""
+
+        state = {
+            "source": source,
+            "etag": etag,
+            "last_modified": last_modified,
+            "checked_at": checked_at or utc_now(),
+            "successful": successful,
+            "metadata": metadata or {},
+            "status": status,
+            "error": error,
+            "retry_after": retry_after,
+        }
+        with self._logged_mutation(run, operation="record_source_state") as (
+            connection,
+            context,
+        ):
+            self._set_source_state(connection, state)
+            if successful:
+                context.record_success()
+            else:
+                context.record_failure()
 
     def run_log_entries(
         self,
@@ -3003,10 +3509,12 @@ __all__ = [
     "InsertResult",
     "MIGRATIONS_PATH",
     "OtherCoverageRecord",
+    "Phase0Admin",
     "Phase0Error",
     "Phase0IntegrityError",
     "Phase0MigrationError",
     "Phase0Repository",
+    "Phase0RunContextError",
     "Phase0ValidationError",
     "ProviderConflictRecord",
     "ReconciliationReport",
@@ -3017,6 +3525,7 @@ __all__ = [
     "STAGE_KEY_STATUSES",
     "SemanticMergeRecord",
     "StageKeyError",
+    "StageRunContext",
     "StageRunRecorder",
     "StoryMemberRecord",
     "StoryRecord",

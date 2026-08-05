@@ -123,13 +123,19 @@ def _backfill_ledger(
 
     Databases created before the ledger existed only report ``user_version``.
     Everything at or below that version is, by definition, already applied.
+
+    This runs *only* against an empty ledger.  Once a database keeps its own
+    history, ``user_version`` stops being evidence of what has run: a later
+    migration may share a version number with one already applied (numbers
+    collide across stacked branches), and inferring "applied" from the
+    number would skip it forever without ever executing it.
     """
 
     applied = _applied_migrations(connection)
+    if applied:
+        return
     pending = [
-        migration
-        for migration in migrations
-        if migration.version <= user_version and migration.name not in applied
+        migration for migration in migrations if migration.version <= user_version
     ]
     if not pending:
         return
