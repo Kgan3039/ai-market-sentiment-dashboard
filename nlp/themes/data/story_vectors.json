@@ -6,7 +6,7 @@
   "issue": "#72",
   "model_name": "sentence-transformers/all-MiniLM-L6-v2",
   "model_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
-  "note": "Produced once from the real Phase 0 encoder and committed so the evaluation, and the test that regenerates its artifact, run offline and byte-identically. Rounded to vector_precision, so cohesion figures derived from these vectors are reproducible rather than hardware-dependent. Regenerate with tools.eval_themes --real-model --write-vectors.",
+  "note": "Produced from the real Phase 0 encoder and committed so the evaluation, and the test that regenerates its artifact, run offline and byte-identically. Rounded to vector_precision, so cohesion figures derived from these vectors are reproducible rather than hardware-dependent. Regenerate with tools.eval_themes --real-model --write-vectors.",
   "schema_version": "phase0.theme_vectors.v1",
   "stage_specific_trust_summary": {
     "detail": "These are synthetic authored ticker-days, not ingested coverage: no theme here was produced from a real trading day, so there is no real ticker-day validation of AC-4 behind any number in this file; the expected groupings are single-author, unadjudicated and have no second reviewer, so a clustering that reproduces them has agreed with its author and nothing more; the dataset is non-gate-eligible and nothing here validates AC-4 (clustering) and G1 (theme-assignment agreement), which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60.",

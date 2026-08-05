@@ -125,6 +125,19 @@ class ThemeStory:
     content_hash: str | None = None
 
     @property
+    def authoritative_outlet_count(self) -> int:
+        """Distinct outlets as upstream counted them, not as M5 sees them.
+
+        M3's ``outlet_count`` wins when present: it counts the outlets the
+        dedup stage actually saw, which can exceed the names projected
+        here.  Ranking anywhere in M5 uses this, never ``len(outlets)``.
+        """
+
+        if self.outlet_count is not None:
+            return int(self.outlet_count)
+        return len({outlet for outlet in self.outlets if outlet})
+
+    @property
     def is_quarantined(self) -> bool:
         """True when M3 held this story out under an M2 provider conflict."""
 
@@ -339,6 +352,12 @@ class ThemeSet:
     #: Keys appearing in more than one place.  Derived.
     duplicate_membership_keys: tuple[str, ...] = ()
 
+    @property
+    def theme_keys(self) -> tuple[str, ...]:
+        """Every theme identity, in rank order.  Unique by construction."""
+
+        return tuple(theme.theme_key for theme in self.themes)
+
     def __post_init__(self) -> None:
         """Derive the accounting, and refuse a set that cannot be honest.
 
@@ -454,6 +473,18 @@ def validate_theme_set_invariants(theme_set: "ThemeSet") -> None:
     coverage.  Called from ``ThemeSet.__post_init__`` and again at the
     summarization boundary, so both use one definition of "valid".
     """
+
+    keys = [theme.theme_key for theme in theme_set.themes]
+    duplicate_theme_keys = tuple(sorted({key for key in keys if keys.count(key) > 1}))
+    if duplicate_theme_keys:
+        # Two themes under one key is not a diagnostic, it is a lost theme:
+        # every downstream map is keyed on theme_key, so the second one
+        # overwrites the first and the set still reports itself complete.
+        raise ThemeInvariantError(
+            f"theme_key(s) {list(duplicate_theme_keys)} are used by more than "
+            "one theme; a theme identity must name exactly one theme",
+            duplicate_theme_keys=duplicate_theme_keys,
+        )
 
     for index, theme in enumerate(theme_set.themes):
         if not theme.member_story_keys:

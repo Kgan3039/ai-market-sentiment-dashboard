@@ -44,7 +44,7 @@ from nlp.dedup.text import display_text
 from .models import ThemeStory
 
 #: Bumped when a family, a phrase list, or the comparison changes.
-NARRATIVE_POLICY_VERSION = "m5.narrative.v1"
+NARRATIVE_POLICY_VERSION = "m5.narrative.v2"
 
 #: ``(family, pattern)``.  Every pattern is a phrase a newsroom writes on
 #: purpose; none is a bare noun that could appear in passing.  Ordered only
@@ -213,35 +213,146 @@ def families_compatible(left: frozenset[str], right: frozenset[str]) -> bool:
     )
 
 
+#: Largest candidate cluster the exact search is run on.  Above it the
+#: search is abandoned rather than allowed to run unbounded, and the greedy
+#: path is used with that stated.  A candidate cluster this large cannot
+#: survive the cohesion floors in practice, so the bound is a guard rather
+#: than a routine path.
+MAX_EXACT_SUBSET_SEARCH = 24
+
+#: Hard ceiling on maximal groups enumerated before the search gives up.
+MAX_SUBSET_ENUMERATIONS = 20000
+
+
+def _selection_key(
+    stories: Sequence[ThemeStory], group: Sequence[int]
+) -> tuple[int, int, float, tuple[str, ...]]:
+    """Order candidate groups best-first, on authoritative evidence.
+
+    Size first, because the policy is the largest compatible subset.  Then
+    the authoritative salience evidence - ``ThemeStory.outlet_count`` as
+    upstream counted it, never the projected ``len(outlets)``, which
+    under-ranks a widely syndicated story whose carriers M5 cannot name.
+    Then recency, then the sorted story keys, which is a total order on
+    data and settles a complete tie the same way every run.
+    """
+
+    outlets = sum(stories[position].authoritative_outlet_count for position in group)
+    latest = max(
+        (
+            stories[position].published_at.timestamp()
+            for position in group
+            if stories[position].published_at is not None
+        ),
+        default=0.0,
+    )
+    keys = tuple(sorted(stories[position].story_key for position in group))
+    return (len(group), outlets, latest, keys)
+
+
+def _maximal_groups(
+    positions: Sequence[int], compatible: dict[int, set[int]]
+) -> list[list[int]]:
+    """Every maximal mutually-compatible group, by Bron-Kerbosch with a pivot.
+
+    Bounded twice: the caller only reaches here below
+    :data:`MAX_EXACT_SUBSET_SEARCH` members, and the enumeration stops at
+    :data:`MAX_SUBSET_ENUMERATIONS`.  Returns ``[]`` when the ceiling is
+    hit, which the caller reads as "fall back and say so".
+    """
+
+    found: list[list[int]] = []
+    overflowed = False
+
+    def expand(clique: list[int], candidates: set[int], excluded: set[int]) -> None:
+        nonlocal overflowed
+        if overflowed:
+            return
+        if not candidates and not excluded:
+            found.append(sorted(clique))
+            if len(found) >= MAX_SUBSET_ENUMERATIONS:
+                overflowed = True
+            return
+        pivot = max(
+            candidates | excluded, key=lambda node: len(candidates & compatible[node])
+        )
+        for node in sorted(candidates - compatible[pivot]):
+            expand(
+                clique + [node],
+                candidates & compatible[node],
+                excluded & compatible[node],
+            )
+            candidates = candidates - {node}
+            excluded = excluded | {node}
+            if overflowed:
+                return
+
+    expand([], set(positions), set())
+    return [] if overflowed else found
+
+
+def largest_compatible_group(
+    stories: Sequence[ThemeStory], ordered_positions: Sequence[int]
+) -> tuple[int, ...]:
+    """Return the largest mutually compatible group, exactly.
+
+    The previous greedy grew one group per anchor in list order, which is
+    not "the largest": an anchor could be diverted by an earlier-ordered
+    neighbour that conflicts with the rest of a bigger group, and every
+    member of that bigger group could be diverted the same way, so a
+    compatible pair survived while a compatible trio was available.  This
+    enumerates the maximal groups and picks by :func:`_selection_key`, so
+    the implementation and the stated policy are the same thing.
+    """
+
+    positions = list(ordered_positions)
+    if len(positions) <= 1:
+        return tuple(positions)
+    families = {
+        position: narrative_families(stories[position]) for position in positions
+    }
+    compatible = {
+        position: {
+            other
+            for other in positions
+            if other != position
+            and families_compatible(families[position], families[other])
+        }
+        for position in positions
+    }
+    groups = (
+        _maximal_groups(positions, compatible)
+        if len(positions) <= MAX_EXACT_SUBSET_SEARCH
+        else []
+    )
+    if not groups:
+        # Bounded out: grow one group per anchor in the caller's order.
+        # Never larger than the exact answer, and reported as the fallback
+        # it is rather than described as a maximum.
+        for anchor in positions:
+            group = [anchor]
+            for position in positions:
+                if position != anchor and all(
+                    families_compatible(families[position], families[member])
+                    for member in group
+                ):
+                    group.append(position)
+            groups.append(sorted(group))
+    return tuple(max(groups, key=lambda group: _selection_key(stories, group)))
+
+
 def narratively_incompatible(
     stories: Sequence[ThemeStory], ordered_positions: Sequence[int]
 ) -> tuple[int, ...]:
     """Return the positions to move out so a theme is about one subject.
 
-    Cluster-wide and deterministic.  The theme keeps the largest group of
-    mutually compatible members, ties broken by the caller's order — which
-    is salience order, so a theme stays about what it was mostly about.
-    Everything outside that group leaves together.
+    Cluster-wide, exact and deterministic: the theme keeps the largest
+    mutually compatible group, ties settled by authoritative salience and
+    then by story key.  Everything outside that group leaves together, and
+    the caller records it as ``narrative_mismatch``.
     """
 
-    families = {
-        position: narrative_families(stories[position])
-        for position in ordered_positions
-    }
-    best: list[int] = []
-    for anchor in ordered_positions:
-        group = [anchor]
-        for position in ordered_positions:
-            if position == anchor:
-                continue
-            if all(
-                families_compatible(families[position], families[member])
-                for member in group
-            ):
-                group.append(position)
-        if len(group) > len(best):
-            best = group
-    keep = set(best)
+    keep = set(largest_compatible_group(stories, ordered_positions))
     return tuple(
         sorted(position for position in ordered_positions if position not in keep)
     )
@@ -274,7 +385,16 @@ def policy_components() -> dict[str, str]:
         "unknown_rule": "empty_family_set_blocks_nothing",
         "default_rule": "two_distinct_explicit_families_cannot_share_a_theme",
         "scope": "whole_prospective_theme_after_subset_extraction",
-        "selection": "largest_mutually_compatible_group_ties_by_salience_order",
+        "selection": (
+            "exact_largest_mutually_compatible_group_by_bron_kerbosch; ties by "
+            "authoritative_outlet_count_sum, then recency, then sorted story keys"
+        ),
+        "selection_bound": (
+            f"exact below {MAX_EXACT_SUBSET_SEARCH} members and "
+            f"{MAX_SUBSET_ENUMERATIONS} maximal groups; greedy per-anchor "
+            "fallback above either, never described as a maximum"
+        ),
+        "ranking_evidence": "ThemeStory.authoritative_outlet_count_never_len_outlets",
         "recall_key": "recall:<product>_or_recall:unspecified",
         "recall_pattern": _RECALL.pattern,
         "product_pattern": _PRODUCT.pattern,

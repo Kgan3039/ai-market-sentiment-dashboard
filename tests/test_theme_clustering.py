@@ -34,6 +34,7 @@ from nlp.themes import (
     ThemeEncodingError,
     ThemeInputError,
     ThemeInvariantError,
+    ThemeSet,
     ThemeStory,
     cluster_themes,
     encoder_identity,
@@ -3588,11 +3589,19 @@ INCOMPATIBLE_PAIRS = [
 
 @pytest.mark.parametrize("left,right", INCOMPATIBLE_PAIRS)
 def test_two_narratives_cannot_share_a_theme(left, right):
+    """Exactly one leaves; which one is the ranking's job, not the order's."""
+
     from nlp.themes import narratively_incompatible
+    from nlp.themes.narrative import _selection_key, largest_compatible_group
 
     stories = [story("a", left, 0), story("b", right, 1)]
+    ejected = narratively_incompatible(stories, [0, 1])
+    kept = largest_compatible_group(stories, [0, 1])
 
-    assert narratively_incompatible(stories, [0, 1]) == (1,)
+    assert len(ejected) == 1
+    assert len(kept) == 1
+    assert set(ejected) | set(kept) == {0, 1}
+    assert _selection_key(stories, kept) > _selection_key(stories, list(ejected))
 
 
 COMPATIBLE_PAIRS = [
@@ -3994,3 +4003,507 @@ def test_no_vacuous_assertion_survives_in_this_suite():
 
     for pattern in vacuous:
         assert pattern not in body, pattern
+
+
+# --------------------------------------------------------------------------
+# Theme identities must be unique
+# --------------------------------------------------------------------------
+
+
+def test_two_themes_sharing_one_key_are_refused():
+    with pytest.raises(ThemeInvariantError, match="more than one theme") as caught:
+        theme_set_of(
+            themes=(
+                theme_of(("a",), fingerprint="k" * 64),
+                theme_of(("b",), fingerprint="k" * 64, items={"b": ("b1",)}),
+            ),
+            declared=("a", "b"),
+        )
+
+    assert caught.value.duplicate_theme_keys == ("k" * 64,)
+
+
+def test_three_themes_with_two_duplicate_keys_report_both():
+    with pytest.raises(ThemeInvariantError) as caught:
+        theme_set_of(
+            themes=(
+                theme_of(("a",), fingerprint="k" * 64),
+                theme_of(("b",), fingerprint="k" * 64, items={"b": ("b1",)}),
+                theme_of(("c",), fingerprint="m" * 64, items={"c": ("c1",)}),
+                theme_of(("d",), fingerprint="m" * 64, items={"d": ("d1",)}),
+            ),
+            declared=("a", "b", "c", "d"),
+        )
+
+    assert caught.value.duplicate_theme_keys == ("k" * 64, "m" * 64)
+
+
+def test_a_duplicate_key_is_refused_even_with_a_perfect_partition():
+    """The reported case: three valid, non-overlapping themes, two keys."""
+
+    with pytest.raises(ThemeInvariantError, match="theme identity"):
+        theme_set_of(
+            themes=(
+                theme_of(("a",), fingerprint="k" * 64),
+                theme_of(("b",), fingerprint="k" * 64, items={"b": ("b1",)}),
+                theme_of(("c",), fingerprint="z" * 64, items={"c": ("c1",)}),
+            ),
+            declared=("a", "b", "c"),
+        )
+
+
+def test_replace_cannot_introduce_a_duplicate_theme_key():
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+    first, second = result.themes[0], result.themes[1]
+    collided = dataclasses.replace(second, theme_key=first.theme_key)
+
+    with pytest.raises(ThemeInvariantError, match="more than one theme"):
+        dataclasses.replace(result, themes=(first, collided))
+
+
+def test_summarizer_inputs_refuses_a_hostile_set_rather_than_dropping_a_theme():
+    from nlp.themes import summarizer_inputs
+
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+    first = result.themes[0]
+    collided = dataclasses.replace(result.themes[1], theme_key=first.theme_key)
+    # Bypass construction the way a deserializer or a future caller could.
+    hostile = object.__new__(ThemeSet)
+    for field in dataclasses.fields(result):
+        object.__setattr__(hostile, field.name, getattr(result, field.name))
+    object.__setattr__(hostile, "themes", (first, collided))
+
+    assert len(hostile.themes) == 2
+    with pytest.raises(ThemeInvariantError, match="more than one theme"):
+        summarizer_inputs(hostile)
+
+
+def test_unique_keys_produce_one_adapter_result_per_theme():
+    from nlp.themes import adapt_theme_set, summarizer_inputs
+
+    stories, encoder = three_strand_day()
+    result = run(stories, encoder)
+
+    assert len(set(result.theme_keys)) == len(result.themes)
+    assert len(summarizer_inputs(result)) == len(result.themes)
+    assert len(adapt_theme_set(result)) == len(result.themes)
+
+
+# --------------------------------------------------------------------------
+# The narrative subset selection is exactly what it claims to be
+# --------------------------------------------------------------------------
+
+
+def diverted_trio():
+    """Three decoys, each diverting one member of a compatible trio.
+
+    The trio all carry ``pricing``; each decoy shares one *other* family
+    with exactly one trio member and nothing with the rest.  A per-anchor
+    greedy is diverted from every trio member and keeps a pair.
+    """
+
+    return [
+        story(
+            "d1",
+            "Tesla energy storage deployments set a quarterly record",
+            0,
+            outlets=("reuters",),
+            outlet_count=9,
+        ),
+        story(
+            "d2",
+            "Tesla applies for a robotaxi permit in Arizona",
+            1,
+            outlets=("reuters",),
+            outlet_count=9,
+        ),
+        story(
+            "d3",
+            "Tesla schedules its investor day for 2026-05-14",
+            2,
+            outlets=("reuters",),
+            outlet_count=9,
+        ),
+        story(
+            "m1",
+            "Tesla cuts Model 3 prices and expands energy storage " "deployments",
+            3,
+            outlets=("ft",),
+            outlet_count=1,
+        ),
+        story(
+            "m2",
+            "Tesla cuts Model 3 prices and applies for a robotaxi permit",
+            4,
+            outlets=("ft",),
+            outlet_count=1,
+        ),
+        story(
+            "m3",
+            "Tesla cuts Model 3 prices before its investor day",
+            5,
+            outlets=("ft",),
+            outlet_count=1,
+        ),
+    ]
+
+
+def test_a_compatible_trio_beats_a_compatible_pair():
+    """The reproduced greedy failure."""
+
+    from nlp.themes import narratively_incompatible
+    from nlp.themes.narrative import largest_compatible_group
+
+    stories = diverted_trio()
+    kept = largest_compatible_group(stories, list(range(6)))
+
+    assert {stories[position].story_key for position in kept} == {"m1", "m2", "m3"}
+    assert len(narratively_incompatible(stories, list(range(6)))) == 3
+
+
+def test_the_greedy_path_really_would_have_kept_a_pair():
+    """Guards the test above: the case has to be a case."""
+
+    from nlp.themes.narrative import families_compatible, narrative_families
+
+    stories = diverted_trio()
+    families = {index: narrative_families(entry) for index, entry in enumerate(stories)}
+    best = 0
+    for anchor in range(6):
+        group = [anchor]
+        for position in range(6):
+            if position != anchor and all(
+                families_compatible(families[position], families[member])
+                for member in group
+            ):
+                group.append(position)
+        best = max(best, len(group))
+
+    assert best == 2, "the greedy must be diverted for this test to mean anything"
+
+
+def test_two_equal_groups_are_resolved_by_authoritative_salience():
+    from nlp.themes.narrative import largest_compatible_group
+
+    stories = [
+        story(
+            "wide1",
+            "Tesla cuts Model 3 prices across Europe",
+            0,
+            outlets=("reuters",),
+            outlet_count=9,
+        ),
+        story(
+            "wide2",
+            "European Model Y buyers get a lower sticker price",
+            1,
+            outlets=("reuters",),
+            outlet_count=9,
+        ),
+        story(
+            "narrow1",
+            "Tesla applies for a robotaxi permit in Arizona",
+            2,
+            outlets=("ft",),
+            outlet_count=1,
+        ),
+        story(
+            "narrow2",
+            "Arizona regulators set a hearing date for the permit",
+            3,
+            outlets=("ft",),
+            outlet_count=1,
+        ),
+    ]
+    kept = largest_compatible_group(stories, [0, 1, 2, 3])
+
+    assert {stories[position].story_key for position in kept} == {"wide1", "wide2"}
+
+
+def test_the_projected_outlet_list_does_not_decide_the_tie():
+    """One story names four outlets; the other's upstream count is higher."""
+
+    from nlp.themes.narrative import largest_compatible_group
+
+    stories = [
+        story(
+            "named1",
+            "Tesla cuts Model 3 prices across Europe",
+            0,
+            outlets=("a", "b", "c", "d"),
+        ),
+        story(
+            "named2",
+            "European Model Y buyers get a lower sticker price",
+            1,
+            outlets=("a", "b", "c", "d"),
+        ),
+        story(
+            "counted1",
+            "Tesla applies for a robotaxi permit in Arizona",
+            2,
+            outlets=("ft",),
+            outlet_count=20,
+        ),
+        story(
+            "counted2",
+            "Arizona regulators set a hearing date for the permit",
+            3,
+            outlets=("ft",),
+            outlet_count=20,
+        ),
+    ]
+    kept = largest_compatible_group(stories, [0, 1, 2, 3])
+
+    assert {stories[position].story_key for position in kept} == {
+        "counted1",
+        "counted2",
+    }
+
+
+def test_a_complete_tie_is_resolved_deterministically():
+    from nlp.themes.narrative import largest_compatible_group
+
+    stories = [
+        story("zz1", "Tesla cuts Model 3 prices across Europe", 0),
+        story("zz2", "European Model Y buyers get a lower sticker price", 0),
+        story("aa1", "Tesla applies for a robotaxi permit in Arizona", 0),
+        story("aa2", "Arizona regulators set a hearing date for the permit", 0),
+    ]
+    first = largest_compatible_group(stories, [0, 1, 2, 3])
+    again = largest_compatible_group(stories, [3, 2, 1, 0])
+
+    assert sorted(first) == sorted(again)
+    assert {stories[position].story_key for position in first} == {"zz1", "zz2"}
+
+
+def test_the_selection_is_permutation_invariant():
+    from nlp.themes.narrative import largest_compatible_group
+
+    stories = diverted_trio()
+    forward = largest_compatible_group(stories, list(range(6)))
+    backward = largest_compatible_group(stories, list(reversed(range(6))))
+
+    assert sorted(forward) == sorted(backward)
+
+
+def test_no_compatible_group_above_the_size_floor_dissolves_the_cluster():
+    stories = [
+        story("a", "Tesla delivers 495,000 vehicles in the first quarter", 0),
+        story("b", "Tesla energy storage deployments set a quarterly record", 1),
+        story("c", "Tesla opens a supercharger corridor across Norway", 2),
+        story("d", "Tesla plans a new battery line in Nevada", 3),
+    ]
+    encoder = AngleEncoder(
+        {entry.title: index * 2.0 for index, entry in enumerate(stories)}
+    )
+    result = run(stories, encoder)
+
+    assert not result.themes
+    assert len(result.accounted_story_keys) == 4
+
+
+def test_selected_stories_are_retained_exactly_once():
+    from nlp.themes.narrative import largest_compatible_group
+
+    stories = diverted_trio()
+    kept = largest_compatible_group(stories, list(range(6)))
+
+    assert len(kept) == len(set(kept))
+    ejected = set(range(6)) - set(kept)
+    assert not ejected & set(kept)
+    assert len(kept) + len(ejected) == 6
+
+
+def test_ejected_stories_receive_narrative_mismatch_through_the_stage():
+    stories = diverted_trio() + [
+        story("far1", "far one", 6),
+        story("far2", "far two", 7),
+    ]
+    angles = {entry.title: 2.0 * index for index, entry in enumerate(diverted_trio())}
+    angles.update({"far one": 120.0, "far two": 122.0})
+    result = run(stories, AngleEncoder(angles))
+    reasons = result.other_coverage_by_reason()
+
+    assert set(reasons.get("narrative_mismatch", ())) >= {"d1", "d2", "d3"}
+    assert len(result.accounted_story_keys) == 8
+
+
+def test_the_selection_bound_is_documented_and_fingerprinted():
+    from nlp.themes.narrative import (
+        MAX_EXACT_SUBSET_SEARCH,
+        MAX_SUBSET_ENUMERATIONS,
+        policy_components,
+    )
+
+    components = policy_components()
+
+    assert MAX_EXACT_SUBSET_SEARCH > 0 and MAX_SUBSET_ENUMERATIONS > 0
+    assert "exact_largest" in components["selection"]
+    assert str(MAX_EXACT_SUBSET_SEARCH) in components["selection_bound"]
+    assert "greedy" in components["selection_bound"]
+    assert "never_len_outlets" in components["ranking_evidence"]
+    assert "narrative.selection_bound" in config().fingerprint_components(
+        model_name="m", model_revision="v1", embedding_dimension=3
+    )
+
+
+# --------------------------------------------------------------------------
+# The vector writer emits an asset its own loader accepts
+# --------------------------------------------------------------------------
+
+
+def written_vectors(tmp_path, day_set=None, encoder=None):
+    from nlp.themes.vectors import write_story_vectors
+
+    day_set = day_set or load_ticker_days()
+    encoder = encoder or FixtureVectorEncoder()
+    target = tmp_path / "story_vectors.json"
+    return write_story_vectors(day_set, encoder, target)
+
+
+class FixtureVectorEncoder:
+    """Replays the committed vectors, so the writer needs no model."""
+
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    model_revision = "test-revision"
+
+    def __init__(self) -> None:
+        from nlp.themes.vectors import load_story_vectors
+
+        self.store = load_story_vectors()
+        self.dimension = self.store.dimension
+        self._queue = [self.store.vectors[key] for key in sorted(self.store.vectors)]
+
+    def embed_batch(self, texts):
+        taken, self._queue = self._queue[: len(texts)], self._queue[len(texts) :]
+        return taken
+
+
+def test_a_written_vector_asset_loads_immediately(tmp_path):
+    from nlp.themes.vectors import load_story_vectors
+
+    written = written_vectors(tmp_path)
+    store = load_story_vectors(written)
+
+    assert store.dimension == 384
+    assert len(store.vectors) == 30
+    assert all(len(v) == store.dimension for v in store.vectors.values())
+    assert store.model_name
+
+
+def test_a_written_vector_asset_carries_valid_trust_metadata(tmp_path):
+    from nlp.eval.trust import parse_trust_contract
+    from nlp.themes.trust import derive_stage_trust_summary
+
+    payload = json.loads(written_vectors(tmp_path).read_text(encoding="utf-8"))
+    contract = parse_trust_contract(payload, where="written vectors")
+
+    assert contract.gate_eligible is False
+    assert payload["trust_summary"]["level"] == "WARNING"
+    assert payload["stage_specific_trust_summary"] == (
+        derive_stage_trust_summary(contract).as_dict()
+    )
+    assert payload["dataset_id"] == load_ticker_days().dataset_id
+    assert payload["dataset_version"]
+    assert payload["vector_precision"] > 0
+    assert payload["composition"]
+
+
+def test_the_written_summaries_are_derived_not_supplied(tmp_path):
+    """A caller cannot hand in warning text; both banners are functions."""
+
+    from nlp.eval.trust import derive_trust_summary, parse_trust_contract
+
+    payload = json.loads(written_vectors(tmp_path).read_text(encoding="utf-8"))
+    contract = parse_trust_contract(payload, where="written vectors")
+
+    assert payload["trust_summary"] == derive_trust_summary(contract).as_dict()
+    assert "warning" not in payload["trust_contract"]
+
+
+def test_a_day_set_without_a_trust_contract_cannot_be_written(tmp_path):
+    day_set = dataclasses.replace(load_ticker_days(), trust_contract=None)
+
+    with pytest.raises(ThemeInputError, match="no trust contract"):
+        written_vectors(tmp_path, day_set=day_set)
+
+
+def test_a_gate_eligible_claim_is_refused_by_the_writer(tmp_path):
+    day_set = load_ticker_days()
+    contract = dataclasses.replace(
+        day_set.trust_contract,
+        gate_eligible=True,
+        real_ingested_evidence=True,
+        labeling_status="multi_reviewer_adjudicated",
+        reviewer_count=2,
+        adjudicated=True,
+        dataset_kind="sampled_production",
+        metrics_purpose="gate_acceptance",
+    )
+
+    with pytest.raises(ThemeInputError, match="gate eligibility"):
+        written_vectors(
+            tmp_path, day_set=dataclasses.replace(day_set, trust_contract=contract)
+        )
+
+
+def test_two_consecutive_generations_are_byte_identical(tmp_path):
+    from nlp.themes.vectors import write_story_vectors
+
+    day_set = load_ticker_days()
+    first = write_story_vectors(day_set, FixtureVectorEncoder(), tmp_path / "a.json")
+    second = write_story_vectors(day_set, FixtureVectorEncoder(), tmp_path / "b.json")
+
+    assert first.read_text(encoding="utf-8") == second.read_text(encoding="utf-8")
+
+
+def test_an_unknown_field_is_still_rejected_by_the_loader(tmp_path):
+    from nlp.themes.vectors import load_story_vectors
+
+    written = written_vectors(tmp_path)
+    payload = json.loads(written.read_text(encoding="utf-8"))
+    payload["surprise"] = "text nobody declared"
+    written.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ThemeInputError, match="unknown vector-fixture field"):
+        load_story_vectors(written)
+
+
+def test_the_committed_asset_matches_what_the_writer_produces(tmp_path):
+    """The regeneration path and the committed file are the same schema."""
+
+    written = json.loads(written_vectors(tmp_path).read_text(encoding="utf-8"))
+    committed = json.loads(
+        (REPO_ROOT / "nlp/themes/data/story_vectors.json").read_text(encoding="utf-8")
+    )
+
+    assert set(written) == set(committed)
+    for field in (
+        "schema_version",
+        "dataset_id",
+        "dataset_version",
+        "issue",
+        "trust_contract",
+        "trust_summary",
+        "stage_specific_trust_summary",
+        "dimension",
+        "vector_precision",
+        "composition",
+        "note",
+    ):
+        assert written[field] == committed[field], field
+
+
+def test_the_write_vectors_cli_path_uses_the_same_writer():
+    import inspect
+
+    from tools import eval_themes
+    from nlp.themes.vectors import write_story_vectors
+
+    source = inspect.getsource(eval_themes.main)
+
+    assert "write_story_vectors(" in source
+    assert eval_themes.write_story_vectors is write_story_vectors

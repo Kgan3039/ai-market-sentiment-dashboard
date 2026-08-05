@@ -527,9 +527,7 @@ def outlet_count_of(story: ThemeStory) -> int:
     set is the fallback, never a replacement.
     """
 
-    if story.outlet_count is not None:
-        return int(story.outlet_count)
-    return len({outlet for outlet in story.outlets if outlet})
+    return story.authoritative_outlet_count
 
 
 @dataclass(frozen=True)

@@ -347,7 +347,11 @@ def _narratively_coherent(
     from .narrative import narratively_incompatible
 
     ordered = sorted(
-        members, key=lambda position: (-len(stories[position].outlets), position)
+        members,
+        key=lambda position: (
+            -stories[position].authoritative_outlet_count,
+            position,
+        ),
     )
     ejected = set(narratively_incompatible(stories, ordered))
     if not ejected:

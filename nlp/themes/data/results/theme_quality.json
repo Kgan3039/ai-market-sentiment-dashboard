@@ -32,7 +32,7 @@
     "text": "WARNING [M5 theme clustering (issue #72)]: Issue #72 (M5 theme clustering) on a synthetic authored development fixture: not AC-4 or G1 validation.\nThese are synthetic authored ticker-days, not ingested coverage: no theme here was produced from a real trading day, so there is no real ticker-day validation of AC-4 behind any number in this file; the expected groupings are single-author, unadjudicated and have no second reviewer, so a clustering that reproduces them has agreed with its author and nothing more; the dataset is non-gate-eligible and nothing here validates AC-4 (clustering) and G1 (theme-assignment agreement), which need real ingested ticker-days (#57/#61/#62) and the two-reviewer assignment review in #60.",
     "version": "m5.stage_trust.v2"
   },
-  "theme_config_fingerprint": "b61864e3cf4c3bf2253b1e1462b5bd79e4a941207752aefa762a16d3ce40a7b5",
+  "theme_config_fingerprint": "de58e10a61ba8dea0a2f95c71b0a67dcfdaedf19dfb43f9c11b7dbf3ced7df11",
   "theme_policy_components": {
     "accounting_contract": "input == themes + other_coverage + excluded, exactly once each; complete is false when any diagnostic is non-empty",
     "algorithm_version": "m5.themes.v1",
@@ -110,13 +110,15 @@
     "narrative.family.regulatory_permit": "\\b(?:permit\\w*|licen[cs]e application|applies? for|application for|regulatory (?:approval|filing)|hearing date|files? with the\\b|petition\\w*)\\b",
     "narrative.family.vehicle_deliveries": "\\b(?:deliver(?:s|ed|ing)\\s+(?:[\\d,.]+\\s+)?(?:vehicles?|cars?|units?|trucks?)|vehicle deliver(?:y|ies)|car deliver(?:y|ies)|(?:quarterly|annual|record|first[- ]quarter|q[1-4])\\s+deliver(?:y|ies)|deliveries\\s+(?:top|beat|miss|rose|fell|climbed|dropped)|handovers?)\\b",
     "narrative.product_pattern": "\\b(model\\s+[a-z0-9]+|cybertruck\\w*|semi\\b|roadster\\w*|powerwall\\w*|megapack\\w*|solar roof)\\b",
+    "narrative.ranking_evidence": "ThemeStory.authoritative_outlet_count_never_len_outlets",
     "narrative.recall_key": "recall:<product>_or_recall:unspecified",
     "narrative.recall_pattern": "\\brecall(?:s|ed|ing)?\\b",
     "narrative.scope": "whole_prospective_theme_after_subset_extraction",
-    "narrative.selection": "largest_mutually_compatible_group_ties_by_salience_order",
+    "narrative.selection": "exact_largest_mutually_compatible_group_by_bron_kerbosch; ties by authoritative_outlet_count_sum, then recency, then sorted story keys",
+    "narrative.selection_bound": "exact below 24 members and 20000 maximal groups; greedy per-anchor fallback above either, never described as a maximum",
     "narrative.text_scope": "title_and_description",
     "narrative.unknown_rule": "empty_family_set_blocks_nothing",
-    "narrative.version": "m5.narrative.v1",
+    "narrative.version": "m5.narrative.v2",
     "near_cohesion_floor_margin": "0.05",
     "other_coverage_policy": "explicit_entry_per_story_with_stated_reason; never a narrative theme",
     "other_coverage_reasons": "below_clustering_floor,below_cohesion_floor,below_theme_size_floor,clustering_noise,degenerate_embedding_geometry,insufficient_theme_structure,narrative_mismatch,provider_quarantine,semantic_skip,surplus_to_theme_cap,theme_incompatible",
@@ -174,7 +176,7 @@
     {
       "ac4_shape_detail": "below the clustering floor; AC-4 asks for individual listing and that is what happened",
       "algorithm_version": "m5.themes.v1",
-      "config_fingerprint": "b61864e3cf4c3bf2253b1e1462b5bd79e4a941207752aefa762a16d3ce40a7b5",
+      "config_fingerprint": "de58e10a61ba8dea0a2f95c71b0a67dcfdaedf19dfb43f9c11b7dbf3ced7df11",
       "duplicate_membership_keys": [],
       "embedding_dimension": 384,
       "excluded_by_reason": {},
@@ -248,7 +250,7 @@
     {
       "ac4_shape_detail": "3 theme(s) against the 2-6 band",
       "algorithm_version": "m5.themes.v1",
-      "config_fingerprint": "b61864e3cf4c3bf2253b1e1462b5bd79e4a941207752aefa762a16d3ce40a7b5",
+      "config_fingerprint": "de58e10a61ba8dea0a2f95c71b0a67dcfdaedf19dfb43f9c11b7dbf3ced7df11",
       "duplicate_membership_keys": [],
       "embedding_dimension": 384,
       "excluded_by_reason": {},
@@ -437,7 +439,7 @@
     {
       "ac4_shape_detail": "4 theme(s) against the 2-6 band",
       "algorithm_version": "m5.themes.v1",
-      "config_fingerprint": "b61864e3cf4c3bf2253b1e1462b5bd79e4a941207752aefa762a16d3ce40a7b5",
+      "config_fingerprint": "de58e10a61ba8dea0a2f95c71b0a67dcfdaedf19dfb43f9c11b7dbf3ced7df11",
       "duplicate_membership_keys": [],
       "embedding_dimension": 384,
       "excluded_by_reason": {},

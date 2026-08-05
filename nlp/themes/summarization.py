@@ -190,10 +190,23 @@ def validate_theme_set(theme_set: ThemeSet) -> None:
 
 
 def adapt_theme_set(theme_set: ThemeSet) -> dict[str, AdaptedTheme]:
-    """Adapt every *normal* theme, keyed by ``theme_key``, after validating."""
+    """Adapt every *normal* theme, keyed by ``theme_key``, after validating.
+
+    Validation runs **before** the dictionary is built, and the result is
+    checked afterwards: a comprehension keyed on a duplicate identity
+    overwrites silently and returns a map shorter than the theme list,
+    which is a theme lost with no error anywhere.
+    """
 
     validate_theme_set(theme_set)
-    return {theme.theme_key: adapt_theme(theme) for theme in theme_set.themes}
+    adapted = {theme.theme_key: adapt_theme(theme) for theme in theme_set.themes}
+    if len(adapted) != len(theme_set.themes):
+        raise ThemeInputError(
+            f"adapting {len(theme_set.themes)} themes produced {len(adapted)} "
+            "entries; a theme identity was reused and a theme would have been "
+            "dropped silently"
+        )
+    return adapted
 
 
 def summarizer_inputs(theme_set: ThemeSet) -> dict[str, "ThemeInput"]:

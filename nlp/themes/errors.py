@@ -17,9 +17,16 @@ class ThemeInvariantError(ThemeInputError):
     Raised at construction rather than reported as a diagnostic, because
     these are the failures no diagnostic could describe: a story in two
     themes, an empty theme, evidence that does not match membership, one
-    raw item citable from two themes.  A ``ThemeSet`` that got past this is
-    one whose ``complete`` can be believed.
+    raw item citable from two themes, two themes sharing one identity.  A
+    ``ThemeSet`` that got past this is one whose ``complete`` can be
+    believed.
     """
+
+    def __init__(
+        self, message: str, *, duplicate_theme_keys: tuple[str, ...] = ()
+    ) -> None:
+        super().__init__(message)
+        self.duplicate_theme_keys = duplicate_theme_keys
 
 
 class ThemePartitionError(ThemeInputError):
