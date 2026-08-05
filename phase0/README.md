@@ -25,8 +25,15 @@ AC-8 replayability would have had to be built on top of it anyway.
 
 ## Guarantees
 
+**No public writable connection.** `read_connection()` is the only
+connection the public surface hands out, and it is opened `mode=ro`, so
+SQLite itself refuses every INSERT, UPDATE, DELETE, and DDL statement and
+no `PRAGMA` can talk it back into writing. Raw writable access lives on
+`repository.admin.connect_writable()`, for manual repair and migrations.
+
 **One transaction per public write.** A batch lands whole or not at all.
-Helpers that take a connection never commit; only `connect()` does.
+Helpers that take a connection never commit; only the private writable
+connection does.
 
 **Migrations are additive and are never rewritten.** `schema_migrations`
 records each applied file by name and SHA-256. Editing an already-applied
@@ -69,13 +76,22 @@ shell, or a look-alike with every field matching authorizes nothing. It is
 read-only, and its counts are derived by the operations that run under it;
 there is no caller-facing way to seed or edit them.
 
-**Lease ownership is checked inside the write transaction.** A logged
-mutation takes the write lock first, then validates the run capability,
-the stage key's owner, its expiry, and its stage/ticker/day/version
-partition *on that same connection*, then mutates, then writes the run log,
-then commits. A concurrent reclaimer blocks at the first step and cannot
-take the key between validation and commit, so the data and the stage
-key's ownership cannot end up disagreeing.
+**Lease ownership is checked inside the write transaction, and released
+there too.** `stage_run` proves ownership before the context exists: a
+missing, foreign, completed, reclaimed, or expired key means no context,
+no registration, and no run log. Then a logged mutation takes the write
+lock, re-validates the capability and the key on that same connection,
+mutates, writes the run log, and — when it is the stage's `terminal=True`
+operation — transitions the key to its final status and releases the
+lease, all before committing. There is no committed state in which the
+data says success and the key is still reclaimable as `running`. Updating
+zero rows while finishing a key is an error, never a silent success.
+
+**A run may only write its own partition.** Every logged operation derives
+the payload's partition and rejects the whole batch before writing if it
+disagrees with the run: an NVDA run cannot ingest an AMD item, a v1 theme
+set cannot cite a v2 story, and an embedding cannot name a source from
+another ticker-day.
 
 **Raw evidence is preserved; operational metadata is redacted.** These are
 different serializers, not a flag: `serialize_raw_evidence` stores a
@@ -88,6 +104,8 @@ payload in the first place. Scalar columns follow the same split, in
 (provider namespace and item id, story keys, model name and revision,
 algorithm version, config fingerprint) are *rejected* with a typed error,
 because a silently rewritten identifier repoints the row it names.
+Scheme-introduced credentials are removed at any length — `Bearer a` goes,
+`bearer instrument` stays — because a short token is still a token.
 
 The accurate statement of the security contract is therefore: **no
 operational credential supplied through a diagnostic or configuration
@@ -130,9 +148,15 @@ with repository.stage_run(
 # cache reads and writes need no run; the batch (persist_embeddings) does.
 service.embed_targets(targets, repository)
 
+# Reading: the only public connection, and SQLite refuses writes on it.
+with repository.read_connection() as connection:
+    connection.execute("SELECT * FROM themes WHERE trading_day = ?", (day,))
+
 # Fixtures, backfills, and repair — deliberately unlogged, deliberately
 # named as such.
 repository.admin.insert_raw_items(items)
+with repository.admin.connect_writable() as connection:
+    ...
 ```
 
 `reconcile_stories` and `reconcile_themes` report
@@ -167,6 +191,9 @@ silently.
 | `repository.clear_derived_for_day(day)` | `repository.admin.clear_derived_for_day(day)` |
 | `repository.log_stage(...)` | `with repository.stage_run(...)`, which logs by itself |
 | `run.record_success(n)` / `run.update_counts({...})` | nothing — counts are derived from what the operation did |
+| `with repository.connect() as c:` (reads) | `with repository.read_connection() as c:` |
+| `with repository.connect() as c:` (writes) | a logged entrypoint, or `repository.admin.connect_writable()` for repair |
+| `repository.admin.insert_story(...)` without a version | add `pipeline_version=...`; it is required |
 
 The shape every stage now takes:
 
@@ -184,10 +211,33 @@ with repository.stage_run(
     repository.record_source_state(source, run=run, successful=True)
 ```
 
-The stage key's `stage`, `ticker`, `trading_day`, and `pipeline_version`
-must match the run's; a mismatch is refused when the run opens, not
-discovered later. Leaving the block writes the `run_log` row and releases
-the key in one transaction, whether the stage succeeded or raised.
+The stage key's `stage`, `ticker`, `trading_day`, `pipeline_version`, and
+owning `run_id` must all match the run's; a mismatch is refused when the
+run opens, not discovered later.
+
+**Exactly one operation per stage carries `terminal=True`.** That call
+commits the data, the final run log, and the stage key's completion in a
+single transaction. Operations before it are logged as `degraded` and
+leave the key `running`; a stage that never declares a terminal operation
+ends `degraded` with the key left retryable, because it never said the
+work was finished.
+
+**Payload partition.** Every logged operation validates what you hand it
+against the run, and rejects the whole batch on any mismatch:
+
+* `ingest_raw_items` — a raw item may carry `ticker=None` ("matches no
+  ticker"), which is evidence the run may keep. Any ticker it *does*
+  assert, in `ticker`, `tickers`, or `candidate_tickers`, must equal the
+  run's. Its trading day, derived from `published_at` falling back to
+  `fetched_at`, must equal the run's day. **#82 and #83 must slice their
+  fetch batches per ticker-day before calling this.**
+* `reconcile_stories` — every member raw item must already sit in the
+  run's ticker-day.
+* `reconcile_themes` — every story named in membership, Other Coverage, or
+  exclusions must match the run's ticker, day, *and* pipeline version.
+* `persist_embeddings` — every source must belong to the run's partition.
+* `record_source_state` — an explicit `checked_at` must fall on the run's
+  trading day; omitting it means "now" and asserts no day.
 
 Two more things to expect on rebase:
 
@@ -199,3 +249,9 @@ Two more things to expect on rebase:
   string into `provider_namespace`, `provider_item_id`, a story key, or a
   model name, it now raises `Phase0ValidationError` instead of being
   silently redacted. Fix the value; do not route around the check.
+* **Stories must state a `pipeline_version`.** Migration 011 removed NULL
+  as a category — a version-less story could join a v1 theme and a v2
+  theme at once. Existing NULL rows upgrade to the version inferred from
+  their relationships, or to `legacy-v0` when they have none; a row
+  attached to two different versions fails the migration rather than being
+  assigned one arbitrarily.

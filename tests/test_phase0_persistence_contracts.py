@@ -9,6 +9,7 @@ actually disappear.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import inspect
@@ -132,13 +133,20 @@ def raw_item(index: int, ticker: str = "NVDA") -> dict:
     }
 
 
+#: Per-ticker index offsets, so seeding two tickers produces two distinct
+#: sets of raw items rather than colliding on source/canonical_url and
+#: silently handing back the first ticker's rows.
+_TICKER_OFFSETS = {"NVDA": 0, "AMD": 100, "TSLA": 200, "AAPL": 300, "META": 400}
+
+
 def seed_raw_items(
     repository: Phase0Repository, count: int, ticker="NVDA"
 ) -> list[int]:
+    offset = _TICKER_OFFSETS[ticker]
     return [
         result.item_id
         for result in repository.admin.insert_raw_items(
-            [raw_item(index, ticker) for index in range(1, count + 1)]
+            [raw_item(offset + index, ticker) for index in range(1, count + 1)]
         )
     ]
 
@@ -181,7 +189,7 @@ def theme_set(**overrides) -> ThemeSetRecord:
 def schema_snapshot(repository: Phase0Repository) -> dict:
     """Everything about the schema that two databases must agree on."""
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         objects = [
             (row["type"], row["name"], row["sql"])
             for row in connection.execute(
@@ -223,7 +231,7 @@ def partial_migrations(tmp_path: Path, max_version: int) -> Path:
     """A migrations directory holding only versions up to ``max_version``."""
 
     target = tmp_path / f"migrations_v{max_version}"
-    target.mkdir()
+    target.mkdir(exist_ok=True)
     for migration in ALL_MIGRATIONS:
         if migration.version <= max_version:
             shutil.copy(MIGRATIONS_PATH / migration.name, target / migration.name)
@@ -239,7 +247,7 @@ def legacy_v2_database(tmp_path: Path) -> Path:
         migrations_path=Path(__file__).parent / "fixtures" / "legacy_v2_migrations",
     )
     legacy.migrate()
-    with legacy.connect() as connection:
+    with legacy.admin.connect_writable() as connection:
         connection.execute("DROP TABLE IF EXISTS schema_migrations")
         connection.execute(
             """
@@ -301,7 +309,7 @@ def test_upgrade_from_every_prior_schema_version_matches_a_fresh_database(
     )
     old.migrate()
     assert old.schema_version() == prior_version
-    with old.connect() as connection:
+    with old.admin.connect_writable() as connection:
         connection.execute(
             """
             INSERT INTO raw_items (
@@ -325,7 +333,7 @@ def test_upgrade_from_every_prior_schema_version_matches_a_fresh_database(
     assert [row["id"] for row in kept] == [7]
     assert kept[0]["ticker"] == "NVDA"
     assert json.loads(kept[0]["raw_json"]) == {"kept": True}
-    with upgraded.connect() as connection:
+    with upgraded.admin.connect_writable() as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
@@ -400,7 +408,7 @@ def test_every_connection_enforces_foreign_keys(tmp_path):
     repository = migrated(tmp_path)
 
     for _ in range(3):
-        with repository.connect() as connection:
+        with repository.admin.connect_writable() as connection:
             assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute(
@@ -451,8 +459,8 @@ def test_ticker_normalization_is_deterministic(tmp_path):
             (1,),
         ),
         (
-            "INSERT INTO stories (ticker, trading_day, canonical_title) "
-            "VALUES ('BAD', ?, 't')",
+            "INSERT INTO stories (ticker, trading_day, canonical_title, "
+            "pipeline_version) VALUES ('BAD', ?, 't', 'v1')",
             (DAY,),
         ),
         (
@@ -485,7 +493,7 @@ def test_direct_sql_cannot_store_an_unsupported_ticker(tmp_path, statement, para
     repository = migrated(tmp_path)
     seed_raw_items(repository, 1)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="unsupported Phase 0 ticker"):
             connection.execute(statement, parameters)
 
@@ -514,8 +522,8 @@ TICKER_TABLES = [
     ),
     (
         "stories",
-        "INSERT INTO stories (ticker, trading_day, canonical_title) "
-        "VALUES ('NVDA', ?, 't')",
+        "INSERT INTO stories (ticker, trading_day, canonical_title, "
+        "pipeline_version) VALUES ('NVDA', ?, 't', 'v1')",
         (DAY,),
     ),
     (
@@ -551,7 +559,7 @@ def test_direct_sql_cannot_update_a_row_to_an_unsupported_ticker(
     repository = migrated(tmp_path)
     seed_raw_items(repository, 1)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute(insert, parameters)
         with pytest.raises(sqlite3.IntegrityError, match="unsupported Phase 0 ticker"):
             connection.execute(f"UPDATE {table} SET ticker = 'GOOG'")
@@ -571,7 +579,7 @@ def test_direct_sql_cannot_update_a_row_to_an_unsupported_ticker(
 def test_the_approved_universe_cannot_be_edited_by_direct_sql(tmp_path, statement):
     repository = migrated(tmp_path)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             connection.execute(statement)
 
@@ -590,7 +598,7 @@ def test_widening_the_universe_cannot_widen_any_other_table(tmp_path):
     repository = migrated(tmp_path)
     seed_raw_items(repository, 1)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute("DROP TRIGGER trg_supported_tickers_immutable_insert")
         connection.execute(
             "INSERT INTO supported_tickers (ticker, display_name, position) "
@@ -636,7 +644,7 @@ def test_an_upgraded_database_seals_the_universe_too(tmp_path, version):
     upgraded = Phase0Repository(tmp_path / "phase0.sqlite3")
     upgraded.migrate()
 
-    with upgraded.connect() as connection:
+    with upgraded.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             connection.execute(
                 "INSERT INTO supported_tickers (ticker, display_name, position) "
@@ -705,7 +713,7 @@ def test_stored_run_log_errors_are_redacted(tmp_path, text, credential):
         pipeline_version="v1",
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         stored = connection.execute(
             "SELECT errors FROM run_log WHERE run_id = 'run-secret'"
         ).fetchone()[0]
@@ -726,7 +734,7 @@ def test_source_state_metadata_and_errors_are_redacted(tmp_path, text, credentia
         error=text,
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         row = connection.execute(
             "SELECT metadata, last_error FROM source_state WHERE source = 'rss:secret'"
         ).fetchone()
@@ -897,7 +905,7 @@ def test_direct_sql_cannot_cite_a_non_member_raw_item(tmp_path):
         pipeline_version="v1",
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="member story"):
             connection.execute(
                 "INSERT INTO theme_citations (theme_id, raw_item_id) VALUES (?, ?)",
@@ -931,7 +939,7 @@ def test_a_raw_item_cannot_be_citable_from_two_themes_in_one_ticker_day(tmp_path
         pipeline_version="v1",
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute(
             "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
             (second, day["stories"]["cf1"]),
@@ -973,7 +981,7 @@ def test_theme_cannot_group_a_story_from_another_ticker_or_day(tmp_path):
         pipeline_version="v1",
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(
             sqlite3.IntegrityError, match="ticker, day, and pipeline version"
         ):
@@ -998,7 +1006,7 @@ def test_citation_lifecycle_deletions_follow_a_valid_order(tmp_path):
         pipeline_version="v1",
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(
             sqlite3.IntegrityError, match="required by a theme citation"
         ):
@@ -1013,7 +1021,7 @@ def test_citation_lifecycle_deletions_follow_a_valid_order(tmp_path):
                 (day["stories"]["cf1"], day["items"][1]),
             )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute(
             "DELETE FROM theme_citations WHERE theme_id = ?", (theme_id,)
         )
@@ -1026,7 +1034,7 @@ def test_canonical_member_cannot_leave_its_story(tmp_path):
     repository = migrated(tmp_path)
     day = build_day(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="canonical member"):
             connection.execute(
                 "DELETE FROM story_members WHERE story_id = ? AND raw_item_id = ?",
@@ -1050,7 +1058,7 @@ def test_raw_item_associations_and_labels_follow_their_parent(tmp_path):
         label="different",
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "INSERT INTO raw_item_tickers "
@@ -1070,7 +1078,7 @@ def test_raw_item_associations_and_labels_follow_their_parent(tmp_path):
                 (item_ids[0],),
             )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute("DELETE FROM raw_items WHERE id = ?", (item_ids[0],))
     assert repository.count("raw_item_tickers") == 1
     assert repository.count("eval_labels") == 0
@@ -1211,7 +1219,7 @@ def test_embedding_ownership_and_lifecycle_are_enforced(tmp_path):
         repository.upsert_embedding(embedding_for(item_id + 999))
 
     repository.upsert_embedding(embedding_for(item_id))
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute("DELETE FROM raw_items WHERE id = ?", (item_id,))
     assert repository.count("embeddings") == 0
 
@@ -1681,7 +1689,7 @@ def populated_theme_set(repository: Phase0Repository) -> dict:
     )
     foreign_story = repository.stories_for_day(DAY, "AMD")[0]["id"]
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         theme_id = int(
             connection.execute(
                 "SELECT id FROM themes WHERE ticker = 'NVDA'"
@@ -1700,7 +1708,7 @@ def test_other_coverage_cannot_be_updated_onto_a_cross_ticker_story(tmp_path):
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="ticker/day"):
             connection.execute(
                 "UPDATE theme_other_coverage SET story_id = ? WHERE theme_set_id = ?",
@@ -1712,7 +1720,7 @@ def test_other_coverage_cannot_be_updated_onto_a_different_trading_day(tmp_path)
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
     later = seed_raw_items(repository, 1)
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute(
             "UPDATE raw_items SET published_at = ? WHERE id = ?",
             ("2026-07-24T12:00:00+00:00", later[0]),
@@ -1726,7 +1734,7 @@ def test_other_coverage_cannot_be_updated_onto_a_different_trading_day(tmp_path)
     )
     next_day_story = repository.stories_for_day("2026-07-24", "NVDA")[0]["id"]
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="ticker/day"):
             connection.execute(
                 "UPDATE theme_other_coverage SET story_id = ? WHERE theme_set_id = ?",
@@ -1738,7 +1746,7 @@ def test_a_story_cannot_be_updated_into_both_a_theme_and_other_coverage(tmp_path
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="already a member of a theme"):
             connection.execute(
                 "UPDATE theme_other_coverage SET story_id = ? WHERE theme_set_id = ?",
@@ -1755,7 +1763,7 @@ def test_a_story_cannot_be_updated_into_both_a_theme_and_the_exclusions(tmp_path
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="already accounted for"):
             connection.execute(
                 "UPDATE theme_excluded_stories SET story_id = ? WHERE theme_set_id = ?",
@@ -1772,7 +1780,7 @@ def test_a_story_cannot_be_updated_into_both_other_coverage_and_exclusions(tmp_p
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="already accounted for"):
             connection.execute(
                 "UPDATE theme_other_coverage SET story_id = ? WHERE theme_set_id = ?",
@@ -1784,7 +1792,7 @@ def test_theme_membership_cannot_be_updated_across_ticker_or_day(tmp_path):
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(
             sqlite3.IntegrityError, match="ticker, day, and pipeline version"
         ):
@@ -1798,7 +1806,7 @@ def test_a_citation_cannot_be_updated_onto_evidence_outside_its_theme(tmp_path):
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="member story"):
             connection.execute(
                 "UPDATE theme_citations SET raw_item_id = ? WHERE theme_id = ?",
@@ -1810,7 +1818,7 @@ def test_a_parent_cannot_be_relocated_out_from_under_its_children(tmp_path):
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="populated theme"):
             connection.execute(
                 "UPDATE themes SET ticker = 'AMD' WHERE id = ?", (day["theme_id"],)
@@ -1850,7 +1858,7 @@ def cross_version_day(repository: Phase0Repository) -> dict:
         pipeline_version="v2",
         stories=[story("v2-cf1", day["items"][:2])],
     )
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         v2_story = int(
             connection.execute(
                 "SELECT id FROM stories WHERE pipeline_version = 'v2'"
@@ -1864,7 +1872,7 @@ def test_a_v1_theme_cannot_accept_a_v2_story_on_insert(tmp_path):
     repository = migrated(tmp_path)
     day = cross_version_day(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
             connection.execute(
                 "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
@@ -1876,7 +1884,7 @@ def test_a_v1_theme_cannot_accept_a_v2_story_on_update(tmp_path):
     repository = migrated(tmp_path)
     day = cross_version_day(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
             connection.execute(
                 "UPDATE theme_stories SET story_id = ? WHERE theme_id = ?",
@@ -1889,7 +1897,7 @@ def test_coverage_and_exclusions_reject_a_cross_version_story(tmp_path, table):
     repository = migrated(tmp_path)
     day = cross_version_day(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="ticker/day/version"):
             connection.execute(
                 f"INSERT INTO {table} (theme_set_id, story_id, reason) "
@@ -1915,7 +1923,7 @@ def test_a_referenced_story_cannot_change_pipeline_version(tmp_path):
     repository = migrated(tmp_path)
     day = cross_version_day(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
             connection.execute(
                 "UPDATE stories SET pipeline_version = 'v9' WHERE id = ?",
@@ -1933,7 +1941,7 @@ def test_a_populated_theme_set_cannot_change_version_even_with_only_themes(tmp_p
 
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute(
             "DELETE FROM theme_other_coverage WHERE theme_set_id = ?", (day["set_id"],)
         )
@@ -1952,7 +1960,7 @@ def test_a_populated_theme_cannot_change_version(tmp_path):
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="populated theme"):
             connection.execute(
                 "UPDATE themes SET pipeline_version = 'v2' WHERE id = ?",
@@ -1964,7 +1972,7 @@ def test_metadata_only_updates_are_still_allowed(tmp_path):
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute(
             "UPDATE themes SET label = 'Renamed', salience = 0.42 WHERE id = ?",
             (day["theme_id"],),
@@ -2018,7 +2026,7 @@ def test_valid_theme_set_updates_and_deletion_order_still_work(tmp_path):
     repository = migrated(tmp_path)
     day = populated_theme_set(repository)
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         connection.execute(
             "UPDATE themes SET label = 'Renamed' WHERE id = ?", (day["theme_id"],)
         )
@@ -2577,6 +2585,121 @@ _WRITE_SQL = re.compile(
 )
 
 
+# ----------------------------------------------------------------------
+# The public connection is read-only, and SQLite says so
+# ----------------------------------------------------------------------
+
+
+READ_ONLY_REJECTS = [
+    "INSERT INTO raw_items (source, canonical_url, fetched_at, raw_json, "
+    "ingest_status) VALUES ('s', 'u', '2026-07-23T00:00:00+00:00', '{}', 'invalid')",
+    "UPDATE stories SET ticker = 'AMD'",
+    "DELETE FROM raw_items",
+    "CREATE TABLE smuggled (id INTEGER PRIMARY KEY)",
+    "DROP TABLE raw_items",
+    "ALTER TABLE raw_items ADD COLUMN smuggled TEXT",
+    "CREATE TRIGGER t AFTER INSERT ON raw_items BEGIN SELECT 1; END",
+    "BEGIN IMMEDIATE",
+    "BEGIN EXCLUSIVE",
+]
+
+
+def test_the_public_connection_can_read(tmp_path):
+    repository = migrated(tmp_path)
+    seed_raw_items(repository, 2)
+
+    with repository.read_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM raw_items").fetchone()[0] == 2
+        rows = connection.execute("SELECT ticker FROM supported_tickers").fetchall()
+    assert {row["ticker"] for row in rows} == SUPPORTED_TICKERS
+
+
+@pytest.mark.parametrize("statement", READ_ONLY_REJECTS)
+def test_the_public_connection_cannot_write(tmp_path, statement):
+    repository = migrated(tmp_path)
+    seed_raw_items(repository, 1)
+
+    with repository.read_connection() as connection:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute(statement)
+
+    assert repository.count("raw_items") == 1
+
+
+def test_no_pragma_can_talk_the_public_connection_into_writing(tmp_path):
+    """Read-only is the open mode, not a switch inside the connection."""
+
+    repository = migrated(tmp_path)
+
+    with repository.read_connection() as connection:
+        for pragma in (
+            "PRAGMA query_only = OFF",
+            "PRAGMA writable_schema = ON",
+            "PRAGMA journal_mode = DELETE",
+        ):
+            with contextlib.suppress(sqlite3.Error):
+                connection.execute(pragma)
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("DELETE FROM supported_tickers")
+
+    assert len(repository.supported_tickers()) == 5
+
+
+def test_raw_items_cannot_be_inserted_through_any_public_surface(tmp_path):
+    """The blocker in one test: no public path writes a raw item unlogged."""
+
+    repository = migrated(tmp_path)
+
+    with pytest.raises(AttributeError):
+        repository.connect  # noqa: B018 - the old writable accessor is gone
+    with repository.read_connection() as connection:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute(
+                "INSERT INTO raw_items (source, canonical_url, fetched_at, "
+                "raw_json, ingest_status) VALUES ('s', 'u', ?, '{}', 'invalid')",
+                (f"{DAY}T00:00:00+00:00",),
+            )
+    with pytest.raises(Phase0RunContextError):
+        repository.ingest_raw_items([raw_item(1)], run=None)
+
+    assert repository.count("raw_items") == 0
+    assert repository.run_log_entries() == []
+
+
+def test_the_admin_connection_is_writable_and_says_so(tmp_path):
+    repository = migrated(tmp_path)
+
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "INSERT INTO raw_items (source, canonical_url, fetched_at, "
+            "raw_json, ingest_status) VALUES ('s', 'u', ?, '{}', 'invalid')",
+            (f"{DAY}T00:00:00+00:00",),
+        )
+
+    assert repository.count("raw_items") == 1
+    doc = (Phase0Admin.connect_writable.__doc__ or "").lower()
+    assert "manual repair" in doc and "migrations" in doc
+    assert "pipeline code must never call it" in doc
+
+
+def test_no_public_method_hands_back_a_writable_connection(tmp_path):
+    """Every public connection-returning method must fail closed."""
+
+    repository = migrated(tmp_path)
+    checked = 0
+    for name, member in inspect.getmembers(Phase0Repository, inspect.isfunction):
+        if name.startswith("_"):
+            continue
+        annotation = str(inspect.signature(member).return_annotation)
+        if "Connection" not in annotation:
+            continue
+        checked += 1
+        with getattr(repository, name)() as connection:
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                connection.execute("DELETE FROM supported_tickers")
+    assert checked == 1, "expected exactly one public connection accessor"
+
+
 def _method_writes(name: str, seen: set[str] | None = None) -> bool:
     """True when a method issues write SQL, directly or through a helper.
 
@@ -2969,29 +3092,122 @@ def test_a_stage_key_from_another_partition_cannot_open_a_run(tmp_path, field):
     assert repository.run_log_entries() == []
 
 
-def test_a_stage_key_owned_by_another_run_id_is_refused(tmp_path):
-    repository = migrated(tmp_path)
-    key = {
-        "stage": "ingest",
-        "ticker": "NVDA",
-        "trading_day": DAY,
-        "pipeline_version": "v1",
+def stage_key_for(ticker="NVDA", day=DAY, version="v1", stage="ingest") -> dict:
+    return {
+        "stage": stage,
+        "ticker": ticker,
+        "trading_day": day,
+        "pipeline_version": version,
     }
+
+
+def test_an_impostor_cannot_even_open_a_run_on_someone_elses_key(tmp_path):
+    """Ownership is proved before the context exists, not at first write.
+
+    Checking it only at mutation time left an impostor able to open a run,
+    do nothing, and have the exit path record a clean success against work
+    it never owned.
+    """
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
     assert repository.claim_stage_key(**key, run_id="run-owner")
 
-    with repository.stage_run(
-        run_id="run-impostor",
-        stage="ingest",
-        trading_day=DAY,
-        pipeline_version="v1",
-        ticker="NVDA",
-        stage_key=key,
-    ) as run:
-        with pytest.raises(StageKeyError, match="owned by another run"):
-            repository.ingest_raw_items([raw_item(1)], run=run)
+    with pytest.raises(StageKeyError, match="owned by run 'run-owner'"):
+        with repository.stage_run(
+            run_id="run-impostor",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ):
+            pass
 
     assert repository.count("raw_items") == 0
     assert repository.stage_key_state(**key)["run_id"] == "run-owner"
+    # No context was created, so no run log was written for the impostor.
+    assert repository.run_log_entries(run_id="run-impostor") == []
+
+
+def test_no_run_log_is_written_when_the_context_cannot_be_created(tmp_path):
+    repository = migrated(tmp_path)
+
+    with pytest.raises(StageKeyError, match="no stage key has been claimed"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=stage_key_for(),
+        ):
+            pass
+
+    assert repository.run_log_entries() == []
+
+
+@pytest.mark.parametrize("state", ["missing", "completed", "expired", "reclaimed"])
+def test_an_unusable_stage_key_is_refused_at_run_creation(tmp_path, state):
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    expected = "no stage key has been claimed"
+
+    if state != "missing":
+        assert repository.claim_stage_key(**key, run_id="run-1", lease_seconds=1)
+    if state == "completed":
+        repository.complete_stage_key(**key, run_id="run-1", status="success")
+        expected = "no longer running"
+    elif state == "expired":
+        time.sleep(1.1)
+        expected = "lease has expired"
+    elif state == "reclaimed":
+        time.sleep(1.1)
+        assert repository.claim_stage_key(**key, run_id="run-2")
+        expected = "owned by run 'run-2'"
+
+    with pytest.raises(StageKeyError, match=expected):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ):
+            pass
+
+    assert repository.run_log_entries(run_id="run-1") == []
+
+
+def test_finishing_a_stage_key_this_run_lost_is_an_error_not_a_no_op(tmp_path):
+    """Zero rows updated must never read as success."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1", lease_seconds=300)
+
+    with pytest.raises(StageKeyError, match="no longer owns"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ):
+            # Another owner takes the key mid-run.
+            with repository.admin.connect_writable() as connection:
+                connection.execute(
+                    "UPDATE pipeline_stage_keys SET run_id = 'run-2' "
+                    "WHERE stage = ? AND ticker = ? AND trading_day = ? "
+                    "AND pipeline_version = ?",
+                    ("ingest", "NVDA", DAY, "v1"),
+                )
+
+    # run-1 did not overwrite run-2's ownership on its way out.
+    assert repository.stage_key_state(**key)["run_id"] == "run-2"
+    assert repository.stage_key_state(**key)["status"] == "running"
 
 
 def test_a_lease_cannot_be_reclaimed_between_validation_and_commit(tmp_path):
@@ -3062,7 +3278,9 @@ def test_a_lease_cannot_be_reclaimed_between_validation_and_commit(tmp_path):
                 ticker="NVDA",
                 stage_key=key,
             ) as run:
-                repository.ingest_raw_items([raw_item(1)], run=run)
+                # Terminal: data, run log, and key completion in one
+                # transaction, all under the write lock A already holds.
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
             outcome["a"] = "committed"
         except BaseException as exc:  # noqa: BLE001 - recorded for the assert
             outcome["a"] = f"{type(exc).__name__}: {exc}"
@@ -3112,14 +3330,67 @@ def test_a_lease_cannot_be_reclaimed_between_validation_and_commit(tmp_path):
     assert entry["success_count"] == 1
 
 
-def test_a_run_that_ends_marks_its_stage_key_in_the_same_transaction(tmp_path):
+def test_the_terminal_mutation_completes_the_stage_key_in_its_own_transaction(
+    tmp_path,
+):
+    """Data, final run log, and key completion commit together or not at all."""
+
     repository = migrated(tmp_path)
-    key = {
-        "stage": "ingest",
-        "ticker": "NVDA",
-        "trading_day": DAY,
-        "pipeline_version": "v1",
-    }
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+        # Already committed and released, before the block exits: there is
+        # no window where the data says success and the key says running.
+        assert run.terminated
+        state = repository.stage_key_state(**key)
+        assert state["status"] == "success"
+        assert state["lease_expires_at"] is None
+        assert repository.run_log_entries(run_id="run-1")[0]["status"] == "success"
+
+    state = repository.stage_key_state(**key)
+    assert state["status"] == "success"
+    assert state["completed_at"] is not None
+    assert repository.count("raw_items") == 1
+
+
+def test_a_non_terminal_operation_never_reports_success(tmp_path):
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run)
+        interim = repository.run_log_entries(run_id="run-1")[0]
+        assert interim["status"] == "degraded"
+        assert repository.stage_key_state(**key)["status"] == "running"
+        repository.ingest_raw_items([raw_item(2)], run=run, terminal=True)
+
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "success"
+    assert repository.stage_key_state(**key)["status"] == "success"
+    assert repository.count("raw_items") == 2
+
+
+def test_a_run_that_never_declares_completion_leaves_a_retryable_key(tmp_path):
+    """Holding a lease and never finishing is not a success."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
     assert repository.claim_stage_key(**key, run_id="run-1")
 
     with repository.stage_run(
@@ -3132,10 +3403,29 @@ def test_a_run_that_ends_marks_its_stage_key_in_the_same_transaction(tmp_path):
     ) as run:
         repository.ingest_raw_items([raw_item(1)], run=run)
 
-    state = repository.stage_key_state(**key)
-    assert state["status"] == "success"
-    assert state["lease_expires_at"] is None
-    assert state["completed_at"] is not None
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "degraded"
+    assert repository.stage_key_state(**key)["status"] == "failed"
+    assert repository.claim_stage_key(**key, run_id="run-2")
+
+
+def test_a_completed_stage_key_cannot_be_reclaimed(tmp_path):
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    assert repository.claim_stage_key(**key, run_id="run-2") is False
+    assert repository.recover_expired_leases() == []
+    assert repository.stage_key_state(**key)["run_id"] == "run-1"
 
 
 def test_a_failed_run_does_not_mark_its_stage_key_successful(tmp_path):
@@ -3187,7 +3477,7 @@ def test_an_expired_stage_lease_rejects_the_mutation(tmp_path):
     ) as run:
         # Another worker reclaims the key mid-run, exactly as the recovery
         # sweep would after a crash.
-        with repository.connect() as connection:
+        with repository.admin.connect_writable() as connection:
             connection.execute(
                 "UPDATE pipeline_stage_keys SET run_id = 'run-2' "
                 "WHERE stage = ? AND ticker = ? AND trading_day = ? "
@@ -3198,6 +3488,9 @@ def test_an_expired_stage_lease_rejects_the_mutation(tmp_path):
             repository.ingest_raw_items([raw_item(1)], run=run)
 
     assert repository.count("raw_items") == 0
+    # run-1 recorded its own failure without touching run-2's ownership.
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+    assert repository.stage_key_state(**key)["run_id"] == "run-2"
 
 
 def test_a_successful_mutation_commits_its_run_log_in_the_same_transaction(tmp_path):
@@ -3565,7 +3858,7 @@ def test_run_log_serialization_is_deterministic(tmp_path):
             pipeline_version="v1",
         )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         stored = {row[0] for row in connection.execute("SELECT counts FROM run_log")}
     assert stored == {'{"a":{"c":3,"d":2},"b":1}'}
 
@@ -3615,9 +3908,482 @@ def test_cross_version_theme_membership_is_refused_after_any_upgrade(tmp_path, v
     assert upgraded.schema_version() == LATEST_VERSION
 
     day = cross_version_day(upgraded)
-    with upgraded.connect() as connection:
+    with upgraded.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
             connection.execute(
                 "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
                 (day["theme_id"], day["v2_story"]),
+            )
+
+
+# ----------------------------------------------------------------------
+# A run may only write its own partition
+# ----------------------------------------------------------------------
+
+
+def nvda_run(repository: Phase0Repository, **overrides):
+    defaults = {
+        "run_id": f"run-{next(_RUN_IDS)}",
+        "stage": "ingest",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "ticker": "NVDA",
+    }
+    defaults.update(overrides)
+    return repository.stage_run(**defaults)
+
+
+def test_an_nvda_run_cannot_ingest_an_amd_payload(tmp_path):
+    repository = migrated(tmp_path)
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match=r"asserts \['AMD'\]"):
+            repository.ingest_raw_items([raw_item(1, "AMD")], run=run)
+
+    assert repository.count("raw_items") == 0
+
+
+def test_a_mixed_ticker_batch_is_rejected_whole(tmp_path):
+    repository = migrated(tmp_path)
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match="AMD"):
+            repository.ingest_raw_items(
+                [raw_item(1), raw_item(2), raw_item(3, "AMD")], run=run
+            )
+
+    # Not even the two valid items landed.
+    assert repository.count("raw_items") == 0
+
+
+def test_a_raw_item_from_another_trading_day_is_rejected(tmp_path):
+    repository = migrated(tmp_path)
+    stray = raw_item(1)
+    stray["published_at"] = "2026-07-24T12:00:00+00:00"
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match="falls on 2026-07-24"):
+            repository.ingest_raw_items([raw_item(2), stray], run=run)
+
+    assert repository.count("raw_items") == 0
+
+
+def test_an_unassigned_raw_item_is_allowed_evidence(tmp_path):
+    """The documented rule: ticker=None means "matches no ticker" and is
+    evidence the run may keep; an asserted foreign ticker is not."""
+
+    repository = migrated(tmp_path)
+    unassigned = raw_item(1)
+    unassigned["ticker"] = None
+    unassigned.pop("tickers", None)
+
+    with nvda_run(repository) as run:
+        results = repository.ingest_raw_items(
+            [unassigned, raw_item(2)], run=run, terminal=True
+        )
+
+    assert len(results) == 2
+    assert repository.count("raw_items") == 2
+    stored = {row["id"]: row["ticker"] for row in repository.raw_items_for_day(DAY)}
+    assert None in stored.values() and "NVDA" in stored.values()
+
+
+def test_a_secondary_ticker_association_cannot_smuggle_a_partition(tmp_path):
+    repository = migrated(tmp_path)
+    smuggler = raw_item(1)
+    smuggler["tickers"] = ["NVDA", "AMD"]
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match="AMD"):
+            repository.ingest_raw_items([smuggler], run=run)
+
+    assert repository.count("raw_items") == 0
+
+
+def test_reconcile_stories_rejects_a_member_from_another_partition(tmp_path):
+    repository = migrated(tmp_path)
+    nvda = seed_raw_items(repository, 2)
+    amd = seed_raw_items(repository, 1, ticker="AMD")
+
+    with nvda_run(repository, stage="m3.semantic") as run:
+        with pytest.raises(Phase0RunContextError, match="belongs to AMD"):
+            repository.reconcile_stories(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                stories=[story("cf1", nvda), story("cf2", amd)],
+            )
+
+    assert repository.count("stories") == 0
+    assert repository.run_log_entries(run_id=run.run_id)[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("axis", ["ticker", "trading_day", "pipeline_version"])
+def test_reconcile_stories_rejects_a_run_covering_another_partition(tmp_path, axis):
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+    target = {"ticker": "NVDA", "trading_day": DAY, "pipeline_version": "v1"}
+    target[axis] = {
+        "ticker": "AMD",
+        "trading_day": "2026-07-24",
+        "pipeline_version": "v2",
+    }[axis]
+
+    with nvda_run(repository, stage="m3.semantic") as run:
+        with pytest.raises(Phase0RunContextError, match="but the run covers"):
+            repository.reconcile_stories(
+                run=run, **target, stories=[story("cf1", item_ids)]
+            )
+
+    assert repository.count("stories") == 0
+
+
+def test_reconcile_themes_rejects_a_story_from_another_version(tmp_path):
+    repository = migrated(tmp_path)
+    day = cross_version_day(repository)
+
+    with nvda_run(repository, stage="m5.themes") as run:
+        with pytest.raises(Phase0RunContextError, match="pipeline version v2"):
+            repository.reconcile_themes(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                theme_set=theme_set(),
+                themes=[
+                    ThemeRecord(
+                        fingerprint="tfx",
+                        label="Smuggled",
+                        story_ids=(day["v2_story"],),
+                        salience_rank=1,
+                        status="ready",
+                        method="hdbscan",
+                    )
+                ],
+            )
+
+
+@pytest.mark.parametrize("bucket", ["other_coverage", "excluded"])
+def test_reconcile_themes_rejects_a_foreign_story_in_coverage(tmp_path, bucket):
+    repository = migrated(tmp_path)
+    day = populated_theme_set(repository)
+    payload = {
+        "other_coverage": (),
+        "excluded": (),
+        bucket: (
+            (OtherCoverageRecord(day["foreign_story"], "clustering_noise"),)
+            if bucket == "other_coverage"
+            else (ExcludedStoryRecord(day["foreign_story"], "no_encodable_text"),)
+        ),
+    }
+
+    with nvda_run(repository, stage="m5.themes") as run:
+        with pytest.raises(Phase0RunContextError, match="belongs to AMD"):
+            repository.reconcile_themes(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                theme_set=theme_set(),
+                **payload,
+            )
+
+
+def test_persist_embeddings_rejects_a_source_from_another_partition(tmp_path):
+    repository = migrated(tmp_path)
+    seed_raw_items(repository, 1)
+    amd = seed_raw_items(repository, 1, ticker="AMD")
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        with pytest.raises(Phase0RunContextError, match="belongs to AMD"):
+            repository.persist_embeddings([sample_embedding(amd[0])], run=run)
+
+    assert repository.count("embeddings") == 0
+    assert repository.run_log_entries(run_id=run.run_id)[0]["status"] == "failed"
+
+
+def test_persist_embeddings_rejects_one_bad_source_among_good_ones(tmp_path):
+    repository = migrated(tmp_path)
+    nvda = seed_raw_items(repository, 2)
+    amd = seed_raw_items(repository, 1, ticker="AMD")
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        with pytest.raises(Phase0RunContextError):
+            repository.persist_embeddings(
+                [sample_embedding(nvda[0]), sample_embedding(amd[0])], run=run
+            )
+
+    assert repository.count("embeddings") == 0
+
+
+def test_record_source_state_rejects_another_days_fetch(tmp_path):
+    repository = migrated(tmp_path)
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match="but the run covers"):
+            repository.record_source_state(
+                "rss:test", run=run, checked_at="2026-07-24T12:00:00+00:00"
+            )
+
+    assert repository.source_state("rss:test") is None
+
+
+# ----------------------------------------------------------------------
+# Short scheme credentials
+# ----------------------------------------------------------------------
+
+
+SHORT_CREDENTIALS = [
+    ("Bearer a", "Bearer a"),
+    ("Bearer abc", "Bearer abc"),
+    ("Basic a", "Basic a"),
+    ("Basic abc", "Basic abc"),
+    ("Authorization: Bearer abc", "Bearer abc"),
+    ("Authorization: Basic abc", "Basic abc"),
+    ("lower", "bearer abc"),
+    ("upper", "BEARER ABC"),
+    ("mixed", "BaSiC aBc"),
+    ("quoted", '"Bearer abc"'),
+    ("parens", "(Basic abc)"),
+    ("trailing-period", "Bearer abc."),
+]
+
+
+@pytest.mark.parametrize(
+    "label, text", SHORT_CREDENTIALS, ids=[row[0] for row in SHORT_CREDENTIALS]
+)
+def test_short_scheme_credentials_are_redacted(label, text):
+    redacted = redact_text(text)
+
+    assert "[REDACTED]" in redacted
+    assert redact_text(redacted) == redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a basic understanding of the problem",
+        "the bearer instrument matured",
+        "Basic Auth is required",
+        "Bearer token expired",
+        "tokenizer failed to load",
+    ],
+)
+def test_ordinary_prose_survives_short_credential_redaction(text):
+    assert redact_text(text) == text
+
+
+#: Byte-scanning needs a token distinctive enough that finding it proves
+#: something.  A one-character secret occurs everywhere in a SQLite file,
+#: so those cases are covered by the redaction and stored-JSON assertions
+#: instead; these are short but unmistakable.
+SHORT_DISTINCTIVE_CREDENTIALS = [
+    "Bearer Zq7",
+    "Basic Zq7",
+    "Authorization: Bearer Zq7",
+    "Authorization: Basic Zq7",
+    "bearer Zq7",
+    "BASIC ZQ7X",
+    '"Bearer Zq7"',
+]
+
+
+@pytest.mark.parametrize("text", SHORT_DISTINCTIVE_CREDENTIALS)
+def test_short_credentials_never_reach_the_database_or_wal(tmp_path, text):
+    repository = migrated(tmp_path)
+    secret = text.rsplit(" ", 1)[-1].strip("\"').")
+
+    with nvda_run(repository) as run:
+        repository.record_source_state(
+            "rss:test",
+            run=run,
+            successful=False,
+            status="failed",
+            metadata={"request": text},
+            error=text,
+        )
+
+    assert secret.encode() not in database_bytes(repository)
+    assert secret not in json.dumps(repository.source_state("rss:test"))
+
+
+@pytest.mark.parametrize(
+    "label, text", SHORT_CREDENTIALS, ids=[row[0] for row in SHORT_CREDENTIALS]
+)
+def test_short_credentials_are_redacted_in_stored_metadata(tmp_path, label, text):
+    repository = migrated(tmp_path)
+
+    with nvda_run(repository) as run:
+        repository.record_source_state(
+            "rss:test",
+            run=run,
+            successful=False,
+            status="failed",
+            metadata={"request": text},
+            error=text,
+        )
+
+    state = repository.source_state("rss:test")
+    assert "[REDACTED]" in json.dumps(state)
+    assert text not in json.dumps(state)
+
+
+# ----------------------------------------------------------------------
+# Stories must state their pipeline version (migration 011)
+# ----------------------------------------------------------------------
+
+
+def test_a_fresh_database_refuses_a_null_version_story(tmp_path):
+    repository = migrated(tmp_path)
+
+    with repository.admin.connect_writable() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="explicit pipeline_version"):
+            connection.execute(
+                "INSERT INTO stories (ticker, trading_day, canonical_title) "
+                "VALUES ('NVDA', ?, 't')",
+                (DAY,),
+            )
+        connection.execute(
+            "INSERT INTO stories (ticker, trading_day, canonical_title, "
+            "pipeline_version) VALUES ('NVDA', ?, 't', 'v1')",
+            (DAY,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="explicit pipeline_version"):
+            connection.execute("UPDATE stories SET pipeline_version = NULL")
+
+
+def test_the_admin_story_helper_requires_a_pipeline_version(tmp_path):
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+
+    with pytest.raises(TypeError):
+        repository.admin.insert_story(
+            ticker="NVDA",
+            trading_day=DAY,
+            canonical_title="No version",
+            member_ids=item_ids,
+        )
+    with pytest.raises(Phase0ValidationError, match="pipeline_version"):
+        repository.admin.insert_story(
+            ticker="NVDA",
+            trading_day=DAY,
+            canonical_title="Blank version",
+            member_ids=item_ids,
+            pipeline_version="  ",
+        )
+    assert repository.count("stories") == 0
+
+
+def v10_database_with_null_versions(tmp_path: Path, attached: bool) -> Path:
+    """A genuine v10 database carrying legacy NULL-version stories."""
+
+    directory = partial_migrations(tmp_path, 10)
+    repository = Phase0Repository(
+        tmp_path / "phase0.sqlite3", migrations_path=directory
+    )
+    repository.migrate()
+    item_ids = seed_raw_items(repository, 2)
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "INSERT INTO stories (id, ticker, trading_day, canonical_title, "
+            "content_hash, outlet_count, updated_at) "
+            "VALUES (1, 'NVDA', ?, 'Legacy', 'h', 1, ?)",
+            (DAY, f"{DAY}T12:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO story_members (story_id, raw_item_id, position) "
+            "VALUES (1, ?, 0)",
+            (item_ids[0],),
+        )
+        if attached:
+            connection.execute(
+                "INSERT INTO themes (ticker, trading_day, label, salience_rank, "
+                "status, content_hash, pipeline_version) "
+                "VALUES ('NVDA', ?, 'Legacy theme', 1, 'ready', 'h', 'v7')",
+                (DAY,),
+            )
+            connection.execute(
+                "INSERT INTO theme_stories (theme_id, story_id) "
+                "SELECT id, 1 FROM themes"
+            )
+    return tmp_path / "phase0.sqlite3"
+
+
+def test_an_unattached_legacy_story_upgrades_to_the_sentinel_version(tmp_path):
+    database = v10_database_with_null_versions(tmp_path, attached=False)
+
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+
+    assert upgraded.schema_version() == LATEST_VERSION
+    with upgraded.read_connection() as connection:
+        version = connection.execute(
+            "SELECT pipeline_version FROM stories WHERE id = 1"
+        ).fetchone()["pipeline_version"]
+    assert version == "legacy-v0"
+    assert upgraded.count("story_members") == 1
+
+
+def test_an_attached_legacy_story_inherits_its_relationship_version(tmp_path):
+    database = v10_database_with_null_versions(tmp_path, attached=True)
+
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+
+    with upgraded.read_connection() as connection:
+        version = connection.execute(
+            "SELECT pipeline_version FROM stories WHERE id = 1"
+        ).fetchone()["pipeline_version"]
+    assert version == "v7"
+    assert upgraded.count("theme_stories") == 1
+
+
+def test_an_ambiguous_legacy_story_fails_the_migration_rather_than_guessing(tmp_path):
+    database = v10_database_with_null_versions(tmp_path, attached=True)
+    repository = Phase0Repository(
+        database, migrations_path=partial_migrations(tmp_path, 10)
+    )
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "INSERT INTO themes (ticker, trading_day, label, salience_rank, "
+            "status, content_hash, pipeline_version) "
+            "VALUES ('NVDA', ?, 'Other version', 2, 'ready', 'h2', 'v8')",
+            (DAY,),
+        )
+        connection.execute(
+            "INSERT INTO theme_stories (theme_id, story_id) "
+            "SELECT id, 1 FROM themes WHERE pipeline_version = 'v8'"
+        )
+
+    upgraded = Phase0Repository(database)
+    with pytest.raises(sqlite3.Error, match="more than one pipeline version"):
+        upgraded.migrate()
+
+    # Rolled back whole: still v10, still NULL, data intact.
+    assert upgraded.schema_version() == 10
+    with upgraded.read_connection() as connection:
+        row = connection.execute(
+            "SELECT pipeline_version FROM stories WHERE id = 1"
+        ).fetchone()
+    assert row["pipeline_version"] is None
+    assert upgraded.count("theme_stories") == 2
+
+
+def test_a_story_cannot_join_two_versioned_theme_partitions_after_upgrade(tmp_path):
+    database = v10_database_with_null_versions(tmp_path, attached=True)
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+
+    with upgraded.admin.connect_writable() as connection:
+        connection.execute(
+            "INSERT INTO themes (ticker, trading_day, label, salience_rank, "
+            "status, content_hash, pipeline_version) "
+            "VALUES ('NVDA', ?, 'v8 theme', 2, 'ready', 'h2', 'v8')",
+            (DAY,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="pipeline version"):
+            connection.execute(
+                "INSERT INTO theme_stories (theme_id, story_id) "
+                "SELECT id, 1 FROM themes WHERE pipeline_version = 'v8'"
             )

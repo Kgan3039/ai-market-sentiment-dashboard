@@ -32,7 +32,7 @@ def test_migration_enables_wal_and_creates_expected_tables(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         tables = {
             row[0]
             for row in connection.execute(
@@ -56,7 +56,7 @@ def test_migration_enables_wal_and_creates_expected_tables(tmp_path):
         "theme_citations",
     } <= tables
     assert journal_mode == "wal"
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
             == LATEST_SCHEMA_VERSION
@@ -67,7 +67,7 @@ def test_migration_enables_wal_and_creates_expected_tables(tmp_path):
 def test_migrations_can_be_applied_repeatedly_without_schema_changes(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         before = list(
             connection.execute(
                 "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
@@ -76,7 +76,7 @@ def test_migrations_can_be_applied_repeatedly_without_schema_changes(tmp_path):
 
     repository.migrate()
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         after = list(
             connection.execute(
                 "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
@@ -113,7 +113,7 @@ def test_concurrent_duplicate_inserts_remain_idempotent(tmp_path):
     assert sum(result.inserted for result in results) == 1
     assert len({result.item_id for result in results}) == 1
     assert repository.count("raw_items") == 1
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -199,7 +199,7 @@ def test_exactly_one_concurrent_stage_claim_wins(tmp_path):
     assert claims.count(True) == 1
     assert claims.count(False) == 7
     winning_index = next(index for index, claimed in attempts if claimed)
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         owner = connection.execute("SELECT run_id FROM pipeline_stage_keys").fetchone()[
             0
         ]
@@ -228,7 +228,7 @@ def test_running_stage_claim_uses_lease_and_only_expires_at_boundary(tmp_path):
         lease_seconds=60,
         claimed_at="2026-07-23T12:00:59Z",
     )
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         active = dict(
             connection.execute(
                 """
@@ -248,7 +248,7 @@ def test_running_stage_claim_uses_lease_and_only_expires_at_boundary(tmp_path):
         lease_seconds=120,
         claimed_at="2026-07-23T12:01:00Z",
     )
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         reclaimed = dict(
             connection.execute(
                 """
@@ -312,7 +312,7 @@ def test_failed_migration_rolls_back_schema_and_version(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         repository.migrate()
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 0
         assert (
             connection.execute(
@@ -335,6 +335,7 @@ def test_story_theme_and_label_references_are_foreign_key_enforced(tmp_path):
         canonical_title="NVIDIA story",
         member_ids=[first, second],
         outlet_count=2,
+        pipeline_version="v1",
     )
     theme_id = repository.admin.insert_theme(
         ticker="NVDA",
@@ -360,7 +361,7 @@ def test_story_theme_and_label_references_are_foreign_key_enforced(tmp_path):
     assert label_id > 0
     assert repository.count("story_members") == 2
     assert repository.count("theme_citations") == 1
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         declared = connection.execute(
             """
@@ -380,6 +381,7 @@ def test_invalid_relationships_roll_back_parent_rows(tmp_path):
             trading_day="2026-07-23",
             canonical_title="Missing member",
             member_ids=[999],
+            pipeline_version="v1",
         )
     assert repository.count("stories") == 0
 
@@ -392,6 +394,7 @@ def test_invalid_relationships_roll_back_parent_rows(tmp_path):
         trading_day="2026-07-23",
         canonical_title="NVIDIA story",
         member_ids=[first],
+        pipeline_version="v1",
     )
     with pytest.raises(ValueError, match="citations"):
         repository.admin.insert_theme(
@@ -420,6 +423,7 @@ def test_database_rejects_citation_outside_theme_member_stories(tmp_path):
         trading_day="2026-07-23",
         canonical_title="Member story",
         member_ids=[member],
+        pipeline_version="v1",
     )
     theme_id = repository.admin.insert_theme(
         ticker="NVDA",
@@ -433,7 +437,7 @@ def test_database_rejects_citation_outside_theme_member_stories(tmp_path):
         pipeline_version="v1",
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(
             sqlite3.IntegrityError,
             match="member story",
@@ -490,7 +494,7 @@ def test_raw_evidence_and_associations_survive_reconnect(tmp_path):
     assert reopened.count("raw_items") == 1
     assert reopened.raw_item_tickers(item_id) == ["AMD", "NVDA"]
     assert reopened.count("raw_item_candidates") == 2
-    with reopened.connect() as connection:
+    with reopened.admin.connect_writable() as connection:
         stored = connection.execute(
             "SELECT raw_json FROM raw_items WHERE id = ?", (item_id,)
         ).fetchone()[0]
@@ -542,7 +546,7 @@ def test_database_constraints_reject_invalid_status_json_and_timestamps(tmp_path
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")
     repository.migrate()
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """
@@ -600,7 +604,7 @@ def test_invalid_raw_evidence_is_preserved_without_required_display_fields(tmp_p
         }
     )
 
-    with repository.connect() as connection:
+    with repository.admin.connect_writable() as connection:
         row = connection.execute(
             "SELECT * FROM raw_items WHERE id = ?", (result.item_id,)
         ).fetchone()
@@ -666,11 +670,11 @@ def test_actual_legacy_v2_database_upgrades_to_latest_without_data_loss(tmp_path
     legacy_migrations = Path(__file__).parent / "fixtures" / "legacy_v2_migrations"
     legacy = Phase0Repository(database, migrations_path=legacy_migrations)
     legacy.migrate()
-    with legacy.connect() as connection:
+    with legacy.admin.connect_writable() as connection:
         # Databases published at v2 predate the migration ledger, so the
         # fixture drops it to reproduce one faithfully.
         connection.execute("DROP TABLE IF EXISTS schema_migrations")
-    with legacy.connect() as connection:
+    with legacy.admin.connect_writable() as connection:
         connection.executemany(
             """
             INSERT INTO raw_items (
@@ -771,7 +775,7 @@ def test_actual_legacy_v2_database_upgrades_to_latest_without_data_loss(tmp_path
             )
             """
         )
-    with legacy.connect() as connection:
+    with legacy.admin.connect_writable() as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
 
     upgraded = Phase0Repository(database)
@@ -784,7 +788,7 @@ def test_actual_legacy_v2_database_upgrades_to_latest_without_data_loss(tmp_path
     assert upgraded.count("eval_labels") == 1
     assert upgraded.count("run_log") == 1
     assert upgraded.count("source_state") == 1
-    with upgraded.connect() as connection:
+    with upgraded.admin.connect_writable() as connection:
         assert (
             connection.execute("PRAGMA user_version").fetchone()[0]
             == LATEST_SCHEMA_VERSION
