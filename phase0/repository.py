@@ -107,6 +107,120 @@ OTHER_COVERAGE_REASONS = {
 }
 EXCLUSION_REASONS = {"no_encodable_text"}
 
+#: The only reason a raw item may be pulled into a ticker's derived output.
+#: ``raw_item_tickers`` is the authoritative association table; a row in
+#: ``raw_item_candidates`` is a *suggestion* that nothing has accepted yet,
+#: which is exactly why it does not appear here.
+RAW_ITEM_ASSOCIATION_TABLE = "raw_item_tickers"
+
+#: The default reason recorded for a candidate given as a bare symbol.
+DEFAULT_CANDIDATE_REASON = "relevance_match"
+
+# ----------------------------------------------------------------------
+# What a public read connection is allowed to do.
+#
+# ``mode=ro`` already refuses to write the file it opened.  It does not
+# refuse to open a *second* file: a caller could ATTACH the very same
+# database under another schema name and write through the alias, which is
+# a hole straight through the logged-mutation contract.  The authorizer
+# below closes it by allow-listing, so an action nobody thought about is
+# denied rather than permitted.
+# ----------------------------------------------------------------------
+
+#: Actions a reader legitimately performs.  Everything else — INSERT,
+#: UPDATE, DELETE, every CREATE/DROP/ALTER, REINDEX, ATTACH, DETACH — is
+#: absent on purpose.
+_READ_ONLY_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_FUNCTION,
+        sqlite3.SQLITE_RECURSIVE,
+        # Read transactions and savepoints move no data on their own, and a
+        # writing statement inside one is still denied on its own account.
+        sqlite3.SQLITE_TRANSACTION,
+        sqlite3.SQLITE_SAVEPOINT,
+    }
+)
+
+#: Schema-inspection pragmas, which take the name of the object to inspect.
+_READ_ONLY_PRAGMAS_WITH_ARGUMENT = frozenset(
+    {
+        "foreign_key_list",
+        "index_info",
+        "index_list",
+        "index_xinfo",
+        "table_info",
+        "table_list",
+        "table_xinfo",
+    }
+)
+
+#: Pragmas allowed only in their *query* form.  The value form of several
+#: of these writes (``user_version = 5``, ``journal_mode = DELETE``), and
+#: ``query_only = OFF`` is the first move of the attack this guards
+#: against, so a supplied argument is refused even for a name on the list.
+_READ_ONLY_QUERY_PRAGMAS = frozenset(
+    {
+        "application_id",
+        "auto_vacuum",
+        "busy_timeout",
+        "cache_size",
+        "collation_list",
+        "compile_options",
+        "data_version",
+        "database_list",
+        "encoding",
+        "foreign_key_check",
+        "foreign_keys",
+        "freelist_count",
+        "function_list",
+        "integrity_check",
+        "journal_mode",
+        "locking_mode",
+        "max_page_count",
+        "module_list",
+        "page_count",
+        "page_size",
+        "pragma_list",
+        "query_only",
+        "quick_check",
+        "schema_version",
+        "secure_delete",
+        "synchronous",
+        "temp_store",
+        "user_version",
+        "wal_autocheckpoint",
+    }
+)
+
+
+def _read_only_authorizer(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    database: str | None,
+    trigger_or_view: str | None,
+) -> int:
+    """Allow reads; deny everything else, in every schema.
+
+    Denying by allow-list matters more than the individual entries: the
+    bypass this replaces worked precisely because ``ATTACH`` was not on
+    anybody's list of writes.  An action that is not named here is refused,
+    whichever schema — ``main``, ``temp``, or an attached alias — it names.
+    """
+
+    if action in _READ_ONLY_ACTIONS:
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_PRAGMA:
+        name = (arg1 or "").strip().lower()
+        if name in _READ_ONLY_PRAGMAS_WITH_ARGUMENT:
+            return sqlite3.SQLITE_OK
+        if name in _READ_ONLY_QUERY_PRAGMAS and arg2 is None:
+            return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+
+
 #: Tables :meth:`Phase0Repository.count` will count.  Kept explicit so the
 #: helper can never be turned into an arbitrary-SQL escape hatch.
 COUNTABLE_TABLES = frozenset(
@@ -695,10 +809,26 @@ class Phase0Repository:
     def read_connection(self) -> Iterator[sqlite3.Connection]:
         """A read-only connection for reporting, debugging, and the API.
 
-        Read-only is enforced by SQLite, not by this docstring: the handle
-        is opened with the ``mode=ro`` URI flag, so every INSERT, UPDATE,
-        DELETE, and DDL statement fails with "attempt to write a readonly
-        database", and no ``PRAGMA`` can talk it back into being writable.
+        Read-only is enforced by SQLite, not by this docstring, and in two
+        independent ways:
+
+        * the handle is opened with the ``mode=ro`` URI flag, so writes to
+          the database it opened fail with "attempt to write a readonly
+          database";
+        * a **statement authorizer** allows reads and refuses everything
+          else, in every schema.
+
+        The second one is not belt-and-braces.  ``mode=ro`` protects the
+        file it opened and says nothing about any other: a caller could
+        turn ``query_only`` off, ``ATTACH`` this very database under a
+        second name, and write through the alias — committing data with no
+        run log at all.  ``ATTACH`` and ``DETACH`` are denied outright, as
+        are all DML, all DDL, and any pragma that could re-enable writing,
+        so ``main``, ``temp``, and any alias are equally out of reach.
+
+        The authorizer is installed *here only*.  Internal transactions use
+        the private writable connection, and deliberate manual repair uses
+        :meth:`Phase0Admin.connect_writable`; neither is restricted.
         """
 
         if not self.database_path.exists():
@@ -712,6 +842,9 @@ class Phase0Repository:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout = 10000")
             connection.execute("PRAGMA query_only = ON")
+            # Installed last: the two pragmas above are the settings the
+            # authorizer then refuses to let anyone change.
+            connection.set_authorizer(_read_only_authorizer)
             yield connection
         finally:
             connection.close()

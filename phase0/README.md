@@ -25,11 +25,20 @@ AC-8 replayability would have had to be built on top of it anyway.
 
 ## Guarantees
 
-**No public writable connection.** `read_connection()` is the only
-connection the public surface hands out, and it is opened `mode=ro`, so
-SQLite itself refuses every INSERT, UPDATE, DELETE, and DDL statement and
-no `PRAGMA` can talk it back into writing. Raw writable access lives on
-`repository.admin.connect_writable()`, for manual repair and migrations.
+**No public writable connection, and `ATTACH` is denied.**
+`read_connection()` is the only connection the public surface hands out.
+It is opened `mode=ro` *and* carries a SQLite statement authorizer that
+allows reads and refuses everything else. Both matter: `mode=ro` protects
+the file it opened and says nothing about any other, so a caller could
+otherwise turn `query_only` off, `ATTACH` the same database under a second
+name, and write through the alias — committing data with no run log at
+all. `ATTACH` and `DETACH` are denied outright, as are all DML, all DDL,
+writes to `temp`, and any pragma that could re-enable writing, so `main`,
+`temp`, and any alias are equally out of reach. Reads, joins, and
+schema-inspection pragmas (`table_info`, `integrity_check`, `user_version`
+in its query form, …) work normally. Raw writable access lives on
+`repository.admin.connect_writable()`, for manual repair and migrations,
+and is not restricted.
 
 **One transaction per public write.** A batch lands whole or not at all.
 Helpers that take a connection never commit; only the private writable
