@@ -5447,3 +5447,357 @@ def test_candidates_alone_do_not_authorize_derived_processing(tmp_path):
             pipeline_version="v1",
             stories=[story("cf1", [item_id])],
         )
+
+
+# ----------------------------------------------------------------------
+# Terminal success means committed, not "about to be committed"
+# ----------------------------------------------------------------------
+
+
+class _CommitFails(sqlite3.Connection):
+    """Commit raises, the way a disk error would."""
+
+    def commit(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+class _CommitsThenRaises(sqlite3.Connection):
+    """Commit lands and *then* reports failure.
+
+    The nastier of the two, and not hypothetical: an I/O error can be
+    reported after the transaction is durable. Anything that infers "the
+    data is gone" from "commit raised" gets this case wrong.
+    """
+
+    def commit(self):
+        super().commit()
+        raise sqlite3.OperationalError("disk I/O error")
+
+
+#: Run states observed at the moment each commit was attempted.
+_STATE_AT_COMMIT: list[str] = []
+
+
+def _watching_connection(run_holder):
+    class _RecordsStateAtCommit(sqlite3.Connection):
+        def commit(self):
+            _STATE_AT_COMMIT.append(run_holder["run"].state)
+            super().commit()
+
+    return _RecordsStateAtCommit
+
+
+@contextlib.contextmanager
+def failing_commits(times: int = 1, factory=_CommitFails):
+    """Make the next ``times`` *writable* connections fail to commit.
+
+    Read connections open with ``uri=True`` and are left alone, so a test
+    can still look at the database while the writer is sabotaged.
+    """
+
+    real_connect = sqlite3.connect
+    state = {"remaining": times, "used": 0}
+
+    def connect(*args, **kwargs):
+        if state["remaining"] > 0 and not kwargs.get("uri"):
+            state["remaining"] -= 1
+            state["used"] += 1
+            kwargs["factory"] = factory
+        return real_connect(*args, **kwargs)
+
+    with mock.patch("phase0.repository.sqlite3.connect", side_effect=connect):
+        yield state
+
+
+def test_a_commit_failure_leaves_no_success_anywhere(tmp_path):
+    """The reported defect: in-memory success ahead of a durable commit.
+
+    Every statement ran, the context said ``terminal_succeeded``, and then
+    the commit failed — taking the data and the run log with it while the
+    object still claimed the stage had finished.
+    """
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+    escaped = {}
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            escaped["run"] = run
+            with failing_commits():
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    assert escaped["run"].state == "terminal_failed"
+    assert repository.count("raw_items") == 0
+    entries = repository.run_log_entries(run_id="run-1")
+    assert [entry["status"] for entry in entries] == ["failed"]
+    assert repository.stage_key_state(**key)["status"] == "failed"
+    assert repository.claim_stage_key(**key, run_id="run-2")
+
+
+def test_a_commit_failure_surfaces_the_original_exception(tmp_path):
+    repository = migrated(tmp_path)
+
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            with failing_commits():
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    assert "disk I/O error" in str(caught.value)
+    assert not isinstance(caught.value, StageKeyError)
+    assert not isinstance(caught.value, Phase0RunContextError)
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_a_commit_failure_records_the_operation_as_failed(tmp_path, terminal):
+    """Non-terminal operations settle on commit too, not before it."""
+
+    repository = migrated(tmp_path)
+    escaped = {}
+
+    with pytest.raises(sqlite3.OperationalError):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            escaped["run"] = run
+            with failing_commits():
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=terminal)
+
+    assert escaped["run"].state == "terminal_failed"
+    assert repository.count("raw_items") == 0
+    assert [
+        entry["status"] for entry in repository.run_log_entries(run_id="run-1")
+    ] == ["failed"]
+
+
+def test_the_context_exit_adds_nothing_after_a_commit_failure(tmp_path):
+    """No duplicate settlement, and no contradicting outcome at exit."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+    seen = {}
+
+    with pytest.raises(sqlite3.OperationalError):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            try:
+                with failing_commits():
+                    repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+            finally:
+                seen["log"] = run_log_rows(repository)
+                seen["key"] = key_row(repository, key)
+            raise AssertionError("unreachable")
+
+    assert len(seen["log"]) == 1
+    assert run_log_rows(repository) == seen["log"]
+    assert key_row(repository, key) == seen["key"]
+
+
+def test_a_failed_settlement_is_unknown_rather_than_successful(tmp_path):
+    """When recording the failure fails too, nothing may claim success."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+    escaped = {}
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            escaped["run"] = run
+            # The operation's commit, the settlement's, and the run-log-only
+            # fallback's: all three.
+            with failing_commits(times=3):
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    assert escaped["run"].state == "settlement_failed"
+    assert escaped["run"].terminated is True
+    assert repository.count("raw_items") == 0
+    assert repository.run_log_entries(run_id="run-1") == []
+    # Left exactly as a crash would have left it: still running, still
+    # leased, and reclaimable the moment that lease expires.
+    assert repository.stage_key_state(**key)["status"] == "running"
+
+
+def test_a_settlement_that_loses_the_key_still_records_the_failure(tmp_path):
+    """The run log matters more than the key; one fallback, then stop."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with pytest.raises(sqlite3.OperationalError):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            with failing_commits(times=2):
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    assert [
+        entry["status"] for entry in repository.run_log_entries(run_id="run-1")
+    ] == ["failed"]
+    assert repository.count("raw_items") == 0
+
+
+def test_a_durable_success_is_never_overwritten_by_a_late_error(tmp_path):
+    """Commit landed, then reported an error. The data is real; keep it.
+
+    Inferring "rolled back" from "commit raised" would replace a committed
+    success with a fabricated failure — the worse of the two lies.
+    """
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+    escaped = {}
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            escaped["run"] = run
+            with failing_commits(factory=_CommitsThenRaises):
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    assert repository.count("raw_items") == 1
+    assert [
+        entry["status"] for entry in repository.run_log_entries(run_id="run-1")
+    ] == ["success"]
+    assert repository.stage_key_state(**key)["status"] == "success"
+    assert escaped["run"].state == "terminal_succeeded"
+
+
+def test_the_context_is_marked_successful_only_after_the_commit(tmp_path):
+    """Observed at the moment of commit, not inferred from the outcome."""
+
+    repository = migrated(tmp_path)
+    holder = {}
+    _STATE_AT_COMMIT.clear()
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        holder["run"] = run
+        with failing_commits(factory=_watching_connection(holder)):
+            repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+        assert run.state == "terminal_succeeded"
+
+    assert _STATE_AT_COMMIT == ["active"], _STATE_AT_COMMIT
+    assert repository.count("raw_items") == 1
+
+
+def test_a_committed_outcome_survives_a_reconnect(tmp_path):
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    reopened = Phase0Repository(repository.database_path)
+    assert reopened.count("raw_items") == 1
+    assert reopened.run_log_entries(run_id="run-1")[0]["status"] == "success"
+    assert reopened.stage_key_state(**key)["status"] == "success"
+    assert reopened.read.run_log_rows() == repository.read.run_log_rows()
+
+
+def test_a_commit_failure_outcome_survives_a_reconnect(tmp_path):
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with pytest.raises(sqlite3.OperationalError):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            with failing_commits():
+                repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+
+    reopened = Phase0Repository(repository.database_path)
+    assert reopened.count("raw_items") == 0
+    assert reopened.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+    assert reopened.stage_key_state(**key)["status"] == "failed"
+    assert reopened.claim_stage_key(**key, run_id="run-2")
+
+
+#: The only places allowed to commit.  A helper that commits on the side
+#: would put a transaction boundary somewhere nobody is looking.
+COMMITTERS = {"_connect", "_logged_mutation", "_write_settlement"}
+
+
+def test_no_helper_hides_a_commit():
+    """Transaction boundaries are where the design says they are."""
+
+    committers = set()
+    for name, member in inspect.getmembers(Phase0Repository, inspect.isfunction):
+        try:
+            source = inspect.getsource(member)
+        except (OSError, TypeError) as exc:  # pragma: no cover - defensive
+            raise AssertionError(f"cannot read the source of {name}: {exc}") from exc
+        body = "\n".join(
+            line for line in source.splitlines() if not line.strip().startswith("#")
+        )
+        if re.search(r"\bconnection\.(?:commit|rollback)\(", body):
+            committers.add(name)
+
+    assert committers == COMMITTERS, (
+        f"transaction boundaries this audit does not know about: "
+        f"{sorted(committers - COMMITTERS)}"
+    )

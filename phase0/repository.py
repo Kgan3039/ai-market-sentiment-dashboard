@@ -29,6 +29,7 @@ them:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import threading
@@ -473,7 +474,7 @@ _CONTEXT_KEY = object()
 
 
 # ----------------------------------------------------------------------
-# The lifecycle of one run, as four states rather than a pair of booleans.
+# The lifecycle of one run, as states rather than a pair of booleans.
 #
 # Two booleans could disagree, and did: a terminal operation that failed
 # set "terminated", teardown then read it as "already finalized, but the
@@ -481,17 +482,26 @@ _CONTEXT_KEY = object()
 # raised from a ``finally``, replaced the real exception on its way out.
 # A state is one fact, and the transitions out of a terminal state are
 # refused rather than merged.
+#
+# Every transition out of ACTIVE happens *after* the transaction that
+# earns it has committed.  In-memory success ahead of a durable commit is
+# a lie waiting for a disk error: the rollback takes the data and the run
+# log with it, while the object still says the stage succeeded.
 # ----------------------------------------------------------------------
 
 #: Open for business: operations may run, nothing final has been written.
 RUN_STATE_ACTIVE = "active"
-#: A terminal operation committed its data, run log, and key release.
-#: **Immutable** — nothing may overwrite that outcome afterwards.
+#: A terminal operation's data, run log, and key release are **committed**.
+#: Immutable — nothing may overwrite that outcome afterwards.
 RUN_STATE_TERMINAL_SUCCEEDED = "terminal_succeeded"
-#: An operation failed and its failure was recorded once, authoritatively.
+#: An operation failed and the failure settlement committed, once.
 RUN_STATE_TERMINAL_FAILED = "terminal_failed"
+#: An operation failed and recording that failure *also* failed to commit.
+#: The persisted outcome is unknown, not successful: the stage key is left
+#: as it was, so the lease expires and ordinary recovery reclaims it.
+RUN_STATE_SETTLEMENT_FAILED = "settlement_failed"
 #: The block ended with no operation ever declaring itself terminal, so
-#: teardown wrote the single degraded/retryable outcome.
+#: teardown committed the single degraded/retryable outcome.
 RUN_STATE_CLOSED_WITHOUT_TERMINAL = "closed_without_terminal"
 
 RUN_STATES = frozenset(
@@ -499,16 +509,31 @@ RUN_STATES = frozenset(
         RUN_STATE_ACTIVE,
         RUN_STATE_TERMINAL_SUCCEEDED,
         RUN_STATE_TERMINAL_FAILED,
+        RUN_STATE_SETTLEMENT_FAILED,
         RUN_STATE_CLOSED_WITHOUT_TERMINAL,
     }
 )
 
-#: States in which the run's outcome is already written and settled.
+#: States in which this run's outcome is decided and teardown adds nothing.
+#: ``settlement_failed`` is here on purpose: whatever is on disk, trying
+#: again from a ``finally`` would be the duplicate settlement this design
+#: exists to prevent.
 _SETTLED_RUN_STATES = frozenset(
     {
         RUN_STATE_TERMINAL_SUCCEEDED,
         RUN_STATE_TERMINAL_FAILED,
+        RUN_STATE_SETTLEMENT_FAILED,
         RUN_STATE_CLOSED_WITHOUT_TERMINAL,
+    }
+)
+
+#: States an operation reached by settling (or failing to settle) itself,
+#: as opposed to the block simply ending.
+_TERMINAL_RUN_STATES = frozenset(
+    {
+        RUN_STATE_TERMINAL_SUCCEEDED,
+        RUN_STATE_TERMINAL_FAILED,
+        RUN_STATE_SETTLEMENT_FAILED,
     }
 )
 
@@ -663,12 +688,9 @@ class StageRunContext:
 
     @property
     def terminated(self) -> bool:
-        """True once a terminal operation settled this run, either way."""
+        """True once an operation settled this run, whichever way it went."""
 
-        return self._state in (
-            RUN_STATE_TERMINAL_SUCCEEDED,
-            RUN_STATE_TERMINAL_FAILED,
-        )
+        return self._state in _TERMINAL_RUN_STATES
 
     @property
     def settled(self) -> bool:
@@ -4251,7 +4273,6 @@ class Phase0Repository:
                 # exception the caller was actually raising.
                 pass
             else:
-                context._transition(RUN_STATE_CLOSED_WITHOUT_TERMINAL)
                 if failure is not None:
                     status = "failed"
                 elif key is not None:
@@ -4265,6 +4286,7 @@ class Phase0Repository:
                     context,
                     status,
                     key_status="success" if status == "success" else "failed",
+                    settled_state=RUN_STATE_CLOSED_WITHOUT_TERMINAL,
                     # An exception from the stage body is the one the caller
                     # needs; bookkeeping must not replace it on the way out.
                     suppress_errors=failure is not None,
@@ -4276,34 +4298,125 @@ class Phase0Repository:
         status: str,
         *,
         key_status: str,
+        settled_state: str,
         suppress_errors: bool,
-    ) -> None:
-        """Write a run's single final outcome: run-log row and key release.
+    ) -> str:
+        """Commit a run's single final outcome, then record which one.
 
-        The two belong in one transaction, but the run log matters more:
-        when the key is gone — reclaimed, already completed — that is
-        usually *why* this run is ending, and losing the record of it would
-        hide the failure entirely.  So a lost key falls back to writing the
-        run log alone.
+        The run-log row and the key release belong in one transaction, but
+        the run log matters more: when the key is gone — reclaimed,
+        already completed — that is usually *why* this run is ending, and
+        losing the record of it would hide the failure entirely.  So a lost
+        key falls back to writing the run log alone.
 
-        ``suppress_errors`` is for teardown after an exception, where
-        raising from a ``finally`` would replace the real exception.
+        The context moves only *after* a commit returns.  Nothing here
+        marks a run settled on the strength of statements that have not
+        reached the disk yet.
+
+        Returns the state the context ended in.  ``suppress_errors`` is for
+        teardown after an exception, where raising from a ``finally`` would
+        replace the real exception.
         """
 
         try:
-            with self._connect(immediate=True) as connection:
-                self._write_final_run_log(connection, context, status)
-                if context._stage_key is not None:
-                    self._finish_stage_key(connection, context, key_status)
-            return
+            observed = self._write_settlement(
+                context, status, key_status, include_key=True
+            )
         except Exception:
             if not suppress_errors:
                 raise
+            try:
+                observed = self._write_settlement(
+                    context, status, key_status, include_key=False
+                )
+            except Exception:  # noqa: BLE001 - the caller's exception wins
+                # Nothing durable was written and nothing may claim
+                # otherwise.  The stage key is left exactly as it was, so
+                # the lease expires and ordinary recovery reclaims it —
+                # which is also what a crash here would have looked like.
+                context._transition(RUN_STATE_SETTLEMENT_FAILED)
+                return RUN_STATE_SETTLEMENT_FAILED
+        if observed == "already_succeeded":
+            # The operation's own commit *did* land, and only reporting it
+            # failed.  Overwriting a durable success with a failure would
+            # be the worse of the two lies.
+            context._transition(RUN_STATE_TERMINAL_SUCCEEDED)
+            return RUN_STATE_TERMINAL_SUCCEEDED
+        context._transition(settled_state)
+        return settled_state
+
+    def _write_settlement(
+        self,
+        context: StageRunContext,
+        status: str,
+        key_status: str,
+        *,
+        include_key: bool,
+    ) -> str:
+        """One transaction: the final run log, and optionally the key.
+
+        Conditional as well as atomic.  A commit that raises has not
+        necessarily failed to land — an I/O error can be reported after
+        the transaction is durable — so this looks at what is actually on
+        disk first, and refuses to overwrite a committed success with a
+        failure it inferred from an exception.
+        """
+
+        connection = self._open_connection()
         try:
-            with self._connect(immediate=True) as connection:
-                self._write_final_run_log(connection, context, status)
-        except Exception:  # noqa: BLE001 - the caller's exception wins
-            pass
+            connection.execute("BEGIN IMMEDIATE")
+            if status != "success" and self._already_succeeded(connection, context):
+                connection.rollback()
+                return "already_succeeded"
+            self._write_final_run_log(connection, context, status)
+            if include_key and context._stage_key is not None:
+                self._finish_stage_key(connection, context, key_status)
+            connection.commit()
+            return "settled"
+        except BaseException:
+            with contextlib.suppress(Exception):
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _already_succeeded(
+        connection: sqlite3.Connection, context: StageRunContext
+    ) -> bool:
+        """True when this run's success is already on disk.
+
+        Read on the settlement's own transaction, so it sees the committed
+        state rather than whatever the failed transaction thought.
+        """
+
+        row = connection.execute(
+            "SELECT status FROM run_log WHERE run_id = ? AND stage = ?",
+            (context.run_id, context.stage),
+        ).fetchone()
+        if row is None or str(row["status"]) != "success":
+            return False
+        key = context._stage_key
+        if key is None:
+            return True
+        key_row = connection.execute(
+            """
+            SELECT run_id, status FROM pipeline_stage_keys
+            WHERE stage = ? AND ticker = ? AND trading_day = ?
+              AND pipeline_version = ?
+            """,
+            (
+                key["stage"],
+                key["ticker"],
+                key["trading_day"],
+                key["pipeline_version"],
+            ),
+        ).fetchone()
+        return (
+            key_row is not None
+            and str(key_row["run_id"]) == context.run_id
+            and str(key_row["status"]) == "success"
+        )
 
     def _write_final_run_log(
         self,
@@ -4620,31 +4733,44 @@ class Phase0Repository:
     ) -> Iterator[tuple[sqlite3.Connection, StageRunContext]]:
         """One transaction holding authorization, mutation, log, and release.
 
-        The order matters and is the fix for both the TOCTOU hole and the
-        completion gap that followed it:
+        The transaction is managed by hand rather than by ``_connect``, and
+        that is the whole point of this shape.  A context manager commits
+        on the way out, *after* the body has run — so marking the run
+        successful in the body meant marking it successful before the
+        commit, and an injected commit failure left the object saying
+        "terminal_succeeded" over a database that had rolled the data,
+        the run log, and the key release all back.
 
-        1. take the write lock (``BEGIN IMMEDIATE``);
-        2. authorize the run and its lease *on that connection*;
-        3. mutate;
-        4. write the derived counts and the run-log row;
-        5. when ``terminal``, transition the stage key to its final status
-           and release the lease — still inside this transaction;
-        6. commit, releasing the lock.
+        The order:
 
-        A concurrent reclaimer blocks at step 1 and cannot get in anywhere
-        between steps 2 and 6.  Because step 5 is inside, there is no
+        1. open a private writable connection;
+        2. ``BEGIN IMMEDIATE`` — take the write lock;
+        3. authorize the run, its owner, and its lease *on that connection*;
+        4. validate the payload (the caller's body does this);
+        5. mutate;
+        6. write the derived counts and the run-log row;
+        7. when ``terminal``, transition the stage key and release the
+           lease — still inside this transaction;
+        8. ``commit()``;
+        9. **only now**, mark the context ``TERMINAL_SUCCEEDED``.
+
+        A concurrent reclaimer blocks at step 2 and cannot get in anywhere
+        between steps 3 and 8.  Because step 7 is inside, there is no
         committed state in which the data says success and the stage key is
         still sitting there reclaimable as ``running``.
 
         A non-terminal operation never records ``success``: its interim
         run-log row is written as ``degraded`` until some operation
-        declares the stage finished.
+        declares the stage finished.  It, too, changes nothing in memory
+        until its own commit returns.
 
-        On failure the data rolls back, the run is marked terminal-failed
-        once, and the original exception propagates untouched.
+        If anything raises — including ``commit()`` — the data rolls back,
+        the failure settlement runs in its own transaction, the context
+        becomes ``TERMINAL_FAILED`` only once *that* commits, and the
+        original exception propagates untouched.
 
         A run whose outcome is already settled is refused *before* any
-        transaction opens.  That ordering is the point: the previous
+        transaction opens.  That ordering matters too: the previous
         version let a second call reach the failure path, which rewrote a
         committed ``success`` run log to ``failed`` while the stage key it
         described stayed ``success``.
@@ -4653,31 +4779,42 @@ class Phase0Repository:
         # ``getattr`` because a hand-made ``object.__new__`` shell has no
         # state at all; it is not terminal, and ``_authorize_run`` below is
         # what refuses it.
-        if isinstance(run, StageRunContext) and getattr(
-            run, "_state", RUN_STATE_ACTIVE
-        ) in (RUN_STATE_TERMINAL_SUCCEEDED, RUN_STATE_TERMINAL_FAILED):
-            # Before ``_connect``, before ``_authorize_run``, and before the
-            # failure path below: a run that has already declared itself
-            # finished must not be able to reach code that writes an
-            # outcome, because that code would overwrite the one it has.
+        if (
+            isinstance(run, StageRunContext)
+            and getattr(run, "_state", RUN_STATE_ACTIVE) in _TERMINAL_RUN_STATES
+        ):
+            # Before opening a connection, before ``_authorize_run``, and
+            # before the failure path below: a run that has already settled
+            # must not reach code that writes an outcome, because that code
+            # would overwrite the one it has.
             raise Phase0RunContextError(
                 f"{operation}: this run is already {run.state} and its outcome "
                 "is written; open a new stage_run to do more work"
             )
+        connection: sqlite3.Connection | None = None
+        context: StageRunContext | None = None
+        committed = False
         try:
-            with self._connect(immediate=True) as connection:
-                context = self._authorize_run(connection, run, operation=operation)
-                yield connection, context
-                if terminal:
-                    status = context._resolved_status()
-                    self._write_final_run_log(connection, context, status)
-                    if context._stage_key is not None:
-                        self._finish_stage_key(connection, context, status)
-                    context._transition(RUN_STATE_TERMINAL_SUCCEEDED)
-                else:
-                    # Never "success" before the stage says it is finished.
-                    self._write_final_run_log(connection, context, "degraded")
+            connection = self._open_connection()
+            connection.execute("BEGIN IMMEDIATE")
+            context = self._authorize_run(connection, run, operation=operation)
+            yield connection, context
+            if terminal:
+                status = context._resolved_status()
+                self._write_final_run_log(connection, context, status)
+                if context._stage_key is not None:
+                    self._finish_stage_key(connection, context, status)
+            else:
+                # Never "success" before the stage says it is finished.
+                self._write_final_run_log(connection, context, "degraded")
+            connection.commit()
+            committed = True
         except BaseException as exc:  # noqa: BLE001 - re-raised below
+            if connection is not None:
+                # Best effort, and deliberately silent: a rollback that
+                # cannot run must not become the exception the caller sees.
+                with contextlib.suppress(Exception):
+                    connection.rollback()
             # Only a run that was genuinely authorized gets a failed record;
             # a rejected forgery has no run to write against, and a run that
             # is already settled must not have its outcome rewritten.
@@ -4690,13 +4827,23 @@ class Phase0Repository:
                 run._record_error(
                     {"operation": operation, "error": f"{type(exc).__name__}: {exc}"}
                 )
-                run._transition(RUN_STATE_TERMINAL_FAILED)
-                # Recorded once, and never at the cost of the exception the
+                # Settles the run in its own transaction and only then moves
+                # the context — and never at the cost of the exception the
                 # caller is waiting for: the failure below *is* the news.
                 self._settle_run(
-                    run, "failed", key_status="failed", suppress_errors=True
+                    run,
+                    "failed",
+                    key_status="failed",
+                    settled_state=RUN_STATE_TERMINAL_FAILED,
+                    suppress_errors=True,
                 )
             raise
+        finally:
+            if connection is not None:
+                connection.close()
+        if terminal and committed and context is not None:
+            # Durable first, then said out loud.
+            context._transition(RUN_STATE_TERMINAL_SUCCEEDED)
 
     def ingest_raw_items(
         self,
@@ -5018,6 +5165,7 @@ __all__ = [
     "RUN_STATE_ACTIVE",
     "RUN_STATE_CLOSED_WITHOUT_TERMINAL",
     "RUN_STATE_TERMINAL_FAILED",
+    "RUN_STATE_SETTLEMENT_FAILED",
     "RUN_STATE_TERMINAL_SUCCEEDED",
     "RUN_STATUSES",
     "SECRET_KEY_PATTERN",

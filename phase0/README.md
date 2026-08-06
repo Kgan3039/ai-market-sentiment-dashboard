@@ -128,16 +128,48 @@ an operator releasing a key they have repaired by hand, and writes no data
 and no run log — which is exactly why it cannot be mistaken for a stage
 finishing.
 
-**A run settles once, and a settled outcome is immutable.** The lifecycle
-is four states — `active`, `terminal_succeeded`, `terminal_failed`,
-`closed_without_terminal` — and only repository internals move it. A
-second terminal operation is refused *before* any transaction opens, so it
-cannot rewrite the committed success it follows. A terminal failure is
-recorded once and the original exception propagates untouched: teardown
-does nothing after either terminal state, which is what stops a cleanup
-`StageKeyError` from replacing the exception the caller actually needs. A
-run that never declares a terminal operation gets exactly one
-degraded/retryable outcome at teardown.
+**A run settles once, after a commit, and the outcome is immutable.** The
+lifecycle is `active`, `terminal_succeeded`, `terminal_failed`,
+`settlement_failed`, and `closed_without_terminal`; only repository
+internals move it, and **every move happens after the transaction that
+earns it has committed**. The terminal sequence is exactly:
+
+1. open a private writable connection;
+2. `BEGIN IMMEDIATE`;
+3. authorize the context, owner, lease, and partition;
+4. validate the payload;
+5. mutate;
+6. write the derived final run log;
+7. transition the stage key to `success` and release the lease;
+8. `commit()`;
+9. *only now*, mark the context `terminal_succeeded`.
+
+Marking it at step 7 — which a `with`-managed transaction forces, since
+the context manager commits after the body — meant an injected commit
+failure rolled back the data, the run log, and the key release while the
+object still said the stage had succeeded.
+
+If any step raises, including `commit()`, the data rolls back, the
+failure settlement runs in its own transaction, the context becomes
+`terminal_failed` only once *that* commits, and the original exception
+propagates untouched. If the settlement cannot commit either, the state
+is `settlement_failed` — explicitly unknown, never successful. The stage
+key is left exactly as it was, so the lease expires and ordinary recovery
+reclaims it, which is also what a crash at that moment would have looked
+like.
+
+Settlement is conditional as well as atomic. A commit that raises has not
+necessarily failed to land — an I/O error can be reported after the
+transaction is durable — so settlement reads what is actually on disk
+first and refuses to overwrite a committed success with a failure it
+inferred from an exception.
+
+A second terminal operation is refused *before* any transaction opens, so
+it cannot rewrite the committed success it follows. Teardown does nothing
+after any settled state, which is what stops a cleanup `StageKeyError`
+from replacing the exception the caller actually needs. A run that never
+declares a terminal operation gets exactly one degraded/retryable outcome
+at teardown.
 
 **Anything that can reject an operation runs inside it.** All five logged
 entrypoints — including argument normalization — validate on the run's own
