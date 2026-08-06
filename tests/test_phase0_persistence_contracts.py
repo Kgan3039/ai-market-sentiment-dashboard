@@ -58,10 +58,12 @@ from phase0.models import (
 )
 from phase0.redaction import redact_secrets, redact_text
 from phase0.repository import (
+    DEFAULT_CANDIDATE_REASON,
     MIGRATIONS_PATH,
     Phase0Admin,
     Phase0Repository,
     StageRunContext,
+    normalize_candidate_tickers,
     serialize_operational_metadata,
     serialize_raw_evidence,
 )
@@ -4591,3 +4593,868 @@ def test_a_story_cannot_join_two_versioned_theme_partitions_after_upgrade(tmp_pa
                 "INSERT INTO theme_stories (theme_id, story_id) "
                 "SELECT id, 1 FROM themes WHERE pipeline_version = 'v8'"
             )
+
+
+# ----------------------------------------------------------------------
+# Stage-key completion is not a public API
+# ----------------------------------------------------------------------
+
+
+def test_the_repository_has_no_public_stage_key_completion():
+    """Claim a key, declare it a success, write nothing: that was public.
+
+    Nothing about it needed to be clever — ``complete_stage_key`` moved a
+    claimed key to ``success`` with no data and no ``run_log`` row, so the
+    ledger recorded a stage that never ran.
+    """
+
+    assert not hasattr(Phase0Repository, "complete_stage_key")
+    public = _public_repository_methods()
+    assert "complete_stage_key" not in public
+    completers = [
+        name
+        for name in public
+        if "complete" in name and "stage" in name.replace("_", "")
+    ]
+    assert completers == [], f"a public stage-key completer came back: {completers}"
+
+
+#: Public methods that may move a stage key at all, and why.  A completer
+#: under a different name lands here or fails the audit.
+STAGE_KEY_MOVERS = {
+    "claim_stage_key": "takes an unowned, retryable, or expired key",
+    "heartbeat_stage_key": "extends the lease it already holds",
+    "recover_expired_leases": "marks abandoned claims retryable",
+    "stage_run": "settles the run that owns the key",
+}
+
+_MOVES_A_STAGE_KEY = re.compile(
+    r"UPDATE\s+pipeline_stage_keys|INSERT\s+INTO\s+pipeline_stage_keys"
+    r"|_finish_stage_key|_complete_stage_key_unlogged",
+    re.IGNORECASE,
+)
+
+
+def test_no_public_method_moves_a_stage_key_to_success_by_itself():
+    """Renaming the hole does not close it.
+
+    Follows delegation the same way the write audit does, so a public
+    method that only *calls* the completer is caught too.
+    """
+
+    def moves(name, seen=None):
+        seen = seen if seen is not None else set()
+        if name in seen:
+            return False
+        seen.add(name)
+        member = getattr(Phase0Repository, name, None)
+        if member is None or not callable(member):
+            return False
+        try:
+            source = inspect.getsource(member)
+        except (OSError, TypeError) as exc:  # pragma: no cover - defensive
+            raise AssertionError(f"cannot read the source of {name}: {exc}") from exc
+        if _MOVES_A_STAGE_KEY.search(source):
+            return True
+        return any(
+            moves(callee, seen) for callee in set(re.findall(r"self\.(\w+)\(", source))
+        )
+
+    movers = {name for name in _public_repository_methods() if moves(name)}
+    assert movers, "reflection found no stage-key movers; the audit is broken"
+
+    unclassified = []
+    for name in sorted(movers):
+        if name in STAGE_KEY_MOVERS:
+            assert STAGE_KEY_MOVERS[name].strip(), f"{name} needs a stated reason"
+            continue
+        # Everything else must be a logged mutation, where the key moves
+        # only in the transaction that also commits the data and the log.
+        if "run" in inspect.signature(getattr(Phase0Repository, name)).parameters:
+            assert (
+                name in LOGGED_ENTRYPOINTS
+            ), f"{name} moves a key outside the contract"
+            continue
+        unclassified.append(name)
+    assert not unclassified, (
+        "public methods move stage keys with neither a run nor a stated "
+        f"reason: {unclassified}"
+    )
+
+
+def test_admin_stage_key_completion_says_it_is_manual_repair():
+    doc = (Phase0Admin.complete_stage_key.__doc__ or "").lower()
+    assert "manual repair only" in doc
+    assert "must never call it" in doc
+    assert "terminal=true" in doc
+
+
+def test_admin_completion_cannot_be_mistaken_for_a_stage_finishing(tmp_path):
+    """It moves the key and nothing else — no data, no run log."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    repository.admin.complete_stage_key(**key, run_id="run-1", status="success")
+
+    assert repository.stage_key_state(**key)["status"] == "success"
+    assert repository.run_log_entries() == []
+    assert repository.count("raw_items") == 0
+
+
+def test_a_claimed_key_cannot_reach_success_without_a_terminal_mutation(tmp_path):
+    """The only route to a success key is a terminal logged mutation."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run)
+        assert repository.stage_key_state(**key)["status"] == "running"
+
+    assert repository.stage_key_state(**key)["status"] != "success"
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "degraded"
+    # And the key is retryable rather than stranded.
+    assert repository.claim_stage_key(**key, run_id="run-2")
+
+
+# ----------------------------------------------------------------------
+# The terminal lifecycle: settled once, immutably
+# ----------------------------------------------------------------------
+
+
+def key_row(repository: Phase0Repository, key: dict) -> tuple:
+    with repository.read_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT status, run_id, updated_at, completed_at, lease_expires_at,
+                   last_error, attempts, recovered_count
+            FROM pipeline_stage_keys
+            WHERE stage = ? AND ticker = ? AND trading_day = ?
+              AND pipeline_version = ?
+            """,
+            (key["stage"], key["ticker"], key["trading_day"], key["pipeline_version"]),
+        ).fetchone()
+    return tuple(row)
+
+
+def run_log_rows(repository: Phase0Repository) -> list[tuple]:
+    with repository.read_connection() as connection:
+        return [
+            tuple(row)
+            for row in connection.execute("SELECT * FROM run_log ORDER BY id")
+        ]
+
+
+def test_a_terminal_validation_error_reaches_the_caller_unmasked(tmp_path):
+    """The reported bug: cleanup replaced the exception on its way out.
+
+    A terminal operation that failed validation recorded its failure, and
+    then ``stage_run`` teardown tried to finalize *again*.  The second
+    ``_finish_stage_key`` found nothing to update and raised StageKeyError
+    from a ``finally`` — so the caller was told the lease was lost, not
+    what was actually wrong with their data.
+    """
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with pytest.raises(Phase0RunContextError) as caught:
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            repository.ingest_raw_items([raw_item(1, "AMD")], run=run, terminal=True)
+
+    assert not isinstance(caught.value, StageKeyError)
+    assert "AMD" in str(caught.value)
+    assert repository.count("raw_items") == 0
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+
+
+def test_a_terminal_failure_records_exactly_one_outcome(tmp_path):
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with pytest.raises(Phase0RunContextError):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            repository.ingest_raw_items([raw_item(1, "AMD")], run=run, terminal=True)
+
+    assert len(run_log_rows(repository)) == 1
+    assert repository.stage_key_state(**key)["status"] == "failed"
+    assert repository.claim_stage_key(**key, run_id="run-2")
+
+
+def test_a_second_terminal_operation_leaves_the_success_untouched(tmp_path):
+    """A settled success is immutable, including when the retry fails."""
+
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+        settled_log = run_log_rows(repository)
+        settled_key = key_row(repository, key)
+
+        with pytest.raises(Phase0RunContextError, match="already terminal_succeeded"):
+            repository.ingest_raw_items([raw_item(2)], run=run, terminal=True)
+
+        assert run_log_rows(repository) == settled_log
+        assert key_row(repository, key) == settled_key
+
+    assert run_log_rows(repository) == settled_log
+    assert key_row(repository, key) == settled_key
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "success"
+    assert repository.stage_key_state(**key)["status"] == "success"
+    assert repository.count("raw_items") == 1
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_no_operation_persists_anything_after_terminal_success(tmp_path, terminal):
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items([raw_item(2)], run=run, terminal=True)
+        before_log = run_log_rows(repository)
+        before_items = repository.count("raw_items")
+
+        for attempt in (
+            lambda: repository.ingest_raw_items(
+                [raw_item(3)], run=run, terminal=terminal
+            ),
+            lambda: repository.record_source_state("yahoo", run=run, terminal=terminal),
+            lambda: repository.persist_embeddings(
+                [sample_embedding(item_ids[0])], run=run, terminal=terminal
+            ),
+        ):
+            with pytest.raises(Phase0RunContextError, match="already"):
+                attempt()
+
+        assert run_log_rows(repository) == before_log
+        assert repository.count("raw_items") == before_items
+        assert repository.count("source_state") == 0
+        assert repository.count("embeddings") == 0
+
+    assert run_log_rows(repository) == before_log
+
+
+def test_no_operation_persists_anything_after_terminal_failure(tmp_path):
+    repository = migrated(tmp_path)
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        with pytest.raises(Phase0RunContextError):
+            repository.ingest_raw_items([raw_item(1, "AMD")], run=run)
+        settled = run_log_rows(repository)
+
+        with pytest.raises(Phase0RunContextError, match="already terminal_failed"):
+            repository.ingest_raw_items([raw_item(2)], run=run, terminal=True)
+
+        assert run_log_rows(repository) == settled
+
+    assert run_log_rows(repository) == settled
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+    assert repository.count("raw_items") == 0
+
+
+def test_normal_exit_after_a_settled_run_is_a_no_op(tmp_path):
+    """Teardown adds nothing once an operation has settled the run."""
+
+    repository = migrated(tmp_path)
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+        inside = run_log_rows(repository)
+        assert run.state == "terminal_succeeded"
+
+    assert run_log_rows(repository) == inside
+
+
+def test_a_run_with_no_terminal_operation_settles_exactly_once(tmp_path):
+    repository = migrated(tmp_path)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run)
+        repository.ingest_raw_items([raw_item(2)], run=run)
+        assert run.state == "active"
+
+    rows = run_log_rows(repository)
+    assert len(rows) == 1
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "degraded"
+    assert repository.claim_stage_key(**key, run_id="run-2")
+
+
+def test_a_run_state_never_leaves_a_settled_state(tmp_path):
+    """Only repository internals move the state, and only out of active."""
+
+    repository = migrated(tmp_path)
+    escaped = {}
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        assert run.state == "active"
+        assert run.settled is False
+        escaped["run"] = run
+        repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+        assert run.state == "terminal_succeeded"
+        assert run.settled is True
+
+    settled = escaped["run"]
+    assert settled.state == "terminal_succeeded"
+    with pytest.raises(Phase0RunContextError):
+        settled._transition("active")
+    with pytest.raises(Phase0RunContextError):
+        settled._transition("terminal_failed")
+    with pytest.raises(Phase0RunContextError):
+        settled.state = "active"
+    assert settled.state == "terminal_succeeded"
+
+
+# ----------------------------------------------------------------------
+# Rejection-capable validation runs inside the authoritative transaction
+# ----------------------------------------------------------------------
+
+
+def caught_validation_cases(repository: Phase0Repository) -> dict:
+    """One rejectable call per logged entrypoint, with what it must not write.
+
+    Each rejection is a *validation* rejection — a foreign ticker, a
+    foreign day, a source that does not exist — the kind a caller might
+    plausibly wrap in ``try``/``except`` and carry on from.
+    """
+
+    item_ids = seed_raw_items(repository, 1)
+    return {
+        "ingest_raw_items": (
+            lambda run, terminal: repository.ingest_raw_items(
+                [raw_item(1, "AMD")], run=run, terminal=terminal
+            ),
+            "raw_items",
+        ),
+        "record_source_state": (
+            lambda run, terminal: repository.record_source_state(
+                "yahoo",
+                run=run,
+                checked_at="2026-07-24T12:00:00+00:00",
+                terminal=terminal,
+            ),
+            "source_state",
+        ),
+        "reconcile_stories": (
+            lambda run, terminal: repository.reconcile_stories(
+                run=run,
+                ticker="AMD",
+                trading_day=DAY,
+                pipeline_version="v1",
+                stories=[story("cf1", item_ids)],
+                terminal=terminal,
+            ),
+            "stories",
+        ),
+        "reconcile_themes": (
+            lambda run, terminal: repository.reconcile_themes(
+                run=run,
+                ticker="AMD",
+                trading_day=DAY,
+                pipeline_version="v1",
+                theme_set=theme_set(),
+                terminal=terminal,
+            ),
+            "themes",
+        ),
+        "persist_embeddings": (
+            lambda run, terminal: repository.persist_embeddings(
+                [sample_embedding("999999")], run=run, terminal=terminal
+            ),
+            "embeddings",
+        ),
+    }
+
+
+@pytest.mark.parametrize("entrypoint", LOGGED_ENTRYPOINTS)
+@pytest.mark.parametrize("terminal", [False, True])
+def test_a_caught_validation_failure_still_ends_the_run_as_failed(
+    tmp_path, entrypoint, terminal
+):
+    """Swallowing the exception must not buy the caller a clean exit.
+
+    This is the whole point of doing the validation inside the run's own
+    transaction.  When it ran *before* ``_logged_mutation``, the run had
+    not yet taken responsibility for the operation, so a caller who caught
+    the rejection and exited normally left the stage recorded as a success
+    for work that was rejected.
+    """
+
+    repository = migrated(tmp_path)
+    call, table = caught_validation_cases(repository)[entrypoint]
+    baseline = repository.count(table)
+    key = stage_key_for()
+    assert repository.claim_stage_key(**key, run_id="run-x")
+
+    with repository.stage_run(
+        run_id="run-x",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        with contextlib.suppress(Phase0Error):
+            call(run, terminal)
+        # ...and the caller carries on as if nothing happened.
+
+    entry = repository.run_log_entries(run_id="run-x")[0]
+    assert entry["status"] == "failed"
+    assert entry["failure_count"] >= 1
+    assert repository.count(table) == baseline
+    assert repository.stage_key_state(**key)["status"] == "failed"
+    assert repository.claim_stage_key(**key, run_id="run-y")
+
+
+@pytest.mark.parametrize("entrypoint", LOGGED_ENTRYPOINTS)
+def test_a_caught_failure_cannot_be_followed_by_a_reported_success(
+    tmp_path, entrypoint
+):
+    repository = migrated(tmp_path)
+    call, _ = caught_validation_cases(repository)[entrypoint]
+
+    with repository.stage_run(
+        run_id="run-x",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        with contextlib.suppress(Phase0Error):
+            call(run, False)
+        with pytest.raises(Phase0RunContextError, match="already terminal_failed"):
+            repository.ingest_raw_items([raw_item(50)], run=run, terminal=True)
+
+    assert repository.run_log_entries(run_id="run-x")[0]["status"] == "failed"
+    assert repository.count("raw_items") == 1  # only the seeded one
+
+
+@pytest.mark.parametrize("entrypoint", LOGGED_ENTRYPOINTS)
+def test_every_logged_entrypoint_validates_inside_its_mutation(entrypoint):
+    """Structural: nothing that can reject runs before the ``with``.
+
+    Read as a rule rather than a lint: the body above the
+    ``_logged_mutation`` line may not call anything that raises, because
+    an exception raised there belongs to no run.
+    """
+
+    source = inspect.getsource(getattr(Phase0Repository, entrypoint))
+    body = source.split("_logged_mutation", 1)[0]
+    body = body.split('"""')[-1]  # drop the docstring
+    forbidden = re.compile(
+        r"\b(?:normalize_ticker|_normalize_day|_normalize_datetime|_require_text"
+        r"|_require_int|validate_embedding|_prepare_raw_item|_assert_\w+)\("
+    )
+    found = forbidden.findall(body)
+    assert not found, f"{entrypoint} can reject before taking responsibility: {found}"
+
+
+# ----------------------------------------------------------------------
+# candidate_tickers: one parser, used by validation and persistence alike
+# ----------------------------------------------------------------------
+
+
+def test_candidate_tickers_normalize_both_supported_forms():
+    assert normalize_candidate_tickers(["NVDA"]) == [
+        {"ticker": "NVDA", "reason": DEFAULT_CANDIDATE_REASON}
+    ]
+    assert normalize_candidate_tickers([{"ticker": "NVDA", "reason": "headline"}]) == [
+        {"ticker": "NVDA", "reason": "headline"}
+    ]
+    assert normalize_candidate_tickers(None) == []
+    assert normalize_candidate_tickers([]) == []
+
+
+def test_candidate_tickers_normalize_case_and_whitespace():
+    assert normalize_candidate_tickers([" nvda ", {"ticker": "amd\t"}]) == [
+        {"ticker": "AMD", "reason": DEFAULT_CANDIDATE_REASON},
+        {"ticker": "NVDA", "reason": DEFAULT_CANDIDATE_REASON},
+    ]
+
+
+def test_candidate_ticker_duplicates_are_deterministic():
+    """First mention wins, and the order does not depend on input order."""
+
+    forward = normalize_candidate_tickers(
+        [{"ticker": "NVDA", "reason": "first"}, "nvda", {"ticker": "AMD"}]
+    )
+    assert forward == [
+        {"ticker": "AMD", "reason": DEFAULT_CANDIDATE_REASON},
+        {"ticker": "NVDA", "reason": "first"},
+    ]
+    assert normalize_candidate_tickers(["AMD", "NVDA"]) == normalize_candidate_tickers(
+        ["NVDA", "AMD"]
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [""],
+        ["   "],
+        ["NVDA AMD"],
+        ["NVDA,AMD"],
+        ["GOOG"],
+        [None],
+        [7],
+        [["NVDA"]],
+        [{"reason": "no ticker at all"}],
+        [{"ticker": None}],
+        [{"ticker": ""}],
+        "NVDA",
+        {"ticker": "NVDA"},
+    ],
+)
+def test_malformed_candidate_tickers_are_rejected(value):
+    with pytest.raises(Phase0ValidationError):
+        normalize_candidate_tickers(value)
+
+
+def test_one_bad_candidate_rejects_the_whole_item():
+    with pytest.raises(Phase0ValidationError):
+        normalize_candidate_tickers(["NVDA", {"ticker": "AMD"}, 7])
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        ["AMD"],
+        [{"ticker": "AMD"}],
+        ["NVDA", "AMD"],
+        [{"ticker": "NVDA"}, "AMD"],
+        ["nvda", {"ticker": " amd "}],
+    ],
+)
+def test_a_foreign_candidate_ticker_cannot_ride_into_another_run(tmp_path, candidates):
+    """The bypass: the validator understood mappings, the writer both.
+
+    ``candidate_tickers=["AMD"]`` was therefore persisted under an NVDA
+    run, because the check that would have caught it only inspected the
+    mapping form.
+    """
+
+    repository = migrated(tmp_path)
+    item = {**raw_item(1), "candidate_tickers": candidates}
+
+    with pytest.raises(Phase0RunContextError, match="AMD"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.ingest_raw_items([item], run=run, terminal=True)
+
+    assert repository.count("raw_items") == 0
+    assert repository.count("raw_item_candidates") == 0
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+
+
+def test_one_bad_candidate_rolls_back_a_whole_ingestion_batch(tmp_path):
+    repository = migrated(tmp_path)
+    poisoned = {**raw_item(2), "candidate_tickers": ["AMD"]}
+
+    with pytest.raises(Phase0RunContextError):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.ingest_raw_items(
+                [raw_item(1), poisoned, raw_item(3)], run=run, terminal=True
+            )
+
+    assert repository.count("raw_items") == 0
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+
+
+def test_accepted_candidates_are_persisted_from_the_normalized_form(tmp_path):
+    repository = migrated(tmp_path)
+    item = {
+        **raw_item(1),
+        "candidate_tickers": [" nvda ", {"ticker": "NVDA", "reason": "ignored"}],
+    }
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items([item], run=run, terminal=True)
+
+    with repository.read_connection() as connection:
+        rows = [
+            (row["ticker"], row["reason"])
+            for row in connection.execute(
+                "SELECT ticker, reason FROM raw_item_candidates ORDER BY ticker"
+            )
+        ]
+    assert rows == [("NVDA", DEFAULT_CANDIDATE_REASON)]
+
+
+def test_no_second_candidate_parser_survives_downstream():
+    """One parser, or the two of them will disagree again."""
+
+    writer = inspect.getsource(Phase0Repository._insert_raw_item)
+    candidate_block = writer.split("candidate_tickers", 1)[-1]
+    assert "normalize_ticker(" not in candidate_block
+    assert "isinstance(candidate" not in candidate_block
+    assert "relevance_match" not in candidate_block
+
+    prepare = inspect.getsource(Phase0Repository._prepare_raw_item)
+    assert "normalize_candidate_tickers(" in prepare
+
+
+# ----------------------------------------------------------------------
+# Ticker-scoped derived output needs an explicit association
+# ----------------------------------------------------------------------
+
+
+def unattributed_item(repository: Phase0Repository, index: int = 1, **overrides) -> int:
+    """Raw evidence stored with no ticker of its own."""
+
+    item = {**raw_item(index), "ticker": None}
+    item.update(overrides)
+    return repository.admin.insert_raw_item(item).item_id
+
+
+def test_tickerless_evidence_is_still_storable(tmp_path):
+    """Ingestion keeps what it could not attribute; that part is fine."""
+
+    repository = migrated(tmp_path)
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items(
+            [{**raw_item(1), "ticker": None}], run=run, terminal=True
+        )
+
+    assert repository.count("raw_items") == 1
+    assert repository.count("raw_item_tickers") == 0
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "success"
+
+
+def test_an_unattributed_item_cannot_become_an_nvda_story_member(tmp_path):
+    repository = migrated(tmp_path)
+    item_id = unattributed_item(repository)
+
+    with pytest.raises(Phase0RunContextError, match="no accepted association"):
+        reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", [item_id])],
+        )
+
+    assert repository.count("stories") == 0
+    assert repository.count("story_members") == 0
+
+
+def test_an_unattributed_item_cannot_become_an_nvda_embedding_source(tmp_path):
+    repository = migrated(tmp_path)
+    item_id = unattributed_item(repository)
+
+    with pytest.raises(Phase0RunContextError, match="no accepted association"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="m1.embed",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.persist_embeddings(
+                [sample_embedding(item_id)], run=run, terminal=True
+            )
+
+    assert repository.count("embeddings") == 0
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+
+
+def test_an_amd_only_association_is_rejected_under_an_nvda_run(tmp_path):
+    repository = migrated(tmp_path)
+    item_id = unattributed_item(repository, tickers=["AMD"])
+
+    with pytest.raises(Phase0RunContextError, match="no accepted association"):
+        reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", [item_id])],
+        )
+
+    assert repository.count("stories") == 0
+
+
+def test_an_explicit_nvda_association_is_accepted(tmp_path):
+    repository = migrated(tmp_path)
+    item_id = unattributed_item(repository, tickers=["NVDA"])
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", [item_id])],
+    )
+
+    assert len(report.inserted) == 1
+    assert repository.count("story_members") == 1
+
+    with repository.stage_run(
+        run_id="run-embed",
+        stage="m1.embed",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.persist_embeddings(
+            [sample_embedding(item_id)], run=run, terminal=True
+        )
+    assert repository.count("embeddings") == 1
+
+
+def test_an_item_associated_with_two_tickers_serves_both(tmp_path):
+    """Membership, not exclusivity: one article can be about two companies."""
+
+    repository = migrated(tmp_path)
+    item_id = unattributed_item(repository, tickers=["NVDA", "AMD"])
+
+    for ticker in ("NVDA", "AMD"):
+        report = reconcile_stories(
+            repository,
+            ticker=ticker,
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story(f"cf-{ticker}", [item_id])],
+        )
+        assert len(report.inserted) == 1
+
+    assert repository.count("stories") == 2
+    assert repository.count("story_members") == 2
+
+
+def test_a_rejected_association_writes_nothing_and_fails_the_run(tmp_path):
+    """One bad member rolls back the good ones with it."""
+
+    repository = migrated(tmp_path)
+    good = seed_raw_items(repository, 1)[0]
+    orphan = unattributed_item(repository, index=9)
+
+    with pytest.raises(Phase0RunContextError, match="no accepted association"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage="m3.semantic",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.reconcile_stories(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                stories=[story("cf-good", [good]), story("cf-bad", [orphan])],
+                terminal=True,
+            )
+
+    assert repository.count("stories") == 0
+    assert repository.count("story_members") == 0
+    assert repository.run_log_entries(run_id="run-1")[0]["status"] == "failed"
+
+
+def test_candidates_alone_do_not_authorize_derived_processing(tmp_path):
+    """A candidate is a suggestion; the association table is the authority."""
+
+    repository = migrated(tmp_path)
+    item_id = repository.admin.insert_raw_item(
+        {**raw_item(1), "ticker": None, "candidate_tickers": ["NVDA"]}
+    ).item_id
+    assert repository.count("raw_item_candidates") == 1
+
+    with pytest.raises(Phase0RunContextError, match="no accepted association"):
+        reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", [item_id])],
+        )

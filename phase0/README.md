@@ -96,6 +96,33 @@ lease, all before committing. There is no committed state in which the
 data says success and the key is still reclaimable as `running`. Updating
 zero rows while finishing a key is an error, never a silent success.
 
+**A stage key reaches `success` exactly one way.** There is no public
+`complete_stage_key`: a caller could claim a key and declare it finished
+with no data and no `run_log` row behind it. Only a terminal logged
+mutation transitions a key to `success`, in the transaction that commits
+the data and the log. `repository.admin.complete_stage_key()` remains for
+an operator releasing a key they have repaired by hand, and writes no data
+and no run log — which is exactly why it cannot be mistaken for a stage
+finishing.
+
+**A run settles once, and a settled outcome is immutable.** The lifecycle
+is four states — `active`, `terminal_succeeded`, `terminal_failed`,
+`closed_without_terminal` — and only repository internals move it. A
+second terminal operation is refused *before* any transaction opens, so it
+cannot rewrite the committed success it follows. A terminal failure is
+recorded once and the original exception propagates untouched: teardown
+does nothing after either terminal state, which is what stops a cleanup
+`StageKeyError` from replacing the exception the caller actually needs. A
+run that never declares a terminal operation gets exactly one
+degraded/retryable outcome at teardown.
+
+**Anything that can reject an operation runs inside it.** All five logged
+entrypoints — including argument normalization — validate on the run's own
+transaction, after `_logged_mutation` has taken responsibility. A caller
+who catches the rejection inside the `stage_run` block and exits normally
+still ends the run `failed`; validation that ran *before* the mutation let
+that caller record a success for work that was rejected.
+
 **A run may only write its own partition.** Every logged operation derives
 the payload's partition and rejects the whole batch before writing if it
 disagrees with the run: an NVDA run cannot ingest an AMD item, a v1 theme
@@ -144,20 +171,24 @@ with repository.stage_run(
         pipeline_version="v1", stories=[StoryRecord(...)],
     )
 
-    # M5 — one ticker/trading-day theme set, atomically
+    # M5 — one ticker/trading-day theme set, atomically.  The stage's last
+    # operation carries terminal=True: it commits the data, the final run
+    # log, and the stage key's completion together.
     repository.reconcile_themes(
         run=run, ticker="NVDA", trading_day="2026-07-23",
         pipeline_version="v1", theme_set=ThemeSetRecord(...),
         themes=[ThemeRecord(...)],
         other_coverage=[OtherCoverageRecord(...)],
         excluded=[ExcludedStoryRecord(...)],
+        terminal=True,
     )
 
 # M1 — implements nlp.embeddings.EmbeddingRepository, so its single-vector
 # cache reads and writes need no run; the batch (persist_embeddings) does.
 service.embed_targets(targets, repository)
 
-# Reading: the only public connection, and SQLite refuses writes on it.
+# Reading: the only public connection.  SQLite refuses writes on it, and
+# the authorizer refuses ATTACH, so there is no way out of read-only.
 with repository.read_connection() as connection:
     connection.execute("SELECT * FROM themes WHERE trading_day = ?", (day,))
 
@@ -220,8 +251,15 @@ with repository.stage_run(
     pipeline_version=version, ticker=ticker, stage_key=key,
 ) as run:
     repository.ingest_raw_items(items, run=run)
-    repository.record_source_state(source, run=run, successful=True)
+    # The last operation says so, and that is what completes the key.
+    repository.record_source_state(
+        source, run=run, successful=True, terminal=True
+    )
 ```
+
+There is no `repository.complete_stage_key(...)` line to add after the
+block, and no version of this loop where the stage marks itself finished
+separately from the transaction that wrote its data.
 
 The stage key's `stage`, `ticker`, `trading_day`, `pipeline_version`, and
 owning `run_id` must all match the run's; a mismatch is refused when the
@@ -244,19 +282,45 @@ against the run, and rejects the whole batch on any mismatch:
   `fetched_at`, must equal the run's day. **#82 and #83 must slice their
   fetch batches per ticker-day before calling this.**
 * `reconcile_stories` — every member raw item must already sit in the
-  run's ticker-day.
+  run's ticker-day **and be explicitly associated with its ticker**.
 * `reconcile_themes` — every story named in membership, Other Coverage, or
   exclusions must match the run's ticker, day, *and* pipeline version.
 * `persist_embeddings` — every source must belong to the run's partition.
 * `record_source_state` — an explicit `checked_at` must fall on the run's
   trading day; omitting it means "now" and asserts no day.
 
+**`candidate_tickers` has two accepted forms and one parser.** A bare
+symbol — `"NVDA"`, `" nvda "` — which records the reason
+`relevance_match`; or a mapping, `{"ticker": "NVDA", "reason": "..."}`.
+Anything else raises, and one bad candidate rejects the whole item.
+Duplicates keep the first mention's reason and the result is sorted by
+symbol, so replays compare equal. Validation and persistence read the same
+normalized output: two parsers is how `candidate_tickers=["AMD"]` came to
+be stored under an NVDA run, because the validator understood only the
+mapping form.
+
+**Ticker-scoped derived processing needs an explicit association.**
+Tickerless raw evidence is storable — a fetcher legitimately keeps what it
+could not attribute — but it may not drift into being some ticker's story
+member or embedding source just because that run held the transaction. A
+raw item may enter `TICKER`'s derived output only when `raw_items.ticker`
+is `TICKER`, or an accepted association exists in `raw_item_tickers`, the
+authoritative relationship table. A `raw_item_candidates` row is a
+suggestion nothing has accepted and does not count. An item associated
+with several tickers is fine and serves each of them: the rule is
+membership, not exclusivity, so each ticker's output is built
+independently and an AMD-only item stays out of NVDA's. A ticker-agnostic
+embedding pass, if one is ever needed, needs its own stage contract rather
+than borrowing a ticker-scoped run.
+
 Two more things to expect on rebase:
 
 * **Migrations renumber.** #82's `004_supported_ticker_universe.sql` is
-  superseded by this branch's, and #83's `005_rss_evidence_and_provenance.sql`
-  should become `011_...`. The ledger keys on filename, so a renumbered
-  file still applies.
+  superseded by this branch's. `011_` is now occupied by
+  `011_required_story_pipeline_version.sql`, so #83's
+  `005_rss_evidence_and_provenance.sql` — and anything else arriving from
+  those branches — must take the next free numbers from `012_` upward. The
+  ledger keys on filename, so a renumbered file still applies.
 * **Identity scalars are validated.** If a fixture puts a credential-shaped
   string into `provider_namespace`, `provider_item_id`, a story key, or a
   model name, it now raises `Phase0ValidationError` instead of being

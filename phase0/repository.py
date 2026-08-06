@@ -384,6 +384,67 @@ def serialize_operational_metadata(value: Any, field: str, expected_type: type) 
 _serialize_json = serialize_operational_metadata
 
 
+def normalize_candidate_tickers(value: Any) -> list[dict[str, str]]:
+    """Normalize ``candidate_tickers`` once, for validation *and* storage.
+
+    Two accepted forms, and nothing else:
+
+    * a bare symbol — ``"NVDA"``, ``" nvda "`` — which records the reason
+      ``relevance_match``;
+    * a mapping with ``ticker`` and an optional ``reason`` —
+      ``{"ticker": "NVDA", "reason": "headline_match"}``.
+
+    Anything else (``None`` in the list, a number, a nested list, a mapping
+    with no ``ticker``, a blank string, ``"NVDA AMD"``) raises, and one bad
+    candidate rejects the whole item rather than being dropped quietly.
+
+    **Duplicates:** the first mention of a symbol wins, including its
+    reason, and the result is sorted by symbol.  Deterministic order
+    matters because these rows are compared across replays.
+
+    This function existing *once* is the fix, not the parsing it does.  A
+    second parser downstream is how ``candidate_tickers=["AMD"]`` came to
+    be stored under an NVDA run: the validator understood only the mapping
+    form, and the writer understood both.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, Mapping)):
+        raise Phase0ValidationError(
+            "candidate_tickers must be a sequence of symbols or mappings"
+        )
+    if not isinstance(value, Sequence):
+        raise Phase0ValidationError(
+            "candidate_tickers must be a sequence of symbols or mappings"
+        )
+
+    seen: dict[str, str] = {}
+    for position, candidate in enumerate(value):
+        if isinstance(candidate, Mapping):
+            if "ticker" not in candidate:
+                raise Phase0ValidationError(
+                    f"candidate ticker {position} is a mapping with no 'ticker'"
+                )
+            ticker = normalize_ticker(
+                candidate.get("ticker"), field=f"candidate ticker {position}"
+            )
+            raw_reason = candidate.get("reason")
+            reason = str(raw_reason).strip() if raw_reason is not None else ""
+            reason = reason or DEFAULT_CANDIDATE_REASON
+        elif isinstance(candidate, str):
+            ticker = normalize_ticker(candidate, field=f"candidate ticker {position}")
+            reason = DEFAULT_CANDIDATE_REASON
+        else:
+            raise Phase0ValidationError(
+                f"candidate ticker {position} must be a symbol or a mapping, "
+                f"not {type(candidate).__name__}"
+            )
+        # normalize_ticker raises rather than returning None here.
+        seen.setdefault(str(ticker), reason)
+    return [{"ticker": ticker, "reason": seen[ticker]} for ticker in sorted(seen)]
+
+
 def _optional_blob(value: Any, field: str) -> bytes | None:
     if value is None:
         return None
@@ -409,6 +470,47 @@ class InsertResult:
 #: an instance, and never reachable from the public API, so a caller cannot
 #: build a :class:`StageRunContext` even by copying every visible field.
 _CONTEXT_KEY = object()
+
+
+# ----------------------------------------------------------------------
+# The lifecycle of one run, as four states rather than a pair of booleans.
+#
+# Two booleans could disagree, and did: a terminal operation that failed
+# set "terminated", teardown then read it as "already finalized, but the
+# stage also failed" and finalized a second time — whose StageKeyError,
+# raised from a ``finally``, replaced the real exception on its way out.
+# A state is one fact, and the transitions out of a terminal state are
+# refused rather than merged.
+# ----------------------------------------------------------------------
+
+#: Open for business: operations may run, nothing final has been written.
+RUN_STATE_ACTIVE = "active"
+#: A terminal operation committed its data, run log, and key release.
+#: **Immutable** — nothing may overwrite that outcome afterwards.
+RUN_STATE_TERMINAL_SUCCEEDED = "terminal_succeeded"
+#: An operation failed and its failure was recorded once, authoritatively.
+RUN_STATE_TERMINAL_FAILED = "terminal_failed"
+#: The block ended with no operation ever declaring itself terminal, so
+#: teardown wrote the single degraded/retryable outcome.
+RUN_STATE_CLOSED_WITHOUT_TERMINAL = "closed_without_terminal"
+
+RUN_STATES = frozenset(
+    {
+        RUN_STATE_ACTIVE,
+        RUN_STATE_TERMINAL_SUCCEEDED,
+        RUN_STATE_TERMINAL_FAILED,
+        RUN_STATE_CLOSED_WITHOUT_TERMINAL,
+    }
+)
+
+#: States in which the run's outcome is already written and settled.
+_SETTLED_RUN_STATES = frozenset(
+    {
+        RUN_STATE_TERMINAL_SUCCEEDED,
+        RUN_STATE_TERMINAL_FAILED,
+        RUN_STATE_CLOSED_WITHOUT_TERMINAL,
+    }
+)
 
 
 class StageRunContext:
@@ -447,7 +549,7 @@ class StageRunContext:
         "_success_count",
         "_partial_count",
         "_failure_count",
-        "_terminated",
+        "_state",
         "_started_at",
     )
 
@@ -472,7 +574,7 @@ class StageRunContext:
         setter(self, "_success_count", 0)
         setter(self, "_partial_count", 0)
         setter(self, "_failure_count", 0)
-        setter(self, "_terminated", False)
+        setter(self, "_state", RUN_STATE_ACTIVE)
         setter(self, "_started_at", datetime.now(timezone.utc))
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -549,10 +651,30 @@ class StageRunContext:
         return self._failure_count
 
     @property
-    def terminated(self) -> bool:
-        """True once a terminal operation completed this run's stage key."""
+    def state(self) -> str:
+        """Where this run is in its lifecycle; see ``RUN_STATE_*``.
 
-        return self._terminated
+        Read-only, like everything else here.  Only repository internals
+        move it, through :meth:`_transition`, and only out of
+        ``RUN_STATE_ACTIVE``.
+        """
+
+        return self._state
+
+    @property
+    def terminated(self) -> bool:
+        """True once a terminal operation settled this run, either way."""
+
+        return self._state in (
+            RUN_STATE_TERMINAL_SUCCEEDED,
+            RUN_STATE_TERMINAL_FAILED,
+        )
+
+    @property
+    def settled(self) -> bool:
+        """True once this run's outcome is written and may not change."""
+
+        return self._state in _SETTLED_RUN_STATES
 
     @property
     def started_at(self) -> datetime:
@@ -580,8 +702,25 @@ class StageRunContext:
         setter(self, "_partial_count", self._partial_count + int(partial))
         setter(self, "_failure_count", self._failure_count + int(failure))
 
-    def _mark_terminated(self) -> None:
-        object.__setattr__(self, "_terminated", True)
+    def _transition(self, state: str) -> None:
+        """Move the run to a settled state, once.
+
+        Leaving a settled state is refused rather than ignored: every way
+        of reaching one has already written an authoritative outcome, and
+        overwriting it is precisely the bug — a second terminal call
+        rewriting a committed success to ``failed``.  Callers check
+        :attr:`settled` first, so reaching here twice is a repository bug,
+        not a caller error.
+        """
+
+        if state not in RUN_STATES:
+            raise Phase0RunContextError(f"unknown run state {state!r}")
+        if self._state in _SETTLED_RUN_STATES:
+            raise Phase0RunContextError(
+                f"this run is already {self._state}; its outcome is written "
+                "and cannot be changed"
+            )
+        object.__setattr__(self, "_state", state)
 
     def _record_error(self, error: Mapping[str, Any] | str) -> None:
         self._errors.append(error)
@@ -1313,7 +1452,9 @@ class Phase0Repository:
                     if str(ticker).strip()
                 }
             ),
-            "candidate_tickers": item.get("candidate_tickers") or [],
+            "candidate_tickers": normalize_candidate_tickers(
+                item.get("candidate_tickers")
+            ),
         }
 
     @staticmethod
@@ -1358,15 +1499,11 @@ class Phase0Repository:
                 """,
                 (item_id, ticker),
             )
+        # Already normalized by :func:`normalize_candidate_tickers`, in
+        # ``_prepare_raw_item``.  Parsing them a second time here is what
+        # let a bare ``"AMD"`` past a validator that only understood the
+        # mapping form, so this loop deliberately understands one shape.
         for candidate in values.get("candidate_tickers") or []:
-            if isinstance(candidate, Mapping):
-                ticker = normalize_ticker(
-                    candidate.get("ticker"), field="candidate ticker"
-                )
-                reason = str(candidate.get("reason") or "relevance_match")
-            else:
-                ticker = normalize_ticker(candidate, field="candidate ticker")
-                reason = "relevance_match"
             connection.execute(
                 """
                 INSERT INTO raw_item_candidates (raw_item_id, ticker, reason)
@@ -1374,7 +1511,7 @@ class Phase0Repository:
                 ON CONFLICT(raw_item_id, ticker)
                 DO UPDATE SET reason = excluded.reason
                 """,
-                (item_id, ticker, reason),
+                (item_id, candidate["ticker"], candidate["reason"]),
             )
         return InsertResult(item_id, inserted)
 
@@ -1935,21 +2072,29 @@ class Phase0Repository:
         ``run`` is the :class:`StageRunContext` from :meth:`stage_run`.  The
         stories and the ``run_log`` row commit in one transaction, and the
         counts are derived here rather than supplied by the caller.  Every
-        member raw item must already belong to the run's ticker-day, so a
-        story cannot quietly drag foreign evidence into this partition.
+        member raw item must already belong to the run's ticker-day *and*
+        be explicitly associated with its ticker, so a story cannot quietly
+        drag foreign — or unattributed — evidence into this partition.
+
+        Argument normalization happens inside the logged mutation together
+        with those checks: an unsupported ticker or a malformed day is a
+        recorded failure of this run, not an exception raised before the
+        run took responsibility for the operation.
         """
 
-        normalized_ticker = normalize_ticker(ticker)
-        day = _normalize_day(trading_day)
-        version = _require_text(pipeline_version, "pipeline_version")
         with self._logged_mutation(
-            run,
-            operation="reconcile_stories",
-            ticker=normalized_ticker,
-            trading_day=day,
-            pipeline_version=version,
-            terminal=terminal,
+            run, operation="reconcile_stories", terminal=terminal
         ) as (connection, context):
+            normalized_ticker = normalize_ticker(ticker)
+            day = _normalize_day(trading_day)
+            version = _require_text(pipeline_version, "pipeline_version")
+            self._assert_run_partition(
+                context,
+                operation="reconcile_stories",
+                ticker=normalized_ticker,
+                trading_day=day,
+                pipeline_version=version,
+            )
             self._assert_members_in_partition(
                 connection,
                 stories,
@@ -1972,7 +2117,55 @@ class Phase0Repository:
             return report
 
     @staticmethod
+    def _assert_raw_item_association(
+        connection: sqlite3.Connection,
+        raw_item_id: int,
+        ticker: str,
+        *,
+        operation: str,
+    ) -> None:
+        """The one rule for pulling raw evidence into ticker-scoped output.
+
+        A raw item may take part in ``ticker``'s derived processing only
+        when it is *explicitly* associated with it, which means either:
+
+        * ``raw_items.ticker`` is that symbol; or
+        * an accepted association exists in ``raw_item_tickers`` — the
+          authoritative relationship table.  A ``raw_item_candidates`` row
+          is a suggestion nothing has accepted, and does not count.
+
+        Ingestion may still store an item with ``ticker=None`` and no
+        associations: unattributable evidence is real, and the spec says to
+        keep it.  What it may not do is drift, later, into being an NVDA
+        story member or an NVDA embedding source just because an NVDA run
+        happened to be the one holding the transaction.
+
+        **Multiple associations.**  An item associated with both NVDA and
+        AMD is legitimate — one article can be about two companies — and
+        the rule is membership, not exclusivity: each run requires its own
+        ticker to be among the associations and ignores the others.  Each
+        ticker's derived output is therefore built independently, and an
+        AMD-only item stays out of NVDA's.
+        """
+
+        associated = connection.execute(
+            f"""
+            SELECT 1 FROM {RAW_ITEM_ASSOCIATION_TABLE}
+            WHERE raw_item_id = ? AND ticker = ?
+            """,
+            (raw_item_id, ticker),
+        ).fetchone()
+        if associated is not None:
+            return
+        raise Phase0RunContextError(
+            f"{operation}: raw item {raw_item_id} has no accepted association "
+            f"with {ticker}; associate it explicitly before using it in "
+            f"{ticker}'s derived output"
+        )
+
+    @classmethod
     def _assert_members_in_partition(
+        cls,
         connection: sqlite3.Connection,
         stories: Sequence[StoryRecord],
         *,
@@ -2004,6 +2197,9 @@ class Phase0Repository:
                         f"raw item {raw_item_id} falls on {row['day']} but this "
                         f"reconciliation covers {trading_day}"
                     )
+                cls._assert_raw_item_association(
+                    connection, int(raw_item_id), ticker, operation="reconcile_stories"
+                )
 
     def _reconcile_stories_unlogged(
         self,
@@ -2705,19 +2901,25 @@ class Phase0Repository:
         Other Coverage, exclusions — must already sit in this ticker, day,
         and pipeline version, and a mismatch rejects the whole batch before
         anything is written.
+
+        As with :meth:`reconcile_stories`, normalization and validation run
+        inside the run's own transaction so that a rejection is recorded as
+        this run's failure.
         """
 
-        normalized_ticker = normalize_ticker(ticker)
-        day = _normalize_day(trading_day)
-        version = _require_text(pipeline_version, "pipeline_version")
         with self._logged_mutation(
-            run,
-            operation="reconcile_themes",
-            ticker=normalized_ticker,
-            trading_day=day,
-            pipeline_version=version,
-            terminal=terminal,
+            run, operation="reconcile_themes", terminal=terminal
         ) as (connection, context):
+            normalized_ticker = normalize_ticker(ticker)
+            day = _normalize_day(trading_day)
+            version = _require_text(pipeline_version, "pipeline_version")
+            self._assert_run_partition(
+                context,
+                operation="reconcile_themes",
+                ticker=normalized_ticker,
+                trading_day=day,
+                pipeline_version=version,
+            )
             self._assert_stories_in_partition(
                 connection,
                 themes=themes,
@@ -3848,29 +4050,69 @@ class Phase0Repository:
             raise
         finally:
             self._unregister_run(context)
-            if failure is not None:
-                status = "failed"
-            elif key is not None and not context.terminated:
-                # The stage held a lease and never declared completion.
-                # Retryable, not successful: saying otherwise here would be
-                # the separate success-marking this design removed.
-                status = "degraded"
-            else:
-                status = context._resolved_status()
-
-            if context.terminated and failure is None:
-                # The terminal mutation already committed the final run log
-                # and released the key, atomically.  Nothing to add.
+            if context.settled:
+                # A terminal operation already committed the whole outcome:
+                # data, final run log, and stage-key transition, in one
+                # transaction.  Finalizing again here is what used to
+                # rewrite a committed success and — when the second
+                # ``_finish_stage_key`` found nothing to update — throw a
+                # StageKeyError out of this ``finally`` in place of the
+                # exception the caller was actually raising.
                 pass
             else:
-                with self._connect(immediate=True) as connection:
-                    self._write_final_run_log(connection, context, status)
-                    if key is not None:
-                        self._finish_stage_key(
-                            connection,
-                            context,
-                            "failed" if status != "success" else "success",
-                        )
+                context._transition(RUN_STATE_CLOSED_WITHOUT_TERMINAL)
+                if failure is not None:
+                    status = "failed"
+                elif key is not None:
+                    # The stage held a lease and never declared completion.
+                    # Retryable, not successful: saying otherwise here would
+                    # be the separate success-marking this design removed.
+                    status = "degraded"
+                else:
+                    status = context._resolved_status()
+                self._settle_run(
+                    context,
+                    status,
+                    key_status="success" if status == "success" else "failed",
+                    # An exception from the stage body is the one the caller
+                    # needs; bookkeeping must not replace it on the way out.
+                    suppress_errors=failure is not None,
+                )
+
+    def _settle_run(
+        self,
+        context: StageRunContext,
+        status: str,
+        *,
+        key_status: str,
+        suppress_errors: bool,
+    ) -> None:
+        """Write a run's single final outcome: run-log row and key release.
+
+        The two belong in one transaction, but the run log matters more:
+        when the key is gone — reclaimed, already completed — that is
+        usually *why* this run is ending, and losing the record of it would
+        hide the failure entirely.  So a lost key falls back to writing the
+        run log alone.
+
+        ``suppress_errors`` is for teardown after an exception, where
+        raising from a ``finally`` would replace the real exception.
+        """
+
+        try:
+            with self._connect(immediate=True) as connection:
+                self._write_final_run_log(connection, context, status)
+                if context._stage_key is not None:
+                    self._finish_stage_key(connection, context, key_status)
+            return
+        except Exception:
+            if not suppress_errors:
+                raise
+        try:
+            with self._connect(immediate=True) as connection:
+                self._write_final_run_log(connection, context, status)
+        except Exception:  # noqa: BLE001 - the caller's exception wins
+            pass
 
     def _write_final_run_log(
         self,
@@ -4065,9 +4307,6 @@ class Phase0Repository:
         run: Any,
         *,
         operation: str,
-        ticker: str | None = None,
-        trading_day: str | None = None,
-        pipeline_version: str | None = None,
     ) -> StageRunContext:
         """Authorize a mutation **on the transaction that will perform it**.
 
@@ -4097,6 +4336,27 @@ class Phase0Repository:
                 f"{operation} was given a stage run that is no longer active; "
                 "a run authorizes writes only inside its stage_run block"
             )
+        self._assert_lease_held(connection, run, operation=operation)
+        return run
+
+    @staticmethod
+    def _assert_run_partition(
+        run: StageRunContext,
+        *,
+        operation: str,
+        ticker: str | None = None,
+        trading_day: str | None = None,
+        pipeline_version: str | None = None,
+    ) -> None:
+        """The operation's partition must be the one the run covers.
+
+        Called from inside :meth:`_logged_mutation`, on the authoritative
+        transaction, so a rejection here rolls the operation back and is
+        recorded as this run's failure — rather than being raised before
+        the run took responsibility, where a caller could swallow it and
+        let the stage go on to report success.
+        """
+
         if trading_day is not None and run.trading_day != trading_day:
             raise Phase0RunContextError(
                 f"{operation} targets {trading_day} but the run covers "
@@ -4111,8 +4371,6 @@ class Phase0Repository:
             raise Phase0RunContextError(
                 f"{operation} targets {ticker} but the run covers {run.ticker}"
             )
-        self._assert_lease_held(connection, run, operation=operation)
-        return run
 
     def _assert_lease_held(
         self,
@@ -4167,9 +4425,6 @@ class Phase0Repository:
         run: Any,
         *,
         operation: str,
-        ticker: str | None = None,
-        trading_day: str | None = None,
-        pipeline_version: str | None = None,
         terminal: bool = False,
     ) -> Iterator[tuple[sqlite3.Connection, StageRunContext]]:
         """One transaction holding authorization, mutation, log, and release.
@@ -4194,53 +4449,62 @@ class Phase0Repository:
         run-log row is written as ``degraded`` until some operation
         declares the stage finished.
 
-        On failure the data rolls back, and the failed run log *and* the
-        key's retryable transition are written together in a second
-        authoritative transaction.
+        On failure the data rolls back, the run is marked terminal-failed
+        once, and the original exception propagates untouched.
+
+        A run whose outcome is already settled is refused *before* any
+        transaction opens.  That ordering is the point: the previous
+        version let a second call reach the failure path, which rewrote a
+        committed ``success`` run log to ``failed`` while the stage key it
+        described stayed ``success``.
         """
 
+        # ``getattr`` because a hand-made ``object.__new__`` shell has no
+        # state at all; it is not terminal, and ``_authorize_run`` below is
+        # what refuses it.
+        if isinstance(run, StageRunContext) and getattr(
+            run, "_state", RUN_STATE_ACTIVE
+        ) in (RUN_STATE_TERMINAL_SUCCEEDED, RUN_STATE_TERMINAL_FAILED):
+            # Before ``_connect``, before ``_authorize_run``, and before the
+            # failure path below: a run that has already declared itself
+            # finished must not be able to reach code that writes an
+            # outcome, because that code would overwrite the one it has.
+            raise Phase0RunContextError(
+                f"{operation}: this run is already {run.state} and its outcome "
+                "is written; open a new stage_run to do more work"
+            )
         try:
             with self._connect(immediate=True) as connection:
-                context = self._authorize_run(
-                    connection,
-                    run,
-                    operation=operation,
-                    ticker=ticker,
-                    trading_day=trading_day,
-                    pipeline_version=pipeline_version,
-                )
+                context = self._authorize_run(connection, run, operation=operation)
                 yield connection, context
                 if terminal:
                     status = context._resolved_status()
                     self._write_final_run_log(connection, context, status)
                     if context._stage_key is not None:
                         self._finish_stage_key(connection, context, status)
-                    context._mark_terminated()
+                    context._transition(RUN_STATE_TERMINAL_SUCCEEDED)
                 else:
                     # Never "success" before the stage says it is finished.
                     self._write_final_run_log(connection, context, "degraded")
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             # Only a run that was genuinely authorized gets a failed record;
-            # a rejected forgery has no run to write against.
-            if isinstance(run, StageRunContext) and self._is_active_run(run):
+            # a rejected forgery has no run to write against, and a run that
+            # is already settled must not have its outcome rewritten.
+            if (
+                isinstance(run, StageRunContext)
+                and self._is_active_run(run)
+                and not run.settled
+            ):
                 run._record_outcome(failure=1)
                 run._record_error(
                     {"operation": operation, "error": f"{type(exc).__name__}: {exc}"}
                 )
-                try:
-                    with self._connect(immediate=True) as connection:
-                        self._write_final_run_log(connection, run, "failed")
-                        if run._stage_key is not None:
-                            self._finish_stage_key(connection, run, "failed")
-                            run._mark_terminated()
-                except StageKeyError:
-                    # The key was already lost — which is usually *why* this
-                    # failed. Recording that is best-effort; the original
-                    # exception is the one the caller needs to see, so it
-                    # must not be masked by the bookkeeping.
-                    with self._connect(immediate=True) as connection:
-                        self._write_final_run_log(connection, run, "failed")
-                    run._mark_terminated()
+                run._transition(RUN_STATE_TERMINAL_FAILED)
+                # Recorded once, and never at the cost of the exception the
+                # caller is waiting for: the failure below *is* the news.
+                self._settle_run(
+                    run, "failed", key_status="failed", suppress_errors=True
+                )
             raise
 
     def ingest_raw_items(
@@ -4266,14 +4530,18 @@ class Phase0Repository:
         The item's trading day, derived as the spec does from
         ``published_at`` falling back to ``fetched_at``, must equal the
         run's trading day.
+
+        Preparation and partition checks both run *inside* the logged
+        mutation.  Anything that can reject the batch has to, or a caller
+        that catches the rejection outside leaves the stage free to go on
+        and report success for work that never happened.
         """
 
-        prepared = [self._prepare_raw_item(item) for item in items]
-        if self._is_active_run(run) if isinstance(run, StageRunContext) else False:
-            self._assert_raw_item_partition(prepared, run)
         with self._logged_mutation(
             run, operation="ingest_raw_items", terminal=terminal
         ) as (connection, context):
+            prepared = [self._prepare_raw_item(item) for item in items]
+            self._assert_raw_item_partition(prepared, context)
             results = [self._insert_raw_item(connection, values) for values in prepared]
             if source_state is not None:
                 self._set_source_state(connection, source_state)
@@ -4286,18 +4554,20 @@ class Phase0Repository:
 
     @staticmethod
     def _assert_raw_item_partition(
-        prepared: Sequence[Mapping[str, Any]], run: Any
+        prepared: Sequence[Mapping[str, Any]], run: StageRunContext
     ) -> None:
-        """Reject a mixed or foreign-partition ingestion batch before writing."""
+        """Reject a mixed or foreign-partition ingestion batch before writing.
 
-        if not isinstance(run, StageRunContext):
-            return  # _logged_mutation rejects the handle itself.
+        Reads the *normalized* candidates, so a bare ``"AMD"`` string is
+        checked exactly like ``{"ticker": "AMD"}``.  When this walked the
+        raw values it understood only the mapping form, and the string form
+        went straight through into an NVDA run.
+        """
+
         for position, values in enumerate(prepared):
             asserted = {values["ticker"]} | set(values["tickers"])
             asserted |= {
-                normalize_ticker(candidate.get("ticker"))
-                for candidate in values["candidate_tickers"]
-                if isinstance(candidate, Mapping) and candidate.get("ticker")
+                candidate["ticker"] for candidate in values["candidate_tickers"]
             }
             asserted.discard(None)
             if run.ticker is not None and asserted - {run.ticker}:
@@ -4332,12 +4602,17 @@ class Phase0Repository:
         embedding is derived from a raw item, story, or theme, so a vector
         whose source belongs to another ticker-day is either a bug or a
         cross-partition write dressed up as a cache fill.
+
+        A raw-item source additionally needs an *explicit* association with
+        the run's ticker; see :meth:`_assert_raw_item_association`.
+        Validation and partition checks both run inside the transaction the
+        run owns, so a rejection is recorded as this run's failure.
         """
 
-        prepared = [validate_embedding(embedding) for embedding in embeddings]
         with self._logged_mutation(
             run, operation="persist_embeddings", terminal=terminal
         ) as (connection, context):
+            prepared = [validate_embedding(embedding) for embedding in embeddings]
             self._assert_embedding_partition(connection, prepared, context)
             for values in prepared:
                 self._write_embedding(connection, values)
@@ -4345,8 +4620,9 @@ class Phase0Repository:
             context._merge_counts({"embeddings_written": len(prepared)})
             return len(prepared)
 
-    @staticmethod
+    @classmethod
     def _assert_embedding_partition(
+        cls,
         connection: sqlite3.Connection,
         prepared: Sequence[Mapping[str, Any]],
         run: StageRunContext,
@@ -4391,6 +4667,17 @@ class Phase0Repository:
                     f"persist_embeddings source {position} belongs to pipeline "
                     f"version {version} but the run covers {run.pipeline_version}"
                 )
+            if values["source_kind"] == "raw_item" and run.ticker is not None:
+                # A ticker-scoped run embeds *this ticker's* evidence.  An
+                # unattributed item is storable, but it is not NVDA's until
+                # something says so; borrowing an NVDA run to embed it is
+                # how it would silently become NVDA's.
+                cls._assert_raw_item_association(
+                    connection,
+                    int(values["source_id"]),
+                    run.ticker,
+                    operation="persist_embeddings",
+                )
 
     def record_source_state(
         self,
@@ -4414,33 +4701,33 @@ class Phase0Repository:
         promises: when the caller states a ``checked_at``, it must fall on
         the run's trading day, so a run cannot stamp another day's fetch as
         its own.  Omitting it means "now", which asserts no day.
+
+        Both the timestamp normalization and that check happen inside the
+        logged mutation, so rejecting either one is this run's recorded
+        failure rather than an exception a caller can catch and walk away
+        from.
         """
 
-        moment = _normalize_datetime(checked_at or utc_now(), "checked_at")
-        if (
-            checked_at is not None
-            and isinstance(run, StageRunContext)
-            and self._is_active_run(run)
-            and moment[:10] != run.trading_day
-        ):
-            raise Phase0RunContextError(
-                f"record_source_state checked {moment[:10]} but the run covers "
-                f"{run.trading_day}"
-            )
-        state = {
-            "source": source,
-            "etag": etag,
-            "last_modified": last_modified,
-            "checked_at": moment,
-            "successful": successful,
-            "metadata": metadata or {},
-            "status": status,
-            "error": error,
-            "retry_after": retry_after,
-        }
         with self._logged_mutation(
             run, operation="record_source_state", terminal=terminal
         ) as (connection, context):
+            moment = _normalize_datetime(checked_at or utc_now(), "checked_at")
+            if checked_at is not None and moment[:10] != context.trading_day:
+                raise Phase0RunContextError(
+                    f"record_source_state checked {moment[:10]} but the run covers "
+                    f"{context.trading_day}"
+                )
+            state = {
+                "source": source,
+                "etag": etag,
+                "last_modified": last_modified,
+                "checked_at": moment,
+                "successful": successful,
+                "metadata": metadata or {},
+                "status": status,
+                "error": error,
+                "retry_after": retry_after,
+            }
             self._set_source_state(connection, state)
             context._record_outcome(
                 success=1 if successful else 0,
@@ -4518,6 +4805,7 @@ class Phase0Repository:
 
 __all__ = [
     "COUNTABLE_TABLES",
+    "DEFAULT_CANDIDATE_REASON",
     "DEFAULT_DATABASE_PATH",
     "EmbeddingPersistenceError",
     "ExcludedStoryRecord",
@@ -4532,7 +4820,13 @@ __all__ = [
     "Phase0RunContextError",
     "Phase0ValidationError",
     "ProviderConflictRecord",
+    "RAW_ITEM_ASSOCIATION_TABLE",
     "ReconciliationReport",
+    "RUN_STATES",
+    "RUN_STATE_ACTIVE",
+    "RUN_STATE_CLOSED_WITHOUT_TERMINAL",
+    "RUN_STATE_TERMINAL_FAILED",
+    "RUN_STATE_TERMINAL_SUCCEEDED",
     "RUN_STATUSES",
     "SECRET_KEY_PATTERN",
     "SOURCE_STATE_STATUSES",
@@ -4549,6 +4843,7 @@ __all__ = [
     "ThemeRecord",
     "ThemeSetRecord",
     "UnsupportedTickerError",
+    "normalize_candidate_tickers",
     "normalize_ticker",
     "redact_secrets",
     "redact_text",
