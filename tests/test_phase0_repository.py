@@ -170,9 +170,9 @@ def test_derived_stage_idempotency_key_allows_retry_but_not_repeat_success(tmp_p
     }
 
     assert repository.claim_stage_key(**key, run_id="run-1") is True
-    repository.complete_stage_key(**key, run_id="run-1", status="failed")
+    repository.admin.complete_stage_key(**key, run_id="run-1", status="failed")
     assert repository.claim_stage_key(**key, run_id="run-2") is True
-    repository.complete_stage_key(**key, run_id="run-2", status="success")
+    repository.admin.complete_stage_key(**key, run_id="run-2", status="success")
     assert repository.claim_stage_key(**key, run_id="run-3") is False
 
 
@@ -274,7 +274,7 @@ def test_replay_cleanup_removes_stage_keys_but_keeps_raw_evidence(tmp_path):
         pipeline_version="v1",
         run_id="run-1",
     )
-    repository.complete_stage_key(
+    repository.admin.complete_stage_key(
         stage="cluster",
         ticker="NVDA",
         trading_day="2026-07-23",

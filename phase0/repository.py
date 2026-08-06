@@ -713,6 +713,24 @@ class Phase0Admin:
     def clear_derived_for_day(self, trading_day: str | date) -> None:
         return self._repository._clear_derived_for_day_unlogged(trading_day)
 
+    # -- Stage keys ------------------------------------------------------
+
+    def complete_stage_key(self, **kwargs: Any) -> None:
+        """Force a stage key to a terminal status. **Manual repair only.**
+
+        This writes no data and no ``run_log`` row, so a ``success`` written
+        here is an assertion by an operator, not evidence that a stage ran.
+        Use it to release a key an operator has finished repairing by hand.
+
+        A pipeline stage must never call it — it declares completion by
+        passing ``terminal=True`` to its last logged mutation, which commits
+        the data, the final run log, and the key's transition in one
+        transaction.  That is why this lives behind ``repository.admin`` and
+        not on :class:`Phase0Repository`.
+        """
+
+        return self._repository._complete_stage_key_unlogged(**kwargs)
+
     # -- Run log ---------------------------------------------------------
 
     def log_stage(self, **kwargs: Any) -> int:
@@ -3412,7 +3430,7 @@ class Phase0Repository:
             )
             return cursor.rowcount == 1
 
-    def complete_stage_key(
+    def _complete_stage_key_unlogged(
         self,
         *,
         stage: str,
@@ -3423,6 +3441,18 @@ class Phase0Repository:
         status: str = "success",
         error: Any = None,
     ) -> None:
+        """Force a stage key to a terminal status with no run behind it.
+
+        Private, and reachable only through
+        :meth:`Phase0Admin.complete_stage_key`.  As a *public* method this
+        was a hole with nothing subtle about it: claim a key, call this
+        with ``status="success"``, and the ledger says the stage finished
+        while no data moved and no ``run_log`` row exists.  A pipeline
+        stage now reaches ``success`` exactly one way — a terminal logged
+        mutation, which commits the data, the run log, and this transition
+        together.
+        """
+
         if status not in STAGE_KEY_STATUSES:
             raise Phase0ValidationError("invalid stage-key status")
         day = _normalize_day(trading_day)

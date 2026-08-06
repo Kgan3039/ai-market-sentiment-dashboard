@@ -199,10 +199,13 @@ silently.
 | `repository.update_raw_item_ticker(...)` | `repository.admin.update_raw_item_ticker(...)` — fixtures and repair only |
 | `repository.clear_derived_for_day(day)` | `repository.admin.clear_derived_for_day(day)` |
 | `repository.log_stage(...)` | `with repository.stage_run(...)`, which logs by itself |
+| `repository.complete_stage_key(...)` (a stage finishing) | `terminal=True` on the stage's last logged mutation |
+| `repository.complete_stage_key(...)` (operator repair) | `repository.admin.complete_stage_key(...)` |
 | `run.record_success(n)` / `run.update_counts({...})` | nothing — counts are derived from what the operation did |
 | `with repository.connect() as c:` (reads) | `with repository.read_connection() as c:` |
 | `with repository.connect() as c:` (writes) | a logged entrypoint, or `repository.admin.connect_writable()` for repair |
 | `repository.admin.insert_story(...)` without a version | add `pipeline_version=...`; it is required |
+| a story or embedding built from a tickerless raw item | associate the item with the ticker first (`raw_item_tickers`) |
 
 The shape every stage now takes:
 

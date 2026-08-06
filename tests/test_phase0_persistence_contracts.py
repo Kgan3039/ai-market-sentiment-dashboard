@@ -757,7 +757,7 @@ def test_stage_key_errors_do_not_leak_credentials(tmp_path):
     repository = migrated(tmp_path)
 
     with pytest.raises(StageKeyError) as caught:
-        repository.complete_stage_key(
+        repository.admin.complete_stage_key(
             stage="fetch",
             ticker="NVDA",
             trading_day=DAY,
@@ -823,7 +823,7 @@ def test_losing_claimants_never_overwrite_the_owner(tmp_path):
 def test_completed_work_cannot_be_reclaimed_and_records_its_lifecycle(tmp_path):
     repository = migrated(tmp_path)
     repository.claim_stage_key(**STAGE_KEY, run_id="owner")
-    repository.complete_stage_key(**STAGE_KEY, run_id="owner", status="success")
+    repository.admin.complete_stage_key(**STAGE_KEY, run_id="owner", status="success")
 
     assert not repository.claim_stage_key(**STAGE_KEY, run_id="later")
     state = repository.stage_key_state(**STAGE_KEY)
@@ -2565,7 +2565,6 @@ UNLOGGED_BY_DESIGN = {
     "stage_run": "the run factory itself; it writes the run log",
     "claim_stage_key": "claims the lease a run is later opened against",
     "heartbeat_stage_key": "extends the lease of an in-flight run",
-    "complete_stage_key": "releases a lease after its run has ended",
     "recover_expired_leases": "operator/crash sweep; by definition has no run",
     "upsert_embedding": (
         "nlp.embeddings.EmbeddingRepository protocol; a single recomputable "
@@ -3361,7 +3360,7 @@ def test_an_unusable_stage_key_is_refused_at_run_creation(tmp_path, state):
     if state != "missing":
         assert repository.claim_stage_key(**key, run_id="run-1", lease_seconds=1)
     if state == "completed":
-        repository.complete_stage_key(**key, run_id="run-1", status="success")
+        repository.admin.complete_stage_key(**key, run_id="run-1", status="success")
         expected = "no longer running"
     elif state == "expired":
         time.sleep(1.1)
