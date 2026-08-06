@@ -28,6 +28,7 @@ from .scalars import (
 )
 from .repository import (
     Phase0Admin,
+    Phase0Reader,
     Phase0Repository,
     StageRunContext,
     serialize_operational_metadata,
@@ -42,6 +43,7 @@ __all__ = [
     "Phase0IntegrityError",
     "Phase0Admin",
     "Phase0MigrationError",
+    "Phase0Reader",
     "Phase0Repository",
     "Phase0RunContextError",
     "Phase0ValidationError",

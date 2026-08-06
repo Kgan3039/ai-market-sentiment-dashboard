@@ -61,6 +61,7 @@ from phase0.repository import (
     DEFAULT_CANDIDATE_REASON,
     MIGRATIONS_PATH,
     Phase0Admin,
+    Phase0Reader,
     Phase0Repository,
     StageRunContext,
     normalize_candidate_tickers,
@@ -2587,200 +2588,176 @@ _WRITE_SQL = re.compile(
 
 
 # ----------------------------------------------------------------------
-# The public connection is read-only, and SQLite says so
+# The public read surface hands back data, never a connection
 # ----------------------------------------------------------------------
 
 
-READ_ONLY_REJECTS = [
-    "INSERT INTO raw_items (source, canonical_url, fetched_at, raw_json, "
-    "ingest_status) VALUES ('s', 'u', '2026-07-23T00:00:00+00:00', '{}', 'invalid')",
-    "UPDATE stories SET ticker = 'AMD'",
-    "DELETE FROM raw_items",
-    "CREATE TABLE smuggled (id INTEGER PRIMARY KEY)",
-    "DROP TABLE raw_items",
-    "ALTER TABLE raw_items ADD COLUMN smuggled TEXT",
-    "CREATE TRIGGER t AFTER INSERT ON raw_items BEGIN SELECT 1; END",
-    "CREATE INDEX smuggled_idx ON raw_items(source)",
-    "REINDEX",
-    "BEGIN IMMEDIATE",
-    "BEGIN EXCLUSIVE",
-    "CREATE TEMP TABLE smuggled (id INTEGER PRIMARY KEY)",
+#: Everything a caller would need to escape a read-only connection, if it
+#: ever got hold of one.  ``set_authorizer`` is first because it is the
+#: whole reason a hardened connection cannot be handed out: the caller can
+#: simply take the authorizer off again.
+ESCAPE_HATCHES = [
+    "set_authorizer",
+    "execute",
+    "executemany",
+    "executescript",
+    "cursor",
+    "commit",
+    "rollback",
+    "close",
+    "create_function",
+    "backup",
+    "iterdump",
+    "connection",
+    "attach",
 ]
 
-#: Either layer refusing.  The authorizer answers "not authorized"; the
-#: ``mode=ro`` open mode answers "attempt to write a readonly database".
-#: Which one speaks first is an implementation detail — that *something*
-#: refuses, in every case, is the contract.
-REFUSED = "not authorized|readonly"
+#: Reader methods, each with arguments that exercise it.  A new public
+#: reader method with no probe here fails the audit below, so the read
+#: surface cannot grow untested.
+READER_PROBES = {
+    "raw_item": ((1,), {}),
+    "raw_item_candidates": ((), {}),
+    "raw_item_associations": ((), {}),
+    "story": ((1,), {}),
+    "theme": ((1,), {}),
+    "source_state_rows": ((), {}),
+    "run_log_rows": ((), {}),
+    "stage_key_rows": ((), {}),
+    "table_names": ((), {}),
+    "schema_objects": ((), {}),
+    "table_columns": (("raw_items",), {}),
+    "foreign_keys": (("story_members",), {}),
+    "indexes": (("raw_items",), {}),
+    "integrity_check": ((), {}),
+    "schema_version": ((), {}),
+    "count": (("raw_items",), {}),
+}
 
-#: The whole of the reported bypass, in the order it was reported.
-ATTACH_ESCAPES = [
-    "ATTACH DATABASE '{same}' AS alias",
-    "ATTACH DATABASE '{other}' AS other",
-    "ATTACH DATABASE ':memory:' AS scratch",
-    "ATTACH ':memory:' AS scratch",
-]
+
+def _public_names(obj) -> set:
+    return {name for name in dir(obj) if not name.startswith("_")}
 
 
-def test_the_public_connection_can_read(tmp_path):
+def _reachable_values(obj, depth: int = 0):
+    """Everything an ordinary caller can get to from ``obj`` by attribute."""
+
+    yield obj
+    if depth > 2:
+        return
+    for name in _public_names(obj):
+        try:
+            value = getattr(obj, name)
+        except Exception:  # noqa: BLE001 - a property that raises exposes nothing
+            continue
+        if callable(value) or isinstance(value, (str, bytes, int, float, Path)):
+            continue
+        yield from _reachable_values(value, depth + 1)
+
+
+def test_the_reader_answers_the_reads_phase_0_needs(tmp_path):
     repository = migrated(tmp_path)
-    seed_raw_items(repository, 2)
+    item_ids = seed_raw_items(repository, 2)
 
-    with repository.read_connection() as connection:
-        assert connection.execute("SELECT COUNT(*) FROM raw_items").fetchone()[0] == 2
-        rows = connection.execute("SELECT ticker FROM supported_tickers").fetchall()
-    assert {row["ticker"] for row in rows} == SUPPORTED_TICKERS
+    reader = repository.read
+    assert reader.count("raw_items") == 2
+    assert reader.raw_item(item_ids[0])["source"].startswith("yahoo:")
+    assert [row["ticker"] for row in reader.raw_item_associations(item_ids[0])] == [
+        "NVDA"
+    ]
+    assert reader.schema_version() == LATEST_VERSION
+    assert reader.integrity_check() == "ok"
+    assert "raw_items" in reader.table_names()
+    assert [column["name"] for column in reader.table_columns("raw_items")][0] == "id"
+    assert reader.foreign_keys("story_members")
+    assert reader.indexes("raw_items")
+    assert any(row["type"] == "trigger" for row in reader.schema_objects())
+    assert reader.story(999) is None
+    assert reader.run_log_rows() == []
 
 
-@pytest.mark.parametrize("statement", READ_ONLY_REJECTS)
-def test_the_public_connection_cannot_write(tmp_path, statement):
+def test_every_reader_method_returns_plain_data(tmp_path):
+    """No probe, no method: the read surface cannot grow unexamined."""
+
     repository = migrated(tmp_path)
     seed_raw_items(repository, 1)
+    methods = {
+        name
+        for name in _public_names(Phase0Reader)
+        if callable(getattr(Phase0Reader, name))
+    }
+    assert methods == set(READER_PROBES), (
+        "reader methods without a hostile probe: "
+        f"{sorted(methods - set(READER_PROBES))}"
+    )
 
-    with repository.read_connection() as connection:
-        with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-            connection.execute(statement)
+    for name, (args, kwargs) in READER_PROBES.items():
+        result = getattr(repository.read, name)(*args, **kwargs)
+        values = result if isinstance(result, list) else [result]
+        for value in values:
+            assert not isinstance(value, (sqlite3.Connection, sqlite3.Cursor))
+            assert isinstance(value, (dict, str, int, type(None))), (name, value)
+            if isinstance(value, dict):
+                assert all(
+                    not isinstance(item, (sqlite3.Connection, sqlite3.Cursor))
+                    for item in value.values()
+                )
 
-    assert repository.count("raw_items") == 1
 
+@pytest.mark.parametrize("attribute", ESCAPE_HATCHES)
+def test_the_reader_has_no_way_out(tmp_path, attribute):
+    """A caller holding a connection can always undo its protections.
 
-@pytest.mark.parametrize("template", ATTACH_ESCAPES)
-def test_the_public_connection_cannot_attach_anything(tmp_path, template):
-    """``mode=ro`` guards the file it opened; ATTACH opens another one.
-
-    That was the bypass: turn ``query_only`` off, ATTACH the same database
-    under a second name, and write through the alias — committing data with
-    no run log at all.
+    ``set_authorizer(None)``, ``PRAGMA query_only = OFF``, ATTACH, INSERT,
+    COMMIT — the reported bypass, and unanswerable while the object handed
+    out is a connection.  So none is handed out.
     """
 
     repository = migrated(tmp_path)
+
+    assert not hasattr(repository.read, attribute)
+    assert not hasattr(repository, "read_connection")
+    assert not hasattr(repository, "connect")
+
+
+def test_the_reader_holds_no_connection_anywhere(tmp_path):
+    """Not even privately: its whole state is one path."""
+
+    repository = migrated(tmp_path)
+    reader = repository.read
+
+    assert Phase0Reader.__slots__ == ("_database_path",)
+    assert isinstance(reader._database_path, Path)
+    assert not hasattr(reader, "__dict__")
+    for name in ("_connection", "connection", "_repository", "repository", "_db"):
+        assert not hasattr(reader, name), name
+
+    # And a read leaves nothing behind that a later caller could pick up.
+    reader.count("raw_items")
+    assert not hasattr(reader, "__dict__")
+
+
+def test_no_public_surface_reaches_a_connection_or_cursor(tmp_path):
+    """Walk what a caller can actually touch, not what is annotated."""
+
+    repository = migrated(tmp_path)
     seed_raw_items(repository, 1)
-    other = tmp_path / "other.sqlite3"
-    sqlite3.connect(other).close()
-    statement = template.format(same=repository.database_path, other=other)
 
-    with repository.read_connection() as connection:
-        with contextlib.suppress(sqlite3.Error):
-            connection.execute("PRAGMA query_only = OFF")
-        with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-            connection.execute(statement)
-        assert "alias" not in [
-            row["name"] for row in connection.execute("PRAGMA database_list")
-        ]
+    for value in _reachable_values(repository):
+        assert not isinstance(value, (sqlite3.Connection, sqlite3.Cursor)), value
+    for value in _reachable_values(repository.read):
+        assert not isinstance(value, (sqlite3.Connection, sqlite3.Cursor)), value
 
-    assert repository.count("raw_items") == 1
-    assert repository.run_log_entries() == []
+    assert _public_names(repository) >= {"read", "admin"}
 
 
-def test_the_reported_attach_bypass_writes_nothing(tmp_path):
-    """The exact reported sequence, start to finish."""
-
-    repository = migrated(tmp_path)
-    before = repository.database_path.read_bytes()
-
-    with repository.read_connection() as connection:
-        with contextlib.suppress(sqlite3.Error):
-            connection.execute("PRAGMA query_only = OFF")
-        with contextlib.suppress(sqlite3.Error):
-            connection.execute(
-                f"ATTACH DATABASE '{repository.database_path}' AS smuggle"
-            )
-        # The alias never came into existence, so the write through it
-        # fails on the schema name as well as on the authorizer.
-        with pytest.raises(
-            sqlite3.DatabaseError, match=f"{REFUSED}|unknown database|no such table"
-        ):
-            connection.execute(
-                "INSERT INTO smuggle.raw_items (source, canonical_url, "
-                "fetched_at, raw_json, ingest_status) "
-                "VALUES ('s', 'u', ?, '{}', 'invalid')",
-                (f"{DAY}T00:00:00+00:00",),
-            )
-        with contextlib.suppress(sqlite3.Error):
-            connection.commit()
-
-    assert repository.count("raw_items") == 0
-    assert repository.run_log_entries() == []
-    assert repository.database_path.read_bytes() == before
-
-
-def test_the_public_connection_cannot_detach_or_write_temp(tmp_path):
-    repository = migrated(tmp_path)
-
-    with repository.read_connection() as connection:
-        with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-            connection.execute("DETACH DATABASE main")
-        with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-            connection.execute("CREATE TEMP TABLE scratch (id INTEGER)")
-        with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-            connection.execute(
-                "CREATE TEMP TRIGGER t AFTER INSERT ON raw_items BEGIN SELECT 1; END"
-            )
-
-
-def test_no_pragma_can_talk_the_public_connection_into_writing(tmp_path):
-    """Read-only is the open mode *and* the authorizer, not a switch."""
+def test_no_normal_public_surface_can_insert_a_raw_item(tmp_path):
+    """The blocker in one test: no public read path writes anything."""
 
     repository = migrated(tmp_path)
 
-    with repository.read_connection() as connection:
-        for pragma in (
-            "PRAGMA query_only = OFF",
-            "PRAGMA writable_schema = ON",
-            "PRAGMA journal_mode = DELETE",
-            "PRAGMA user_version = 99",
-            "PRAGMA foreign_keys = OFF",
-        ):
-            with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-                connection.execute(pragma)
-        with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-            connection.execute("DELETE FROM supported_tickers")
-
-    assert len(repository.supported_tickers()) == 5
-    assert repository.schema_version() != 99
-
-
-def test_the_public_connection_still_reads_and_inspects(tmp_path):
-    """Denial is by allow-list, so check the allow-list actually allows."""
-
-    repository = migrated(tmp_path)
-    seed_raw_items(repository, 2)
-
-    with repository.read_connection() as connection:
-        rows = connection.execute(
-            "SELECT r.id, t.ticker FROM raw_items r "
-            "LEFT JOIN raw_item_tickers t ON t.raw_item_id = r.id "
-            "WHERE substr(COALESCE(r.published_at, r.fetched_at), 1, 10) = ? "
-            "ORDER BY r.id",
-            (DAY,),
-        ).fetchall()
-        assert len(rows) == 2
-        assert connection.execute("PRAGMA table_info(raw_items)").fetchall()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] > 0
-        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert (
-            connection.execute(
-                "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n "
-                "WHERE x < 3) SELECT count(*) FROM n"
-            ).fetchone()[0]
-            == 3
-        )
-
-
-def test_raw_items_cannot_be_inserted_through_any_public_surface(tmp_path):
-    """The blocker in one test: no public path writes a raw item unlogged."""
-
-    repository = migrated(tmp_path)
-
-    with pytest.raises(AttributeError):
-        repository.connect  # noqa: B018 - the old writable accessor is gone
-    with repository.read_connection() as connection:
-        with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-            connection.execute(
-                "INSERT INTO raw_items (source, canonical_url, fetched_at, "
-                "raw_json, ingest_status) VALUES ('s', 'u', ?, '{}', 'invalid')",
-                (f"{DAY}T00:00:00+00:00",),
-            )
+    for name, (args, kwargs) in READER_PROBES.items():
+        getattr(repository.read, name)(*args, **kwargs)
     with pytest.raises(Phase0RunContextError):
         repository.ingest_raw_items([raw_item(1)], run=None)
 
@@ -2788,10 +2765,42 @@ def test_raw_items_cannot_be_inserted_through_any_public_surface(tmp_path):
     assert repository.run_log_entries() == []
 
 
-def test_the_admin_connection_is_writable_and_says_so(tmp_path):
+def test_the_reader_refuses_sql_it_did_not_write(tmp_path):
+    """Table names are looked up, not interpolated from a caller string."""
+
+    repository = migrated(tmp_path)
+
+    for bad in ("raw_items; DROP TABLE raw_items", "sqlite_master", "nope", ""):
+        with pytest.raises(Phase0ValidationError):
+            repository.read.table_columns(bad)
+        with pytest.raises(Phase0ValidationError):
+            repository.read.count(bad)
+    assert repository.count("raw_items") == 0
+
+
+def test_reader_queries_are_module_literals():
+    """Structural: no caller string reaches ``_query``.
+
+    Every call site passes a literal or an f-string this module builds from
+    validated fragments; none forwards a parameter.
+    """
+
+    calls = []
+    for name in READER_PROBES:
+        source = inspect.getsource(getattr(Phase0Reader, name))
+        calls.extend(re.findall(r"self\._(?:query|one)\(\s*([^,\n]+)", source))
+    assert calls, "reflection found no reader queries; the audit is broken"
+    for call in calls:
+        assert call.strip().startswith(('"', "'", 'f"', "f'")), call
+
+
+def test_the_admin_connection_is_the_only_raw_handle(tmp_path):
+    """Deliberate, named, and documented — the one exception to the rule."""
+
     repository = migrated(tmp_path)
 
     with repository.admin.connect_writable() as connection:
+        assert isinstance(connection, sqlite3.Connection)
         connection.execute(
             "INSERT INTO raw_items (source, canonical_url, fetched_at, "
             "raw_json, ingest_status) VALUES ('s', 'u', ?, '{}', 'invalid')",
@@ -2802,14 +2811,23 @@ def test_the_admin_connection_is_writable_and_says_so(tmp_path):
     doc = (Phase0Admin.connect_writable.__doc__ or "").lower()
     assert "manual repair" in doc and "migrations" in doc
     assert "pipeline code must never call it" in doc
+    assert "only raw connection" in doc
 
 
-#: The one public method that may hand back a connection.  Anything else
-#: that does — deliberately or by accident — fails the audit below.
-PUBLIC_CONNECTION_ACCESSORS = {"read_connection"}
+#: Public methods that may hand back a raw connection, and where they
+#: live.  ``Phase0Repository`` has none: that is the contract.
+RAW_CONNECTION_ACCESSORS = {
+    Phase0Repository: set(),
+    Phase0Reader: set(),
+    Phase0Admin: {"connect_writable"},
+}
 
-#: A method that gives its connection away, whatever its annotation says.
-_HANDS_BACK_CONNECTION = re.compile(r"\b(?:yield|return)\s+\w*connection\b")
+#: A method that gives a connection or cursor away, whatever it declares.
+#: Anchored at the end of the statement so ``return cursor.rowcount == 1``
+#: — a count, not a handle — is not mistaken for handing one out.
+_HANDS_BACK_CONNECTION = re.compile(
+    r"^\s*(?:yield|return)\s+\w*(?:connection|cursor)\s*,?\s*$", re.MULTILINE
+)
 
 
 def _public_repository_methods() -> list[str]:
@@ -2820,16 +2838,15 @@ def _public_repository_methods() -> list[str]:
     ]
 
 
-def _connections_from(repository, name):
-    """Everything a zero-argument public method actually hands back.
+def _handles_from(instance, name):
+    """Whatever a zero-argument public method actually hands back.
 
-    Calling the method is the point.  An audit that reads return
-    annotations only trusts the annotation, and a method that forgot to
-    declare its type — or declared the wrong one — is exactly the case
-    worth catching.
+    Calling it is the point.  An audit that reads return annotations only
+    trusts the annotation, and a method that declared the wrong one — or
+    none — is exactly the case worth catching.
     """
 
-    method = getattr(repository, name)
+    method = getattr(instance, name)
     parameters = list(inspect.signature(method).parameters.values())
     if any(
         parameter.default is inspect.Parameter.empty
@@ -2840,59 +2857,56 @@ def _connections_from(repository, name):
         return []
     try:
         result = method()
-    except Exception:  # noqa: BLE001 - not every accessor is callable bare
+    except Exception:  # noqa: BLE001 - not every method is callable bare
         return []
-    if isinstance(result, sqlite3.Connection):
+    handles = (sqlite3.Connection, sqlite3.Cursor)
+    if isinstance(result, handles):
         return [result]
     if hasattr(result, "__enter__"):
         with result as value:
-            return [value] if isinstance(value, sqlite3.Connection) else []
+            return [value] if isinstance(value, handles) else []
     return []
 
 
-def test_no_public_method_hands_back_a_writable_connection(tmp_path):
-    """Fail closed: find every public method that exposes a connection.
+@pytest.mark.parametrize(
+    "owner, attribute",
+    [(Phase0Repository, None), (Phase0Reader, "read"), (Phase0Admin, "admin")],
+)
+def test_no_public_method_hands_back_a_connection_or_cursor(tmp_path, owner, attribute):
+    """Fail closed, across all three public objects.
 
-    Two ways, because either alone can be fooled.  Statically, any public
-    method whose source yields or returns something called ``connection``
-    — annotation or no annotation.  Dynamically, every public method that
-    can be called with no arguments, with whatever comes back inspected
-    for a real :class:`sqlite3.Connection`.  The union must be exactly
-    :data:`PUBLIC_CONNECTION_ACCESSORS`.
+    Three ways, because each alone can be fooled: the declared return type,
+    the source (any ``return``/``yield`` of something called connection or
+    cursor), and — the one that cannot be talked around — calling every
+    method that takes no arguments and looking at what comes back.
     """
 
     repository = migrated(tmp_path)
+    instance = repository if attribute is None else getattr(repository, attribute)
     exposed = set()
-    for name in _public_repository_methods():
-        member = getattr(Phase0Repository, name)
+    for name, member in inspect.getmembers(owner, inspect.isfunction):
+        if name.startswith("_"):
+            continue
         try:
             source = inspect.getsource(member)
         except (OSError, TypeError) as exc:  # pragma: no cover - defensive
             raise AssertionError(f"cannot read the source of {name}: {exc}") from exc
-        if "Connection" in str(inspect.signature(member).return_annotation):
+        annotation = str(inspect.signature(member).return_annotation)
+        if "Connection" in annotation or "Cursor" in annotation:
             exposed.add(name)
         elif _HANDS_BACK_CONNECTION.search(source):
             exposed.add(name)
-        if _connections_from(repository, name):
+        if _handles_from(instance, name):
             exposed.add(name)
 
-    assert exposed == PUBLIC_CONNECTION_ACCESSORS, (
-        "the public surface exposes connections this audit does not know "
-        f"about: {sorted(exposed - PUBLIC_CONNECTION_ACCESSORS)}"
+    expected = RAW_CONNECTION_ACCESSORS[owner]
+    assert exposed == expected, (
+        f"{owner.__name__} exposes raw handles this audit does not know "
+        f"about: {sorted(exposed - expected)}"
     )
 
-    for name in sorted(exposed):
-        with getattr(repository, name)() as connection:
-            with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-                connection.execute("DELETE FROM supported_tickers")
-            with pytest.raises(sqlite3.DatabaseError, match=REFUSED):
-                connection.execute(
-                    f"ATTACH DATABASE '{repository.database_path}' AS alias"
-                )
-    assert len(repository.supported_tickers()) == 5
 
-
-def test_the_public_connection_audit_notices_a_new_accessor(tmp_path):
+def test_the_connection_audit_notices_a_new_accessor(tmp_path):
     """The audit is only worth having if it can fail."""
 
     class Leaky(Phase0Repository):
@@ -2901,9 +2915,13 @@ def test_the_public_connection_audit_notices_a_new_accessor(tmp_path):
             with self._connect() as connection:
                 yield connection
 
-    source = inspect.getsource(Leaky.debug_connection)
-    assert _HANDS_BACK_CONNECTION.search(source)
-    assert "debug_connection" not in PUBLIC_CONNECTION_ACCESSORS
+        def debug_cursor(self):
+            cursor = self._open_connection().cursor()
+            return cursor
+
+    for method in (Leaky.debug_connection, Leaky.debug_cursor):
+        assert _HANDS_BACK_CONNECTION.search(inspect.getsource(method))
+    assert not RAW_CONNECTION_ACCESSORS[Phase0Repository]
 
 
 def _method_writes(name: str, seen: set[str] | None = None) -> bool:
@@ -4523,11 +4541,7 @@ def test_an_unattached_legacy_story_upgrades_to_the_sentinel_version(tmp_path):
     upgraded.migrate()
 
     assert upgraded.schema_version() == LATEST_VERSION
-    with upgraded.read_connection() as connection:
-        version = connection.execute(
-            "SELECT pipeline_version FROM stories WHERE id = 1"
-        ).fetchone()["pipeline_version"]
-    assert version == "legacy-v0"
+    assert upgraded.read.story(1)["pipeline_version"] == "legacy-v0"
     assert upgraded.count("story_members") == 1
 
 
@@ -4537,11 +4551,7 @@ def test_an_attached_legacy_story_inherits_its_relationship_version(tmp_path):
     upgraded = Phase0Repository(database)
     upgraded.migrate()
 
-    with upgraded.read_connection() as connection:
-        version = connection.execute(
-            "SELECT pipeline_version FROM stories WHERE id = 1"
-        ).fetchone()["pipeline_version"]
-    assert version == "v7"
+    assert upgraded.read.story(1)["pipeline_version"] == "v7"
     assert upgraded.count("theme_stories") == 1
 
 
@@ -4568,11 +4578,7 @@ def test_an_ambiguous_legacy_story_fails_the_migration_rather_than_guessing(tmp_
 
     # Rolled back whole: still v10, still NULL, data intact.
     assert upgraded.schema_version() == 10
-    with upgraded.read_connection() as connection:
-        row = connection.execute(
-            "SELECT pipeline_version FROM stories WHERE id = 1"
-        ).fetchone()
-    assert row["pipeline_version"] is None
+    assert upgraded.read.story(1)["pipeline_version"] is None
     assert upgraded.count("theme_stories") == 2
 
 
@@ -4732,27 +4738,14 @@ def test_a_claimed_key_cannot_reach_success_without_a_terminal_mutation(tmp_path
 # ----------------------------------------------------------------------
 
 
-def key_row(repository: Phase0Repository, key: dict) -> tuple:
-    with repository.read_connection() as connection:
-        row = connection.execute(
-            """
-            SELECT status, run_id, updated_at, completed_at, lease_expires_at,
-                   last_error, attempts, recovered_count
-            FROM pipeline_stage_keys
-            WHERE stage = ? AND ticker = ? AND trading_day = ?
-              AND pipeline_version = ?
-            """,
-            (key["stage"], key["ticker"], key["trading_day"], key["pipeline_version"]),
-        ).fetchone()
-    return tuple(row)
+def key_row(repository: Phase0Repository, key: dict) -> dict:
+    rows = repository.read.stage_key_rows(**key)
+    assert len(rows) == 1
+    return rows[0]
 
 
-def run_log_rows(repository: Phase0Repository) -> list[tuple]:
-    with repository.read_connection() as connection:
-        return [
-            tuple(row)
-            for row in connection.execute("SELECT * FROM run_log ORDER BY id")
-        ]
+def run_log_rows(repository: Phase0Repository) -> list[dict]:
+    return repository.read.run_log_rows()
 
 
 def test_a_terminal_validation_error_reaches_the_caller_unmasked(tmp_path):
@@ -5254,13 +5247,9 @@ def test_accepted_candidates_are_persisted_from_the_normalized_form(tmp_path):
     ) as run:
         repository.ingest_raw_items([item], run=run, terminal=True)
 
-    with repository.read_connection() as connection:
-        rows = [
-            (row["ticker"], row["reason"])
-            for row in connection.execute(
-                "SELECT ticker, reason FROM raw_item_candidates ORDER BY ticker"
-            )
-        ]
+    rows = [
+        (row["ticker"], row["reason"]) for row in repository.read.raw_item_candidates()
+    ]
     assert rows == [("NVDA", DEFAULT_CANDIDATE_REASON)]
 
 

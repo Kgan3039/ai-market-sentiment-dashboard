@@ -798,12 +798,18 @@ class Phase0Admin:
     ) -> Iterator[sqlite3.Connection]:
         """A raw **writable** connection, for manual repair and migrations.
 
-        Nothing validates what you do with this: no ticker check, no
-        partition check, no run log.  It exists because an operator
-        occasionally has to fix one row by hand, and because migrations
-        need it.  Pipeline code must never call it — use the logged
-        entrypoints on :class:`Phase0Repository`, which is why the public
-        connection accessor (``read_connection``) cannot write.
+        The only raw connection anything outside this module can obtain,
+        and it is spelled ``repository.admin.connect_writable()`` so that
+        the call site says what it is.  Nothing validates what you do with
+        it: no ticker check, no partition check, no run log.
+
+        It exists because an operator occasionally has to fix one row by
+        hand, and because migrations need it.
+
+        Pipeline code must never call it: use the logged entrypoints on
+        :class:`Phase0Repository` for writes and :class:`Phase0Reader`
+        (``repository.read``) for reads, neither of which hands back a
+        connection at all.
         """
 
         with self._repository._connect(immediate=immediate) as connection:
@@ -882,6 +888,233 @@ class Phase0Admin:
         return self._repository._log_stage_unlogged(**kwargs)
 
 
+class Phase0Reader:
+    """The public read surface: named queries, and no connection.
+
+    Handing out a live :class:`sqlite3.Connection` cannot be made safe by
+    hardening the connection.  Whatever the handle arrives with —
+    ``mode=ro``, ``query_only``, an authorizer — the caller holding it can
+    take back off again::
+
+        connection.set_authorizer(None)
+        connection.execute("PRAGMA query_only = OFF")
+        connection.execute("ATTACH DATABASE '...' AS alias")
+        connection.execute("INSERT INTO alias.raw_items ...")
+        connection.commit()
+
+    So this object never yields one.  Each method opens a private
+    read-only connection, runs *one query this module wrote*, converts the
+    rows to plain dictionaries, and closes the connection before
+    returning.  There is no ``execute``, no ``cursor``, no
+    ``executescript``, no ``commit``/``rollback``, no ``set_authorizer``,
+    and no attribute holding a connection: ``__slots__`` is a single
+    :class:`~pathlib.Path`.
+
+    Callers who need a read Phase 0 does not expose should add a method
+    here rather than reaching for raw SQL — that keeps the read surface
+    reviewable, which is the point.  Deliberate raw access still exists
+    for operators, spelled out at :meth:`Phase0Admin.connect_writable`.
+    """
+
+    __slots__ = ("_database_path",)
+
+    def __init__(self, database_path: str | Path) -> None:
+        object.__setattr__(self, "_database_path", Path(database_path))
+
+    def __repr__(self) -> str:
+        return f"<Phase0Reader {self._database_path}>"
+
+    # -- The one place a connection exists, and it never leaves ---------
+
+    def _query(self, sql: str, parameters: Sequence[Any] = ()) -> list[dict[str, Any]]:
+        """Run one module-authored query and return plain rows.
+
+        ``sql`` is always a literal from the method calling this; it is
+        never a caller's string.  The read-only open mode and the
+        authorizer stay as defense in depth for the moment this connection
+        is alive, but the real guarantee is that it does not outlive this
+        call.
+        """
+
+        if not self._database_path.exists():
+            raise Phase0ValidationError(
+                f"no Phase 0 database at {self._database_path}; call migrate() first"
+            )
+        connection = sqlite3.connect(
+            f"file:{self._database_path}?mode=ro", uri=True, timeout=10
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA query_only = ON")
+            connection.set_authorizer(_read_only_authorizer)
+            return [dict(row) for row in connection.execute(sql, tuple(parameters))]
+        finally:
+            connection.close()
+
+    def _one(self, sql: str, parameters: Sequence[Any] = ()) -> dict[str, Any] | None:
+        rows = self._query(sql, parameters)
+        return rows[0] if rows else None
+
+    def _table(self, table: str) -> str:
+        """A real table name, checked against the schema, never a fragment.
+
+        ``PRAGMA table_info(?)`` is not a thing SQLite will bind, so the
+        name has to be interpolated; it is looked up in ``sqlite_master``
+        first so what gets interpolated is a name the database already
+        has.
+        """
+
+        name = _require_text(table, "table")
+        if name not in set(self.table_names()):
+            raise Phase0ValidationError(f"unknown Phase 0 table {name!r}")
+        return name
+
+    # -- Raw evidence ---------------------------------------------------
+
+    def raw_item(self, item_id: int) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM raw_items WHERE id = ?",
+            (_require_int(item_id, "item_id", minimum=1),),
+        )
+
+    def raw_item_candidates(self, item_id: int | None = None) -> list[dict[str, Any]]:
+        if item_id is None:
+            return self._query(
+                "SELECT * FROM raw_item_candidates ORDER BY raw_item_id, ticker"
+            )
+        return self._query(
+            "SELECT * FROM raw_item_candidates WHERE raw_item_id = ? ORDER BY ticker",
+            (_require_int(item_id, "item_id", minimum=1),),
+        )
+
+    def raw_item_associations(self, item_id: int | None = None) -> list[dict[str, Any]]:
+        if item_id is None:
+            return self._query(
+                "SELECT * FROM raw_item_tickers ORDER BY raw_item_id, ticker"
+            )
+        return self._query(
+            "SELECT * FROM raw_item_tickers WHERE raw_item_id = ? ORDER BY ticker",
+            (_require_int(item_id, "item_id", minimum=1),),
+        )
+
+    # -- Derived output --------------------------------------------------
+
+    def story(self, story_id: int) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM stories WHERE id = ?",
+            (_require_int(story_id, "story_id", minimum=1),),
+        )
+
+    def theme(self, theme_id: int) -> dict[str, Any] | None:
+        return self._one(
+            "SELECT * FROM themes WHERE id = ?",
+            (_require_int(theme_id, "theme_id", minimum=1),),
+        )
+
+    def source_state_rows(self) -> list[dict[str, Any]]:
+        return self._query("SELECT * FROM source_state ORDER BY source")
+
+    # -- The operational ledger ------------------------------------------
+
+    def run_log_rows(
+        self,
+        *,
+        run_id: str | None = None,
+        stage: str | None = None,
+        trading_day: str | date | None = None,
+    ) -> list[dict[str, Any]]:
+        """Whole ``run_log`` rows, in insertion order.
+
+        :meth:`Phase0Repository.run_log_entries` decodes counts and errors
+        for a reader; this is the raw row, for tests and operators
+        comparing two states of the ledger exactly.
+        """
+
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            parameters.append(_require_text(run_id, "run_id"))
+        if stage is not None:
+            clauses.append("stage = ?")
+            parameters.append(_require_text(stage, "stage"))
+        if trading_day is not None:
+            clauses.append("trading_day = ?")
+            parameters.append(_normalize_day(trading_day))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._query(f"SELECT * FROM run_log{where} ORDER BY id", parameters)
+
+    def stage_key_rows(
+        self,
+        *,
+        stage: str | None = None,
+        ticker: str | None = None,
+        trading_day: str | date | None = None,
+        pipeline_version: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if stage is not None:
+            clauses.append("stage = ?")
+            parameters.append(_require_text(stage, "stage"))
+        if ticker is not None:
+            clauses.append("ticker = ?")
+            parameters.append(normalize_ticker(ticker))
+        if trading_day is not None:
+            clauses.append("trading_day = ?")
+            parameters.append(_normalize_day(trading_day))
+        if pipeline_version is not None:
+            clauses.append("pipeline_version = ?")
+            parameters.append(_require_text(pipeline_version, "pipeline_version"))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self._query(
+            f"SELECT * FROM pipeline_stage_keys{where} "
+            "ORDER BY trading_day, ticker, stage",
+            parameters,
+        )
+
+    # -- Schema inspection, for #82/#83/#68 rebases -----------------------
+
+    def table_names(self) -> list[str]:
+        return [
+            row["name"]
+            for row in self._query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+
+    def schema_objects(self) -> list[dict[str, Any]]:
+        return self._query(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        )
+
+    def table_columns(self, table: str) -> list[dict[str, Any]]:
+        return self._query(f"PRAGMA table_info({self._table(table)})")
+
+    def foreign_keys(self, table: str) -> list[dict[str, Any]]:
+        return self._query(f"PRAGMA foreign_key_list({self._table(table)})")
+
+    def indexes(self, table: str) -> list[dict[str, Any]]:
+        return self._query(f"PRAGMA index_list({self._table(table)})")
+
+    def integrity_check(self) -> str:
+        rows = self._query("PRAGMA integrity_check")
+        return str(next(iter(rows[0].values()))) if rows else "unknown"
+
+    def schema_version(self) -> int:
+        rows = self._query("PRAGMA user_version")
+        return int(next(iter(rows[0].values()))) if rows else 0
+
+    def count(self, table: str) -> int:
+        if table not in COUNTABLE_TABLES:
+            raise Phase0ValidationError(f"unknown Phase 0 table {table!r}")
+        rows = self._query(f"SELECT COUNT(*) AS total FROM {table}")
+        return int(rows[0]["total"])
+
+
 class Phase0Repository:
     """Repository contract shared by the scheduled writer and API readers."""
 
@@ -894,6 +1127,8 @@ class Phase0Repository:
         self.database_path = Path(database_path)
         self.migrations_path = Path(migrations_path)
         self.admin = Phase0Admin(self)
+        #: The public read surface.  Holds a path, never a connection.
+        self.read = Phase0Reader(self.database_path)
         # Identity registry of live run contexts.  A context authorizes a
         # write only while it is in here, and only the object itself does —
         # never a copy carrying the same fields.
@@ -959,50 +1194,6 @@ class Phase0Repository:
         except Exception:
             connection.rollback()
             raise
-        finally:
-            connection.close()
-
-    @contextmanager
-    def read_connection(self) -> Iterator[sqlite3.Connection]:
-        """A read-only connection for reporting, debugging, and the API.
-
-        Read-only is enforced by SQLite, not by this docstring, and in two
-        independent ways:
-
-        * the handle is opened with the ``mode=ro`` URI flag, so writes to
-          the database it opened fail with "attempt to write a readonly
-          database";
-        * a **statement authorizer** allows reads and refuses everything
-          else, in every schema.
-
-        The second one is not belt-and-braces.  ``mode=ro`` protects the
-        file it opened and says nothing about any other: a caller could
-        turn ``query_only`` off, ``ATTACH`` this very database under a
-        second name, and write through the alias — committing data with no
-        run log at all.  ``ATTACH`` and ``DETACH`` are denied outright, as
-        are all DML, all DDL, and any pragma that could re-enable writing,
-        so ``main``, ``temp``, and any alias are equally out of reach.
-
-        The authorizer is installed *here only*.  Internal transactions use
-        the private writable connection, and deliberate manual repair uses
-        :meth:`Phase0Admin.connect_writable`; neither is restricted.
-        """
-
-        if not self.database_path.exists():
-            raise Phase0ValidationError(
-                f"no Phase 0 database at {self.database_path}; call migrate() first"
-            )
-        connection = sqlite3.connect(
-            f"file:{self.database_path}?mode=ro", uri=True, timeout=10
-        )
-        try:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA busy_timeout = 10000")
-            connection.execute("PRAGMA query_only = ON")
-            # Installed last: the two pragmas above are the settings the
-            # authorizer then refuses to let anyone change.
-            connection.set_authorizer(_read_only_authorizer)
-            yield connection
         finally:
             connection.close()
 
@@ -4816,6 +5007,7 @@ __all__ = [
     "Phase0Error",
     "Phase0IntegrityError",
     "Phase0MigrationError",
+    "Phase0Reader",
     "Phase0Repository",
     "Phase0RunContextError",
     "Phase0ValidationError",

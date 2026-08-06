@@ -25,24 +25,47 @@ AC-8 replayability would have had to be built on top of it anyway.
 
 ## Guarantees
 
-**No public writable connection, and `ATTACH` is denied.**
-`read_connection()` is the only connection the public surface hands out.
-It is opened `mode=ro` *and* carries a SQLite statement authorizer that
-allows reads and refuses everything else. Both matter: `mode=ro` protects
-the file it opened and says nothing about any other, so a caller could
-otherwise turn `query_only` off, `ATTACH` the same database under a second
-name, and write through the alias — committing data with no run log at
-all. `ATTACH` and `DETACH` are denied outright, as are all DML, all DDL,
-writes to `temp`, and any pragma that could re-enable writing, so `main`,
-`temp`, and any alias are equally out of reach. Reads, joins, and
-schema-inspection pragmas (`table_info`, `integrity_check`, `user_version`
-in its query form, …) work normally. Raw writable access lives on
-`repository.admin.connect_writable()`, for manual repair and migrations,
-and is not restricted.
+**The public surface never hands out a connection.** Reads go through
+`repository.read`, a `Phase0Reader` with explicit methods — `story(id)`,
+`raw_item(id)`, `run_log_rows(...)`, `stage_key_rows(...)`,
+`table_columns(table)`, `integrity_check()`, `count(table)`, and the rest
+listed below. Each opens a private read-only connection, runs *one query
+this module wrote*, converts the rows to plain dictionaries, and closes
+the connection before returning. There is no `execute`, no `cursor`, no
+`executescript`, no `commit`/`rollback`, no `set_authorizer`, and no
+attribute holding a connection: the reader's entire state is one `Path`.
 
-**One transaction per public write.** A batch lands whole or not at all.
-Helpers that take a connection never commit; only the private writable
-connection does.
+This replaces the earlier `read_connection()`, and the replacement is the
+point rather than a tidy-up. That method returned a real
+`sqlite3.Connection`, hardened with `mode=ro`, `query_only`, and a
+statement authorizer — and a caller holding a connection can undo all
+three:
+
+```python
+connection.set_authorizer(None)          # the authorizer was theirs to remove
+connection.execute("PRAGMA query_only = OFF")
+connection.execute("ATTACH DATABASE '<same file>' AS alias")
+connection.execute("INSERT INTO alias.raw_items ...")
+connection.commit()                      # committed, with no run log at all
+```
+
+No amount of further hardening answers that, because every protection
+lives on the object the caller was given. So the object is not given.
+
+Raw writable access exists in exactly one place,
+`repository.admin.connect_writable()`, spelled that way so the call site
+says what it is; it is documented as manual-repair and migration only and
+is deliberately unrestricted. Migrations and every internal transaction
+use the private `_connect()`.
+
+**One transaction per public write, and success means committed.** A
+batch lands whole or not at all, and a terminal operation is successful
+only once `commit()` has returned. Nothing is marked succeeded in memory
+on the strength of statements that have not reached the disk.
+
+Helpers that take a connection never commit; the transaction boundaries
+are `_connect`, `_logged_mutation`, and `_write_settlement`, and a test
+enumerates them so a fourth cannot appear unnoticed.
 
 **Migrations are additive and are never rewritten.** `schema_migrations`
 records each applied file by name and SHA-256. Editing an already-applied
@@ -187,17 +210,46 @@ with repository.stage_run(
 # cache reads and writes need no run; the batch (persist_embeddings) does.
 service.embed_targets(targets, repository)
 
-# Reading: the only public connection.  SQLite refuses writes on it, and
-# the authorizer refuses ATTACH, so there is no way out of read-only.
-with repository.read_connection() as connection:
-    connection.execute("SELECT * FROM themes WHERE trading_day = ?", (day,))
+# Reading: named queries returning plain dictionaries.  No connection is
+# handed out, so there is nothing to take the protections off.
+repository.theme_set(ticker="NVDA", trading_day=day, pipeline_version="v1")
+repository.stories_for_day(day, ticker="NVDA")
+repository.read.story(story_id)
+repository.read.run_log_rows(run_id=run_id)
 
 # Fixtures, backfills, and repair — deliberately unlogged, deliberately
-# named as such.
+# named as such.  The one raw connection in the codebase is here.
 repository.admin.insert_raw_items(items)
 with repository.admin.connect_writable() as connection:
     ...
 ```
+
+### The read surface
+
+Higher-level reads stay on the repository: `stories_for_day`,
+`theme_set`, `raw_items_for_day`, `raw_item_tickers`, `source_state`,
+`run_log_entries`, `latest_stage_status`, `pipeline_status`,
+`stage_key_state`, `stage_keys_for_day`, `supported_tickers`,
+`schema_version`, `applied_migrations`, `count`, `get_embedding`.
+
+Row- and schema-level reads live on `repository.read`:
+
+| Method | Returns |
+|---|---|
+| `raw_item(id)` / `story(id)` / `theme(id)` | one row as a `dict`, or `None` |
+| `raw_item_candidates(id=None)` | candidate ticker rows |
+| `raw_item_associations(id=None)` | accepted `raw_item_tickers` rows |
+| `source_state_rows()` | every `source_state` row |
+| `run_log_rows(run_id=…, stage=…, trading_day=…)` | whole `run_log` rows, in order |
+| `stage_key_rows(stage=…, ticker=…, trading_day=…, pipeline_version=…)` | whole stage-key rows |
+| `table_names()` / `schema_objects()` | the schema, for rebasing branches |
+| `table_columns(t)` / `foreign_keys(t)` / `indexes(t)` | per-table introspection |
+| `integrity_check()` / `schema_version()` / `count(t)` | scalars |
+
+A read this list does not cover is a method to add here, not a reason to
+reach for raw SQL — which is what keeps the read surface reviewable. Table
+names are checked against the live schema before they are ever
+interpolated, and no method accepts SQL.
 
 `reconcile_stories` and `reconcile_themes` report
 `inserted / updated / unchanged / deleted / invalidated`. A structural
@@ -233,7 +285,8 @@ silently.
 | `repository.complete_stage_key(...)` (a stage finishing) | `terminal=True` on the stage's last logged mutation |
 | `repository.complete_stage_key(...)` (operator repair) | `repository.admin.complete_stage_key(...)` |
 | `run.record_success(n)` / `run.update_counts({...})` | nothing — counts are derived from what the operation did |
-| `with repository.connect() as c:` (reads) | `with repository.read_connection() as c:` |
+| `with repository.connect() as c:` (reads) | a repository read method, or `repository.read.*` |
+| `with repository.read_connection() as c:` (reads) | the same — no connection is handed out any more |
 | `with repository.connect() as c:` (writes) | a logged entrypoint, or `repository.admin.connect_writable()` for repair |
 | `repository.admin.insert_story(...)` without a version | add `pipeline_version=...`; it is required |
 | a story or embedding built from a tickerless raw item | associate the item with the ticker first (`raw_item_tickers`) |
