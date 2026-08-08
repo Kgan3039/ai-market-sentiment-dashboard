@@ -30,7 +30,7 @@ from phase0.lineages import (
     REMOTE_V4_LINEAGE,
 )
 from phase0.repository import Phase0Repository
-from phase0.schema import LEDGER_TABLE, split_statements
+from phase0.schema import LEDGER_DDL, LEDGER_TABLE, split_statements
 
 from test_phase0_persistence_contracts import (
     ALL_MIGRATIONS,
@@ -604,12 +604,7 @@ def test_an_unknown_004_variant_is_still_rejected(tmp_path):
             for statement in split_statements(path.read_text(encoding="utf-8")):
                 connection.execute(statement)
             connection.execute(f"PRAGMA user_version = {version}")
-        connection.execute(
-            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, "
-            "version INTEGER NOT NULL CHECK (version > 0), "
-            "checksum TEXT NOT NULL CHECK (length(checksum) = 64), "
-            "applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL))"
-        )
+        connection.execute(LEDGER_DDL)
         for path in sorted(altered.glob("*.sql")):
             text = path.read_text(encoding="utf-8")
             connection.execute(
@@ -658,12 +653,7 @@ def test_a_random_database_claiming_version_four_is_rejected(tmp_path):
     try:
         connection.execute("CREATE TABLE raw_items (id INTEGER PRIMARY KEY)")
         connection.execute("PRAGMA user_version = 4")
-        connection.execute(
-            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, "
-            "version INTEGER NOT NULL CHECK (version > 0), "
-            "checksum TEXT NOT NULL CHECK (length(checksum) = 64), "
-            "applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL))"
-        )
+        connection.execute(LEDGER_DDL)
         connection.execute(
             "INSERT INTO schema_migrations VALUES (?, 4, ?, ?)",
             (
@@ -686,12 +676,7 @@ def test_the_right_schema_with_a_wrong_checksum_is_rejected(tmp_path):
     database = remote_v4_database(tmp_path)
     connection = sqlite3.connect(database)
     try:
-        connection.execute(
-            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, "
-            "version INTEGER NOT NULL CHECK (version > 0), "
-            "checksum TEXT NOT NULL CHECK (length(checksum) = 64), "
-            "applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL))"
-        )
+        connection.execute(LEDGER_DDL)
         for path in sorted(REMOTE_FIXTURE.glob("*.sql")):
             text = path.read_text(encoding="utf-8")
             checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -720,12 +705,7 @@ def test_a_lineage_whose_earlier_history_differs_is_rejected(tmp_path):
     database = remote_v4_database(tmp_path)
     connection = sqlite3.connect(database)
     try:
-        connection.execute(
-            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, "
-            "version INTEGER NOT NULL CHECK (version > 0), "
-            "checksum TEXT NOT NULL CHECK (length(checksum) = 64), "
-            "applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL))"
-        )
+        connection.execute(LEDGER_DDL)
         for path in sorted(REMOTE_FIXTURE.glob("*.sql")):
             text = path.read_text(encoding="utf-8")
             checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -1339,21 +1319,12 @@ def test_a_partial_ledger_on_the_remote_schema_is_refused(tmp_path, label, names
     seed_remote_data(database)
     connection = sqlite3.connect(database)
     try:
-        connection.execute(
-            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, "
-            "version INTEGER NOT NULL CHECK (version > 0), "
-            "checksum TEXT NOT NULL CHECK (length(checksum) = 64), "
-            "applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL))"
-        )
+        connection.execute(LEDGER_DDL)
         for name in names:
+            version, checksum = REMOTE_V4_LINEAGE.historical_ledger[name]
             connection.execute(
                 "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
-                (
-                    name,
-                    int(name.split("_", 1)[0]),
-                    REMOTE_V4_LINEAGE.historical_ledger[name],
-                    f"{DAY}T12:00:00+00:00",
-                ),
+                (name, version, checksum, f"{DAY}T12:00:00+00:00"),
             )
         connection.commit()
     finally:
@@ -1373,16 +1344,11 @@ def test_an_exactly_ledgered_remote_database_is_accepted(tmp_path):
     seed_remote_data(database)
     connection = sqlite3.connect(database)
     try:
-        connection.execute(
-            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, "
-            "version INTEGER NOT NULL CHECK (version > 0), "
-            "checksum TEXT NOT NULL CHECK (length(checksum) = 64), "
-            "applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL))"
-        )
-        for name, checksum in REMOTE_V4_LINEAGE.historical_ledger.items():
+        connection.execute(LEDGER_DDL)
+        for name, (version, checksum) in REMOTE_V4_LINEAGE.historical_ledger.items():
             connection.execute(
                 "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
-                (name, int(name.split("_", 1)[0]), checksum, f"{DAY}T12:00:00+00:00"),
+                (name, version, checksum, f"{DAY}T12:00:00+00:00"),
             )
         connection.commit()
     finally:
@@ -1407,12 +1373,7 @@ def test_a_local_checksum_on_a_remote_looking_schema_is_refused(tmp_path):
     database = remote_v4_database(tmp_path, "localsum.sqlite3")
     connection = sqlite3.connect(database)
     try:
-        connection.execute(
-            "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, "
-            "version INTEGER NOT NULL CHECK (version > 0), "
-            "checksum TEXT NOT NULL CHECK (length(checksum) = 64), "
-            "applied_at TEXT NOT NULL CHECK (datetime(applied_at) IS NOT NULL))"
-        )
+        connection.execute(LEDGER_DDL)
         for name, checksum in approved.items():
             connection.execute(
                 "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
@@ -1636,3 +1597,545 @@ def test_the_settlement_applies_every_approved_migration(tmp_path):
     assert sorted(applied) == sorted(expected)
     ledger = {row["name"] for row in repository.applied_migrations()}
     assert ledger == {m.name for m in ALL_MIGRATIONS} | {REMOTE_V4_LINEAGE.convergence}
+
+
+# ----------------------------------------------------------------------
+# Migration metadata is validated as exactly as the application schema
+# ----------------------------------------------------------------------
+
+
+def ledgered_remote_database(
+    tmp_path: Path,
+    name: str,
+    *,
+    ddl: str = LEDGER_DDL,
+    rows: dict | None = None,
+) -> Path:
+    """A remote-lineage database that also carries a ledger."""
+
+    database = remote_v4_database(tmp_path, name)
+    seed_remote_data(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(ddl)
+        for migration, (version, checksum) in (
+            rows if rows is not None else REMOTE_V4_LINEAGE.historical_ledger
+        ).items():
+            connection.execute(
+                "INSERT INTO schema_migrations (name, version, checksum, applied_at) "
+                "VALUES (?, ?, ?, ?)",
+                (migration, version, checksum, f"{DAY}T12:00:00+00:00"),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return database
+
+
+#: One difference each from the ledger table this code creates.  Excluding
+#: the metadata tables from the *application* fingerprint is not the same
+#: as not checking them, and it used to be.
+ALTERED_LEDGER_TABLES = [
+    (
+        "extra-column",
+        "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER "
+        "NOT NULL CHECK (version > 0), checksum TEXT NOT NULL CHECK "
+        "(length(checksum) = 64), applied_at TEXT NOT NULL CHECK "
+        "(datetime(applied_at) IS NOT NULL), smuggled TEXT)",
+    ),
+    (
+        "missing-column",
+        "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER "
+        "NOT NULL, checksum TEXT NOT NULL)",
+    ),
+    (
+        "renamed-column",
+        "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER "
+        "NOT NULL CHECK (version > 0), digest TEXT NOT NULL CHECK "
+        "(length(digest) = 64), applied_at TEXT NOT NULL)",
+    ),
+    (
+        "changed-type",
+        "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version TEXT "
+        "NOT NULL CHECK (version > 0), checksum TEXT NOT NULL CHECK "
+        "(length(checksum) = 64), applied_at TEXT NOT NULL CHECK "
+        "(datetime(applied_at) IS NOT NULL))",
+    ),
+    (
+        "dropped-not-null",
+        "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER "
+        "CHECK (version > 0), checksum TEXT CHECK (length(checksum) = 64), "
+        "applied_at TEXT CHECK (datetime(applied_at) IS NOT NULL))",
+    ),
+    (
+        "no-primary-key",
+        "CREATE TABLE schema_migrations (name TEXT, version INTEGER NOT NULL "
+        "CHECK (version > 0), checksum TEXT NOT NULL CHECK "
+        "(length(checksum) = 64), applied_at TEXT NOT NULL CHECK "
+        "(datetime(applied_at) IS NOT NULL))",
+    ),
+    (
+        "different-primary-key",
+        "CREATE TABLE schema_migrations (name TEXT NOT NULL, version INTEGER "
+        "NOT NULL CHECK (version > 0), checksum TEXT NOT NULL CHECK "
+        "(length(checksum) = 64), applied_at TEXT NOT NULL CHECK "
+        "(datetime(applied_at) IS NOT NULL), PRIMARY KEY (name, version))",
+    ),
+    (
+        "added-default",
+        "CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, version INTEGER "
+        "NOT NULL DEFAULT 1 CHECK (version > 0), checksum TEXT NOT NULL CHECK "
+        "(length(checksum) = 64), applied_at TEXT NOT NULL CHECK "
+        "(datetime(applied_at) IS NOT NULL))",
+    ),
+]
+
+
+#: Shapes that can still hold this lineage's four rows, so the rejection
+#: has to come from the table's definition rather than from a failed insert.
+POPULATABLE_LEDGER_TABLES = [
+    row
+    for row in ALTERED_LEDGER_TABLES
+    if row[0] not in {"missing-column", "renamed-column"}
+]
+
+#: Shapes that cannot hold them at all.
+UNPOPULATABLE_LEDGER_TABLES = [
+    row
+    for row in ALTERED_LEDGER_TABLES
+    if row[0] in {"missing-column", "renamed-column"}
+]
+
+
+@pytest.mark.parametrize(
+    "label, ddl",
+    POPULATABLE_LEDGER_TABLES,
+    ids=[row[0] for row in POPULATABLE_LEDGER_TABLES],
+)
+def test_an_altered_ledger_table_is_refused(tmp_path, label, ddl):
+    rows = REMOTE_V4_LINEAGE.historical_ledger
+    database = ledgered_remote_database(
+        tmp_path, f"{label}.sqlite3", ddl=ddl, rows=rows
+    )
+    before = full_snapshot(database)
+
+    with pytest.raises(Phase0MigrationError, match="does not match it"):
+        Phase0Repository(database).migrate()
+
+    assert full_snapshot(database) == before
+
+
+@pytest.mark.parametrize(
+    "label, ddl",
+    UNPOPULATABLE_LEDGER_TABLES,
+    ids=[row[0] for row in UNPOPULATABLE_LEDGER_TABLES],
+)
+def test_a_structurally_wrong_ledger_table_is_refused(tmp_path, label, ddl):
+    """Shapes that cannot even hold this lineage's rows."""
+
+    database = remote_v4_database(tmp_path, f"shape-{label}.sqlite3")
+    seed_remote_data(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(ddl)
+        connection.commit()
+    finally:
+        connection.close()
+    before = full_snapshot(database)
+
+    with pytest.raises(Phase0MigrationError, match="does not match it"):
+        Phase0Repository(database).migrate()
+
+    assert full_snapshot(database) == before
+
+
+def test_an_unexpected_index_on_the_ledger_is_refused(tmp_path):
+    database = ledgered_remote_database(tmp_path, "ledger-index.sqlite3")
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE INDEX idx_smuggled ON schema_migrations(checksum)")
+        connection.commit()
+    finally:
+        connection.close()
+    before = full_snapshot(database)
+
+    with pytest.raises(Phase0MigrationError, match="does not match it"):
+        Phase0Repository(database).migrate()
+
+    assert full_snapshot(database) == before
+
+
+def test_an_altered_provenance_table_is_refused(tmp_path):
+    """The other metadata table gets the same treatment."""
+
+    database = remote_v4_database(tmp_path, "lineage-table.sqlite3")
+    Phase0Repository(database).migrate()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(f"ALTER TABLE {LINEAGE_TABLE} ADD COLUMN smuggled TEXT")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase0MigrationError, match="was modified after it was applied"):
+        Phase0Repository(database).migrate()
+
+
+def test_the_pinned_metadata_fingerprints_describe_what_this_code_creates(tmp_path):
+    """The pins are only worth having if a fresh database matches them."""
+
+    repository = Phase0Repository(tmp_path / "fresh.sqlite3")
+    repository.migrate()
+
+    with repository.admin.connect_writable() as connection:
+        assert (
+            lineages.metadata_fingerprint(connection, "schema_migrations")
+            == lineages.LEDGER_SCHEMA_FINGERPRINT
+        )
+        assert (
+            lineages.metadata_fingerprint(connection, LINEAGE_TABLE)
+            == lineages.LINEAGE_SCHEMA_FINGERPRINT
+        )
+        assert lineages.metadata_fingerprint(connection, "nonexistent") is None
+
+
+# ----------------------------------------------------------------------
+# Ledger rows are compared whole, never by checksum alone
+# ----------------------------------------------------------------------
+
+
+WRONG_LEDGER_TUPLES = [
+    ("historical-version-99", "004_supported_ticker_universe.sql", 99, None),
+    ("historical-version-3", "004_supported_ticker_universe.sql", 3, None),
+    ("companion-version-99", "002_source_state_and_stage_keys.sql", 99, None),
+    ("historical-checksum", "004_supported_ticker_universe.sql", None, "a" * 64),
+    ("companion-checksum", "001_initial.sql", None, "b" * 64),
+]
+
+
+@pytest.mark.parametrize(
+    "label, migration, version, checksum",
+    WRONG_LEDGER_TUPLES,
+    ids=[row[0] for row in WRONG_LEDGER_TUPLES],
+)
+def test_a_wrong_ledger_tuple_is_refused(tmp_path, label, migration, version, checksum):
+    """A checksum is half a row, and half a row used to be enough."""
+
+    rows = dict(REMOTE_V4_LINEAGE.historical_ledger)
+    was_version, was_checksum = rows[migration]
+    rows[migration] = (
+        version if version is not None else was_version,
+        checksum if checksum is not None else was_checksum,
+    )
+    database = ledgered_remote_database(tmp_path, f"{label}.sqlite3", rows=rows)
+    before = full_snapshot(database)
+
+    with pytest.raises(Phase0MigrationError, match="does not match it"):
+        Phase0Repository(database).migrate()
+
+    assert full_snapshot(database) == before
+
+
+def test_a_blank_applied_at_cannot_reach_the_ledger(tmp_path):
+    """The column's own CHECK is the first line; the tuple check is the second."""
+
+    database = ledgered_remote_database(tmp_path, "blank-applied.sqlite3")
+    connection = sqlite3.connect(database)
+    try:
+        for value in ("", "   ", "not a date"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE schema_migrations SET applied_at = ? WHERE name = ?",
+                    (value, REMOTE_V4_LINEAGE.migration),
+                )
+    finally:
+        connection.close()
+
+    # ...and the database is still exactly the lineage it was.
+    repository = Phase0Repository(database)
+    repository.migrate()
+    assert repository.schema_version() == LATEST_VERSION
+
+
+@pytest.mark.parametrize("version", [3, 5, 99])
+def test_a_wrong_convergence_version_is_refused(tmp_path, version):
+    """Post-convergence, the convergence row is checked whole too."""
+
+    database = remote_v4_database(tmp_path, f"convver-{version}.sqlite3")
+    Phase0Repository(database).migrate()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            f"UPDATE {LEDGER_TABLE} SET version = ? WHERE name = ?",
+            (version, REMOTE_V4_LINEAGE.convergence),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase0MigrationError, match="was modified after it was applied"):
+        Phase0Repository(database).migrate()
+
+
+def test_a_wrong_convergence_checksum_is_refused(tmp_path):
+    database = remote_v4_database(tmp_path, "convsum.sqlite3")
+    Phase0Repository(database).migrate()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            f"UPDATE {LEDGER_TABLE} SET checksum = ? WHERE name = ?",
+            ("c" * 64, REMOTE_V4_LINEAGE.convergence),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase0MigrationError, match="was modified after it was applied"):
+        Phase0Repository(database).migrate()
+
+
+def test_a_wrong_historical_version_after_convergence_is_refused(tmp_path):
+    database = remote_v4_database(tmp_path, "histver.sqlite3")
+    Phase0Repository(database).migrate()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            f"UPDATE {LEDGER_TABLE} SET version = 99 WHERE name = ?",
+            (REMOTE_V4_LINEAGE.migration,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase0MigrationError, match="was modified after it was applied"):
+        Phase0Repository(database).migrate()
+
+
+# ----------------------------------------------------------------------
+# Provenance corroborates; the schema and the ledger decide
+# ----------------------------------------------------------------------
+
+
+def test_forged_provenance_and_convergence_row_cannot_bless_a_fresh_database(
+    tmp_path,
+):
+    """The reported bypass, with the convergence row forged too.
+
+    Everything a converged database's ledger has, assembled by hand on a
+    fresh one. What it cannot assemble is a settlement: the historical
+    row, the convergence row, and the provenance row are written together
+    and carry one timestamp, and rows pasted in afterwards do not.
+    """
+
+    repository = Phase0Repository(tmp_path / "forged-pair.sqlite3")
+    repository.migrate()
+    connection = sqlite3.connect(repository.database_path)
+    try:
+        connection.execute(
+            f"UPDATE {LEDGER_TABLE} SET checksum = ? WHERE name = ?",
+            (REMOTE_V4_LINEAGE.checksum, REMOTE_V4_LINEAGE.migration),
+        )
+        connection.execute(
+            f"INSERT INTO {LEDGER_TABLE} VALUES (?, ?, ?, ?)",
+            (
+                REMOTE_V4_LINEAGE.convergence,
+                REMOTE_V4_LINEAGE.convergence_version,
+                REMOTE_V4_LINEAGE.convergence_checksum,
+                f"{DAY}T12:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            f"INSERT INTO {LINEAGE_TABLE} VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                REMOTE_V4_LINEAGE.lineage,
+                REMOTE_V4_LINEAGE.migration,
+                REMOTE_V4_LINEAGE.checksum,
+                REMOTE_V4_LINEAGE.schema_fingerprint,
+                REMOTE_V4_LINEAGE.convergence,
+                f"{DAY}T12:00:00+00:00",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    before = full_snapshot(repository.database_path)
+
+    with pytest.raises(Phase0MigrationError, match="was modified after it was applied"):
+        Phase0Repository(repository.database_path).migrate()
+
+    assert full_snapshot(repository.database_path) == before
+
+
+def test_provenance_written_apart_from_its_settlement_is_refused(tmp_path):
+    """Even on a genuinely converged database."""
+
+    database = remote_v4_database(tmp_path, "apart.sqlite3")
+    Phase0Repository(database).migrate()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            f"UPDATE {LINEAGE_TABLE} SET recognized_at = ? WHERE lineage = ?",
+            (f"{DAY}T09:00:00+00:00", REMOTE_V4_LINEAGE.lineage),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase0MigrationError, match="was modified after it was applied"):
+        Phase0Repository(database).migrate()
+
+
+def test_provenance_cannot_rescue_a_ledger_missing_its_companions(tmp_path):
+    database = remote_v4_database(tmp_path, "nocompanion.sqlite3")
+    Phase0Repository(database).migrate()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            f"DELETE FROM {LEDGER_TABLE} WHERE name = ?",
+            ("002_source_state_and_stage_keys.sql",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase0MigrationError, match="was modified after it was applied"):
+        Phase0Repository(database).migrate()
+
+
+# ----------------------------------------------------------------------
+# Exactly two accepted states; every hybrid fails closed
+# ----------------------------------------------------------------------
+
+
+def test_the_two_accepted_states_are_named_and_exclusive(tmp_path):
+    database = remote_v4_database(tmp_path, "states.sqlite3")
+    seed_remote_data(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        state, reason = lineages.classify(connection, REMOTE_V4_LINEAGE)
+        assert (state, reason) == (lineages.STATE_PRE_CONVERGENCE, None)
+    finally:
+        connection.close()
+
+    Phase0Repository(database).migrate()
+
+    connection = sqlite3.connect(database)
+    try:
+        state, reason = lineages.classify(connection, REMOTE_V4_LINEAGE)
+        assert (state, reason) == (lineages.STATE_POST_CONVERGENCE, None)
+    finally:
+        connection.close()
+
+    fresh = Phase0Repository(tmp_path / "fresh.sqlite3")
+    fresh.migrate()
+    with fresh.admin.connect_writable() as connection:
+        state, reason = lineages.classify(connection, REMOTE_V4_LINEAGE)
+        assert state == lineages.STATE_UNRELATED
+        assert reason
+
+
+HYBRIDS = [
+    "historical-schema-with-convergence-row",
+    "converged-schema-with-historical-fingerprint-claim",
+    "historical-schema-with-provenance",
+    "partial-convergence-metadata",
+]
+
+
+@pytest.mark.parametrize("hybrid", HYBRIDS)
+def test_a_hybrid_state_fails_closed(tmp_path, hybrid):
+    """Neither state, so no state: half a conversion is not a conversion."""
+
+    database = remote_v4_database(tmp_path, f"{hybrid}.sqlite3")
+    seed_remote_data(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(LEDGER_DDL)
+        connection.execute(lineages.LINEAGE_DDL)
+        for name, (version, checksum) in REMOTE_V4_LINEAGE.historical_ledger.items():
+            connection.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
+                (name, version, checksum, f"{DAY}T12:00:00+00:00"),
+            )
+        if hybrid in {
+            "historical-schema-with-convergence-row",
+            "partial-convergence-metadata",
+        }:
+            connection.execute(
+                f"INSERT INTO {LEDGER_TABLE} VALUES (?, ?, ?, ?)",
+                (
+                    REMOTE_V4_LINEAGE.convergence,
+                    REMOTE_V4_LINEAGE.convergence_version,
+                    REMOTE_V4_LINEAGE.convergence_checksum,
+                    f"{DAY}T12:00:00+00:00",
+                ),
+            )
+        if hybrid in {
+            "historical-schema-with-provenance",
+            "converged-schema-with-historical-fingerprint-claim",
+        }:
+            connection.execute(
+                f"INSERT INTO {LINEAGE_TABLE} VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    REMOTE_V4_LINEAGE.lineage,
+                    REMOTE_V4_LINEAGE.migration,
+                    REMOTE_V4_LINEAGE.checksum,
+                    REMOTE_V4_LINEAGE.schema_fingerprint,
+                    REMOTE_V4_LINEAGE.convergence,
+                    f"{DAY}T12:00:00+00:00",
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    before = full_snapshot(database)
+
+    with pytest.raises(Phase0MigrationError):
+        Phase0Repository(database).migrate()
+
+    assert full_snapshot(database) == before
+
+
+def test_a_converged_database_with_the_historical_schema_back_is_refused(tmp_path):
+    """Provenance says converged; the schema says otherwise."""
+
+    database = remote_v4_database(tmp_path, "reverted.sqlite3")
+    Phase0Repository(database).migrate()
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TABLE supported_tickers")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(Phase0MigrationError):
+        Phase0Repository(database).migrate()
+
+
+# ----------------------------------------------------------------------
+# The success paths, still
+# ----------------------------------------------------------------------
+
+
+def test_an_exact_approved_local_database_is_untouched_by_any_of_this(tmp_path):
+    repository = Phase0Repository(tmp_path / "approved.sqlite3")
+    applied = repository.migrate()
+
+    assert applied == [migration.name for migration in ALL_MIGRATIONS]
+    assert repository.schema_lineages() == []
+    assert repository.migrate() == []
+    ledger = {row["name"]: row["version"] for row in repository.applied_migrations()}
+    assert ledger == {m.name: m.version for m in ALL_MIGRATIONS}
+
+
+def test_a_converged_database_repeats_cleanly(tmp_path):
+    database = remote_v4_database(tmp_path, "repeat.sqlite3")
+    seed_remote_data(database)
+    repository = Phase0Repository(database)
+    repository.migrate()
+    snapshot = full_snapshot(database)
+
+    for _ in range(3):
+        assert Phase0Repository(database).migrate() == []
+    assert full_snapshot(database) == snapshot

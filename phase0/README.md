@@ -307,9 +307,12 @@ policy. One entry today:
 | lineage | `remote-v4-supported-ticker-universe` |
 | migration | `004_supported_ticker_universe.sql` |
 | historical checksum | `fd4d208833984199a0a4307b82a8693767349c89e039ec1ec4d93eada78b9eab` |
-| structural fingerprint | `ea38ea10cf7f0657f45f68fec86ffc18bd86a3f087d61924e67b235d8db7df5d` |
+| historical version | `4` |
+| application fingerprint | `ea38ea10cf7f0657f45f68fec86ffc18bd86a3f087d61924e67b235d8db7df5d` |
+| `schema_migrations` fingerprint | `80eb31deee50ce560b411c6020c755dd3c3764dc4fc7b99a470f57d7f7788df4` |
+| `schema_lineage` fingerprint | `1b5c479ea1ac90e14017ade4fe46f0df498b9d1097c743fd95b5fad7f9c6118c` |
 | signature objects | the twelve `enforce_*` ticker triggers |
-| convergence | `migrations/compat/004_remote_v4_convergence.sql` |
+| convergence | `migrations/compat/004_remote_v4_convergence.sql` at version `4`, checksum `eb0609c3…` |
 
 **What made it incompatible.** That `004` enforced the ticker universe
 with literal `IN`-lists and twelve `enforce_*` triggers, and never created
@@ -319,49 +322,66 @@ chain could not run on such a database at all — and, worse, the ledger
 backfill used to write the *approved* checksum onto it, silently claiming
 a migration had run that never had.
 
+**What qualifies.** All of it, or none. The lineage's identity is five
+things that must agree:
+
+1. `user_version` is 4;
+2. the **application fingerprint** matches — a SHA-256 over every object in
+   `sqlite_master` with its stored SQL, plus every table's full
+   `table_info` (name, declared type, nullability, default, primary-key
+   position), `foreign_key_list`, and every index with its columns. A
+   missing table, an extra table, an added or dropped index, a changed
+   column, or a reworded trigger all fail it;
+3. the **migration-metadata fingerprint** matches. `schema_migrations` and
+   `schema_lineage` are excluded from the application fingerprint because
+   they describe migration state rather than schema — but excluded is not
+   unchecked. Each is digested the same way and pinned, so a ledger with
+   an extra column, a renamed one, a widened type, a dropped `NOT NULL`, a
+   different primary key, an added default, or an unexpected index is a
+   ledger this code did not create, and nothing it reports can be taken at
+   face value;
+4. the **ledger contents** match, as whole rows. Either the ledger is
+   absent — the genuine database predates it — or it holds exactly this
+   lineage's history: `001`–`003` at the approved `(version, checksum)`
+   and `004` at the historical one, no more and no less. A checksum is
+   half a row: `004` recorded at version 99 with the right checksum
+   describes a migration that does not exist, and is refused;
+5. the historical **checksum** is exactly `fd4d2088…`.
+
 **Claiming versus qualifying.** A database carrying any of the twelve
 `enforce_*` triggers is *claiming* this lineage — nothing on the approved
 lineage has ever created one. Claiming is not qualifying: such a database
-must then match the lineage exactly or be **refused**, before a single
-statement runs. It may not fall through to the ordinary path, because that
-path assumes a pre-ledger database ran the approved migrations up to its
-`user_version`, and a fork is exactly what breaks that assumption. One
-remote-like database with `run_log` dropped used to be waved through on a
-partial fingerprint and advanced four migrations before anything noticed.
+must then match all five, or be **refused** before a single statement
+runs. It may not fall through to the ordinary path, because that path
+assumes a pre-ledger database ran the approved migrations up to its
+`user_version`, and a fork is exactly what breaks that assumption.
 
-**What qualifies.** All of it, or none:
+**Two accepted states, and no third.**
 
-- `user_version` is 4;
-- the **structural fingerprint** matches — a SHA-256 over every object in
-  `sqlite_master` with its stored SQL, plus every table's full
-  `table_info` (name, declared type, nullability, default, primary-key
-  position), `foreign_key_list`, and every index with its columns. A
-  missing table, an extra table, an added or dropped index, a changed
-  column, or a reworded trigger all fail it;
-- the migration ledger is either **absent** (the genuine database predates
-  it) or **exactly** this lineage's history — the shared, byte-identical
-  `001`–`003` at the approved checksums and `004` at the historical one,
-  no more and no less. A partial ledger is refused;
-- no lineage provenance is already recorded.
+| | |
+|---|---|
+| `pre-convergence` | `user_version` 4, the exact historical application schema, the exact metadata-table shapes, the exact historical ledger (or none at all), and no provenance yet |
+| `post-convergence` | the historical row at `(4, fd4d2088…)`, the convergence row at `(4, eb0609c3…)`, the shared `001`–`003` rows whole, the convergence's effects live in the schema, and provenance whose every field is the registry's |
 
-Migration-state tables are excluded from the fingerprint and checked by
-those rules instead, so "what does this schema look like" and "what does
-this database claim to have run" stay separate questions.
+Anything that is neither fails closed. A historical schema carrying a
+convergence row, a converged schema with a partial ledger, provenance over
+an invalid ledger, a valid ledger under a tampered metadata table, partial
+convergence metadata — none of these is a state, so none of them is
+accepted.
 
-**Provenance is evidence, never authority.** A `schema_lineage` row is
-re-verified against the live database on every `migrate()`, never trusted:
-every field must be the registry's, the ledger must record the historical
-checksum **and** the convergence migration at its pinned checksum, and the
-convergence's effects must actually be present (`supported_tickers` exists,
-the `enforce_*` triggers are gone). The convergence's ledger row is the
-part a tampered database cannot honestly produce — swapping a fresh
-database's `004` checksum and inserting a copied lineage row used to be
-enough to be waved through, and is now refused.
+**Provenance corroborates; the schema and the ledger decide.** The order is
+the authority order: the live schema and the ledger are validated first and
+on their own, and only then is `schema_lineage` consulted — to confirm what
+they already say, or to contradict it. A provenance row can never supply
+something they do not, and never upgrades an invalid ledger into a
+recognized history.
 
-A valid live historical schema *without* provenance is **recognized and
-given provenance transactionally from verified state** (option A) — that
-is the genuine pre-ledger case, and the row is written from the registry
-inside the settlement, never from anything the database asserted.
+One internal-consistency rule ties the settlement together: the historical
+row, the convergence row, and the provenance row are written in the same
+transaction and carry one timestamp. A ledger assembled from parts
+afterwards does not, which is what refuses a fresh database dressed up with
+a swapped `004` checksum, a hand-written convergence row, and a copied
+lineage row.
 
 **The compatibility settlement is one transaction.** The ordinary path
 commits one migration at a time and still does; that is right for a

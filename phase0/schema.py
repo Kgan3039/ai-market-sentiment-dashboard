@@ -30,7 +30,7 @@ from .lineages import HistoricalLineage
 
 LEDGER_TABLE = "schema_migrations"
 
-_LEDGER_DDL = f"""
+LEDGER_DDL = f"""
 CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} (
     name TEXT PRIMARY KEY,
     version INTEGER NOT NULL CHECK (version > 0),
@@ -236,7 +236,7 @@ def apply_migrations(
     if lineage is not None:
         return _converge(connection, migrations, lineage)
 
-    connection.execute(_LEDGER_DDL)
+    connection.execute(LEDGER_DDL)
     connection.execute(lineages.LINEAGE_DDL)
     connection.commit()
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -328,13 +328,17 @@ def _converge(
                 f"before conversion could start: {reason}"
             )
 
-        connection.execute(_LEDGER_DDL)
+        connection.execute(LEDGER_DDL)
         connection.execute(lineages.LINEAGE_DDL)
 
         # The history this database actually lived, told truthfully: the
         # shared approved files at their own checksums, and the historical
         # migration at *its* checksum, never the approved one.
-        now = _utc_now()
+        #
+        # One timestamp for the whole settlement.  The historical row, the
+        # convergence row, and the provenance row are written together and
+        # say so, which is a thing a ledger assembled from parts does not.
+        settled_at = _utc_now()
         for migration in migrations:
             if migration.version > lineage.user_version:
                 continue
@@ -346,17 +350,20 @@ def _converge(
             connection.execute(
                 f"INSERT OR REPLACE INTO {LEDGER_TABLE} "
                 "(name, version, checksum, applied_at) VALUES (?, ?, ?, ?)",
-                (migration.name, migration.version, checksum, now),
+                (migration.name, migration.version, checksum, settled_at),
             )
 
         newly_applied: list[str] = []
         for migration in plan:
             for statement in statements[migration.name]:
                 connection.execute(statement)
+            applied_at = (
+                settled_at if migration.name == lineage.convergence else _utc_now()
+            )
             connection.execute(
                 f"INSERT INTO {LEDGER_TABLE} (name, version, checksum, applied_at) "
                 "VALUES (?, ?, ?, ?)",
-                (migration.name, migration.version, migration.checksum, _utc_now()),
+                (migration.name, migration.version, migration.checksum, applied_at),
             )
             newly_applied.append(migration.name)
 
@@ -364,7 +371,7 @@ def _converge(
         connection.execute(f"PRAGMA user_version = {int(target)}")
 
         _assert_converged(connection, migrations, lineage, target)
-        lineages.record(connection, lineage, now)
+        lineages.record(connection, lineage, settled_at)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -436,6 +443,7 @@ def _assert_converged(
 
 
 __all__ = [
+    "LEDGER_DDL",
     "LEDGER_TABLE",
     "LEGACY_SCHEMA_VERSION",
     "LEGACY_UPGRADE_MIGRATION",
