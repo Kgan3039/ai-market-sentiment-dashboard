@@ -307,7 +307,8 @@ policy. One entry today:
 | lineage | `remote-v4-supported-ticker-universe` |
 | migration | `004_supported_ticker_universe.sql` |
 | historical checksum | `fd4d208833984199a0a4307b82a8693767349c89e039ec1ec4d93eada78b9eab` |
-| schema fingerprint | `8c4b16cb453668d3383263eafedadf4ff1c011857e39bdf289a3ee7044587b31` |
+| structural fingerprint | `ea38ea10cf7f0657f45f68fec86ffc18bd86a3f087d61924e67b235d8db7df5d` |
+| signature objects | the twelve `enforce_*` ticker triggers |
 | convergence | `migrations/compat/004_remote_v4_convergence.sql` |
 
 **What made it incompatible.** That `004` enforced the ticker universe
@@ -318,36 +319,93 @@ chain could not run on such a database at all — and, worse, the ledger
 backfill used to write the *approved* checksum onto it, silently claiming
 a migration had run that never had.
 
-**What qualifies.** All of it, or none: `user_version` is 4; the
-`001`–`003` ledger rows match the approved checksums exactly; the `004`
-row is absent (that lineage predates the ledger) or holds exactly the
-historical checksum; `supported_tickers` does not exist; the approved
-`trg_*` v4 triggers do not exist; and a SHA-256 over the stored SQL of all
-twelve `enforce_*` triggers equals the pinned fingerprint. A database that
-merely claims version 4 does not qualify, and neither does the right
-checksum with the wrong schema, or the right schema with the wrong
-checksum.
+**Claiming versus qualifying.** A database carrying any of the twelve
+`enforce_*` triggers is *claiming* this lineage — nothing on the approved
+lineage has ever created one. Claiming is not qualifying: such a database
+must then match the lineage exactly or be **refused**, before a single
+statement runs. It may not fall through to the ordinary path, because that
+path assumes a pre-ledger database ran the approved migrations up to its
+`user_version`, and a fork is exactly what breaks that assumption. One
+remote-like database with `run_log` dropped used to be waved through on a
+partial fingerprint and advanced four migrations before anything noticed.
 
-**What happens then.** A convergence migration is spliced into the
-schedule at version 4 — before `005`, because that is where the
-divergence is. It drops the remote lineage's triggers and performs the
-approved v4 transition, producing exactly an approved v4 schema; a test
-asserts that equality against a real approved v4 database rather than
-trusting the file. Migrations `005`–`011` then run normally, and the
-result is schema-identical to a fresh database.
+**What qualifies.** All of it, or none:
+
+- `user_version` is 4;
+- the **structural fingerprint** matches — a SHA-256 over every object in
+  `sqlite_master` with its stored SQL, plus every table's full
+  `table_info` (name, declared type, nullability, default, primary-key
+  position), `foreign_key_list`, and every index with its columns. A
+  missing table, an extra table, an added or dropped index, a changed
+  column, or a reworded trigger all fail it;
+- the migration ledger is either **absent** (the genuine database predates
+  it) or **exactly** this lineage's history — the shared, byte-identical
+  `001`–`003` at the approved checksums and `004` at the historical one,
+  no more and no less. A partial ledger is refused;
+- no lineage provenance is already recorded.
+
+Migration-state tables are excluded from the fingerprint and checked by
+those rules instead, so "what does this schema look like" and "what does
+this database claim to have run" stay separate questions.
+
+**Provenance is evidence, never authority.** A `schema_lineage` row is
+re-verified against the live database on every `migrate()`, never trusted:
+every field must be the registry's, the ledger must record the historical
+checksum **and** the convergence migration at its pinned checksum, and the
+convergence's effects must actually be present (`supported_tickers` exists,
+the `enforce_*` triggers are gone). The convergence's ledger row is the
+part a tampered database cannot honestly produce — swapping a fresh
+database's `004` checksum and inserting a copied lineage row used to be
+enough to be waved through, and is now refused.
+
+A valid live historical schema *without* provenance is **recognized and
+given provenance transactionally from verified state** (option A) — that
+is the genuine pre-ledger case, and the row is written from the registry
+inside the settlement, never from anything the database asserted.
+
+**The compatibility settlement is one transaction.** The ordinary path
+commits one migration at a time and still does; that is right for a
+database taking steps every database takes, where a failure at step *n*
+leaves it honestly at step *n-1*. None of that holds for a fork. A
+half-converted database is at no version at all: bootstrap tables it did
+not ask for, a ledger describing a history it has not lived, and a schema
+partway between two branches.
+
+So the conversion runs as a single settlement:
+
+1. recognize the lineage **read-only** — nothing is created or backfilled
+   by asking;
+2. read and checksum the convergence file, before any transaction opens;
+3. `BEGIN IMMEDIATE`;
+4. re-validate the lineage inside the write lock;
+5. create the ledger and provenance tables;
+6. backfill the ledger **truthfully** — the historical checksum for the
+   historical file, never the approved one;
+7. run the convergence, then every remaining approved migration;
+8. set `user_version`;
+9. validate the result — every migration applied, the historical checksum
+   intact, the convergence recorded, `supported_tickers` present, the
+   `enforce_*` triggers gone, the version correct;
+10. write provenance;
+11. commit.
+
+Any failure rolls the whole thing back: the original tables and data, the
+absence of `schema_migrations` and `schema_lineage`, and `user_version`,
+all exactly as they were. Step 9 exists because marking a migration
+applied is not the same as its schema existing — a settlement that only
+claims to have converged is refused rather than committed.
 
 **What the record says.** The ledger goes on reporting the *historical*
 checksum for `004`, because that is what ran; nothing is rewritten,
 deleted, or reset. The convergence gets its own ledger row under its own
-name and pinned checksum. Provenance lands in `schema_lineage`, readable
-via `repository.schema_lineages()`, in the same transaction as the
-convergence — so a rollback takes both and no database ever claims to have
-converged when it has not. That table is created for *every* database, so
-a converged one stays schema-identical to a fresh one; it just has a row.
+name and pinned checksum. `schema_lineage` is created for *every*
+database, so a converged one stays schema-identical to a fresh one and
+just has a row; read it with `repository.schema_lineages()`.
 
 Everything else still fails exactly as before: an unregistered variant, an
-edited approved migration, a forged provenance row paired with a third
-checksum, and a tampered convergence file are all refused.
+edited approved migration, a forged provenance row, a tampered convergence
+file, a partial ledger, and a database that merely resembles the lineage
+are all refused — and refused before anything is written.
 
 ## Recovery
 

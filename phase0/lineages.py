@@ -71,19 +71,24 @@ class HistoricalLineage:
     checksum: str
     #: ``user_version`` a database on this lineage reports before converging.
     user_version: int
-    #: SHA-256 over the defining schema objects; see :func:`schema_fingerprint`.
+    #: SHA-256 over the *whole* schema; see :func:`structural_fingerprint`.
+    #: Every table, column, type, nullability, default, primary key, foreign
+    #: key, index, and trigger body is in it.
     schema_fingerprint: str
-    #: Trigger names the fingerprint is computed over, in sorted order.
+    #: The historical lineage's own triggers.  Named here so the converged
+    #: check can insist they are gone.
     fingerprint_triggers: tuple[str, ...]
-    #: Objects the lineage must have, and must not have.
-    required_tables: tuple[str, ...]
-    forbidden_tables: tuple[str, ...]
-    #: Objects the *approved* lineage would have at this version, proving
-    #: this database did not come through the approved 004.
-    forbidden_triggers: tuple[str, ...]
-    #: Other ledger rows that must match the approved checksums exactly, so
-    #: a database that forked earlier than this file does not qualify.
-    companion_checksums: Mapping[str, str]
+    #: Objects no approved database ever has.  Finding one means this
+    #: database is *claiming* the lineage, and it then has to match it
+    #: exactly or be refused — never quietly handled as something else.
+    signature_objects: tuple[str, ...]
+    #: The exact ledger a database on this lineage may carry.  The genuine
+    #: one predates the ledger and has none at all; anything else must be
+    #: precisely this, no more and no less.
+    historical_ledger: Mapping[str, str]
+    #: Tables the convergence creates, checked when validating provenance
+    #: and after the settlement.
+    converged_tables: tuple[str, ...]
     #: The additive migration that brings this lineage onto the approved one.
     convergence: str
     convergence_checksum: str
@@ -129,25 +134,24 @@ REMOTE_V4_LINEAGE = HistoricalLineage(
     checksum="fd4d208833984199a0a4307b82a8693767349c89e039ec1ec4d93eada78b9eab",
     user_version=4,
     schema_fingerprint=(
-        "8c4b16cb453668d3383263eafedadf4ff1c011857e39bdf289a3ee7044587b31"
+        "ea38ea10cf7f0657f45f68fec86ffc18bd86a3f087d61924e67b235d8db7df5d"
     ),
     fingerprint_triggers=_REMOTE_V4_TRIGGERS,
-    # The 001–003 shape, which this lineage shares with the approved one.
-    required_tables=(
-        "pipeline_stage_keys",
-        "raw_item_candidates",
-        "raw_item_tickers",
-        "raw_items",
-        "stories",
-        "story_members",
-        "theme_citations",
-        "themes",
-    ),
-    # The approved 004 creates this table; the remote one never did.  Its
-    # absence at user_version 4 is the single clearest tell.
-    forbidden_tables=("supported_tickers",),
-    forbidden_triggers=("trg_raw_item_ticker_insert", "trg_supported_ticker_delete"),
-    companion_checksums=_APPROVED_001_003,
+    # The approved 004 calls its triggers ``trg_*``; nothing on the approved
+    # lineage has ever created one of these.
+    signature_objects=_REMOTE_V4_TRIGGERS,
+    # The genuine database predates the ledger, so it has none.  A database
+    # that has been given one must carry exactly this and nothing else: the
+    # shared, byte-identical 001–003, and the historical 004.
+    historical_ledger={
+        **_APPROVED_001_003,
+        "004_supported_ticker_universe.sql": (
+            "fd4d208833984199a0a4307b82a8693767349c89e039ec1ec4d93eada78b9eab"
+        ),
+    },
+    # The approved 004 creates this table; the remote one never did, which
+    # is why the approved 008 and 009 cannot run on such a database.
+    converged_tables=("supported_tickers",),
     convergence="004_remote_v4_convergence.sql",
     convergence_checksum=(
         "eb0609c33ea7de41c46eda8684fa7b4012cea198f96f25dc1f68e75646e0532e"
@@ -178,24 +182,10 @@ def convergence_migrations() -> dict[str, str]:
     }
 
 
-def schema_fingerprint(connection: sqlite3.Connection, names: tuple[str, ...]) -> str:
-    """Digest the stored SQL of the named triggers, in sorted order.
-
-    Names alone would be trivial to fake; this is taken over what SQLite
-    actually stored, so a database with a trigger of the right name and a
-    different body does not match.
-    """
-
-    rows = {
-        str(row[0]): str(row[1] or "").strip()
-        for row in connection.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
-        )
-    }
-    if set(names) - set(rows):
-        return ""
-    blob = "\n".join(f"{name}\n{rows[name]}" for name in sorted(names))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+#: Excluded from the structural fingerprint and checked by their own rules.
+#: They describe migration *state* rather than schema, and the genuine
+#: historical database has neither of them.
+METADATA_TABLES = frozenset({LINEAGE_TABLE, "schema_migrations"})
 
 
 def _objects(connection: sqlite3.Connection, kind: str) -> set[str]:
@@ -207,72 +197,239 @@ def _objects(connection: sqlite3.Connection, kind: str) -> set[str]:
     }
 
 
-def matches(
-    connection: sqlite3.Connection,
-    lineage: HistoricalLineage,
-    applied: Mapping[str, str],
-) -> bool:
-    """True when this database really is ``lineage``, on every count.
+def _table_names(connection: sqlite3.Connection) -> list[str]:
+    return sorted(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        )
+        if str(row[0]) not in METADATA_TABLES
+    )
 
-    The ledger is checked when there is one.  The genuine remote database
-    predates the ledger entirely and reports nothing but ``user_version``,
-    which is exactly why the schema conditions carry the proof.
+
+def structural_fingerprint(connection: sqlite3.Connection) -> str:
+    """A digest of the *whole* schema, not a sample of it.
+
+    Every object in ``sqlite_master`` with its stored SQL, and for every
+    table its full ``table_info`` (name, declared type, nullability,
+    default, primary-key position), ``foreign_key_list``, and every index
+    with its columns.  Deterministic, and exhaustive on purpose: a
+    fingerprint over a chosen handful of triggers accepted a database with
+    ``run_log`` missing entirely, which then advanced through four
+    migrations before failing.
+
+    Migration-state tables are excluded and checked separately — the
+    genuine historical database has neither, and a database that has been
+    given one is a different question from what its schema looks like.
+    """
+
+    parts: list[str] = []
+    for row in connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ):
+        kind, name, table, sql = (str(value or "") for value in row)
+        if name in METADATA_TABLES or table in METADATA_TABLES:
+            continue
+        parts.append(f"object\t{kind}\t{name}\t{table}\t{sql.strip()}")
+    for table in _table_names(connection):
+        for column in connection.execute(f"PRAGMA table_info({table})"):
+            parts.append(
+                f"column\t{table}\t" + "\t".join(str(value) for value in column)
+            )
+        foreign_keys = sorted(
+            tuple(str(value) for value in row)
+            for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        )
+        for row in foreign_keys:
+            parts.append(f"fk\t{table}\t" + "\t".join(row))
+        indexes = sorted(
+            tuple(str(value) for value in row)
+            for row in connection.execute(f"PRAGMA index_list({table})")
+        )
+        for row in indexes:
+            parts.append(f"index\t{table}\t" + "\t".join(row))
+            for column in connection.execute(f"PRAGMA index_info({row[1]})"):
+                parts.append(
+                    f"indexcol\t{table}\t{row[1]}\t"
+                    + "\t".join(str(value) for value in column)
+                )
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def ledger_rows(connection: sqlite3.Connection) -> dict[str, str] | None:
+    """The ledger as it stands, or ``None`` when there is no ledger table.
+
+    ``None`` and ``{}`` are different facts: the genuine historical
+    database predates the ledger entirely, while an empty ledger table is
+    something else's doing.
+    """
+
+    if "schema_migrations" not in _objects(connection, "table"):
+        return None
+    return {
+        str(row[0]): str(row[1])
+        for row in connection.execute("SELECT name, checksum FROM schema_migrations")
+    }
+
+
+def lineage_rows(connection: sqlite3.Connection) -> list[dict[str, str]] | None:
+    if LINEAGE_TABLE not in _objects(connection, "table"):
+        return None
+    return [
+        {
+            "lineage": str(row[0]),
+            "migration": str(row[1]),
+            "historical_checksum": str(row[2]),
+            "schema_fingerprint": str(row[3]),
+            "convergence": str(row[4]),
+        }
+        for row in connection.execute(
+            f"SELECT lineage, migration, historical_checksum, schema_fingerprint, "
+            f"convergence FROM {LINEAGE_TABLE}"
+        )
+    ]
+
+
+def mismatch(connection: sqlite3.Connection, lineage: HistoricalLineage) -> str | None:
+    """Why this database is *not* ``lineage``, or ``None`` when it is.
+
+    Read-only, and total: every condition is checked, and the first one
+    that fails is named so a rejection can say what was wrong rather than
+    just refusing.
     """
 
     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     if version != lineage.user_version:
-        return False
-    tables = _objects(connection, "table")
-    if set(lineage.required_tables) - tables:
-        return False
-    if set(lineage.forbidden_tables) & tables:
-        return False
-    if set(lineage.forbidden_triggers) & _objects(connection, "trigger"):
-        return False
-    if schema_fingerprint(connection, lineage.fingerprint_triggers) != (
-        lineage.schema_fingerprint
-    ):
-        return False
-    if applied:
-        # A ledger that disagrees about the shared history means this
-        # database forked somewhere this registry says nothing about.
-        for name, checksum in lineage.companion_checksums.items():
-            if applied.get(name, checksum) != checksum:
-                return False
-        recorded = applied.get(lineage.migration)
-        if recorded is not None and recorded != lineage.checksum:
-            return False
-    return True
+        return f"user_version is {version}, not {lineage.user_version}"
+
+    fingerprint = structural_fingerprint(connection)
+    if fingerprint != lineage.schema_fingerprint:
+        return (
+            "the schema does not match this lineage exactly "
+            f"(fingerprint {fingerprint[:12]}…, expected "
+            f"{lineage.schema_fingerprint[:12]}…)"
+        )
+
+    applied = ledger_rows(connection)
+    if applied is not None and applied != dict(lineage.historical_ledger):
+        return "the migration ledger does not match this lineage's history"
+
+    provenance = lineage_rows(connection)
+    if provenance:
+        return "this database already carries lineage provenance"
+    return None
 
 
-def recognize(
-    connection: sqlite3.Connection, applied: Mapping[str, str]
-) -> HistoricalLineage | None:
-    """The known lineage this database is on, if it is on one."""
+def claimed(connection: sqlite3.Connection) -> HistoricalLineage | None:
+    """The lineage this database *claims*, by carrying its marker objects.
 
+    Claiming is not qualifying.  It only means the ordinary path must not
+    have this database: a pre-ledger database is assumed to have run the
+    approved migrations up to its ``user_version``, and that assumption is
+    exactly what a fork invalidates.
+    """
+
+    names = _objects(connection, "trigger") | _objects(connection, "table")
     for lineage in KNOWN_HISTORICAL_MIGRATIONS.values():
-        if matches(connection, lineage, applied):
+        if names & set(lineage.signature_objects):
             return lineage
     return None
 
 
-def recorded(connection: sqlite3.Connection) -> dict[str, HistoricalLineage]:
-    """Lineages this database has already been recognized as, by migration.
+def recognize(
+    connection: sqlite3.Connection,
+) -> tuple[HistoricalLineage | None, str | None]:
+    """What this database is, and — when it falls short — why.
 
-    After convergence the schema no longer looks like the historical one —
-    that was the point — so provenance is what keeps the ledger's
-    historical checksum explicable on every later ``migrate()``.
+    Read-only.  Nothing is created, backfilled, or advanced by asking.
+
+    Three answers.  ``(None, None)``: no historical lineage is claimed, so
+    the ordinary path applies.  ``(lineage, None)``: it is exactly that
+    lineage.  ``(lineage, reason)``: it claims that lineage and is not it,
+    which is a refusal — a database carrying half of a fork's schema is not
+    something to guess about, and letting it fall through to the ordinary
+    path is how one missing ``run_log`` advanced four migrations before
+    anything noticed.
     """
 
-    names = _objects(connection, "table")
-    if LINEAGE_TABLE not in names:
+    lineage = claimed(connection)
+    if lineage is None:
+        return None, None
+    return lineage, mismatch(connection, lineage)
+
+
+def converged_mismatch(
+    connection: sqlite3.Connection, lineage: HistoricalLineage
+) -> str | None:
+    """Why this database's provenance is not trustworthy, or ``None``.
+
+    Provenance is evidence, never authority.  A row saying "I came through
+    the remote-v4 path" is checked against the live database every time:
+    the ledger must record the historical checksum *and* the convergence
+    that only this path applies, the row's own fields must be the
+    registry's, and the convergence's effects must actually be present.
+
+    Without that, replacing a fresh database's ``004`` checksum and
+    inserting a matching row is enough to be waved through — which is
+    exactly what it was.
+    """
+
+    rows = [
+        row
+        for row in (lineage_rows(connection) or [])
+        if row["lineage"] == lineage.lineage
+    ]
+    if not rows:
+        return "no provenance row for this lineage"
+    if len(rows) > 1:
+        return "duplicate provenance rows for this lineage"
+    row = rows[0]
+    expected = {
+        "migration": lineage.migration,
+        "historical_checksum": lineage.checksum,
+        "schema_fingerprint": lineage.schema_fingerprint,
+        "convergence": lineage.convergence,
+    }
+    for field_name, want in expected.items():
+        if row[field_name] != want:
+            return f"provenance {field_name} is not this lineage's"
+
+    applied = ledger_rows(connection)
+    if applied is None:
+        return "provenance without a migration ledger"
+    if applied.get(lineage.migration) != lineage.checksum:
+        return "the ledger does not record this lineage's historical checksum"
+    if applied.get(lineage.convergence) != lineage.convergence_checksum:
+        # The one row a converged database has and a tampered fresh one
+        # does not: the convergence migration actually ran.
+        return "the ledger does not record the convergence that ran"
+
+    tables = _objects(connection, "table")
+    triggers = _objects(connection, "trigger")
+    if set(lineage.converged_tables) - tables:
+        return "the convergence's effects are not present in this schema"
+    if set(lineage.fingerprint_triggers) & triggers:
+        return "this schema still carries the historical lineage's triggers"
+    return None
+
+
+def recorded(connection: sqlite3.Connection) -> dict[str, HistoricalLineage]:
+    """Lineages whose provenance this database can actually stand behind.
+
+    After convergence the schema no longer looks like the historical one —
+    that was the point — so this is what keeps the ledger's historical
+    checksum explicable on every later ``migrate()``.  Each row is
+    re-verified against the live database; an unverifiable one is simply
+    not returned, and the ordinary checksum rule then refuses the database.
+    """
+
+    if lineage_rows(connection) is None:
         return {}
     found: dict[str, HistoricalLineage] = {}
-    for row in connection.execute(
-        f"SELECT lineage, migration, historical_checksum FROM {LINEAGE_TABLE}"
-    ):
-        lineage = KNOWN_HISTORICAL_MIGRATIONS.get((str(row[1]), str(row[2])))
-        if lineage is not None and lineage.lineage == str(row[0]):
+    for lineage in KNOWN_HISTORICAL_MIGRATIONS.values():
+        if converged_mismatch(connection, lineage) is None:
             found[lineage.migration] = lineage
     return found
 
@@ -332,11 +489,16 @@ __all__ = [
     "LINEAGE_DDL",
     "LINEAGE_TABLE",
     "REMOTE_V4_LINEAGE",
+    "METADATA_TABLES",
+    "claimed",
+    "converged_mismatch",
     "convergence_migrations",
+    "ledger_rows",
+    "lineage_rows",
     "load_convergence",
-    "matches",
+    "mismatch",
     "recognize",
     "record",
     "recorded",
-    "schema_fingerprint",
+    "structural_fingerprint",
 ]
