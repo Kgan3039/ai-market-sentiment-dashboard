@@ -71,7 +71,8 @@ enumerates them so a fourth cannot appear unnoticed.
 records each applied file by name and SHA-256. Editing an already-applied
 migration is refused — add a new file instead. Each migration runs inside
 one `BEGIN IMMEDIATE` that also advances `user_version`, so a failure
-leaves the schema, the ledger, and `user_version` untouched.
+leaves the schema, the ledger, and `user_version` untouched. The one
+documented exception is a *registered historical lineage*; see below.
 
 **The database enforces the contracts, not just the API.** Direct SQL
 cannot store an unsupported ticker, cite a raw item that is not in one of
@@ -288,6 +289,65 @@ interpolated, and no method accepts SQL.
 story change (a story added, removed, or re-membered) drops the day's
 theme set in the same transaction, because a theme whose membership no
 longer exists is not a theme that can be replayed.
+
+## Historical lineages
+
+Checksum immutability answers "was this file edited after it ran". It has
+nothing to say about a **fork**: two branches wrote a different
+`004_supported_ticker_universe.sql`, both were applied to real databases,
+and the approved implementation supersedes the other. A database on the
+superseded branch is not corrupt and its checksum is not wrong — it is
+evidence of a different, known transition.
+
+So the exception is a closed registry (`phase0/lineages.py`), not a
+policy. One entry today:
+
+| | |
+|---|---|
+| lineage | `remote-v4-supported-ticker-universe` |
+| migration | `004_supported_ticker_universe.sql` |
+| historical checksum | `fd4d208833984199a0a4307b82a8693767349c89e039ec1ec4d93eada78b9eab` |
+| schema fingerprint | `8c4b16cb453668d3383263eafedadf4ff1c011857e39bdf289a3ee7044587b31` |
+| convergence | `migrations/compat/004_remote_v4_convergence.sql` |
+
+**What made it incompatible.** That `004` enforced the ticker universe
+with literal `IN`-lists and twelve `enforce_*` triggers, and never created
+`supported_tickers`. The approved `004` creates that table and drives
+every trigger from it; approved `008` and `009` read it. So the approved
+chain could not run on such a database at all — and, worse, the ledger
+backfill used to write the *approved* checksum onto it, silently claiming
+a migration had run that never had.
+
+**What qualifies.** All of it, or none: `user_version` is 4; the
+`001`–`003` ledger rows match the approved checksums exactly; the `004`
+row is absent (that lineage predates the ledger) or holds exactly the
+historical checksum; `supported_tickers` does not exist; the approved
+`trg_*` v4 triggers do not exist; and a SHA-256 over the stored SQL of all
+twelve `enforce_*` triggers equals the pinned fingerprint. A database that
+merely claims version 4 does not qualify, and neither does the right
+checksum with the wrong schema, or the right schema with the wrong
+checksum.
+
+**What happens then.** A convergence migration is spliced into the
+schedule at version 4 — before `005`, because that is where the
+divergence is. It drops the remote lineage's triggers and performs the
+approved v4 transition, producing exactly an approved v4 schema; a test
+asserts that equality against a real approved v4 database rather than
+trusting the file. Migrations `005`–`011` then run normally, and the
+result is schema-identical to a fresh database.
+
+**What the record says.** The ledger goes on reporting the *historical*
+checksum for `004`, because that is what ran; nothing is rewritten,
+deleted, or reset. The convergence gets its own ledger row under its own
+name and pinned checksum. Provenance lands in `schema_lineage`, readable
+via `repository.schema_lineages()`, in the same transaction as the
+convergence — so a rollback takes both and no database ever claims to have
+converged when it has not. That table is created for *every* database, so
+a converged one stays schema-identical to a fresh one; it just has a row.
+
+Everything else still fails exactly as before: an unregistered variant, an
+edited approved migration, a forged provenance row paired with a third
+checksum, and a tampered convergence file are all refused.
 
 ## Recovery
 

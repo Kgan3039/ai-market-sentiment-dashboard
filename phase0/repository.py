@@ -74,7 +74,12 @@ from .scalars import (
     sanitize_diagnostic_scalar,
     validate_safe_identifier_scalar,
 )
-from .schema import apply_migrations, load_migrations, split_statements
+from .schema import (
+    LINEAGE_TABLE,
+    apply_migrations,
+    load_migrations,
+    split_statements,
+)
 from .tickers import SUPPORTED_TICKERS, TICKER_UNIVERSE, normalize_ticker
 
 
@@ -234,6 +239,7 @@ COUNTABLE_TABLES = frozenset(
         "raw_items",
         "run_log",
         "run_log_stage_keys",
+        "schema_lineage",
         "schema_migrations",
         "source_state",
         "stories",
@@ -1247,6 +1253,24 @@ class Phase0Repository:
                 for row in connection.execute(
                     "SELECT name, version, checksum, applied_at "
                     "FROM schema_migrations ORDER BY version, name"
+                )
+            ]
+
+    def schema_lineages(self) -> list[dict[str, Any]]:
+        """Historical lineages this database was recognized as, if any.
+
+        Empty for a database built on the approved migrations, which is
+        every fresh one.  A row here says this database arrived from a
+        known historical fork and names it — the ledger still records the
+        *historical* checksum for the migration that actually ran, so the
+        two together tell the whole story without either one lying.
+        """
+
+        with self._connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    f"SELECT * FROM {LINEAGE_TABLE} ORDER BY lineage"
                 )
             ]
 

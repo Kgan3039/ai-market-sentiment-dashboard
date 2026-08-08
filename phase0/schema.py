@@ -23,7 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
+from . import lineages
 from .errors import Phase0MigrationError
+from .lineages import HistoricalLineage
 
 
 LEDGER_TABLE = "schema_migrations"
@@ -118,6 +120,7 @@ def _backfill_ledger(
     connection: sqlite3.Connection,
     migrations: Sequence[Migration],
     user_version: int,
+    lineage: HistoricalLineage | None,
 ) -> None:
     """Record migrations a pre-ledger database already carries.
 
@@ -129,6 +132,12 @@ def _backfill_ledger(
     migration may share a version number with one already applied (numbers
     collide across stacked branches), and inferring "applied" from the
     number would skip it forever without ever executing it.
+
+    When the database is on a recognized historical ``lineage``, that
+    lineage's file is backfilled with *its* checksum, not the local file's.
+    Writing the local checksum would be the worst thing here: it is a
+    silent claim that the approved migration ran, on a database where a
+    different one did.
     """
 
     applied = _applied_migrations(connection)
@@ -142,10 +151,13 @@ def _backfill_ledger(
     connection.execute("BEGIN IMMEDIATE")
     try:
         for migration in pending:
+            checksum = migration.checksum
+            if lineage is not None and migration.name == lineage.migration:
+                checksum = lineage.checksum
             connection.execute(
                 f"INSERT INTO {LEDGER_TABLE} (name, version, checksum, applied_at) "
                 "VALUES (?, ?, ?, ?)",
-                (migration.name, migration.version, migration.checksum, _utc_now()),
+                (migration.name, migration.version, checksum, _utc_now()),
             )
         connection.commit()
     except Exception:
@@ -154,10 +166,25 @@ def _backfill_ledger(
 
 
 def _verify_history(
-    connection: sqlite3.Connection, migrations: Sequence[Migration]
+    connection: sqlite3.Connection,
+    migrations: Sequence[Migration],
+    lineage: HistoricalLineage | None,
 ) -> None:
+    """Every applied migration must be one this code knows, unchanged.
+
+    The single exception is a checksum that a registered historical
+    lineage pins *and* that this database has proved it is on — either by
+    still carrying that lineage's schema, or by having converged and
+    recorded the provenance.  Any other mismatch is refused exactly as
+    before: an unknown variant is not a lineage, it is a modified file.
+    """
+
     applied = _applied_migrations(connection)
     known = {migration.name: migration.checksum for migration in migrations}
+    known.update(lineages.convergence_migrations())
+    excused = dict(lineages.recorded(connection))
+    if lineage is not None:
+        excused[lineage.migration] = lineage
     for name, checksum in sorted(applied.items()):
         expected = known.get(name)
         if expected is None:
@@ -165,11 +192,15 @@ def _verify_history(
                 f"database has applied unknown migration {name}; "
                 "this database is newer than this code"
             )
-        if expected != checksum:
-            raise Phase0MigrationError(
-                f"migration {name} was modified after it was applied; "
-                "add a new additive migration instead of rewriting history"
-            )
+        if expected == checksum:
+            continue
+        historical = excused.get(name)
+        if historical is not None and historical.checksum == checksum:
+            continue
+        raise Phase0MigrationError(
+            f"migration {name} was modified after it was applied; "
+            "add a new additive migration instead of rewriting history"
+        )
 
 
 def apply_migrations(
@@ -181,14 +212,20 @@ def apply_migrations(
     """Apply every unapplied migration atomically; return their names."""
 
     connection.execute(_LEDGER_DDL)
+    connection.execute(lineages.LINEAGE_DDL)
     connection.commit()
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    _backfill_ledger(connection, migrations, user_version)
-    _verify_history(connection, migrations)
+    # Recognition happens before the backfill, because the backfill is what
+    # would otherwise write the approved checksum over a history that
+    # belongs to a different lineage.
+    lineage = lineages.recognize(connection, _applied_migrations(connection))
+    _backfill_ledger(connection, migrations, user_version, lineage)
+    _verify_history(connection, migrations, lineage)
 
+    schedule = _schedule(connection, migrations, lineage)
     applied = set(_applied_migrations(connection))
     newly_applied: list[str] = []
-    for migration in migrations:
+    for migration, converges in schedule:
         if migration.name in applied:
             continue
         statements = list(split_statements(migration.sql))
@@ -207,6 +244,11 @@ def apply_migrations(
                 "VALUES (?, ?, ?, ?)",
                 (migration.name, migration.version, migration.checksum, _utc_now()),
             )
+            if converges is not None:
+                # Provenance lands in the same transaction as the
+                # convergence itself: a rollback takes both, so a database
+                # never claims to have converged when it has not.
+                lineages.record(connection, converges, _utc_now())
             target = max(user_version, migration.version)
             connection.execute(f"PRAGMA user_version = {int(target)}")
             connection.commit()
@@ -218,12 +260,46 @@ def apply_migrations(
     return newly_applied
 
 
+def _schedule(
+    connection: sqlite3.Connection,
+    migrations: Sequence[Migration],
+    lineage: HistoricalLineage | None,
+) -> list[tuple[Migration, HistoricalLineage | None]]:
+    """The migrations to run, with any convergence spliced in.
+
+    A convergence migration carries its lineage's version, so it lands
+    immediately after the historical file it converges and *before* the
+    approved migrations that assume the approved schema.  Putting it at the
+    end would not work: the approved 008 and 009 read ``supported_tickers``,
+    which is precisely what the remote lineage never created.
+    """
+
+    schedule: list[tuple[Migration, HistoricalLineage | None]] = [
+        (migration, None) for migration in migrations
+    ]
+    if lineage is None or lineage.migration in lineages.recorded(connection):
+        return schedule
+    sql = lineages.load_convergence(lineage)
+    convergence = Migration(
+        name=lineage.convergence,
+        version=lineage.user_version,
+        sql=sql,
+        checksum=lineage.convergence_checksum,
+    )
+    schedule.append((convergence, lineage))
+    schedule.sort(key=lambda entry: (entry[0].version, entry[0].name))
+    return schedule
+
+
 __all__ = [
     "LEDGER_TABLE",
     "LEGACY_SCHEMA_VERSION",
     "LEGACY_UPGRADE_MIGRATION",
+    "LINEAGE_TABLE",
     "Migration",
     "apply_migrations",
     "load_migrations",
     "split_statements",
 ]
+
+LINEAGE_TABLE = lineages.LINEAGE_TABLE
