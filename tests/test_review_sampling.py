@@ -193,12 +193,16 @@ class SampleSummarySentencesTests(unittest.TestCase):
 class SentenceCsvTests(unittest.TestCase):
     def test_write_and_read_round_trip(self) -> None:
         _, theme_sets = load_theme_sets()
-        sample = sample_summary_sentences(theme_sets, client=FakeGeminiClient(), days=1, seed="csv-test")
+        # days=3 (all committed days) guarantees at least one themed day
+        # (NVDA/TSLA) is included; a day below M5's 4-story clustering floor
+        # (AAPL) legitimately produces zero themes and thus zero sentences.
+        sample = sample_summary_sentences(theme_sets, client=FakeGeminiClient(), days=3, seed="csv-test")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "summaries.csv"
             write_sentence_csv(sample, path)
             rows = read_csv_rows(path)
             self.assertEqual(len(rows), len(sample.rows))
+            self.assertGreater(len(rows), 0)
             self.assertEqual(
                 set(rows[0].keys()),
                 {
@@ -329,11 +333,14 @@ class ScoreAssignmentsTests(unittest.TestCase):
 class ScoreSummariesTests(unittest.TestCase):
     def test_faithfulness_rate_and_threshold(self) -> None:
         _, theme_sets = load_theme_sets()
-        sample = sample_summary_sentences(theme_sets, client=FakeGeminiClient(), days=1, seed="summary-score")
+        # days=3 guarantees a themed day is included regardless of seed; a
+        # day below M5's clustering floor (AAPL) has zero themes to sample.
+        sample = sample_summary_sentences(theme_sets, client=FakeGeminiClient(), days=3, seed="summary-score")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sentences.csv"
             write_sentence_csv(sample, path)
             row_ids = [row.row_id for row in sample.rows]
+            self.assertGreater(len(row_ids), 1)
             verdicts = {row_id: "supported" for row_id in row_ids}
             if len(row_ids) > 1:
                 verdicts[row_ids[-1]] = "not_supported"
