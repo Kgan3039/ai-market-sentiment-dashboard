@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import "./App.css";
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+import { API_BASE } from "./api";
 
 function formatTickerLabel(ticker) {
   return ticker.company_name ? `${ticker.ticker} — ${ticker.company_name}` : ticker.ticker;
@@ -197,7 +196,7 @@ export default function App() {
         <p className="stale-banner">Data may be delayed. Last successful update: {formatTime(dataAsOf)}.</p>
       ) : null}
 
-      <nav className="ticker-tabs" aria-label="Ticker narratives">
+      <nav className="ticker-tabs" aria-label="Ticker Narratives">
         {tickers.map((ticker) => (
           <button
             key={ticker.ticker}

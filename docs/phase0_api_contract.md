@@ -60,6 +60,21 @@ interface.
 - Map the newest `run_log` entry for each stage to `/meta/status` and compute
   the stale flag using the approved market-hours rule.
 
+### Live-data readiness gate
+
+Do not switch the default API source from fixtures merely because the SQLite
+repository is present. The switch requires all of the following:
+
+- The I1 repository and I2–I4 pipeline stack are merged into `main`.
+- The pipeline registers downstream deduplication, clustering, and
+  summarization stages and writes `ready` or `degraded` themes. Fetch-only
+  `raw_items` cannot satisfy this API contract.
+- A `SQLiteNarrativeRepository` resolves each cited sentence to a returned
+  member story, maps `ready`/`degraded` persistence states to the API's
+  `degraded` flag, and excludes incomplete or failed themes.
+- Temporary-SQLite contract tests cover `/tickers`, `/themes`, and
+  `/meta/status` with real persisted rows before the source selection changes.
+
 Do not change these response names during the handoff. Add live-data adapter
 tests using a temporary SQLite database before switching the default source
 from fixtures.
