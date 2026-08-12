@@ -123,6 +123,85 @@ RAW_ITEM_ASSOCIATION_TABLE = "raw_item_tickers"
 DEFAULT_CANDIDATE_REASON = "relevance_match"
 
 # ----------------------------------------------------------------------
+# What reconciliation owns.
+#
+# Story and theme reconciliation decide "unchanged" by comparing what is
+# stored against what a settlement would write.  That comparison is only
+# as honest as its column list, so the list lives here, next to the
+# statements built from it, and the contract tests assert that every
+# column of ``stories``/``themes`` is either on it or deliberately
+# exempt.  A column added to the table and written by reconciliation but
+# missed here would make a real change look like a replay.
+# ----------------------------------------------------------------------
+
+#: ``stories`` columns one reconciliation owns; see
+#: :meth:`Phase0Repository._story_column_values` for what is excluded and
+#: why.  Sorted, because the order is a comparison key, not a schema.
+STORY_RECONCILED_COLUMNS: tuple[str, ...] = (
+    "algorithm_version",
+    "canonical_title",
+    "canonical_url",
+    "config_fingerprint",
+    "content_hash",
+    "embedding",
+    "embedding_dimension",
+    "member_ids",
+    "member_story_keys",
+    "model_name",
+    "model_revision",
+    "outlet",
+    "outlet_count",
+    "published_at",
+    "quarantined",
+    "semantic_skip_reason",
+    "source",
+    "stage",
+)
+
+#: ``themes`` columns one reconciliation owns; see
+#: :meth:`Phase0Repository._theme_column_values`.
+THEME_RECONCILED_COLUMNS: tuple[str, ...] = (
+    "algorithm_version",
+    "centroid",
+    "citations",
+    "cohesion",
+    "config_fingerprint",
+    "content_hash",
+    "embedding_dimension",
+    "label",
+    "label_source",
+    "latest_published_at",
+    "matched_previous_key",
+    "method",
+    "min_pairwise_cohesion",
+    "model_name",
+    "model_revision",
+    "outlet_count",
+    "salience",
+    "salience_outlet_component",
+    "salience_rank",
+    "salience_recency_component",
+    "salience_story_component",
+    "status",
+    "story_count",
+    "summary",
+    "theme_key",
+)
+
+#: Columns whose stored value is compared as an ``int``.  SQLite returns
+#: the right type for a declared INTEGER column, but a comparison that
+#: silently depends on that is a comparison waiting to go wrong.
+_INTEGER_RECONCILED_COLUMNS = frozenset(
+    {
+        "embedding_dimension",
+        "outlet_count",
+        "quarantined",
+        "salience_rank",
+        "story_count",
+    }
+)
+
+# ----------------------------------------------------------------------
 # What a public read connection is allowed to do.
 #
 # ``mode=ro`` already refuses to write the file it opened.  It does not
@@ -2266,26 +2345,118 @@ class Phase0Repository:
         }
 
     @staticmethod
-    def _story_signature(values: Mapping[str, Any]) -> tuple[Any, ...]:
+    def _story_column_values(values: Mapping[str, Any]) -> dict[str, Any]:
+        """The exact ``stories`` columns one reconciliation owns and writes.
+
+        This mapping is the single definition of "what a settlement puts
+        in the row": :meth:`_insert_reconciled_story` and
+        :meth:`_update_reconciled_story` both build their statement from
+        it, and :meth:`_story_signature` compares it.  A column therefore
+        cannot be persisted by a settlement and left out of the comparison
+        that decides whether a settlement is needed — which is precisely
+        how a stale embedding survived an otherwise-identical replay.
+
+        Absent on purpose: the partition identity (``ticker``,
+        ``trading_day``, ``pipeline_version``, ``cluster_fingerprint``),
+        which is what pairs an incoming story with a stored one rather
+        than something to compare; ``updated_at`` and ``invalidated_at``,
+        which are bookkeeping this class sets itself; and
+        ``canonical_item_id``, which the canonical-member trigger requires
+        to be written *after* membership exists.  The last two are still
+        part of the equality contract — see :meth:`_story_signature`.
+        """
+
+        return {
+            "canonical_title": values["canonical_title"],
+            "embedding": values["embedding"],
+            "outlet_count": values["outlet_count"],
+            "member_ids": json.dumps(values["member_ids"], separators=(",", ":")),
+            "stage": values["stage"],
+            "canonical_url": values["canonical_url"],
+            "source": values["source"],
+            "outlet": values["outlet"],
+            "published_at": values["published_at"],
+            "content_hash": values["content_hash"],
+            "algorithm_version": values["algorithm_version"],
+            "config_fingerprint": values["config_fingerprint"],
+            "model_name": values["model_name"],
+            "model_revision": values["model_revision"],
+            "embedding_dimension": values["embedding_dimension"],
+            "quarantined": values["quarantined"],
+            "semantic_skip_reason": values["semantic_skip_reason"],
+            "member_story_keys": values["member_story_keys"],
+        }
+
+    @classmethod
+    def _story_signature(cls, values: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Everything about a story that one reconciliation persists.
+
+        Equality here means one thing exactly: *a settlement would write
+        what is already stored*.  So it covers every owned column, the
+        canonical member, whether the row is live, and the full payload of
+        every child relation this path owns — not merely the child
+        identities.  A replay that changes only an embedding, only a
+        provider conflict's fields, only a merge's similarity, or only a
+        member's outlet is a change, and has to take the update path.
+
+        Ordering is canonical on both sides (members by raw item,
+        conflicts by provider identity, merges by story-key pair), so two
+        semantically identical results compare equal however the caller
+        happened to order them.
+        """
+
+        columns = cls._story_column_values(values)
         return (
-            values["canonical_title"],
-            values["outlet_count"],
-            values["published_at"],
-            values["canonical_url"],
-            values["source"],
-            values["outlet"],
-            values["content_hash"],
-            values["algorithm_version"],
-            values["config_fingerprint"],
-            values["stage"],
-            values["model_name"],
-            values["model_revision"],
-            values["embedding_dimension"],
-            values["quarantined"],
-            values["semantic_skip_reason"],
-            values["member_story_keys"],
+            tuple(columns[column] for column in STORY_RECONCILED_COLUMNS),
             values["canonical_item_id"],
-            tuple(values["member_ids"]),
+            # A reconciled story is live by definition: the update path
+            # clears ``invalidated_at``.  A story that was invalidated and
+            # comes back unchanged is therefore *not* unchanged.
+            True,
+            tuple(
+                (
+                    member["raw_item_id"],
+                    member["position"],
+                    member["outlet"],
+                    member["url"],
+                    member["canonical_url"],
+                    member["match_reason"],
+                    member["quarantined"],
+                )
+                for member in sorted(
+                    values["members"], key=lambda member: member["raw_item_id"]
+                )
+            ),
+            tuple(
+                (
+                    conflict["provider_namespace"],
+                    conflict["provider_item_id"],
+                    conflict["item_ids"],
+                    conflict["fields"],
+                )
+                for conflict in sorted(
+                    values["provider_conflicts"],
+                    key=lambda conflict: (
+                        conflict["provider_namespace"],
+                        conflict["provider_item_id"],
+                    ),
+                )
+            ),
+            tuple(
+                (
+                    merge["left_story_key"],
+                    merge["right_story_key"],
+                    merge["similarity"],
+                    merge["reason"],
+                )
+                for merge in sorted(
+                    values["semantic_merges"],
+                    key=lambda merge: (
+                        merge["left_story_key"],
+                        merge["right_story_key"],
+                    ),
+                )
+            ),
         )
 
     def reconcile_stories(
@@ -2501,9 +2672,7 @@ class Phase0Repository:
                     structural.add(story_id)
                     continue
                 story_id = int(row["id"])
-                stored = self._stored_story_signature(
-                    row, existing_members[fingerprint]
-                )
+                stored = self._stored_story_signature(connection, row)
                 if stored == self._story_signature(values):
                     unchanged.append(story_id)
                     continue
@@ -2571,29 +2740,83 @@ class Phase0Repository:
             )
         ]
 
+    @staticmethod
+    def _stored_columns(row: sqlite3.Row, columns: Sequence[str]) -> tuple[Any, ...]:
+        """One stored row's owned columns, typed to compare with prepared."""
+
+        stored: list[Any] = []
+        for column in columns:
+            value = row[column]
+            if value is None:
+                stored.append(None)
+            elif column in _INTEGER_RECONCILED_COLUMNS:
+                stored.append(int(value))
+            elif isinstance(value, memoryview):
+                stored.append(bytes(value))
+            else:
+                stored.append(value)
+        return tuple(stored)
+
     @classmethod
     def _stored_story_signature(
-        cls, row: sqlite3.Row, member_ids: Sequence[int]
+        cls, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> tuple[Any, ...]:
+        """The stored counterpart of :meth:`_story_signature`, read whole.
+
+        The child relations are read back from the tables rather than from
+        the ``member_ids`` summary column, because the summary is exactly
+        the thing that stays true while the payload beneath it rots.
+        """
+
+        story_id = int(row["id"])
+        members = tuple(
+            (
+                int(member["raw_item_id"]),
+                int(member["position"]),
+                member["outlet"],
+                member["url"],
+                member["canonical_url"],
+                member["match_reason"],
+                int(member["quarantined"]),
+            )
+            for member in connection.execute(
+                "SELECT * FROM story_members WHERE story_id = ? ORDER BY raw_item_id",
+                (story_id,),
+            )
+        )
+        conflicts = tuple(
+            (
+                conflict["provider_namespace"],
+                conflict["provider_item_id"],
+                conflict["item_ids"],
+                conflict["fields"],
+            )
+            for conflict in connection.execute(
+                "SELECT * FROM story_provider_conflicts WHERE story_id = ? "
+                "ORDER BY provider_namespace, provider_item_id",
+                (story_id,),
+            )
+        )
+        merges = tuple(
+            (
+                merge["left_story_key"],
+                merge["right_story_key"],
+                float(merge["similarity"]),
+                merge["reason"],
+            )
+            for merge in connection.execute(
+                "SELECT * FROM story_semantic_merges WHERE story_id = ? "
+                "ORDER BY left_story_key, right_story_key",
+                (story_id,),
+            )
+        )
         return (
-            row["canonical_title"],
-            int(row["outlet_count"]),
-            row["published_at"],
-            row["canonical_url"],
-            row["source"],
-            row["outlet"],
-            row["content_hash"],
-            row["algorithm_version"],
-            row["config_fingerprint"],
-            row["stage"],
-            row["model_name"],
-            row["model_revision"],
-            row["embedding_dimension"],
-            int(row["quarantined"]),
-            row["semantic_skip_reason"],
-            row["member_story_keys"],
+            cls._stored_columns(row, STORY_RECONCILED_COLUMNS),
             None if row["canonical_item_id"] is None else int(row["canonical_item_id"]),
-            tuple(sorted(member_ids)),
+            row["invalidated_at"] is None,
+            members,
+            conflicts,
+            merges,
         )
 
     def _insert_reconciled_story(
@@ -2604,46 +2827,19 @@ class Phase0Repository:
         version: str,
         values: Mapping[str, Any],
     ) -> int:
-        now = utc_now()
+        columns = {
+            "ticker": ticker,
+            "trading_day": day,
+            "pipeline_version": version,
+            "cluster_fingerprint": values["cluster_fingerprint"],
+            **self._story_column_values(values),
+            "updated_at": utc_now(),
+        }
+        names = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
         cursor = connection.execute(
-            """
-            INSERT INTO stories (
-                ticker, trading_day, canonical_title, embedding, outlet_count,
-                member_ids, cluster_fingerprint, pipeline_version, stage,
-                canonical_url, source, outlet, published_at, content_hash,
-                algorithm_version, config_fingerprint, model_name,
-                model_revision, embedding_dimension, quarantined,
-                semantic_skip_reason, member_story_keys, updated_at
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?
-            )
-            """,
-            (
-                ticker,
-                day,
-                values["canonical_title"],
-                values["embedding"],
-                values["outlet_count"],
-                json.dumps(values["member_ids"], separators=(",", ":")),
-                values["cluster_fingerprint"],
-                version,
-                values["stage"],
-                values["canonical_url"],
-                values["source"],
-                values["outlet"],
-                values["published_at"],
-                values["content_hash"],
-                values["algorithm_version"],
-                values["config_fingerprint"],
-                values["model_name"],
-                values["model_revision"],
-                values["embedding_dimension"],
-                values["quarantined"],
-                values["semantic_skip_reason"],
-                values["member_story_keys"],
-                now,
-            ),
+            f"INSERT INTO stories ({names}) VALUES ({placeholders})",
+            tuple(columns.values()),
         )
         story_id = int(cursor.lastrowid)
         self._write_story_children(connection, story_id, values)
@@ -2668,40 +2864,12 @@ class Phase0Repository:
                 "DELETE FROM story_members WHERE story_id = ? AND raw_item_id = ?",
                 (story_id, raw_item_id),
             )
+        columns = self._story_column_values(values)
+        assignments = ", ".join(f"{column} = ?" for column in columns)
         connection.execute(
-            """
-            UPDATE stories SET
-                canonical_title = ?, embedding = ?, outlet_count = ?,
-                member_ids = ?, stage = ?, canonical_url = ?, source = ?,
-                outlet = ?, published_at = ?, content_hash = ?,
-                algorithm_version = ?, config_fingerprint = ?, model_name = ?,
-                model_revision = ?, embedding_dimension = ?, quarantined = ?,
-                semantic_skip_reason = ?, member_story_keys = ?,
-                invalidated_at = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                values["canonical_title"],
-                values["embedding"],
-                values["outlet_count"],
-                json.dumps(values["member_ids"], separators=(",", ":")),
-                values["stage"],
-                values["canonical_url"],
-                values["source"],
-                values["outlet"],
-                values["published_at"],
-                values["content_hash"],
-                values["algorithm_version"],
-                values["config_fingerprint"],
-                values["model_name"],
-                values["model_revision"],
-                values["embedding_dimension"],
-                values["quarantined"],
-                values["semantic_skip_reason"],
-                values["member_story_keys"],
-                utc_now(),
-                story_id,
-            ),
+            f"UPDATE stories SET {assignments}, invalidated_at = NULL, "
+            "updated_at = ? WHERE id = ?",
+            (*columns.values(), utc_now(), story_id),
         )
         connection.execute(
             "DELETE FROM story_provider_conflicts WHERE story_id = ?", (story_id,)
@@ -3465,36 +3633,79 @@ class Phase0Repository:
         return int(row["id"])
 
     @staticmethod
-    def _theme_signature(values: Mapping[str, Any]) -> tuple[Any, ...]:
+    def _theme_column_values(values: Mapping[str, Any]) -> dict[str, Any]:
+        """The exact ``themes`` columns one reconciliation owns and writes.
+
+        The theme counterpart of :meth:`_story_column_values`, with the
+        same rule: this mapping drives the insert, the update, *and* the
+        equality test, so a derived value cannot be written by a
+        settlement and then be invisible to the next one.  The centroid
+        and every salience component are derived outputs of the theme
+        stage — a run that recomputes them has produced a different
+        theme even when its label and membership are word-for-word the
+        same.
+
+        Absent on purpose: the partition identity (``ticker``,
+        ``trading_day``, ``pipeline_version``, ``fingerprint``) and
+        ``updated_at``.
+        """
+
+        return {
+            "label": values["label"],
+            "summary": values["summary"],
+            # Sorted, so the denormalized copy of a citation *set* is the
+            # same bytes whatever order the stage emitted it in.  Without
+            # that this column would make equality order-sensitive, and
+            # two identical theme sets would take the update path forever.
+            "citations": _serialize_json(
+                sorted(values["citation_ids"]), "citations", list
+            ),
+            "salience_rank": values["salience_rank"],
+            "status": values["status"],
+            "centroid": values["centroid"],
+            "content_hash": values["content_hash"],
+            "theme_key": values["theme_key"],
+            "label_source": values["label_source"],
+            "method": values["method"],
+            "salience": values["salience"],
+            "cohesion": values["cohesion"],
+            "min_pairwise_cohesion": values["min_pairwise_cohesion"],
+            "story_count": values["story_count"],
+            "outlet_count": values["outlet_count"],
+            "latest_published_at": values["latest_published_at"],
+            "salience_story_component": values["salience_story_component"],
+            "salience_outlet_component": values["salience_outlet_component"],
+            "salience_recency_component": values["salience_recency_component"],
+            "matched_previous_key": values["matched_previous_key"],
+            "algorithm_version": values["algorithm_version"],
+            "config_fingerprint": values["config_fingerprint"],
+            "model_name": values["model_name"],
+            "model_revision": values["model_revision"],
+            "embedding_dimension": values["embedding_dimension"],
+        }
+
+    @classmethod
+    def _theme_signature(cls, values: Mapping[str, Any]) -> tuple[Any, ...]:
+        """Everything about a theme that one reconciliation persists.
+
+        Every owned column plus both membership relations, canonically
+        ordered so equivalent inputs compare equal regardless of the order
+        the stage produced them in.
+        """
+
+        columns = cls._theme_column_values(values)
         return (
-            values["theme_key"],
-            values["label"],
-            values["label_source"],
-            values["summary"],
-            values["status"],
-            values["salience"],
-            values["salience_rank"],
-            values["cohesion"],
-            values["min_pairwise_cohesion"],
-            values["story_count"],
-            values["outlet_count"],
-            values["latest_published_at"],
-            values["matched_previous_key"],
-            values["method"],
-            values["content_hash"],
-            values["algorithm_version"],
-            values["config_fingerprint"],
-            values["model_name"],
-            values["model_revision"],
-            values["embedding_dimension"],
+            tuple(columns[column] for column in THEME_RECONCILED_COLUMNS),
             tuple(sorted(values["story_ids"])),
             tuple(sorted(values["citation_ids"])),
         )
 
-    @staticmethod
+    @classmethod
     def _stored_theme_signature(
-        connection: sqlite3.Connection, row: sqlite3.Row
+        cls, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> tuple[Any, ...]:
+        """The stored counterpart of :meth:`_theme_signature`."""
+
         theme_id = int(row["id"])
         story_ids = tuple(
             sorted(
@@ -3515,26 +3726,7 @@ class Phase0Repository:
             )
         )
         return (
-            row["theme_key"],
-            row["label"],
-            row["label_source"],
-            row["summary"],
-            row["status"],
-            row["salience"],
-            int(row["salience_rank"]),
-            row["cohesion"],
-            row["min_pairwise_cohesion"],
-            row["story_count"],
-            row["outlet_count"],
-            row["latest_published_at"],
-            row["matched_previous_key"],
-            row["method"],
-            row["content_hash"],
-            row["algorithm_version"],
-            row["config_fingerprint"],
-            row["model_name"],
-            row["model_revision"],
-            row["embedding_dimension"],
+            cls._stored_columns(row, THEME_RECONCILED_COLUMNS),
             story_ids,
             citation_ids,
         )
@@ -3547,54 +3739,19 @@ class Phase0Repository:
         version: str,
         values: Mapping[str, Any],
     ) -> int:
+        columns = {
+            "ticker": ticker,
+            "trading_day": day,
+            "pipeline_version": version,
+            "fingerprint": values["fingerprint"],
+            **self._theme_column_values(values),
+            "updated_at": utc_now(),
+        }
+        names = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
         cursor = connection.execute(
-            """
-            INSERT INTO themes (
-                ticker, trading_day, label, summary, citations, salience_rank,
-                status, centroid, content_hash, pipeline_version, theme_key,
-                fingerprint, label_source, method, salience, cohesion,
-                min_pairwise_cohesion, story_count, outlet_count,
-                latest_published_at, salience_story_component,
-                salience_outlet_component, salience_recency_component,
-                matched_previous_key, algorithm_version, config_fingerprint,
-                model_name, model_revision, embedding_dimension, updated_at
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            )
-            """,
-            (
-                ticker,
-                day,
-                values["label"],
-                values["summary"],
-                _serialize_json(values["citation_ids"], "citations", list),
-                values["salience_rank"],
-                values["status"],
-                values["centroid"],
-                values["content_hash"],
-                version,
-                values["theme_key"],
-                values["fingerprint"],
-                values["label_source"],
-                values["method"],
-                values["salience"],
-                values["cohesion"],
-                values["min_pairwise_cohesion"],
-                values["story_count"],
-                values["outlet_count"],
-                values["latest_published_at"],
-                values["salience_story_component"],
-                values["salience_outlet_component"],
-                values["salience_recency_component"],
-                values["matched_previous_key"],
-                values["algorithm_version"],
-                values["config_fingerprint"],
-                values["model_name"],
-                values["model_revision"],
-                values["embedding_dimension"],
-                utc_now(),
-            ),
+            f"INSERT INTO themes ({names}) VALUES ({placeholders})",
+            tuple(columns.values()),
         )
         theme_id = int(cursor.lastrowid)
         self._write_theme_membership(connection, theme_id, values)
@@ -3610,49 +3767,11 @@ class Phase0Repository:
             "DELETE FROM theme_citations WHERE theme_id = ?", (theme_id,)
         )
         connection.execute("DELETE FROM theme_stories WHERE theme_id = ?", (theme_id,))
+        columns = self._theme_column_values(values)
+        assignments = ", ".join(f"{column} = ?" for column in columns)
         connection.execute(
-            """
-            UPDATE themes SET
-                label = ?, summary = ?, citations = ?, salience_rank = ?,
-                status = ?, centroid = ?, content_hash = ?, theme_key = ?,
-                label_source = ?, method = ?, salience = ?, cohesion = ?,
-                min_pairwise_cohesion = ?, story_count = ?, outlet_count = ?,
-                latest_published_at = ?, salience_story_component = ?,
-                salience_outlet_component = ?, salience_recency_component = ?,
-                matched_previous_key = ?, algorithm_version = ?,
-                config_fingerprint = ?, model_name = ?, model_revision = ?,
-                embedding_dimension = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                values["label"],
-                values["summary"],
-                _serialize_json(values["citation_ids"], "citations", list),
-                values["salience_rank"],
-                values["status"],
-                values["centroid"],
-                values["content_hash"],
-                values["theme_key"],
-                values["label_source"],
-                values["method"],
-                values["salience"],
-                values["cohesion"],
-                values["min_pairwise_cohesion"],
-                values["story_count"],
-                values["outlet_count"],
-                values["latest_published_at"],
-                values["salience_story_component"],
-                values["salience_outlet_component"],
-                values["salience_recency_component"],
-                values["matched_previous_key"],
-                values["algorithm_version"],
-                values["config_fingerprint"],
-                values["model_name"],
-                values["model_revision"],
-                values["embedding_dimension"],
-                utc_now(),
-                theme_id,
-            ),
+            f"UPDATE themes SET {assignments}, updated_at = ? WHERE id = ?",
+            (*columns.values(), utc_now(), theme_id),
         )
         self._write_theme_membership(connection, theme_id, values)
 
@@ -4983,35 +5102,84 @@ class Phase0Repository:
             return len(prepared)
 
     @classmethod
+    def _resolve_embedding_source(
+        cls,
+        connection: sqlite3.Connection,
+        source_kind: str,
+        source_id: str,
+    ) -> list[sqlite3.Row]:
+        """Every row an embedding source identity names, per the schema.
+
+        ``embeddings.source_id`` is text, and migration 007's ownership
+        triggers say exactly which text is allowed to name a row: a raw
+        item by id, a story by id *or* cluster fingerprint, a theme by id
+        *or* fingerprint *or* theme key.  That is the durable contract, so
+        it is the contract resolved here — a partition check that only
+        understood integers rejected identities the database itself
+        accepts, and rejected them as "does not exist".
+
+        The comparisons mirror the triggers' ``CAST(id AS TEXT) = …``
+        exactly rather than relying on SQLite's integer affinity, so
+        ``'007'`` does not resolve to story 7 here and then be refused by
+        the trigger a moment later.
+
+        Every match is returned, not just the first: fingerprints and
+        theme keys are unique only *within* a ticker-day partition, so an
+        identity naming more than one row is genuinely ambiguous and the
+        caller fails closed on it.
+        """
+
+        queries = {
+            "raw_item": (
+                "SELECT id, ticker, "
+                "substr(COALESCE(published_at, fetched_at), 1, 10) AS day, "
+                "NULL AS pipeline_version FROM raw_items "
+                "WHERE CAST(id AS TEXT) = ?",
+                1,
+            ),
+            "story": (
+                "SELECT id, ticker, trading_day AS day, pipeline_version "
+                "FROM stories "
+                "WHERE CAST(id AS TEXT) = ? OR cluster_fingerprint = ?",
+                2,
+            ),
+            "theme": (
+                "SELECT id, ticker, trading_day AS day, pipeline_version "
+                "FROM themes "
+                "WHERE CAST(id AS TEXT) = ? OR fingerprint = ? OR theme_key = ?",
+                3,
+            ),
+        }
+        sql, arity = queries[source_kind]
+        return list(connection.execute(sql, (source_id,) * arity))
+
+    @classmethod
     def _assert_embedding_partition(
         cls,
         connection: sqlite3.Connection,
         prepared: Sequence[Mapping[str, Any]],
         run: StageRunContext,
     ) -> None:
-        queries = {
-            "raw_item": (
-                "SELECT ticker, substr(COALESCE(published_at, fetched_at), 1, 10) "
-                "AS day, NULL AS pipeline_version FROM raw_items WHERE id = ?"
-            ),
-            "story": (
-                "SELECT ticker, trading_day AS day, pipeline_version "
-                "FROM stories WHERE id = ?"
-            ),
-            "theme": (
-                "SELECT ticker, trading_day AS day, pipeline_version "
-                "FROM themes WHERE id = ?"
-            ),
-        }
         for position, values in enumerate(prepared):
-            row = connection.execute(
-                queries[values["source_kind"]], (values["source_id"],)
-            ).fetchone()
-            if row is None:
+            matches = cls._resolve_embedding_source(
+                connection, values["source_kind"], values["source_id"]
+            )
+            if not matches:
                 raise Phase0RunContextError(
                     f"persist_embeddings source {position} "
                     f"({values['source_kind']} {values['source_id']}) does not exist"
                 )
+            if len(matches) > 1:
+                # One identity, several rows it could mean.  The embedding
+                # is keyed globally by (source_kind, source_id), so there
+                # is no partition this vector could honestly belong to.
+                raise Phase0RunContextError(
+                    f"persist_embeddings source {position} "
+                    f"({values['source_kind']} {values['source_id']}) is ambiguous: "
+                    f"it names {values['source_kind']}s "
+                    f"{sorted(int(match['id']) for match in matches)}"
+                )
+            row = matches[0]
             if row["ticker"] is not None and run.ticker is not None:
                 if str(row["ticker"]) != run.ticker:
                     raise Phase0RunContextError(
@@ -5036,7 +5204,7 @@ class Phase0Repository:
                 # how it would silently become NVDA's.
                 cls._assert_raw_item_association(
                     connection,
-                    int(values["source_id"]),
+                    int(row["id"]),
                     run.ticker,
                     operation="persist_embeddings",
                 )
@@ -5194,6 +5362,7 @@ __all__ = [
     "RUN_STATUSES",
     "SECRET_KEY_PATTERN",
     "SOURCE_STATE_STATUSES",
+    "STORY_RECONCILED_COLUMNS",
     "SUPPORTED_TICKERS",
     "STAGE_KEY_STATUSES",
     "SemanticMergeRecord",
@@ -5202,6 +5371,7 @@ __all__ = [
     "StageRunRecorder",
     "StoryMemberRecord",
     "StoryRecord",
+    "THEME_RECONCILED_COLUMNS",
     "THEME_STATUSES",
     "TICKER_UNIVERSE",
     "ThemeRecord",

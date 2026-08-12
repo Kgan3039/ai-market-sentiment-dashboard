@@ -208,6 +208,65 @@ unchanged.**
 `story_fingerprint`, and M5's `fingerprint` / `theme_key` are stored beside
 the durable row ids as change-detection handles, never instead of them.
 
+**A replay is "unchanged" only when a settlement would write exactly what
+is already stored.** Reconciliation reports each story and theme as
+inserted, updated, or unchanged, and `unchanged` skips the update path
+entirely — so an equality test that is narrower than the write is not a
+performance detail, it is a way to persist stale derived state forever.
+Nothing downstream notices, because nothing downstream looks.
+
+The contract is therefore stated once, as the columns each path owns:
+
+* **Stories** — every column in `STORY_RECONCILED_COLUMNS` (which
+  includes the `embedding` blob), plus `canonical_item_id`, plus whether
+  the row is live (`invalidated_at IS NULL`, which the update path
+  clears), plus the *full payload* of all three child relations:
+  `story_members` down to each member's position, outlet, url,
+  canonical url, match reason, and quarantine flag; every
+  `story_provider_conflicts` row including its `item_ids` and `fields`;
+  every `story_semantic_merges` row including its similarity and reason.
+  Child *identities* are not enough — a conflict whose fields changed is
+  a changed story.
+* **Themes** — every column in `THEME_RECONCILED_COLUMNS`, which includes
+  the `centroid` blob and all three salience components. These are
+  derived outputs of the theme stage: a rerun that recomputes them has
+  produced a different theme even when its label and membership are
+  word-for-word identical. Plus both membership relations.
+
+Everything else on those tables is named as not-owned and checked against
+the table itself by
+`test_every_story_column_is_owned_or_deliberately_exempt` and its theme
+twin: the partition identity (which is what *pairs* an incoming row with
+a stored one, not something to compare), the row id, and `updated_at`.
+
+Two properties hold this in place rather than good intentions. First, the
+same column mapping builds the INSERT, the UPDATE, and the comparison, so
+a column cannot be written by a settlement and be invisible to the next
+one. Second, equality is canonical on both sides — members by raw item,
+conflicts by provider identity, merges by story-key pair, memberships and
+the denormalized `themes.citations` list sorted — so equivalent inputs
+compare equal however the stage happened to order them.
+
+**An embedding source identity means what the schema says it means.**
+Migration 007's ownership triggers are the durable contract: a raw item
+is named by `id`; a story by `id` *or* `cluster_fingerprint`; a theme by
+`id` *or* `fingerprint` *or* `theme_key`. The logged `persist_embeddings`
+partition check resolves exactly that set — no fewer, since rejecting a
+legal fingerprint as "does not exist" would make the only entrypoint a
+pipeline stage may use strictly less capable than the contract it
+implements, and no more, since the comparisons mirror the triggers'
+`CAST(id AS TEXT) = …` rather than leaning on SQLite's integer affinity
+(`'01'` does not become story 1 here and then get refused by the trigger
+a moment later).
+
+Widening *identity* widened nothing else. The resolved row still has to
+be in the run's ticker, day, and pipeline version; a raw-item source
+still needs its explicit ticker association. And because fingerprints and
+theme keys are unique only *within* a ticker-day while `embeddings` keys
+globally on `(source_kind, source_id)`, an identity that resolves to more
+than one row is ambiguous rather than resolvable: there is no partition
+that vector could honestly belong to, so the batch is refused.
+
 ## The boundaries downstream stages use
 
 ```python

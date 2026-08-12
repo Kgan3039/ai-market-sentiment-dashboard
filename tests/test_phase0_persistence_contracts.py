@@ -60,6 +60,8 @@ from phase0.redaction import redact_secrets, redact_text
 from phase0.repository import (
     DEFAULT_CANDIDATE_REASON,
     MIGRATIONS_PATH,
+    STORY_RECONCILED_COLUMNS,
+    THEME_RECONCILED_COLUMNS,
     Phase0Admin,
     Phase0Reader,
     Phase0Repository,
@@ -1425,6 +1427,386 @@ def test_structural_story_change_invalidates_the_days_themes(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# What "unchanged" has to mean
+#
+# A replay is unchanged only when a settlement would write exactly what is
+# already stored.  Anything less lets a real change be reported as a
+# no-op and leaves the earlier payload persisted for good, which is the
+# one failure mode replay cannot absorb: nothing later notices, because
+# nothing later looks.
+#
+# Every probe below changes exactly one persisted thing, replays, and
+# asserts both halves — the report says "updated", *and* the stored value
+# is the new one.
+# ----------------------------------------------------------------------
+
+
+def stored_story(repository: Phase0Repository, fingerprint: str = "cf1") -> dict:
+    with repository.admin.connect_writable() as connection:
+        row = connection.execute(
+            "SELECT * FROM stories WHERE cluster_fingerprint = ?", (fingerprint,)
+        ).fetchone()
+        story_id = int(row["id"])
+        return {
+            "row": dict(row),
+            "members": [
+                dict(member)
+                for member in connection.execute(
+                    "SELECT * FROM story_members WHERE story_id = ? "
+                    "ORDER BY raw_item_id",
+                    (story_id,),
+                )
+            ],
+            "conflicts": [
+                dict(conflict)
+                for conflict in connection.execute(
+                    "SELECT * FROM story_provider_conflicts WHERE story_id = ? "
+                    "ORDER BY provider_namespace, provider_item_id",
+                    (story_id,),
+                )
+            ],
+            "merges": [
+                dict(merge)
+                for merge in connection.execute(
+                    "SELECT * FROM story_semantic_merges WHERE story_id = ? "
+                    "ORDER BY left_story_key, right_story_key",
+                    (story_id,),
+                )
+            ],
+        }
+
+
+VECTOR_A = serialize_vector(np.ones(4, dtype=EMBEDDING_DTYPE))
+VECTOR_B = serialize_vector(np.full(4, 0.5, dtype=EMBEDDING_DTYPE))
+
+
+#: (label, first payload, replayed payload, what to read back afterwards).
+STORY_PAYLOAD_CHANGES = [
+    (
+        "embedding",
+        {"embedding": VECTOR_A},
+        {"embedding": VECTOR_B},
+        lambda stored: stored["row"]["embedding"],
+    ),
+    (
+        "embedding-appears",
+        {},
+        {"embedding": VECTOR_B},
+        lambda stored: stored["row"]["embedding"],
+    ),
+    (
+        "embedding-disappears",
+        {"embedding": VECTOR_A},
+        {},
+        lambda stored: stored["row"]["embedding"],
+    ),
+    (
+        "provider-conflict-fields",
+        {
+            "provider_conflicts": (
+                ProviderConflictRecord("yahoo", "dup-1", ("1",), ("title",)),
+            )
+        },
+        {
+            "provider_conflicts": (
+                ProviderConflictRecord("yahoo", "dup-1", ("1",), ("title", "url")),
+            )
+        },
+        lambda stored: [conflict["fields"] for conflict in stored["conflicts"]],
+    ),
+    (
+        "provider-conflict-item-ids",
+        {
+            "provider_conflicts": (
+                ProviderConflictRecord("yahoo", "dup-1", ("1",), ("title",)),
+            )
+        },
+        {
+            "provider_conflicts": (
+                ProviderConflictRecord("yahoo", "dup-1", ("1", "2"), ("title",)),
+            )
+        },
+        lambda stored: [conflict["item_ids"] for conflict in stored["conflicts"]],
+    ),
+    (
+        "provider-conflict-added",
+        {
+            "provider_conflicts": (
+                ProviderConflictRecord("yahoo", "dup-1", ("1",), ("title",)),
+            )
+        },
+        {
+            "provider_conflicts": (
+                ProviderConflictRecord("yahoo", "dup-1", ("1",), ("title",)),
+                ProviderConflictRecord("finnhub", "dup-2", ("3",), ("url",)),
+            )
+        },
+        lambda stored: len(stored["conflicts"]),
+    ),
+    (
+        "provider-conflict-removed",
+        {
+            "provider_conflicts": (
+                ProviderConflictRecord("yahoo", "dup-1", ("1",), ("title",)),
+            )
+        },
+        {},
+        lambda stored: len(stored["conflicts"]),
+    ),
+    (
+        "semantic-merge-similarity",
+        {"semantic_merges": (SemanticMergeRecord("m2-a", "m2-b", 0.91),)},
+        {"semantic_merges": (SemanticMergeRecord("m2-a", "m2-b", 0.42),)},
+        lambda stored: [merge["similarity"] for merge in stored["merges"]],
+    ),
+    (
+        "semantic-merge-reason",
+        {"semantic_merges": (SemanticMergeRecord("m2-a", "m2-b", 0.91, "near"),)},
+        {"semantic_merges": (SemanticMergeRecord("m2-a", "m2-b", 0.91, "far"),)},
+        lambda stored: [merge["reason"] for merge in stored["merges"]],
+    ),
+    (
+        "semantic-merge-removed",
+        {"semantic_merges": (SemanticMergeRecord("m2-a", "m2-b", 0.91),)},
+        {},
+        lambda stored: len(stored["merges"]),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label, before, after, read",
+    STORY_PAYLOAD_CHANGES,
+    ids=[case[0] for case in STORY_PAYLOAD_CHANGES],
+)
+def test_a_changed_story_payload_is_never_reported_unchanged(
+    tmp_path, label, before, after, read
+):
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+
+    def replay(overrides):
+        return reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[
+                story(
+                    "cf1", item_ids[:1], member_story_keys=("m2-a", "m2-b"), **overrides
+                )
+            ],
+        )
+
+    replay(before)
+    first = read(stored_story(repository))
+
+    report = replay(after)
+    second = read(stored_story(repository))
+
+    assert first != second, "the probe did not actually change anything"
+    assert report.counts["updated"] == 1
+    assert report.counts["unchanged"] == 0
+    # And the replayed payload is the one that is now stored, not merely
+    # "something changed": a partial update would satisfy the counts.
+    assert second == read(stored_story(repository))
+    assert replay(after).counts["unchanged"] == 1
+
+
+#: The story-member columns reconciliation owns, one at a time.
+STORY_MEMBER_CHANGES = [
+    ("position", 0, 5),
+    ("outlet", "Reuters", "Bloomberg"),
+    ("url", "https://example.com/a", "https://example.com/b"),
+    ("canonical_url", "https://example.com/a", "https://example.com/b"),
+    ("match_reason", "exact_url", "semantic"),
+    ("quarantined", False, True),
+]
+
+
+@pytest.mark.parametrize(
+    "field, before, after",
+    STORY_MEMBER_CHANGES,
+    ids=[case[0] for case in STORY_MEMBER_CHANGES],
+)
+def test_a_changed_member_payload_is_never_reported_unchanged(
+    tmp_path, field, before, after
+):
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+
+    def replay(value):
+        return reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[
+                StoryRecord(
+                    cluster_fingerprint="cf1",
+                    canonical_title="Story cf1",
+                    members=(
+                        StoryMemberRecord(raw_item_id=item_ids[0], **{field: value}),
+                    ),
+                    canonical_item_id=item_ids[0],
+                )
+            ],
+        )
+
+    replay(before)
+    report = replay(after)
+
+    member = stored_story(repository)["members"][0]
+    expected = int(after) if field in {"position", "quarantined"} else after
+    assert member[field] == expected
+    assert report.counts["updated"] == 1
+    assert report.counts["unchanged"] == 0
+
+
+def test_a_story_that_returns_unchanged_is_no_longer_invalidated(tmp_path):
+    """The same defect class, one field further on.
+
+    ``_update_reconciled_story`` clears ``invalidated_at``, so being live
+    is persisted state this path owns — and a story that dropped out, was
+    invalidated, and comes back byte-identical was being left flagged
+    because "identical" was decided without looking at the flag.
+    """
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    records = [story("cf1", item_ids[:1]), story("cf2", item_ids[1:])]
+
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=records,
+    )
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=records[1:],
+        delete_obsolete=False,
+    )
+    assert stored_story(repository)["row"]["invalidated_at"] is not None
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=records,
+    )
+
+    assert stored_story(repository)["row"]["invalidated_at"] is None
+    assert report.counts["updated"] == 1
+    assert report.counts["unchanged"] == 1
+
+
+def test_an_equivalent_story_replay_is_still_unchanged(tmp_path):
+    """Determinism, from the other side: reordering is not a change.
+
+    An equality contract that catches every difference is easy to reach by
+    catching differences that are not there.  Members, conflicts, and
+    merges are canonically ordered, so the same result presented in
+    another order must still be a no-op.
+    """
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 3)
+    conflicts = (
+        ProviderConflictRecord("yahoo", "dup-1", ("1", "2"), ("title",)),
+        ProviderConflictRecord("finnhub", "dup-2", ("3",), ("url",)),
+    )
+    merges = (
+        SemanticMergeRecord("m2-a", "m2-b", 0.91),
+        SemanticMergeRecord("m2-b", "m2-c", 0.72),
+    )
+    # Positions start at 1: ``_prepare_story`` treats a falsy position as
+    # "unset" and substitutes the caller's ordering, so a member at
+    # position 0 genuinely does change when the caller reorders.
+    members = tuple(
+        StoryMemberRecord(raw_item_id=item_id, position=position, outlet=f"O{item_id}")
+        for position, item_id in enumerate(item_ids, start=1)
+    )
+    base = {
+        "cluster_fingerprint": "cf1",
+        "canonical_title": "Story cf1",
+        "canonical_item_id": item_ids[0],
+        "outlet_count": 3,
+        "embedding": VECTOR_A,
+        "member_story_keys": ("m2-a", "m2-b", "m2-c"),
+    }
+
+    def replay(**overrides):
+        return reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[StoryRecord(**{**base, **overrides})],
+        )
+
+    replay(members=members, provider_conflicts=conflicts, semantic_merges=merges)
+    report = replay(
+        # Members keep their positions; only the order of presentation and
+        # of the audit children moves.
+        members=tuple(reversed(members)),
+        provider_conflicts=tuple(reversed(conflicts)),
+        semantic_merges=tuple(reversed(merges)),
+    )
+
+    assert report.counts == {
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 1,
+        "deleted": 0,
+        "invalidated": 0,
+        "removed_members": 0,
+        "invalidated_themes": 0,
+    }
+
+
+def test_every_story_column_is_owned_or_deliberately_exempt(tmp_path):
+    """The rule that keeps this fix from rotting.
+
+    A column added to ``stories`` and written by reconciliation but left
+    out of the equality contract reintroduces exactly this bug, silently.
+    So the contract is checked against the table itself: every column is
+    either one reconciliation owns or one named here as not its business.
+    """
+
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(stories)")
+        }
+
+    not_owned = {
+        "id",  # the database's
+        "ticker",  # partition identity: what pairs the rows up
+        "trading_day",
+        "pipeline_version",
+        "cluster_fingerprint",
+        "canonical_item_id",  # written after members; compared separately
+        "invalidated_at",  # compared separately, as liveness
+        "updated_at",  # bookkeeping this class sets itself
+    }
+
+    assert columns == set(STORY_RECONCILED_COLUMNS) | not_owned
+    assert not set(STORY_RECONCILED_COLUMNS) & not_owned
+    # The declared list and the mapping the writes are built from are one
+    # thing, not two that drift.
+    prepared = Phase0Repository._prepare_story(story("cf1", [1]))
+    assert set(Phase0Repository._story_column_values(prepared)) == set(
+        STORY_RECONCILED_COLUMNS
+    )
+
+
+# ----------------------------------------------------------------------
 # Theme reconciliation
 # ----------------------------------------------------------------------
 
@@ -1543,6 +1925,148 @@ def test_theme_reconciliation_removes_obsolete_membership(tmp_path):
     assert report.counts["updated"] == 1
     assert repository.count("themes") == 1
     assert repository.count("theme_citations") == 2
+
+
+#: Every ``themes`` field reconciliation owns, changed one at a time.  The
+#: centroid and the salience components are the ones that were invisible:
+#: they are derived outputs, so a rerun that recomputes them has produced
+#: a different theme even when its label and membership are identical.
+THEME_FIELD_CHANGES = [
+    ("centroid", VECTOR_A, VECTOR_B),
+    ("salience", 0.10, 0.90),
+    ("salience_story_component", 0.10, 0.90),
+    ("salience_outlet_component", 0.20, 0.80),
+    ("salience_recency_component", 0.30, 0.70),
+    ("cohesion", 0.40, 0.60),
+    ("min_pairwise_cohesion", 0.10, 0.20),
+    ("story_count", 1, 7),
+    ("outlet_count", 2, 9),
+    ("salience_rank", 1, 4),
+    ("label", "Chip demand", "Chip supply"),
+    ("summary", "One", "Two"),
+    ("label_source", "highest_salience_member", "llm"),
+    ("status", "pending", "ready"),
+    ("theme_key", "tk-a", "tk-b"),
+    ("content_hash", "hash-a", "hash-b"),
+    ("matched_previous_key", "prev-a", "prev-b"),
+    ("latest_published_at", f"{DAY}T12:00:00+00:00", f"{DAY}T13:00:00+00:00"),
+    ("method", "hdbscan", "agglomerative"),
+    ("algorithm_version", "m5.1", "m5.2"),
+    ("config_fingerprint", "cfg-a", "cfg-b"),
+    ("model_name", "fake", "other"),
+    ("model_revision", "r1", "r2"),
+    ("embedding_dimension", 4, 8),
+]
+
+
+@pytest.mark.parametrize(
+    "field, before, after",
+    THEME_FIELD_CHANGES,
+    ids=[case[0] for case in THEME_FIELD_CHANGES],
+)
+def test_a_changed_theme_field_is_never_reported_unchanged(
+    tmp_path, field, before, after
+):
+    repository = migrated(tmp_path)
+    day = build_day(repository)
+
+    def replay(value):
+        fields = {
+            "fingerprint": "tf1",
+            "label": "Chip demand",
+            "story_ids": (day["stories"]["cf1"],),
+            "citation_item_ids": (day["items"][0],),
+            "method": "hdbscan",
+            field: value,
+        }
+        return reconcile_themes(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            theme_set=theme_set(),
+            themes=[ThemeRecord(**fields)],
+        )
+
+    replay(before)
+    with repository.admin.connect_writable() as connection:
+        stored_before = connection.execute("SELECT * FROM themes").fetchone()[field]
+
+    report = replay(after)
+    with repository.admin.connect_writable() as connection:
+        stored_after = connection.execute("SELECT * FROM themes").fetchone()[field]
+
+    assert stored_before != stored_after, "the probe did not change anything"
+    assert stored_after == after
+    assert report.counts["updated"] == 1
+    assert report.counts["unchanged"] == 0
+    assert replay(after).counts["unchanged"] == 1
+
+
+def test_an_equivalent_theme_replay_is_still_unchanged(tmp_path):
+    """Equivalent inputs stay equal however the stage ordered them."""
+
+    repository = migrated(tmp_path)
+    day = build_day(repository)
+    story_ids = (day["stories"]["cf1"], day["stories"]["cf2"])
+    citations = (day["items"][0], day["items"][2])
+
+    def replay(stories, cites):
+        return reconcile_themes(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            theme_set=theme_set(),
+            themes=[
+                ThemeRecord(
+                    fingerprint="tf1",
+                    label="Chip demand",
+                    story_ids=stories,
+                    citation_item_ids=cites,
+                    method="hdbscan",
+                    centroid=VECTOR_A,
+                    salience=0.5,
+                    salience_story_component=0.1,
+                    salience_outlet_component=0.2,
+                    salience_recency_component=0.3,
+                )
+            ],
+        )
+
+    replay(story_ids, citations)
+    report = replay(tuple(reversed(story_ids)), tuple(reversed(citations)))
+
+    assert report.counts["unchanged"] == 1
+    assert report.counts["updated"] == 0
+
+
+def test_every_theme_column_is_owned_or_deliberately_exempt(tmp_path):
+    """The themes half of the rule that keeps this fix from rotting."""
+
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(themes)")
+        }
+
+    not_owned = {
+        "id",
+        "ticker",
+        "trading_day",
+        "pipeline_version",
+        "fingerprint",  # partition identity: what pairs the rows up
+        "updated_at",
+    }
+
+    assert columns == set(THEME_RECONCILED_COLUMNS) | not_owned
+    assert not set(THEME_RECONCILED_COLUMNS) & not_owned
+    prepared = Phase0Repository._prepare_theme(
+        ThemeRecord(fingerprint="tf1", label="L", story_ids=(1,))
+    )
+    assert set(Phase0Repository._theme_column_values(prepared)) == set(
+        THEME_RECONCILED_COLUMNS
+    )
 
 
 def test_failed_theme_reconciliation_writes_nothing(tmp_path):
@@ -4336,6 +4860,279 @@ def test_persist_embeddings_rejects_one_bad_source_among_good_ones(tmp_path):
         with pytest.raises(Phase0RunContextError):
             repository.persist_embeddings(
                 [sample_embedding(nvda[0]), sample_embedding(amd[0])], run=run
+            )
+
+    assert repository.count("embeddings") == 0
+
+
+# ----------------------------------------------------------------------
+# Embedding source identity
+#
+# Migration 007's ownership triggers are the durable contract: a raw item
+# is named by id, a story by id *or* cluster fingerprint, a theme by id
+# *or* fingerprint *or* theme key.  The logged batch has to resolve the
+# same identities the database itself accepts — no more (an unknown or
+# ambiguous identity still fails closed) and no fewer (rejecting a legal
+# fingerprint as "does not exist" is the bug).
+# ----------------------------------------------------------------------
+
+
+def embedded_day(repository: Phase0Repository) -> dict:
+    """One NVDA day with a story and a theme, and every identity for them."""
+
+    day = build_day(repository)
+    reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint="f" * 64,
+                theme_key="nvda-chip-demand",
+                label="Chip demand",
+                story_ids=(day["stories"]["cf1"],),
+                citation_item_ids=(day["items"][0],),
+                method="hdbscan",
+            )
+        ],
+    )
+    with repository.admin.connect_writable() as connection:
+        theme = dict(connection.execute("SELECT * FROM themes").fetchone())
+    day.update({"theme": theme})
+    return day
+
+
+#: (label, source kind, how to read the legal identity out of the day).
+EMBEDDING_IDENTITIES = [
+    ("raw-item-id", "raw_item", lambda day: str(day["items"][0])),
+    ("story-id", "story", lambda day: str(day["stories"]["cf1"])),
+    ("story-cluster-fingerprint", "story", lambda day: "cf1"),
+    ("theme-id", "theme", lambda day: str(day["theme"]["id"])),
+    ("theme-fingerprint", "theme", lambda day: str(day["theme"]["fingerprint"])),
+    ("theme-key", "theme", lambda day: str(day["theme"]["theme_key"])),
+]
+
+
+@pytest.mark.parametrize(
+    "label, kind, identity",
+    EMBEDDING_IDENTITIES,
+    ids=[case[0] for case in EMBEDDING_IDENTITIES],
+)
+def test_persist_embeddings_resolves_every_legal_source_identity(
+    tmp_path, label, kind, identity
+):
+    repository = migrated(tmp_path)
+    day = embedded_day(repository)
+    source_id = identity(day)
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        assert (
+            repository.persist_embeddings(
+                [sample_embedding(source_id, source_kind=kind)], run=run
+            )
+            == 1
+        )
+
+    assert repository.count("embeddings") == 1
+    assert repository.get_embedding(kind, source_id) is not None
+    assert repository.run_log_entries(run_id=run.run_id)[0]["status"] == "success"
+
+
+@pytest.mark.parametrize(
+    "label, kind, identity",
+    EMBEDDING_IDENTITIES,
+    ids=[case[0] for case in EMBEDDING_IDENTITIES],
+)
+def test_the_logged_and_durable_embedding_contracts_agree(
+    tmp_path, label, kind, identity
+):
+    """Neither path may accept an identity the other refuses.
+
+    The unlogged cache protocol writes straight through the ownership
+    trigger, so it *is* the database's answer.  A logged batch that
+    disagreed would make the run-carrying entrypoint — the only one a
+    pipeline stage may use — strictly less capable than the contract it
+    implements.
+    """
+
+    repository = migrated(tmp_path)
+    day = embedded_day(repository)
+    source_id = identity(day)
+    embedding = sample_embedding(source_id, source_kind=kind)
+
+    repository.upsert_embedding(embedding)
+    with nvda_run(repository, stage="m1.embed") as run:
+        repository.persist_embeddings([embedding], run=run)
+
+    assert repository.count("embeddings") == 1
+
+
+#: Identities that are not this partition's, are nobody's, or are two
+#: rows' at once.  Every one must be refused with nothing written.
+def _foreign_day(repository: Phase0Repository) -> dict:
+    """An AMD story and theme carrying identities NVDA might reach for."""
+
+    items = seed_raw_items(repository, 1, ticker="AMD")
+    reconcile_stories(
+        repository,
+        ticker="AMD",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("amd-cf", items)],
+    )
+    amd_story = repository.stories_for_day(DAY, "AMD")[0]["id"]
+    reconcile_themes(
+        repository,
+        ticker="AMD",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint="a" * 64,
+                theme_key="amd-theme-key",
+                label="AMD",
+                story_ids=(amd_story,),
+                citation_item_ids=(items[0],),
+                method="hdbscan",
+            )
+        ],
+    )
+    return {"items": items, "story": amd_story}
+
+
+HOSTILE_EMBEDDING_IDENTITIES = [
+    ("unknown-story-fingerprint", "story", lambda day: "no-such-fingerprint", "exist"),
+    ("unknown-theme-key", "theme", lambda day: "no-such-theme-key", "exist"),
+    ("unknown-theme-fingerprint", "theme", lambda day: "b" * 64, "exist"),
+    ("empty-ish-identity", "story", lambda day: "0", "exist"),
+    # A story id dressed up so SQLite's integer affinity would match it
+    # but the ownership trigger's text comparison would not.
+    ("zero-padded-story-id", "story", lambda day: "01", "exist"),
+    ("float-shaped-story-id", "story", lambda day: "1.0", "exist"),
+    # Another partition's rows, reached by each of their public forms.
+    ("foreign-story-fingerprint", "story", lambda day: "amd-cf", "belongs to AMD"),
+    ("foreign-theme-key", "theme", lambda day: "amd-theme-key", "belongs to AMD"),
+    ("foreign-theme-fingerprint", "theme", lambda day: "a" * 64, "belongs to AMD"),
+    ("foreign-raw-item-id", "raw_item", lambda day: str(day["items"][0]), "AMD"),
+]
+
+
+@pytest.mark.parametrize(
+    "label, kind, identity, message",
+    HOSTILE_EMBEDDING_IDENTITIES,
+    ids=[case[0] for case in HOSTILE_EMBEDDING_IDENTITIES],
+)
+def test_persist_embeddings_refuses_an_illegitimate_source_identity(
+    tmp_path, label, kind, identity, message
+):
+    repository = migrated(tmp_path)
+    embedded_day(repository)
+    foreign = _foreign_day(repository)
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        with pytest.raises(Phase0RunContextError, match=message):
+            repository.persist_embeddings(
+                [sample_embedding(identity(foreign), source_kind=kind)], run=run
+            )
+
+    assert repository.count("embeddings") == 0
+    assert repository.run_log_entries(run_id=run.run_id)[0]["status"] == "failed"
+
+
+def test_persist_embeddings_refuses_an_ambiguous_source_identity(tmp_path):
+    """One name, two rows: there is no partition this vector belongs to.
+
+    Fingerprints and theme keys are unique only within a ticker-day, and
+    ``embeddings`` keys globally on (source_kind, source_id).  So an
+    identity that names two stories cannot be resolved to a partition,
+    and resolving it to whichever row came back first would let an NVDA
+    run write a vector an AMD read would then get back.
+    """
+
+    repository = migrated(tmp_path)
+    day = build_day(repository)
+    shared = "shared-fingerprint"
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[
+            story("cf1", day["items"][:2]),
+            story("cf2", day["items"][2:3]),
+            story("cf3", day["items"][3:]),
+            story(shared, day["items"][:1]),
+        ],
+    )
+    amd_items = seed_raw_items(repository, 1, ticker="AMD")
+    reconcile_stories(
+        repository,
+        ticker="AMD",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story(shared, amd_items)],
+    )
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        with pytest.raises(Phase0RunContextError, match="is ambiguous"):
+            repository.persist_embeddings(
+                [sample_embedding(shared, source_kind="story")], run=run
+            )
+
+    assert repository.count("embeddings") == 0
+
+
+def test_a_fingerprint_source_still_needs_its_raw_item_association(tmp_path):
+    """Widening identity did not widen anything else.
+
+    A raw item is still named only by id, and a ticker-scoped run may
+    still only embed evidence explicitly associated with its ticker.
+    """
+
+    repository = migrated(tmp_path)
+    unattributed = repository.admin.insert_raw_items(
+        [{**raw_item(90), "ticker": None}]
+    )[0].item_id
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        with pytest.raises(Phase0RunContextError, match="no accepted association"):
+            repository.persist_embeddings(
+                [sample_embedding(str(unattributed))], run=run
+            )
+
+    assert repository.count("embeddings") == 0
+
+
+def test_persist_embeddings_still_refuses_another_day_and_version(tmp_path):
+    """Day and pipeline-version isolation, reached through a fingerprint.
+
+    The identity forms are new; the partition rules they are checked
+    against are not.
+    """
+
+    repository = migrated(tmp_path)
+    day = build_day(repository)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v2",
+        stories=[story("v2-cf", day["items"][:1])],
+    )
+
+    with nvda_run(repository, stage="m1.embed", pipeline_version="v1") as run:
+        with pytest.raises(Phase0RunContextError, match="pipeline version v2"):
+            repository.persist_embeddings(
+                [sample_embedding("v2-cf", source_kind="story")], run=run
+            )
+
+    with nvda_run(repository, stage="m1.embed", trading_day="2026-07-24") as run:
+        with pytest.raises(Phase0RunContextError, match="falls on"):
+            repository.persist_embeddings(
+                [sample_embedding("cf1", source_kind="story")], run=run
             )
 
     assert repository.count("embeddings") == 0
