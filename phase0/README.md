@@ -361,7 +361,29 @@ assumes a pre-ledger database ran the approved migrations up to its
 | | |
 |---|---|
 | `pre-convergence` | `user_version` 4, the exact historical application schema, the exact metadata-table shapes, the exact historical ledger (or none at all), and no provenance yet |
-| `post-convergence` | the historical row at `(4, fd4d2088…)`, the convergence row at `(4, eb0609c3…)`, the shared `001`–`003` rows whole, the convergence's effects live in the schema, and provenance whose every field is the registry's |
+| `post-convergence` | the historical row at `(4, fd4d2088…)`, the convergence row at `(4, eb0609c3…)`, **every other ledger row** whole and expected with none missing and none extra, `user_version` equal to the version the ledger reaches, the convergence's effects live in the schema, the application schema **exactly the one the approved migrations build at that version**, and provenance whose every field is the registry's |
+
+The converged ledger is exact in both directions. Every row present must
+be one a settlement writes — the approved files at their own
+`(version, checksum)`, except `004`, which keeps reporting the historical
+checksum because that is what ran, plus the convergence at its pinned
+version — and every row that should be present at this `user_version` must
+be. A row naming a migration that does not exist, `011` recorded at
+version 99, a deleted `010`, or a `user_version` out of step with the
+rows: none of these is a ledger this path wrote.
+
+**The schema evidence is built, not pinned.** The decisive post-convergence
+condition is that the live application schema equals the schema the
+approved migrations produce at this database's `user_version` — computed by
+running those files into an empty in-memory database and fingerprinting the
+result, never stored as a constant. A pin would have to be re-derived for
+every new migration, and a forgotten one fails *open*, going on comparing
+against a schema the code no longer builds. This makes "a converged
+database is identical to a fresh one" a rule the path enforces rather than
+only something the tests assert. Before it existed, asking of the schema
+only that it was *not* the fork's let three hand-written rows excuse the
+historical checksum over an unknown fork, after which the remaining seven
+approved migrations ran against it.
 
 Anything that is neither fails closed. A historical schema carrying a
 convergence row, a converged schema with a partial ledger, provenance over
@@ -403,17 +425,24 @@ So the conversion runs as a single settlement:
    historical file, never the approved one;
 7. run the convergence, then every remaining approved migration;
 8. set `user_version`;
-9. validate the result — every migration applied, the historical checksum
-   intact, the convergence recorded, `supported_tickers` present, the
-   `enforce_*` triggers gone, the version correct;
-10. write provenance;
+9. write provenance;
+10. validate the result — every migration applied, the historical checksum
+    intact, the convergence recorded, `supported_tickers` present, the
+    `enforce_*` triggers gone, the version correct — and then the closing
+    condition: the settlement may only commit a database that this code
+    would itself recognize as `post-convergence`, exact ledger, exact
+    schema, exact provenance and all;
 11. commit.
 
 Any failure rolls the whole thing back: the original tables and data, the
 absence of `schema_migrations` and `schema_lineage`, and `user_version`,
-all exactly as they were. Step 9 exists because marking a migration
+all exactly as they were. Step 10 exists because marking a migration
 applied is not the same as its schema existing — a settlement that only
-claims to have converged is refused rather than committed.
+claims to have converged is refused rather than committed — and its closing
+condition is what ties this path to the next `migrate()`: whatever is
+committed here must be exactly what recognition accepts there, so the
+settlement can never produce a state the very next run has to refuse.
+Provenance is written at step 9, before that check, for the same reason.
 
 **What the record says.** The ledger goes on reporting the *historical*
 checksum for `004`, because that is what ran; nothing is rewritten,
@@ -426,6 +455,19 @@ Everything else still fails exactly as before: an unregistered variant, an
 edited approved migration, a forged provenance row, a tampered convergence
 file, a partial ledger, and a database that merely resembles the lineage
 are all refused — and refused before anything is written.
+
+**What none of this can promise.** A converged database is *required* to be
+schema-identical to a fresh one — that is what converging means — so no
+schema evidence can separate the two, and anyone able to write to the
+database file can also write the ledger and provenance rows a settlement
+would have written. What the rules above guarantee is that doing so buys
+nothing: the historical checksum is excused only for a database that is
+already, in every respect, a valid database at head — exact schema, exact
+ledger, every approved migration applied. A forgery cannot carry an
+unknown schema, a stale one, a partial ledger, or a migration that never
+ran, which is the whole of what the excusal was ever able to be abused
+for. Anyone with write access to the file could always corrupt it
+directly; the compatibility path grants no capability beyond that.
 
 ## Recovery
 

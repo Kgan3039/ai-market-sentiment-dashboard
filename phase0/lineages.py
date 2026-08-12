@@ -25,9 +25,22 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Protocol, Sequence
 
 from .errors import Phase0MigrationError
+
+
+class MigrationLike(Protocol):
+    """The part of :class:`phase0.schema.Migration` this module reads.
+
+    Structural, so that ``schema`` may keep importing ``lineages`` and not
+    the other way round.
+    """
+
+    name: str
+    version: int
+    checksum: str
+    sql: str
 
 
 #: Provenance, kept beside the ledger rather than inside it.  The ledger
@@ -294,6 +307,77 @@ def structural_fingerprint(connection: sqlite3.Connection) -> str:
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 
+#: Keyed by target version and the exact files that reach it, so a changed
+#: migration set never reuses another's answer.
+_APPROVED_FINGERPRINTS: dict[tuple[int, tuple[tuple[str, str], ...]], str] = {}
+
+
+def approved_fingerprint(migrations: Sequence[MigrationLike], target: int) -> str:
+    """The schema the approved migrations build at ``target``, by construction.
+
+    Built by running the approved files into an empty in-memory database
+    and fingerprinting the result — deliberately not pinned as a constant.
+    A pin would have to be re-derived for every new migration, and a
+    forgotten one fails *open*: the check would go on comparing against a
+    schema the code no longer builds.
+
+    This is the same comparison the "a converged database is identical to a
+    fresh one" test makes.  Here it is a rule rather than an assertion,
+    because it is the one piece of evidence for convergence that cannot be
+    hand-written into a database: ledger rows and provenance rows can.
+    """
+
+    # Deferred: ``schema`` imports this module, so it cannot be imported at
+    # module scope here.  By call time it is always loaded.
+    from .schema import split_statements
+
+    plan = tuple(
+        (migration.name, migration.checksum)
+        for migration in migrations
+        if migration.version <= target
+    )
+    key = (target, plan)
+    cached = _APPROVED_FINGERPRINTS.get(key)
+    if cached is not None:
+        return cached
+    reference = sqlite3.connect(":memory:")
+    try:
+        for migration in migrations:
+            if migration.version > target:
+                continue
+            for statement in split_statements(migration.sql):
+                reference.execute(statement)
+        fingerprint = structural_fingerprint(reference)
+    finally:
+        reference.close()
+    _APPROVED_FINGERPRINTS[key] = fingerprint
+    return fingerprint
+
+
+def expected_converged_ledger(
+    lineage: HistoricalLineage, migrations: Sequence[MigrationLike]
+) -> dict[str, tuple[int, str]]:
+    """Every ledger row a converged database may carry, and no other.
+
+    The approved files at their own versions and checksums, except the one
+    the fork replaced — that row keeps reporting the historical checksum,
+    because that is what ran — plus the convergence at its own pinned
+    version.  Anything outside this map is a row no settlement writes.
+    """
+
+    expected = {
+        migration.name: (migration.version, migration.checksum)
+        for migration in migrations
+    }
+    historical_version, _ = lineage.historical_ledger[lineage.migration]
+    expected[lineage.migration] = (historical_version, lineage.checksum)
+    expected[lineage.convergence] = (
+        lineage.convergence_version,
+        lineage.convergence_checksum,
+    )
+    return expected
+
+
 def metadata_fingerprint(connection: sqlite3.Connection, table: str) -> str | None:
     """Digest one metadata table's own definition, or ``None`` if absent.
 
@@ -493,7 +577,9 @@ def pre_convergence_problem(
 
 
 def post_convergence_problem(
-    connection: sqlite3.Connection, lineage: HistoricalLineage
+    connection: sqlite3.Connection,
+    lineage: HistoricalLineage,
+    migrations: Sequence[MigrationLike],
 ) -> str | None:
     """Why this database's claim to have converged is not good.
 
@@ -501,6 +587,15 @@ def post_convergence_problem(
     checked first and on their own; provenance is consulted last and only
     to corroborate.  Reversing that is what let a fresh database with a
     swapped checksum and a copied lineage row be waved through.
+
+    "Converged" is a claim about a whole database, so the whole database
+    answers it.  The ledger must be exactly the ledger a settlement writes
+    — every row, whole, and no others — and the schema must be exactly the
+    schema the approved migrations build at this database's
+    ``user_version``.  Checking a handful of named rows and then only that
+    the schema was *not* the historical one left three hand-written rows
+    enough to excuse the historical checksum over a schema nobody has ever
+    seen, after which the remaining migrations ran against it.
     """
 
     problem = _metadata_problem(connection)
@@ -511,31 +606,36 @@ def post_convergence_problem(
     if entries is None:
         return "no migration ledger"
 
-    historical_version, historical_checksum = lineage.historical_ledger[
-        lineage.migration
-    ]
-    problem = _entry_problem(
-        entries, lineage.migration, historical_version, historical_checksum
-    )
-    if problem is not None:
-        return problem
-    # The row a converged database has and nothing else produces: the
-    # convergence migration, at its own version and pinned checksum.
-    problem = _entry_problem(
-        entries,
-        lineage.convergence,
-        lineage.convergence_version,
-        lineage.convergence_checksum,
-    )
-    if problem is not None:
-        return problem
-    # The shared history, whole: a fork that diverged earlier is not this.
-    for name, (want_version, want_checksum) in lineage.historical_ledger.items():
-        if name == lineage.migration:
-            continue
+    expected = expected_converged_ledger(lineage, migrations)
+
+    # The two rows only a settlement ever writes, named first so a database
+    # that simply has not converged says so instead of reciting a diff.
+    for name in (lineage.migration, lineage.convergence):
+        want_version, want_checksum = expected[name]
         problem = _entry_problem(entries, name, want_version, want_checksum)
         if problem is not None:
             return problem
+
+    # Every row present must be one a settlement would have written, whole:
+    # an unknown name, a wrong version, or a wrong checksum anywhere in the
+    # ledger means this is not that ledger.
+    for name in sorted(entries):
+        if name not in expected:
+            return f"the ledger carries {name}, which no settlement writes"
+        want_version, want_checksum = expected[name]
+        problem = _entry_problem(entries, name, want_version, want_checksum)
+        if problem is not None:
+            return problem
+
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    # ...and every row that should be present at this version must be.  A
+    # partial ledger is not a shorter history, it is a different one.
+    for name, (want_version, _) in sorted(expected.items()):
+        if want_version <= version and name not in entries:
+            return f"the ledger has no row for {name}"
+    reached = max(entry.version for entry in entries.values())
+    if version != reached:
+        return f"user_version is {version}, but the ledger reaches {reached}"
 
     # The settlement writes the historical row, the convergence row, and
     # the provenance row together, so they carry one timestamp.  A ledger
@@ -549,8 +649,19 @@ def post_convergence_problem(
         return "the convergence's effects are not present in this schema"
     if set(lineage.fingerprint_triggers) & triggers:
         return "this schema still carries the historical lineage's triggers"
-    if structural_fingerprint(connection) == lineage.schema_fingerprint:
+    fingerprint = structural_fingerprint(connection)
+    if fingerprint == lineage.schema_fingerprint:
         return "this schema is still the historical one; it has not converged"
+    # The positive evidence, and the only part of it that cannot simply be
+    # inserted: converging *means* arriving at the schema a fresh database
+    # has, so that is what is required — not merely being unlike the fork.
+    approved = approved_fingerprint(migrations, version)
+    if fingerprint != approved:
+        return (
+            "the application schema is not the one the approved migrations "
+            f"build at version {version} (fingerprint {fingerprint[:12]}…, "
+            f"expected {approved[:12]}…)"
+        )
 
     problem = _provenance_problem(connection, lineage)
     if problem is not None:
@@ -566,7 +677,9 @@ def post_convergence_problem(
 
 
 def classify(
-    connection: sqlite3.Connection, lineage: HistoricalLineage
+    connection: sqlite3.Connection,
+    lineage: HistoricalLineage,
+    migrations: Sequence[MigrationLike],
 ) -> tuple[str, str | None]:
     """Which exact accepted state this database is in, and why not the others.
 
@@ -578,7 +691,7 @@ def classify(
     pre = pre_convergence_problem(connection, lineage)
     if pre is None:
         return STATE_PRE_CONVERGENCE, None
-    post = post_convergence_problem(connection, lineage)
+    post = post_convergence_problem(connection, lineage, migrations)
     if post is None:
         return STATE_POST_CONVERGENCE, None
     return STATE_UNRELATED, pre
@@ -628,21 +741,24 @@ def recognize(
     return lineage, pre_convergence_problem(connection, lineage)
 
 
-def recorded(connection: sqlite3.Connection) -> dict[str, HistoricalLineage]:
+def recorded(
+    connection: sqlite3.Connection, migrations: Sequence[MigrationLike]
+) -> dict[str, HistoricalLineage]:
     """Lineages whose provenance this database can actually stand behind.
 
     After convergence the schema no longer looks like the historical one —
     that was the point — so this is what keeps the ledger's historical
     checksum explicable on every later ``migrate()``.  Each row is
-    re-verified against the live database; an unverifiable one is simply
-    not returned, and the ordinary checksum rule then refuses the database.
+    re-verified against the live database *and* against the schema the
+    approved migrations build; an unverifiable one is simply not returned,
+    and the ordinary checksum rule then refuses the database.
     """
 
     if lineage_rows(connection) is None:
         return {}
     found: dict[str, HistoricalLineage] = {}
     for lineage in KNOWN_HISTORICAL_MIGRATIONS.values():
-        if post_convergence_problem(connection, lineage) is None:
+        if post_convergence_problem(connection, lineage, migrations) is None:
             found[lineage.migration] = lineage
     return found
 
@@ -706,12 +822,15 @@ __all__ = [
     "LINEAGE_SCHEMA_FINGERPRINT",
     "LedgerEntry",
     "METADATA_TABLES",
+    "MigrationLike",
     "STATE_POST_CONVERGENCE",
     "STATE_PRE_CONVERGENCE",
     "STATE_UNRELATED",
+    "approved_fingerprint",
     "claimed",
     "classify",
     "convergence_migrations",
+    "expected_converged_ledger",
     "ledger_entries",
     "ledger_rows",
     "lineage_rows",

@@ -174,15 +174,17 @@ def _verify_history(
 
     The single exception is a checksum that a registered historical
     lineage pins *and* that this database has proved it is on — either by
-    still carrying that lineage's schema, or by having converged and
-    recorded the provenance.  Any other mismatch is refused exactly as
-    before: an unknown variant is not a lineage, it is a modified file.
+    still carrying that lineage's schema, or by having converged, in which
+    case its whole ledger and its whole schema must be exactly what a
+    settlement produces.  Provenance corroborates that; it never supplies
+    it.  Any other mismatch is refused exactly as before: an unknown
+    variant is not a lineage, it is a modified file.
     """
 
     applied = _applied_migrations(connection)
     known = {migration.name: migration.checksum for migration in migrations}
     known.update(lineages.convergence_migrations())
-    excused = dict(lineages.recorded(connection))
+    excused = dict(lineages.recorded(connection, migrations))
     if lineage is not None:
         excused[lineage.migration] = lineage
     for name, checksum in sorted(applied.items()):
@@ -370,8 +372,10 @@ def _converge(
         target = max(migration.version for migration in migrations)
         connection.execute(f"PRAGMA user_version = {int(target)}")
 
-        _assert_converged(connection, migrations, lineage, target)
+        # Provenance first, because the settlement is then held to the very
+        # rule that will later be asked to accept its result.
         lineages.record(connection, lineage, settled_at)
+        _assert_converged(connection, migrations, lineage, target)
         connection.commit()
     except Exception:
         connection.rollback()
@@ -439,6 +443,17 @@ def _assert_converged(
         raise Phase0MigrationError(
             f"compatibility settlement ended at user_version {version}, "
             f"not {target}; refusing to commit"
+        )
+    # The closing condition, and the one that ties this path to the next
+    # ``migrate()``: a settlement may only commit a database that this code
+    # would itself recognize as converged — exact ledger, exact schema,
+    # exact provenance.  Anything less would commit a state that the very
+    # next run has to refuse.
+    problem = lineages.post_convergence_problem(connection, lineage, migrations)
+    if problem is not None:
+        raise Phase0MigrationError(
+            f"compatibility settlement produced a database it would not "
+            f"itself accept ({problem}); refusing to commit"
         )
 
 
