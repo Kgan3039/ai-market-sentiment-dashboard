@@ -478,8 +478,38 @@ still cannot reach another's cache entry through the API.
 
 This was previously recorded here as an accepted residual, on the
 reasoning that closing it meant rewriting a released migration. That
-reasoning was wrong about the premise: migration 007 has never left this
-branch, so it was corrected in place before release, like 010 and 011.
+reasoning was wrong about the premise at the time: migration 007 had not
+yet left this branch, so it was corrected in place before release, like
+010 and 011.
+
+**A rename is the same event as a deletion.** That guard fires on
+`DELETE`, and an owner can reach the identical end state without dying:
+it stays alive and rewrites the handle itself. `reconcile_themes` does
+exactly this through the public API — it matches a theme by `fingerprint`
+and writes `theme_key` as an owned column — so a re-run that assigns a
+new key leaves the old key belonging to nobody while its vector stays
+cached. Nothing reads that row afterwards, because every read resolves a
+handle through a live parent, and nothing ever removed it. A handle later
+reused by an unrelated partition would then find a vector encoding text
+it never saw.
+
+Migration **012** asks the same question on `UPDATE` of
+`stories.cluster_fingerprint`, `themes.fingerprint`, and
+`themes.theme_key`: who is left. A vector is collected only when no live
+row would still be allowed to own the old handle — which is the
+*ownership* predicate from `trg_embedding_owner_insert`, not one column.
+That is what keeps a durable-id vector out of it: if `source_id` matches
+some live row's id, that row is an owner, so a fingerprint moving out
+from under a string that happens to be a row id changes nothing. Nothing
+moves a vector to the new handle either; an embedding names the text that
+produced it, so a renamed owner is a re-encode the repository performs
+explicitly, never a rename the schema performs silently.
+
+012 is additive rather than a correction to 007, because 007 is no longer
+correctable: the branch carrying migrations 005–012 is now published as
+`origin/agent/phase0-i1-persistence`, so every migration on it records a
+checksum that a database somewhere may already hold. See the release-status
+note below.
 
 ## The boundaries downstream stages use
 
@@ -780,12 +810,31 @@ parse before 012 exists.)
 every time and it is worth stating once: a migration is released when a
 database somewhere could have recorded its checksum, which means it
 exists in an authoritative published lineage — not merely in an approved
-local branch. Migrations **001–004 are released**: they are on
-`origin/agent/phase0-i1-persistence` at `836e8b5`, and 004's checksum is
-pinned in `lineages.py` as the remote-v4 lineage's migration. Migrations
-**005–011 are not**: each exists on exactly one local commit and on no
-remote at all. That is why 007, 009, 010, and 011 could be corrected in
-place, and why nothing here has ever edited 001–004.
+local branch. Migrations **001–004** were released first: they are on
+`origin/agent/phase0-i1-persistence`, and 004's checksum is pinned in
+`lineages.py` as the remote-v4 lineage's migration. Nothing here has ever
+edited them.
+
+**005–011 have since joined them.** They were unreleased while this work
+was in progress — each existed on exactly one local commit and on no
+remote — which is why 007, 009, 010, and 011 could be corrected in place.
+That window is closed: `origin/agent/phase0-i1-persistence` now carries
+this branch, so every migration on it is published and immutable on the
+same rule that has always protected 001–004. **Every further correction
+to 001–011 is additive**, which is why the handle-move cleanup above is
+migration 012 rather than an edit to 007. 012 itself is unreleased only
+until the next push, so it is written as a file that never needs
+correcting rather than one that can be corrected.
+
+Applying the rule consistently matters more than which answer it gives.
+The same branch that made 001–004 released is the one that has now
+released 005–011; treating a push as release when it suited an earlier
+conclusion and not when it constrains a later one would make the rule
+decorative. What "additive" costs is visible in 010's case above: an
+additive migration can re-create a *persisted* trigger but cannot help
+fresh creation, because the earlier file must parse before the later one
+exists. 012 has no such problem — a trigger added later governs every
+update after it, on fresh and existing databases alike.
 
 Three tests hold the line, and they are complementary:
 

@@ -922,7 +922,7 @@ SETTLEMENT_STAGES = [
     ("convergence-midway", "CREATE TRIGGER IF NOT EXISTS trg_story_ticker_insert", 1),
     ("ledger-row", "INSERT INTO schema_migrations", 1),
     ("later-migration", "CREATE TABLE IF NOT EXISTS embeddings", 1),
-    ("before-validation", "PRAGMA user_version = 11", 1),
+    ("before-validation", f"PRAGMA user_version = {LATEST_VERSION}", 1),
     ("provenance", "INSERT OR IGNORE INTO schema_lineage", 1),
 ]
 
@@ -2248,7 +2248,7 @@ def test_a_tampered_converged_ledger_is_refused(tmp_path, label, statement, expe
 
 
 def test_a_user_version_out_of_step_with_the_ledger_is_refused(tmp_path):
-    """The ledger reaching 11 and the database sitting at 4 is not a state."""
+    """A full ledger and a database sitting at 4 is not a state."""
 
     database = converged_database(tmp_path, "outofstep.sqlite3")
     edit(database, "PRAGMA user_version = 4")
@@ -2260,11 +2260,12 @@ def test_a_user_version_out_of_step_with_the_ledger_is_refused(tmp_path):
         )
     finally:
         connection.close()
-    assert problem is not None and "but the ledger reaches 11" in problem
+    assert problem is not None
+    assert f"but the ledger reaches {LATEST_VERSION}" in problem
 
 
 def test_a_partial_converged_ledger_is_refused(tmp_path):
-    """Every row 005-011 matters, one at a time."""
+    """Every row past the remote lineage matters, one at a time."""
 
     for migration in ALL_MIGRATIONS:
         if migration.version <= REMOTE_V4_LINEAGE.user_version:
@@ -2367,11 +2368,11 @@ def test_a_forged_settlement_cannot_bless_an_unknown_fork(tmp_path):
 
 
 def test_a_forged_settlement_cannot_bless_a_stale_schema(tmp_path):
-    """A ledger claiming eleven migrations over a schema built by ten."""
+    """A ledger claiming every migration over a schema built by all but one."""
 
     database = tmp_path / "stale.sqlite3"
     Phase0Repository(
-        database, migrations_path=partial_migrations(tmp_path, 10)
+        database, migrations_path=partial_migrations(tmp_path, LATEST_VERSION - 1)
     ).migrate()
     last = ALL_MIGRATIONS[-1]
     edit(

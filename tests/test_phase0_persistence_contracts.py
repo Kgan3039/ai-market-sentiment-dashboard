@@ -24,7 +24,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 from unittest import mock
 
 import numpy as np
@@ -7455,6 +7455,281 @@ def test_a_partition_cannot_delete_a_shared_handle_through_the_api(
     with pytest.raises(Phase0ValidationError, match="not a durable"):
         repository.upsert_embedding(sample_embedding(identity, source_kind=kind))
     assert cached(repository, kind, identity)
+
+
+# ----------------------------------------------------------------------
+# A living owner that renames its handle is the same event as a dying one
+#
+# Migration 007's survivor guard fires on DELETE only.  An owner that
+# stays alive and rewrites `cluster_fingerprint`, `fingerprint`, or
+# `theme_key` leaves the old handle belonging to nobody while its vector
+# stays cached, unreachable and unremovable — and `reconcile_themes`
+# reaches exactly that state through the public API, because it matches a
+# theme by `fingerprint` and writes `theme_key` as an owned column.
+# Migration 012 asks the same question the delete path asks: who is left?
+# ----------------------------------------------------------------------
+
+
+#: Which table and column each shared handle actually lives in.
+HANDLE_COLUMNS = {
+    "story_fingerprint": ("stories", "cluster_fingerprint"),
+    "theme_fingerprint": ("themes", "fingerprint"),
+    "theme_key": ("themes", "theme_key"),
+}
+
+#: A second legal value for each handle, so a move goes somewhere valid.
+MOVED_HANDLE_VALUES = {
+    "story_fingerprint": "moved-cluster-fingerprint",
+    "theme_fingerprint": "d" * 64,
+    "theme_key": "moved-theme-key",
+}
+
+#: A column that is emphatically not a handle, per parent kind.
+UNRELATED_COLUMNS = {
+    "story": ("stories", "canonical_title"),
+    "theme": ("themes", "label"),
+}
+
+
+def parent_of(partition: Mapping[str, Any], kind: str) -> int:
+    return int(partition["theme_id" if kind == "theme" else "story_id"])
+
+
+def set_column(repository, table: str, column: str, row_id: int, value) -> None:
+    """Write one column of one row, the way a re-run of its stage would.
+
+    Going through the table keeps these tests about the schema's ownership
+    lifecycle rather than about which reconciliation path happened to
+    produce the rename — one of which is exercised end to end below.
+    """
+
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            f"UPDATE {table} SET {column} = ? WHERE id = ?", (value, row_id)
+        )
+        connection.commit()
+
+
+def move_handle(repository, handle: str, row_id: int, value=None) -> str:
+    table, column = HANDLE_COLUMNS[handle]
+    value = MOVED_HANDLE_VALUES[handle] if value is None else value
+    set_column(repository, table, column, row_id, value)
+    return value
+
+
+def embed_while_sole_owner(repository, kind: str, identity: str) -> None:
+    """NVDA caches a vector under a handle while it alone carries it.
+
+    The ordering is the whole point: the write has to happen while the
+    handle is unambiguous, because `persist_embeddings` refuses it once
+    two partitions answer to it.
+    """
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        repository.persist_embeddings(
+            [sample_embedding(identity, source_kind=kind)], run=run
+        )
+    assert cached(repository, kind, identity), "setup failed to cache the vector"
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-rename-orphans" for case in SHARED_HANDLES],
+)
+def test_renaming_the_only_owners_handle_removes_the_orphan(
+    tmp_path, label, kind, handle
+):
+    """Cases 1, 3 and 5: sole owner renames, so nobody is left."""
+
+    repository = migrated(tmp_path)
+    identity = SHARED_HANDLE_VALUES[handle]
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    embed_while_sole_owner(repository, kind, identity)
+
+    moved = move_handle(repository, handle, parent_of(nvda, kind))
+
+    assert not cached(repository, kind, identity), "an orphan vector survived"
+    # And nothing inherited it: the new handle has no vector until the
+    # repository writes one for that identity.
+    assert not cached(repository, kind, moved)
+    assert repository.count("embeddings") == 0
+
+
+@pytest.mark.parametrize("mover", ["renaming-owner", "other-partition"])
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-rename-spares" for case in SHARED_HANDLES],
+)
+def test_renaming_one_of_two_owners_keeps_the_shared_embedding(
+    tmp_path, label, kind, handle, mover
+):
+    """Cases 2, 4 and 6, from both directions.
+
+    `renaming-owner` is the partition that cached the vector moving away
+    from the handle; `other-partition` is the one that never touched it
+    moving away.  Either way one live owner still carries the handle, so
+    the vector stays — a rename may not reach across a partition boundary
+    any more than a delete may.
+    """
+
+    repository = migrated(tmp_path)
+    identity = SHARED_HANDLE_VALUES[handle]
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    embed_while_sole_owner(repository, kind, identity)
+    amd = one_handled_partition(repository, "AMD", SHARED_HANDLE_VALUES)
+
+    moving = nvda if mover == "renaming-owner" else amd
+    move_handle(repository, handle, parent_of(moving, kind))
+
+    assert cached(repository, kind, identity), "the surviving owner lost its vector"
+    assert repository.count("embeddings") == 1
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-then-the-survivor" for case in SHARED_HANDLES],
+)
+def test_the_survivor_of_a_rename_still_takes_the_vector_when_it_goes(
+    tmp_path, label, kind, handle
+):
+    """The two verbs compose: a spared vector is not a permanent one."""
+
+    repository = migrated(tmp_path)
+    identity = SHARED_HANDLE_VALUES[handle]
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    embed_while_sole_owner(repository, kind, identity)
+    amd = one_handled_partition(repository, "AMD", SHARED_HANDLE_VALUES)
+
+    move_handle(repository, handle, parent_of(nvda, kind))
+    assert cached(repository, kind, identity)
+
+    # AMD is now the last owner of the old handle, whichever way it goes.
+    drop_parent(repository, kind, parent_of(amd, kind))
+    assert not cached(repository, kind, identity), "an orphan vector survived"
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-noop" for case in SHARED_HANDLES],
+)
+def test_rewriting_a_handle_to_the_value_it_already_had_changes_nothing(
+    tmp_path, label, kind, handle
+):
+    """An UPDATE that moves nothing is not a move."""
+
+    repository = migrated(tmp_path)
+    identity = SHARED_HANDLE_VALUES[handle]
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    embed_while_sole_owner(repository, kind, identity)
+
+    move_handle(repository, handle, parent_of(nvda, kind), value=identity)
+
+    assert cached(repository, kind, identity)
+
+
+@pytest.mark.parametrize("kind", ["story", "theme"])
+def test_changing_an_unrelated_column_keeps_the_embedding(tmp_path, kind):
+    """The triggers fire on the handle columns, not on every write."""
+
+    repository = migrated(tmp_path)
+    handle = "story_fingerprint" if kind == "story" else "theme_fingerprint"
+    identity = SHARED_HANDLE_VALUES[handle]
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    embed_while_sole_owner(repository, kind, identity)
+
+    table, column = UNRELATED_COLUMNS[kind]
+    set_column(repository, table, column, parent_of(nvda, kind), "rewritten text")
+
+    assert cached(repository, kind, identity)
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-durable-survives" for case in SHARED_HANDLES],
+)
+def test_a_durable_id_embedding_survives_its_owners_handle_move(
+    tmp_path, label, kind, handle
+):
+    """A row id names a row, not a fingerprint, so a rename is nothing."""
+
+    repository = migrated(tmp_path)
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    durable = str(parent_of(nvda, kind))
+    embed_while_sole_owner(repository, kind, durable)
+
+    move_handle(repository, handle, parent_of(nvda, kind))
+
+    assert cached(repository, kind, durable), "a durable-id vector was collected"
+    assert repository.get_embedding(kind, durable) is not None
+
+
+def test_a_handle_that_is_some_live_rows_id_is_still_owned(tmp_path):
+    """The survivor check is ownership, not one column.
+
+    Migration 007 accepts a durable id *or* a handle as `source_id`, so
+    "is this orphaned" has to ask whether any live row would still be
+    allowed to own it — otherwise a story renaming its fingerprint away
+    from the string `"1"` collects the vector belonging to story 1.
+    """
+
+    repository = migrated(tmp_path)
+    first = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    durable = str(first["story_id"])
+    embed_while_sole_owner(repository, "story", durable)
+
+    # A second partition whose fingerprint is literally the first story's id.
+    second = one_handled_partition(
+        repository, "AMD", {**SHARED_HANDLE_VALUES, "story_fingerprint": durable}
+    )
+    set_column(
+        repository, "stories", "cluster_fingerprint", second["story_id"], "moved-away"
+    )
+
+    assert cached(repository, "story", durable), "story 1 lost its own vector"
+
+
+def test_reconciling_a_theme_under_a_new_key_drops_the_old_keys_vector(tmp_path):
+    """The path a caller actually reaches, with no raw SQL anywhere.
+
+    `reconcile_themes` matches on `fingerprint` and owns `theme_key`, so a
+    re-run that assigns a new key renames a live owner's handle.  Before
+    migration 012 the old key's vector stayed behind for good.
+    """
+
+    repository = migrated(tmp_path)
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    identity = SHARED_HANDLE_VALUES["theme_key"]
+    embed_while_sole_owner(repository, "theme", identity)
+
+    reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint=SHARED_HANDLE_VALUES["theme_fingerprint"],
+                theme_key="reconciled-theme-key",
+                label="NVDA theme",
+                story_ids=(nvda["story_id"],),
+                citation_item_ids=(nvda["items"][0],),
+                method="hdbscan",
+            )
+        ],
+    )
+
+    stored = repository.theme_set(
+        ticker="NVDA", trading_day=DAY, pipeline_version="v1"
+    )["themes"]
+    assert [row["theme_key"] for row in stored] == ["reconciled-theme-key"]
+    assert not cached(repository, "theme", identity), "the old key kept its vector"
+    assert not cached(repository, "theme", "reconciled-theme-key")
 
 
 def test_record_source_state_rejects_another_days_fetch(tmp_path):
