@@ -1769,6 +1769,217 @@ def test_run_log_links_to_a_claimed_stage_key(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# A claimed key is always one a run can settle
+#
+# `claim_stage_key` normalized only `ticker` and `trading_day`, while
+# `stage_run` requires all five identity fields to be non-blank and
+# stripped.  So a claim with `run_id=""` was written as `running` and
+# then could not be settled by anybody — the identity holding the lease
+# was one `stage_run` refuses, and the partition stayed locked until the
+# lease expired.  A padded `stage` did the same thing more quietly.
+# ----------------------------------------------------------------------
+
+
+VALID_KEY_IDENTITY = {
+    "stage": "m3.semantic",
+    "ticker": "NVDA",
+    "trading_day": DAY,
+    "pipeline_version": "v1",
+    "run_id": "run-lifecycle",
+}
+
+#: Every identity field, blanked and whitespaced.  `ticker` and
+#: `trading_day` were already validated; they are here so the matrix is
+#: the whole identity rather than the half that was broken.
+INVALID_KEY_IDENTITIES = [
+    ("blank stage", {"stage": ""}, Phase0ValidationError),
+    ("whitespace stage", {"stage": "   "}, Phase0ValidationError),
+    ("blank pipeline_version", {"pipeline_version": ""}, Phase0ValidationError),
+    (
+        "whitespace pipeline_version",
+        {"pipeline_version": " \t "},
+        Phase0ValidationError,
+    ),
+    ("blank run_id", {"run_id": ""}, Phase0ValidationError),
+    ("whitespace run_id", {"run_id": " \n "}, Phase0ValidationError),
+    ("none stage", {"stage": None}, Phase0ValidationError),
+    ("none run_id", {"run_id": None}, Phase0ValidationError),
+    ("blank ticker", {"ticker": ""}, Phase0ValidationError),
+    ("unsupported ticker", {"ticker": "GOOG"}, UnsupportedTickerError),
+    ("malformed trading_day", {"trading_day": "not-a-day"}, Phase0ValidationError),
+    ("empty trading_day", {"trading_day": ""}, Phase0ValidationError),
+]
+
+
+@pytest.mark.parametrize(
+    "override, error",
+    [pytest.param(o, e, id=label) for label, o, e in INVALID_KEY_IDENTITIES],
+)
+def test_a_stage_key_cannot_be_claimed_with_an_invalid_identity(
+    tmp_path, override, error
+):
+    repository = migrated(tmp_path)
+
+    with pytest.raises(error):
+        repository.claim_stage_key(**{**VALID_KEY_IDENTITY, **override})
+
+    # Rejected before any write: no claim, no partial row, nothing leased.
+    assert repository.read.stage_key_rows() == []
+    assert repository.count("pipeline_stage_keys") == 0
+
+
+@pytest.mark.parametrize(
+    "override, error",
+    [pytest.param(o, e, id=label) for label, o, e in INVALID_KEY_IDENTITIES],
+)
+def test_the_sibling_stage_key_methods_reject_the_same_identities(
+    tmp_path, override, error
+):
+    """`heartbeat` and the admin completion share the one normalizer.
+
+    They are lookups rather than creators, so the damage is different —
+    a padded stage silently matches nothing — but the identity contract
+    has to be the same one or the lifecycle has two.
+    """
+
+    repository = migrated(tmp_path)
+    repository.claim_stage_key(**VALID_KEY_IDENTITY)
+
+    with pytest.raises(error):
+        repository.heartbeat_stage_key(**{**VALID_KEY_IDENTITY, **override})
+    with pytest.raises(error):
+        repository.admin.complete_stage_key(**{**VALID_KEY_IDENTITY, **override})
+
+    row = repository.read.stage_key_rows()[0]
+    assert row["status"] == "running"
+    assert row["run_id"] == VALID_KEY_IDENTITY["run_id"]
+
+
+NORMALIZED_KEY_IDENTITIES = [
+    ("lowercase ticker", {"ticker": "nvda"}),
+    ("padded ticker", {"ticker": "  NVDA "}),
+    ("padded stage", {"stage": "  m3.semantic  "}),
+    ("padded pipeline_version", {"pipeline_version": " v1 "}),
+    ("padded run_id", {"run_id": "  run-lifecycle  "}),
+    ("datetime-ish trading day", {"trading_day": DAY}),
+]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [pytest.param(o, id=label) for label, o in NORMALIZED_KEY_IDENTITIES],
+)
+def test_a_normalized_claim_is_stored_canonically_and_stays_settleable(
+    tmp_path, override
+):
+    """The point of the contract: whatever is claimed, a run can settle it."""
+
+    repository = migrated(tmp_path)
+    assert repository.claim_stage_key(**{**VALID_KEY_IDENTITY, **override}) is True
+
+    stored = repository.read.stage_key_rows()[0]
+    for column, expected in VALID_KEY_IDENTITY.items():
+        assert str(stored[column]) == str(expected), column
+
+    # And the canonical identity settles it, through the ordinary run.
+    with repository.stage_run(
+        run_id=VALID_KEY_IDENTITY["run_id"],
+        stage=VALID_KEY_IDENTITY["stage"],
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key={k: v for k, v in VALID_KEY_IDENTITY.items() if k != "run_id"},
+    ) as run:
+        repository.ingest_raw_items([], run=run, terminal=True)
+
+    assert repository.read.stage_key_rows()[0]["status"] == "success"
+
+
+def test_a_claim_and_a_run_agree_on_every_identity_field(tmp_path):
+    """Stated as a property rather than a list, so it cannot drift.
+
+    Anything `claim_stage_key` accepts, `stage_run` must accept; anything
+    it rejects, `stage_run` must reject. The two used to disagree on
+    three of the five fields.
+    """
+
+    probes = [
+        {},
+        *(o for _, o, _ in INVALID_KEY_IDENTITIES),
+        *(o for _, o in NORMALIZED_KEY_IDENTITIES),
+    ]
+    for override in probes:
+        identity = {**VALID_KEY_IDENTITY, **override}
+
+        def claim_ok():
+            fresh = migrated(tmp_path, f"c{abs(hash(str(override)))}.db")
+            try:
+                fresh.claim_stage_key(**identity)
+                return True
+            except Phase0Error:
+                return False
+
+        def run_ok():
+            fresh = migrated(tmp_path, f"r{abs(hash(str(override)))}.db")
+            try:
+                with fresh.stage_run(
+                    run_id=identity["run_id"],
+                    stage=identity["stage"],
+                    trading_day=identity["trading_day"],
+                    pipeline_version=identity["pipeline_version"],
+                    ticker=identity["ticker"],
+                ) as run:
+                    fresh.ingest_raw_items([], run=run, terminal=True)
+                return True
+            except Phase0Error:
+                return False
+
+        assert claim_ok() == run_ok(), f"disagreement on {override}"
+
+
+def test_a_rejected_claim_leaves_an_existing_key_untouched(tmp_path):
+    """Not merely "no new row" — no mutation of the one already there."""
+
+    repository = migrated(tmp_path)
+    repository.claim_stage_key(**VALID_KEY_IDENTITY, lease_seconds=600)
+    before = [dict(row) for row in repository.read.stage_key_rows()]
+
+    for _, override, error in INVALID_KEY_IDENTITIES:
+        with pytest.raises(error):
+            repository.claim_stage_key(**{**VALID_KEY_IDENTITY, **override})
+
+    assert [dict(row) for row in repository.read.stage_key_rows()] == before
+
+
+def test_valid_lease_and_reclaim_semantics_survive_the_normalization(tmp_path):
+    """The lease rules are unchanged; only the identity gate moved."""
+
+    repository = migrated(tmp_path)
+    start = "2026-07-23T12:00:00+00:00"
+    assert repository.claim_stage_key(
+        **VALID_KEY_IDENTITY, lease_seconds=60, claimed_at=start
+    )
+    # A live lease is not reclaimable, and its owner may renew it — even
+    # when the caller spells the identity untidily.
+    assert not repository.claim_stage_key(
+        **{**VALID_KEY_IDENTITY, "run_id": "other"},
+        lease_seconds=60,
+        claimed_at="2026-07-23T12:00:30+00:00",
+    )
+    assert repository.heartbeat_stage_key(
+        **{**VALID_KEY_IDENTITY, "stage": " m3.semantic "},
+        lease_seconds=60,
+        now="2026-07-23T12:00:30+00:00",
+    )
+    # Past expiry, another worker takes it.
+    assert repository.claim_stage_key(
+        **{**VALID_KEY_IDENTITY, "run_id": "other"},
+        lease_seconds=60,
+        claimed_at="2026-07-23T12:05:00+00:00",
+    )
+
+
+# ----------------------------------------------------------------------
 # A run identity names exactly one partition, permanently
 #
 # `run_log` is an upsert keyed on `(run_id, stage)`.  The conflict branch
@@ -7256,6 +7467,241 @@ def test_record_source_state_rejects_another_days_fetch(tmp_path):
             )
 
     assert repository.source_state("rss:test") is None
+
+
+# ----------------------------------------------------------------------
+# A fetch outcome is stated once
+#
+# `record_source_state` took both `successful` and `status`.  The stored
+# row resolved from `status` when it was given; the run's counters
+# resolved from `successful` regardless.  So the feed's record and the
+# run that wrote it could say opposite things — and not only when a
+# caller contradicted itself: `status="unknown"` is perfectly valid and
+# does not count as a successful fetch, yet the default `successful=True`
+# still logged the run as a success.
+# ----------------------------------------------------------------------
+
+
+#: (kwargs, stored status) for everything that is accepted.  The stored
+#: status is the whole answer: `last_success_at`, `consecutive_failures`,
+#: and the run's own counters are all derived from it, and the assertions
+#: below check each against that one value rather than against a
+#: separately maintained expectation.
+ACCEPTED_SOURCE_OUTCOMES = [
+    ("nothing stated", {}, "success"),
+    ("successful=True", {"successful": True}, "success"),
+    ("successful=False", {"successful": False}, "failed"),
+    ("status=success", {"status": "success"}, "success"),
+    ("status=failed", {"status": "failed"}, "failed"),
+    ("status=partial", {"status": "partial"}, "partial"),
+    ("status=empty", {"status": "empty"}, "empty"),
+    ("status=unknown", {"status": "unknown"}, "unknown"),
+    ("True + success", {"successful": True, "status": "success"}, "success"),
+    ("False + failed", {"successful": False, "status": "failed"}, "failed"),
+    ("True + partial", {"successful": True, "status": "partial"}, "partial"),
+    ("True + empty", {"successful": True, "status": "empty"}, "empty"),
+    ("False + unknown", {"successful": False, "status": "unknown"}, "unknown"),
+    ("padded status", {"status": "  SUCCESS  "}, "success"),
+]
+
+SUCCEEDED_STATUSES = {"success", "partial", "empty"}
+
+REJECTED_SOURCE_OUTCOMES = [
+    ("True + failed", {"successful": True, "status": "failed"}),
+    ("False + success", {"successful": False, "status": "success"}),
+    ("True + unknown", {"successful": True, "status": "unknown"}),
+    ("False + partial", {"successful": False, "status": "partial"}),
+    ("False + empty", {"successful": False, "status": "empty"}),
+    ("invalid status text", {"status": "banana"}),
+    ("empty status text", {"status": ""}),
+]
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [pytest.param(k, s, id=label) for label, k, s in ACCEPTED_SOURCE_OUTCOMES],
+)
+@pytest.mark.parametrize("terminal", [False, True], ids=["non-terminal", "terminal"])
+def test_the_source_state_and_the_run_agree_on_one_outcome(
+    tmp_path, kwargs, expected, terminal
+):
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "m0.ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    repository.claim_stage_key(**key, run_id="run-src")
+
+    with repository.stage_run(
+        run_id="run-src",
+        stage="m0.ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        stage_key=key,
+    ) as run:
+        repository.record_source_state("rss:test", run=run, terminal=terminal, **kwargs)
+
+    succeeded = expected in SUCCEEDED_STATUSES
+    state = repository.source_state("rss:test")
+    assert state["status"] == expected
+    assert (state["last_success_at"] is not None) is succeeded
+    assert state["consecutive_failures"] == (0 if succeeded else 1)
+    assert state["last_checked_at"] is not None
+
+    entry = dict(repository.read.run_log_rows(run_id="run-src")[0])
+    # The counters are this call's own answer, and they follow the stored
+    # status in both forms.
+    assert entry["success_count"] == (1 if succeeded else 0)
+    assert entry["partial_count"] == (0 if succeeded else 1)
+    assert json.loads(entry["counts"])["source_state_status"] == expected
+
+    if terminal:
+        # Only a terminal run's status is this call's to decide; a run
+        # that never settles is degraded by the lifecycle, whatever it
+        # recorded on the way.
+        assert entry["status"] == ("success" if succeeded else "degraded")
+        assert repository.read.stage_key_rows()[0]["status"] == (
+            "success" if succeeded else "degraded"
+        )
+    else:
+        # A run that never settles terminally is degraded and leaves its
+        # key failed, whatever it recorded along the way — unchanged
+        # lifecycle, asserted here so the outcome fix cannot quietly
+        # start driving it.
+        assert entry["status"] == "degraded"
+        assert repository.read.stage_key_rows()[0]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [pytest.param(k, id=label) for label, k in REJECTED_SOURCE_OUTCOMES],
+)
+@pytest.mark.parametrize("terminal", [False, True], ids=["non-terminal", "terminal"])
+def test_a_contradictory_fetch_outcome_mutates_nothing(tmp_path, kwargs, terminal):
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "m0.ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    repository.claim_stage_key(**key, run_id="run-src")
+
+    with pytest.raises(Phase0ValidationError):
+        with repository.stage_run(
+            run_id="run-src",
+            stage="m0.ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            repository.record_source_state(
+                "rss:test", run=run, terminal=terminal, **kwargs
+            )
+
+    # No source state at all, and the key was not marked finished.
+    assert repository.source_state("rss:test") is None
+    assert repository.count("source_state") == 0
+    assert repository.read.stage_key_rows()[0]["status"] == "failed"
+    # The run is recorded, as a failure — that is the logging contract,
+    # not a mutation of the state this call was refused permission to write.
+    entry = dict(repository.read.run_log_rows(run_id="run-src")[0])
+    assert entry["status"] == "failed"
+    assert entry["success_count"] == 0
+
+
+def test_a_replayed_fetch_outcome_is_deterministic(tmp_path):
+    """The same statement twice reaches the same place, counters included."""
+
+    repository = migrated(tmp_path)
+    for attempt in range(2):
+        with repository.stage_run(
+            run_id=f"run-{attempt}",
+            stage="m0.ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.record_source_state(
+                "rss:test", run=run, status="partial", terminal=True
+            )
+        state = repository.source_state("rss:test")
+        assert state["status"] == "partial"
+        assert state["consecutive_failures"] == 0
+
+
+def test_a_failed_fetch_after_a_success_still_counts_up(tmp_path):
+    """Consecutive failures track the resolved status, not the boolean."""
+
+    repository = migrated(tmp_path)
+    for index, status in enumerate(["success", "failed", "unknown", "empty"]):
+        with repository.stage_run(
+            run_id=f"run-{index}",
+            stage="m0.ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.record_source_state(
+                "rss:test", run=run, status=status, terminal=True
+            )
+        state = repository.source_state("rss:test")
+        assert state["status"] == status
+    # success -> failed(1) -> unknown(2) -> empty resets to 0.
+    assert repository.source_state("rss:test")["consecutive_failures"] == 0
+
+
+def test_the_unlogged_source_state_path_shares_the_contract(tmp_path):
+    """`admin.set_source_state` resolves the outcome the same way."""
+
+    repository = migrated(tmp_path)
+    with pytest.raises(Phase0ValidationError, match="disagree"):
+        repository.admin.set_source_state(
+            "rss:test",
+            etag=None,
+            last_modified=None,
+            checked_at=f"{DAY}T12:00:00+00:00",
+            successful=True,
+            status="failed",
+        )
+    assert repository.source_state("rss:test") is None
+
+
+def test_a_run_logged_as_success_cannot_carry_errors(tmp_path):
+    """The adjacent instance of the same "two answers" shape.
+
+    `_write_run_log` already reads a non-empty `errors` list as *meaning*
+    degraded when no status is given, so a caller stating `success`
+    alongside errors contradicts the module's own rule.
+    """
+
+    repository = migrated(tmp_path)
+    entry = {
+        "run_id": "run-1",
+        "stage": "cluster",
+        "counts": {},
+        "duration_ms": 1,
+        "started_at": f"{DAY}T12:00:00+00:00",
+        "completed_at": f"{DAY}T12:00:01+00:00",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "ticker": "NVDA",
+    }
+    with pytest.raises(Phase0ValidationError, match="recorded errors"):
+        repository.admin.log_stage(**entry, status="success", errors=["boom"])
+    assert repository.read.run_log_rows() == []
+
+    # The honest spellings both work.
+    repository.admin.log_stage(**entry, status="degraded", errors=["boom"])
+    assert repository.read.run_log_rows()[0]["status"] == "degraded"
+    repository.admin.log_stage(
+        **{**entry, "run_id": "run-2"}, status="success", errors=[]
+    )
+    assert repository.read.run_log_rows(run_id="run-2")[0]["status"] == "success"
 
 
 # ----------------------------------------------------------------------

@@ -91,6 +91,13 @@ RUNNING_STATUS = "running"
 THEME_STATUSES = {"pending", "ready", "degraded", "failed"}
 INGEST_STATUSES = {"valid", "invalid", "ambiguous"}
 SOURCE_STATE_STATUSES = {"success", "partial", "empty", "failed", "unknown"}
+
+#: The statuses the schema itself treats as a successful fetch: these are
+#: the ones that stamp ``last_success_at`` and leave
+#: ``consecutive_failures`` at zero.  The run-log outcome is derived from
+#: the same set, so a source state and the run that recorded it cannot
+#: disagree about whether the fetch worked.
+SUCCEEDED_SOURCE_STATE_STATUSES = frozenset({"success", "partial", "empty"})
 STORY_STAGES = {"m2.exact", "m3.semantic"}
 CLUSTERING_METHODS = {
     "hdbscan",
@@ -1949,17 +1956,31 @@ class Phase0Repository:
             raise Phase0ValidationError("source state must be a mapping")
         source = _require_text(state.get("source"), "source state source")
         checked_at = _normalize_datetime(state.get("checked_at"), "checked_at")
-        successful = bool(state.get("successful"))
+        # One resolved outcome, and only one.  ``status`` is the richer
+        # statement — the boolean cannot express ``partial``, ``empty``,
+        # or ``unknown`` at all — so when it is given it decides.
+        # ``successful`` is then a claim about the same thing, and a
+        # caller that states both and disagrees with itself is refused
+        # rather than silently having one half honoured.
         status = state.get("status")
+        successful = state.get("successful")
         if status is None:
-            resolved_status = "success" if successful else "failed"
+            resolved_status = "success" if bool(successful) else "failed"
         else:
             resolved_status = str(status).strip().lower()
             if resolved_status not in SOURCE_STATE_STATUSES:
                 raise Phase0ValidationError(
                     f"invalid source-state status: {resolved_status}"
                 )
-        succeeded = resolved_status in {"success", "partial", "empty"}
+            if successful is not None and bool(successful) != (
+                resolved_status in SUCCEEDED_SOURCE_STATE_STATUSES
+            ):
+                raise Phase0ValidationError(
+                    f"source state for {source!r} says successful="
+                    f"{bool(successful)} and status={resolved_status!r}, which "
+                    f"disagree; state the outcome once"
+                )
+        succeeded = resolved_status in SUCCEEDED_SOURCE_STATE_STATUSES
         error = state.get("error")
         return {
             "source": source,
@@ -1986,7 +2007,14 @@ class Phase0Repository:
     @classmethod
     def _set_source_state(
         cls, connection: sqlite3.Connection, state: Mapping[str, Any]
-    ) -> None:
+    ) -> dict[str, Any]:
+        """Write one source state; return the values actually persisted.
+
+        Returning them is what lets the caller's run outcome be derived
+        from the *resolved* status rather than from its own second copy
+        of the same question.
+        """
+
         values = cls.validate_source_state(state)
         connection.execute(
             """
@@ -2021,6 +2049,7 @@ class Phase0Repository:
             """,
             values,
         )
+        return values
 
     def _set_source_state_unlogged(
         self,
@@ -2029,7 +2058,7 @@ class Phase0Repository:
         etag: str | None,
         last_modified: str | None,
         checked_at: str,
-        successful: bool,
+        successful: bool | None = None,
         metadata: Mapping[str, Any] | None = None,
         status: str | None = None,
         error: Any = None,
@@ -4045,11 +4074,26 @@ class Phase0Repository:
         lease_seconds: int = 300,
         claimed_at: str | datetime | None = None,
     ) -> bool:
-        """Atomically claim an unowned, retryable, or expired stage key."""
+        """Atomically claim an unowned, retryable, or expired stage key.
+
+        Every identity field is normalized and validated first, so a key
+        this method creates is always one :meth:`stage_run` will accept.
+        """
+
         if _require_int(lease_seconds, "lease_seconds") <= 0:
             raise Phase0ValidationError("lease_seconds must be positive")
-        day = _normalize_day(trading_day)
-        normalized_ticker = normalize_ticker(ticker)
+        identity = self._stage_key_identity(
+            stage=stage,
+            ticker=ticker,
+            trading_day=trading_day,
+            pipeline_version=pipeline_version,
+            run_id=run_id,
+        )
+        stage = identity["stage"]
+        day = identity["trading_day"]
+        normalized_ticker = identity["ticker"]
+        pipeline_version = identity["pipeline_version"]
+        run_id = identity["run_id"]
         normalized_claimed_at = _normalize_datetime(
             claimed_at or utc_now(),
             "claimed_at",
@@ -4129,8 +4173,18 @@ class Phase0Repository:
 
         if _require_int(lease_seconds, "lease_seconds") <= 0:
             raise Phase0ValidationError("lease_seconds must be positive")
-        day = _normalize_day(trading_day)
-        normalized_ticker = normalize_ticker(ticker)
+        identity = self._stage_key_identity(
+            stage=stage,
+            ticker=ticker,
+            trading_day=trading_day,
+            pipeline_version=pipeline_version,
+            run_id=run_id,
+        )
+        stage = identity["stage"]
+        day = identity["trading_day"]
+        normalized_ticker = identity["ticker"]
+        pipeline_version = identity["pipeline_version"]
+        run_id = identity["run_id"]
         moment = _normalize_datetime(now or utc_now(), "now")
         expires = (
             datetime.fromisoformat(moment) + timedelta(seconds=int(lease_seconds))
@@ -4183,8 +4237,18 @@ class Phase0Repository:
 
         if status not in STAGE_KEY_STATUSES:
             raise Phase0ValidationError("invalid stage-key status")
-        day = _normalize_day(trading_day)
-        normalized_ticker = normalize_ticker(ticker)
+        identity = self._stage_key_identity(
+            stage=stage,
+            ticker=ticker,
+            trading_day=trading_day,
+            pipeline_version=pipeline_version,
+            run_id=run_id,
+        )
+        stage = identity["stage"]
+        day = identity["trading_day"]
+        normalized_ticker = identity["ticker"]
+        pipeline_version = identity["pipeline_version"]
+        run_id = identity["run_id"]
         now = utc_now()
         with self._connect() as connection:
             cursor = connection.execute(
@@ -4403,6 +4467,19 @@ class Phase0Repository:
         resolved_status = status or ("degraded" if errors else "success")
         if resolved_status not in RUN_STATUSES:
             raise Phase0ValidationError("invalid run status")
+        # `status` and `errors` describe the same outcome, and the line
+        # above says how: an unstated status *means* degraded when there
+        # are errors.  A caller that states `success` alongside errors is
+        # therefore contradicting the module's own rule, and `degraded`
+        # is the word this vocabulary has for "worked, with problems".
+        # `StageRunContext._resolved_status` cannot produce the pairing,
+        # so only the admin path could, and silently.
+        if resolved_status == "success" and errors:
+            raise Phase0ValidationError(
+                f"run {run_id!r} stage {stage!r} is logged as 'success' with "
+                f"{len(list(errors))} error(s); a run that recorded errors is "
+                f"'degraded' or 'failed'"
+            )
         if _require_int(duration_ms, "duration_ms") < 0:
             raise Phase0ValidationError("duration_ms cannot be negative")
         normalized_started = _normalize_datetime(started_at, "started_at")
@@ -4965,6 +5042,40 @@ class Phase0Repository:
         }
 
     @staticmethod
+    def _stage_key_identity(
+        *,
+        stage: Any,
+        ticker: Any,
+        trading_day: Any,
+        pipeline_version: Any,
+        run_id: Any,
+    ) -> dict[str, str]:
+        """The five immutable fields of a stage-key lifecycle, normalized.
+
+        One definition, shared by every entrypoint that creates, renews,
+        or settles a key, using exactly the helpers ``stage_run`` uses.
+        It had been three definitions: the key methods normalized only
+        ``ticker`` and ``trading_day`` and passed ``stage``,
+        ``pipeline_version``, and ``run_id`` through untouched, while
+        ``stage_run`` required all five to be non-blank and stripped.
+
+        The gap was not cosmetic.  A claim with ``run_id=""`` was written
+        as ``running`` and then could not be settled by anybody: the
+        identity that owned the lease was one ``stage_run`` refuses, so
+        the partition stayed locked until the lease expired.  A padded
+        ``stage`` did the same thing more quietly — the key was stored
+        under a name no normalized lookup would ever match.
+        """
+
+        return {
+            "stage": _require_text(stage, "stage"),
+            "ticker": normalize_ticker(ticker),
+            "trading_day": _normalize_day(trading_day),
+            "pipeline_version": _require_text(pipeline_version, "pipeline_version"),
+            "run_id": _require_text(run_id, "run_id"),
+        }
+
+    @staticmethod
     def _assert_stage_key_matches(
         key: Mapping[str, Any],
         *,
@@ -5509,7 +5620,7 @@ class Phase0Repository:
         etag: str | None = None,
         last_modified: str | None = None,
         checked_at: str | None = None,
-        successful: bool = True,
+        successful: bool | None = None,
         metadata: Mapping[str, Any] | None = None,
         status: str | None = None,
         error: Any = None,
@@ -5523,6 +5634,18 @@ class Phase0Repository:
         promises: when the caller states a ``checked_at``, it must fall on
         the run's trading day, so a run cannot stamp another day's fetch as
         its own.  Omitting it means "now", which asserts no day.
+
+        **The outcome is stated once.** ``status`` is the richer of the
+        two — ``partial``, ``empty``, and ``unknown`` have no boolean
+        spelling — so when it is given it decides, and ``successful``
+        becomes a claim about the same thing that must agree.  Stating
+        both and disagreeing is refused.  Whichever way it resolves, the
+        stored status, the ``last_success_at`` stamp, the failure
+        counter, and this run's own counters all come from that one
+        answer, so the feed's record and the run that wrote it can no
+        longer say opposite things.
+
+        Omitting both still means success, as it always has.
 
         Both the timestamp normalization and that check happen inside the
         logged mutation, so rejecting either one is this run's recorded
@@ -5544,18 +5667,31 @@ class Phase0Repository:
                 "etag": etag,
                 "last_modified": last_modified,
                 "checked_at": moment,
-                "successful": successful,
+                # Neither stated is the documented default: success.
+                "successful": True
+                if (successful is None and status is None)
+                else successful,
                 "metadata": metadata or {},
                 "status": status,
                 "error": error,
                 "retry_after": retry_after,
             }
-            self._set_source_state(connection, state)
+            persisted = self._set_source_state(connection, state)
+            # Derived from what was actually stored, not from a second
+            # copy of the question: `failed` is 1 exactly when the
+            # resolved status is one the schema does not count as a
+            # successful fetch.
+            succeeded = not persisted["failed"]
             context._record_outcome(
-                success=1 if successful else 0,
-                partial=0 if successful else 1,
+                success=1 if succeeded else 0,
+                partial=0 if succeeded else 1,
             )
-            context._merge_counts({"source_states_recorded": 1})
+            context._merge_counts(
+                {
+                    "source_states_recorded": 1,
+                    "source_state_status": persisted["status"],
+                }
+            )
 
     def run_log_entries(
         self,

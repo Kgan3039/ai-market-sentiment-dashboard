@@ -148,6 +148,31 @@ anything is written. The unlogged row helpers live on `repository.admin`,
 where they are labelled administrative rather than presented as pipeline
 entrypoints.
 
+**An outcome is stated once.** `record_source_state` takes both
+`successful` and `status`, and the two used to be resolved separately:
+the stored row followed `status` when it was given, while the run's
+counters followed `successful` regardless. So a feed's record and the run
+that wrote it could say opposite things — and not only when a caller
+contradicted itself, because `status="unknown"` is perfectly valid, does
+not count as a successful fetch, and still logged a success under the
+default `successful=True`.
+
+`status` is the richer statement — `partial`, `empty`, and `unknown` have
+no boolean spelling — so when given it decides, and `successful` becomes a
+claim about the same thing that must agree; stating both and disagreeing
+is refused before anything is written. Whichever way it resolves, the
+stored status, the `last_success_at` stamp, `consecutive_failures`, and
+the run's own counters all derive from that one answer, using the same
+succeeded set (`success`, `partial`, `empty`) the schema itself uses.
+Omitting both still means success. `admin.set_source_state` shares the
+contract, since both go through `validate_source_state`.
+
+The same shape appeared once more, in `_write_run_log`: an unstated status
+*means* degraded when there are errors, so a caller stating `success`
+alongside errors was contradicting the module's own rule. That pairing is
+now refused too; `degraded` is the word this vocabulary has for "worked,
+with problems".
+
 **The run handle cannot be forged.** `StageRunContext` refuses direct
 construction, and authorization is by object identity against a registry
 the owning repository keeps — so a copy, a pickle, an `object.__new__`
@@ -248,6 +273,24 @@ IS NULL OR lease_expires_at <= now`). Expiry is the moment ownership
 ends, not a suggestion the previous owner may decline — an owner able to
 push a lapsed lease forward would keep working on a partition another
 worker was already entitled to take, and both would hold it at once.
+
+**A key that can be claimed is a key that can be settled.**
+`claim_stage_key` normalized only `ticker` and `trading_day` and passed
+`stage`, `pipeline_version`, and `run_id` through untouched, while
+`stage_run` requires all five to be non-blank and stripped. So a claim
+with `run_id=""` was written as `running` and then could be settled by
+nobody: the identity holding the lease was one `stage_run` refuses, and
+the partition stayed locked until the lease expired. A padded `stage` did
+the same thing more quietly, storing the key under a name no normalized
+lookup would match.
+
+`_stage_key_identity` is now the one definition of those five fields,
+built from the same helpers `stage_run` uses, and `claim_stage_key`,
+`heartbeat_stage_key`, and `admin.complete_stage_key` all go through it —
+so the lifecycle has one identity contract rather than three. Validation
+happens before any write, so a rejected claim leaves no row and does not
+touch a key already there. Ticker normalization, lease semantics, and
+reclaim semantics are unchanged.
 
 **Ticker membership is membership, not exclusivity.** One article can be
 about two companies. `raw_item_tickers` is the authoritative table for
