@@ -511,6 +511,39 @@ correctable: the branch carrying migrations 005–012 is now published as
 checksum that a database somewhere may already hold. See the release-status
 note below.
 
+**And the delete path had to be brought up to the same predicate.** 012
+asked the ownership question; 007's cleanup, which 012 did not touch,
+still asked two narrower ones. The handle branch compared a single
+column, so an alias colliding with another live row's *durable id* — or,
+for themes, with its other alias — looked orphaned. The durable-id branch
+compared nothing at all, so deleting story 1 took the vector cached under
+`'1'` even while a live story's `cluster_fingerprint` was the string
+`'1'`. Both are states the insert trigger would have called ownership a
+moment earlier, and neither is exotic: handles are unique only within a
+partition, so two of them repeating is ordinary, and a digest that
+happens to spell a small integer is a coincidence nothing forbids.
+
+Migration **013** replaces both cleanup triggers so that every verb asks
+one question — *would any live row still be allowed to own this
+`source_id`, through any accepted form?* — with the `NOT EXISTS`
+correlated to `embeddings.source_id` rather than to one `OLD` column,
+which is what lets the durable-id and handle branches share it. `raw_items`
+is deliberately left alone: its ownership predicate has exactly one form,
+the durable id, which is the one its cleanup already uses, and
+`AUTOINCREMENT` means a deleted id is never issued again.
+
+Replacing a trigger is additive. 007 and 012 keep their bytes and their
+checksums; 013 drops what 007 created and creates the replacement, which
+is a schema change like any other and settles in its own transaction. An
+existing v12 database gains the fix on upgrade, because a trigger is
+schema and the old one is sitting inside it.
+
+What none of this changes is *who may name an owner*. The single-vector
+cache still takes a durable id and means the row with that id, so another
+row's alias spelling the same digits does not make it ambiguous there; a
+handle is still refused there outright; and the run-scoped batch, which
+resolves both forms, still refuses an identity that names two rows.
+
 ## The boundaries downstream stages use
 
 ```python

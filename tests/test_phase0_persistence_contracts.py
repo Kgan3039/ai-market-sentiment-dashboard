@@ -7386,8 +7386,15 @@ def test_deleting_the_last_owner_still_removes_the_embedding(
     assert not cached(repository, kind, identity), "an orphan vector survived"
 
 
-def test_a_durable_id_cleanup_still_needs_no_survivor_check(tmp_path):
-    """A row id is globally unique, so its deletion is unconditional."""
+def test_a_durable_id_cleanup_collects_its_vector_when_nobody_answers(tmp_path):
+    """The ordinary case: an id nothing else answers to takes its vector.
+
+    A row id is globally unique and AUTOINCREMENT never hands a deleted
+    one out again, so normally there is nobody left the moment the row
+    goes.  "Normally" is the operative word — a live row's *handle* can be
+    the same string as a dead row's id, and migration 013 keeps that case
+    honest; it is covered separately below.
+    """
 
     repository = migrated(tmp_path)
     nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
@@ -7517,15 +7524,18 @@ def move_handle(repository, handle: str, row_id: int, value=None) -> str:
     return value
 
 
-def embed_while_sole_owner(repository, kind: str, identity: str) -> None:
-    """NVDA caches a vector under a handle while it alone carries it.
+def embed_while_sole_owner(
+    repository, kind: str, identity: str, ticker: str = "NVDA"
+) -> None:
+    """One partition caches a vector under an identity it alone answers to.
 
     The ordering is the whole point: the write has to happen while the
-    handle is unambiguous, because `persist_embeddings` refuses it once
-    two partitions answer to it.
+    identity is unambiguous, because `persist_embeddings` refuses it once
+    two rows answer to it.  The run has to cover the owning partition too,
+    for the same reason it always does.
     """
 
-    with nvda_run(repository, stage="m1.embed") as run:
+    with nvda_run(repository, stage="m1.embed", ticker=ticker) as run:
         repository.persist_embeddings(
             [sample_embedding(identity, source_kind=kind)], run=run
         )
@@ -7730,6 +7740,329 @@ def test_reconciling_a_theme_under_a_new_key_drops_the_old_keys_vector(tmp_path)
     assert [row["theme_key"] for row in stored] == ["reconciled-theme-key"]
     assert not cached(repository, "theme", identity), "the old key kept its vector"
     assert not cached(repository, "theme", "reconciled-theme-key")
+
+
+# ----------------------------------------------------------------------
+# "Orphaned" is one question, and every verb has to ask all of it
+#
+# `trg_embedding_owner_insert` accepts a durable row id *or* any handle
+# the row answers to.  The cleanup triggers asked something narrower —
+# the handle branch compared one column, and the durable-id branch
+# compared nothing — so an identity that collides across two accepted
+# forms looked orphaned while a live row still owned it.  Migration 013
+# makes both branches ask the insert trigger's question.
+# ----------------------------------------------------------------------
+
+
+#: The identity forms migration 007 accepts, per parent kind.  `durable-id`
+#: is not assignable: a row wears it by being that row.
+ACCEPTED_FORMS = {
+    "story": ("durable-id", "fingerprint"),
+    "theme": ("durable-id", "fingerprint", "key"),
+}
+
+#: Where an assignable form actually lives.
+ALIAS_COLUMN = {
+    ("story", "fingerprint"): "cluster_fingerprint",
+    ("theme", "fingerprint"): "fingerprint",
+    ("theme", "key"): "theme_key",
+}
+
+PARENT_TABLE = {"story": "stories", "theme": "themes"}
+PARENT_KEY = {"story": "story_id", "theme": "theme_id"}
+
+
+def isolated_handles(tag: str) -> dict:
+    """Handles belonging to one partition alone.
+
+    The shared set every other test uses would collide on its own, which
+    would hide which collision a case is actually about.
+    """
+
+    return {
+        "story_fingerprint": f"story-fp-{tag}",
+        "theme_fingerprint": f"theme-fp-{tag}",
+        "theme_key": f"theme-key-{tag}",
+    }
+
+
+def wear_alias(repository, kind: str, parent_id: int, form: str, identity: str) -> None:
+    set_column(
+        repository, PARENT_TABLE[kind], ALIAS_COLUMN[(kind, form)], parent_id, identity
+    )
+
+
+def collided_owners(repository, kind: str, victim_form: str, survivor_form: str) -> str:
+    """Two partitions that end up answering to one identity, differently.
+
+    The victim owns it through `victim_form` and is about to be deleted;
+    the survivor owns it through `survivor_form` and stays. The vector is
+    always cached at the one moment exactly one of them answers, because
+    `persist_embeddings` refuses an ambiguous identity — correctly, and
+    that refusal is not what is under test here.
+    """
+
+    victim = one_handled_partition(repository, "NVDA", isolated_handles("nvda"))
+    survivor = one_handled_partition(repository, "AMD", isolated_handles("amd"))
+    victim_id = victim[PARENT_KEY[kind]]
+    survivor_id = survivor[PARENT_KEY[kind]]
+
+    if victim_form == "durable-id":
+        # The victim already wears it, so cache first and dress the
+        # survivor afterwards.
+        identity = str(victim_id)
+        embed_while_sole_owner(repository, kind, identity)
+        wear_alias(repository, kind, survivor_id, survivor_form, identity)
+    else:
+        if survivor_form == "durable-id":
+            identity = str(survivor_id)
+        else:
+            identity = "collided-identity"
+            wear_alias(repository, kind, survivor_id, survivor_form, identity)
+        embed_while_sole_owner(repository, kind, identity, ticker="AMD")
+        wear_alias(repository, kind, victim_id, victim_form, identity)
+
+    assert cached(repository, kind, identity), "setup lost the vector early"
+    drop_parent(repository, kind, victim_id)
+    return identity
+
+
+#: Every ordered pair of accepted forms. Two rows cannot share a durable
+#: id, so that one pairing is not a state and is left out.
+OWNERSHIP_COLLISIONS = [
+    (kind, victim, survivor)
+    for kind, forms in ACCEPTED_FORMS.items()
+    for victim in forms
+    for survivor in forms
+    if not (victim == "durable-id" and survivor == "durable-id")
+]
+
+
+@pytest.mark.parametrize(
+    "kind, victim_form, survivor_form",
+    OWNERSHIP_COLLISIONS,
+    ids=[f"{k}-{v}-dies-{s}-lives" for k, v, s in OWNERSHIP_COLLISIONS],
+)
+def test_a_deletion_spares_a_vector_another_form_still_owns(
+    tmp_path, kind, victim_form, survivor_form
+):
+    """Cases 1, 2, 6, 7, 8 and 9, and the pairings those imply.
+
+    Every one is cross-partition: the two owners are NVDA's and AMD's,
+    which is the ordinary way one identity comes to have two claimants,
+    since handles are unique only within a ticker/day/version.
+    """
+
+    repository = migrated(tmp_path)
+    identity = collided_owners(repository, kind, victim_form, survivor_form)
+
+    assert cached(repository, kind, identity), "a live owner lost its vector"
+    assert repository.count("embeddings") == 1
+
+
+@pytest.mark.parametrize(
+    "kind, victim_form, survivor_form",
+    OWNERSHIP_COLLISIONS,
+    ids=[f"{k}-{v}-renamed-{s}-lives" for k, v, s in OWNERSHIP_COLLISIONS],
+)
+def test_a_rename_spares_a_vector_another_form_still_owns(
+    tmp_path, kind, victim_form, survivor_form
+):
+    """Cases 3 and 10: the same matrix, reached by the other verb.
+
+    A durable id cannot be renamed, so the victim moves whichever alias
+    it holds; when it holds none — it owned by id — the survivor's alias
+    moves instead, which is the same question asked from the other side.
+    """
+
+    repository = migrated(tmp_path)
+    victim = one_handled_partition(repository, "NVDA", isolated_handles("nvda"))
+    survivor = one_handled_partition(repository, "AMD", isolated_handles("amd"))
+    victim_id = victim[PARENT_KEY[kind]]
+    survivor_id = survivor[PARENT_KEY[kind]]
+
+    if victim_form == "durable-id":
+        identity = str(victim_id)
+        embed_while_sole_owner(repository, kind, identity)
+        wear_alias(repository, kind, survivor_id, survivor_form, identity)
+        # Nothing about the victim can move, so the survivor's alias does:
+        # it leaves and comes back, and the vector must be there after.
+        wear_alias(repository, kind, survivor_id, survivor_form, "elsewhere")
+        wear_alias(repository, kind, survivor_id, survivor_form, identity)
+    else:
+        if survivor_form == "durable-id":
+            identity = str(survivor_id)
+        else:
+            identity = "collided-identity"
+            wear_alias(repository, kind, survivor_id, survivor_form, identity)
+        embed_while_sole_owner(repository, kind, identity, ticker="AMD")
+        wear_alias(repository, kind, victim_id, victim_form, identity)
+        wear_alias(repository, kind, victim_id, victim_form, "moved-away")
+
+    assert cached(repository, kind, identity), "a live owner lost its vector"
+    assert repository.count("embeddings") == 1
+
+
+def two_stories_in_one_partition(repository, ticker="NVDA") -> list[int]:
+    """One partition holding two stories, reconciled together.
+
+    Reconciliation settles a partition as a whole, so a second call would
+    replace the first story rather than join it — both have to arrive in
+    the same settlement.
+    """
+
+    items = seed_raw_items(repository, 2, ticker=ticker)
+    reconcile_stories(
+        repository,
+        ticker=ticker,
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("fp-one", items[:1]), story("fp-two", items[1:])],
+    )
+    return [int(row["id"]) for row in repository.stories_for_day(DAY, ticker)]
+
+
+def test_two_forms_can_collide_inside_one_partition_too(tmp_path):
+    """Cross-partition is the common route, not the only one.
+
+    A row id is a plain integer, and nothing stops another row in the
+    *same* partition from having a fingerprint that spells it — the
+    uniqueness index covers the fingerprint column, not the relationship
+    between a fingerprint and somebody else's id.
+    """
+
+    repository = migrated(tmp_path)
+    first, second = two_stories_in_one_partition(repository)
+    identity = str(first)
+    embed_while_sole_owner(repository, "story", identity)
+
+    wear_alias(repository, "story", second, "fingerprint", identity)
+    drop_parent(repository, "story", first)
+
+    assert cached(repository, "story", identity), "the same-partition owner lost it"
+
+
+@pytest.mark.parametrize("kind", ["story", "theme"])
+@pytest.mark.parametrize("form", ["durable-id", "alias"])
+def test_the_last_owner_in_any_form_still_takes_the_vector(tmp_path, kind, form):
+    """Cases 4 and 11: a complete predicate is not a permanent one.
+
+    The guard exists to spare owners, and when there are none left it has
+    to get out of the way — otherwise every collision leaks a row.
+    """
+
+    repository = migrated(tmp_path)
+    only = one_handled_partition(repository, "NVDA", isolated_handles("only"))
+    parent_id = only[PARENT_KEY[kind]]
+    identity = (
+        str(parent_id)
+        if form == "durable-id"
+        else isolated_handles("only")[
+            "story_fingerprint" if kind == "story" else "theme_fingerprint"
+        ]
+    )
+    embed_while_sole_owner(repository, kind, identity)
+
+    drop_parent(repository, kind, parent_id)
+
+    assert not cached(repository, kind, identity), "an orphan vector survived"
+    assert repository.count("embeddings") == 0
+
+
+@pytest.mark.parametrize("kind", ["story", "theme"])
+def test_an_unrelated_vector_is_untouched_by_a_deletion(tmp_path, kind):
+    """Case 5: a collision-free identity is nobody else's business."""
+
+    repository = migrated(tmp_path)
+    victim = one_handled_partition(repository, "NVDA", isolated_handles("nvda"))
+    other = one_handled_partition(repository, "AMD", isolated_handles("amd"))
+    identity = str(other[PARENT_KEY[kind]])
+    embed_while_sole_owner(repository, kind, identity, ticker="AMD")
+
+    drop_parent(repository, kind, victim[PARENT_KEY[kind]])
+
+    assert cached(repository, kind, identity)
+    assert repository.get_embedding(kind, identity) is not None
+
+
+def test_an_existing_database_gains_the_complete_predicate_on_upgrade(tmp_path):
+    """013 has to reach databases that already exist, not just fresh ones.
+
+    A trigger is schema, so the ones 007 created are sitting inside every
+    database built before this migration. Replacing them is the only way
+    the fix arrives there — and it has to arrive without disturbing the
+    ledger rows for 007 and 012, whose files are released and unchanged.
+    """
+
+    database = tmp_path / "v12.sqlite3"
+    Phase0Repository(
+        database, migrations_path=partial_migrations(tmp_path, 12)
+    ).migrate()
+
+    before = Phase0Repository(database)
+    assert before.schema_version() == 12
+    victim, survivor = two_stories_in_one_partition(before)
+    identity = str(victim)
+    embed_while_sole_owner(before, "story", identity)
+    wear_alias(before, "story", survivor, "fingerprint", identity)
+
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+    assert upgraded.schema_version() == 13
+
+    # The pre-existing vector is still there, and now correctly guarded.
+    assert cached(upgraded, "story", identity)
+    drop_parent(upgraded, "story", victim)
+    assert cached(upgraded, "story", identity), "the upgrade did not take effect"
+
+    # Every earlier migration is still recorded exactly once, unedited.
+    with upgraded.admin.connect_writable() as connection:
+        ledger = [
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM schema_migrations ORDER BY version"
+            )
+        ]
+    assert ledger == [migration.name for migration in ALL_MIGRATIONS]
+
+
+def test_a_collision_does_not_change_what_the_write_apis_accept(tmp_path):
+    """013 widened who counts as an owner, not who may name one.
+
+    Each API keeps the rule it had. The single-vector cache takes a
+    durable id and means *the row with that id*, so another row's alias
+    spelling the same digits does not make it ambiguous — while a
+    fingerprint stays refused there, collision or no. The run-scoped
+    batch resolves both forms, so for it the same string does name two
+    rows, and it still says so.
+    """
+
+    repository = migrated(tmp_path)
+    victim = one_handled_partition(repository, "NVDA", isolated_handles("nvda"))
+    survivor = one_handled_partition(repository, "AMD", isolated_handles("amd"))
+    identity = str(survivor["story_id"])
+    embed_while_sole_owner(repository, "story", identity, ticker="AMD")
+    wear_alias(repository, "story", victim["story_id"], "fingerprint", identity)
+
+    # The cache API: the id still means the id.
+    assert repository.get_embedding("story", identity) is not None
+    repository.upsert_embedding(sample_embedding(identity, source_kind="story"))
+    assert repository.count("embeddings") == 1
+
+    # And a handle is still not a cache key.
+    handle = isolated_handles("nvda")["story_fingerprint"]
+    with pytest.raises(Phase0ValidationError, match="not a durable"):
+        repository.upsert_embedding(sample_embedding(handle, source_kind="story"))
+    with pytest.raises(Phase0ValidationError, match="not a durable"):
+        repository.delete_embedding("story", handle)
+
+    # The batch resolves both forms, so this identity names two rows.
+    with nvda_run(repository, stage="m1.embed") as run:
+        with pytest.raises(Phase0RunContextError, match="is ambiguous"):
+            repository.persist_embeddings(
+                [sample_embedding(identity, source_kind="story")], run=run
+            )
+    assert cached(repository, "story", identity)
 
 
 def test_record_source_state_rejects_another_days_fetch(tmp_path):
