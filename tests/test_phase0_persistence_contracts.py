@@ -19,6 +19,7 @@ import pickle
 import re
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +48,7 @@ from phase0.errors import (
     UnsupportedTickerError,
 )
 from phase0.models import (
+    AUXILIARY_OUTPUTS,
     ExcludedStoryRecord,
     OtherCoverageRecord,
     ProviderConflictRecord,
@@ -62,6 +64,7 @@ from phase0.repository import (
     MIGRATIONS_PATH,
     STORY_RECONCILED_COLUMNS,
     THEME_RECONCILED_COLUMNS,
+    THEME_SET_RECONCILED_COLUMNS,
     Phase0Admin,
     Phase0Reader,
     Phase0Repository,
@@ -70,7 +73,7 @@ from phase0.repository import (
     serialize_operational_metadata,
     serialize_raw_evidence,
 )
-from phase0.schema import load_migrations
+from phase0.schema import MINIMUM_SQLITE_VERSION, load_migrations
 from phase0.tickers import SUPPORTED_TICKERS
 
 
@@ -275,34 +278,28 @@ def legacy_v2_database(tmp_path: Path) -> Path:
 # ----------------------------------------------------------------------
 
 
-#: RAISE() took only a string *literal* until SQLite 3.47 (2024-10);
-#: earlier releases reject a concatenated message with a syntax error, and
-#: because SQLite parses the whole schema when a connection first uses it,
-#: one such trigger makes the entire database unopenable — not merely the
-#: statement that would fire it.
-#:
-#: These three sites shipped in released migrations, so they cannot be
-#: rewritten: the checksum ledger refuses any database whose stored
-#: checksum no longer matches the file ("add a new additive migration
-#: instead of rewriting history").  This test pins the known set so the
-#: cost is visible and, above all, so no *new* one is added — a fourth
-#: would extend the same defect into a migration that could still be
-#: written differently today.
-KNOWN_NON_LITERAL_RAISE_SITES = {
-    ("010_theme_partition_integrity.sql", "trg_story_partition_locked"),
-    ("011_required_story_pipeline_version.sql", "trg_legacy_version_ambiguity"),
-    ("011_required_story_pipeline_version.sql", "trg_story_partition_locked"),
-}
+#: Every migration file, including the compatibility convergence one that
+#: is not part of the numbered sequence but still has to parse everywhere.
+EVERY_MIGRATION_FILE = sorted(MIGRATIONS_PATH.rglob("*.sql"))
 
 
 def _non_literal_raise_sites() -> set[tuple[str, str]]:
-    """Every ``RAISE(..., <expression>)`` in the released migrations."""
+    """Every ``RAISE(..., <expression>)`` in every migration.
+
+    ``RAISE()`` took only a string *literal* until SQLite 3.47 (2024-10);
+    earlier releases reject a concatenated message with a syntax error.
+    That is far worse than one broken statement: SQLite parses the whole
+    schema the first time a connection touches it, so a single trigger it
+    cannot parse makes the entire database unopenable — ``SELECT`` and
+    even ``DROP TRIGGER`` fail alike, which means such a database cannot
+    be repaired from the runtime that cannot open it.
+    """
 
     found: set[tuple[str, str]] = set()
-    for migration in ALL_MIGRATIONS:
+    for path in EVERY_MIGRATION_FILE:
         trigger = None
         statement: list[str] = []
-        for line in migration.sql.splitlines():
+        for line in path.read_text().splitlines():
             match = re.search(
                 r"CREATE\s+(?:TEMPORARY\s+)?TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?"
                 r"([A-Za-z_][A-Za-z0-9_]*)",
@@ -315,30 +312,104 @@ def _non_literal_raise_sites() -> set[tuple[str, str]]:
                 statement.append(line)
                 if ";" in line:
                     if "||" in " ".join(statement):
-                        found.add((migration.name, trigger or "?"))
+                        found.add((path.name, trigger or "?"))
                     statement = []
     return found
 
 
-def test_no_new_migration_uses_a_non_literal_raise_message(tmp_path):
-    assert _non_literal_raise_sites() == KNOWN_NON_LITERAL_RAISE_SITES
+def test_no_migration_uses_a_non_literal_raise_message():
+    """Not one, anywhere — see :func:`_non_literal_raise_sites` for why."""
+
+    assert _non_literal_raise_sites() == set()
 
 
-def test_the_schema_records_the_sqlite_version_it_needs(tmp_path):
-    """A fresh database is only buildable on SQLite >= 3.47, and says so.
+def _older_sqlite_cli() -> str | None:
+    """A ``sqlite3`` CLI older than the library Python is linked against.
 
-    Stated as a test rather than a comment because it is a real
-    deployment constraint: several current distributions ship Python
-    against an older SQLite, and on those the migration fails to parse.
+    The point is to parse the schema with something that is not the
+    in-process SQLite, since that is the whole failure mode: the tests
+    pass on a new library and the deployment does not have one.
     """
 
-    assert KNOWN_NON_LITERAL_RAISE_SITES, "the constraint would be gone"
-    assert sqlite3.sqlite_version_info >= (3, 47), (
-        f"this SQLite ({sqlite3.sqlite_version}) cannot parse migrations "
-        f"{sorted({name for name, _ in KNOWN_NON_LITERAL_RAISE_SITES})}"
+    binary = shutil.which("sqlite3")
+    if binary is None:
+        return None
+    try:
+        reported = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=30
+        ).stdout.split()[0]
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return None
+    version = tuple(int(part) for part in reported.split(".")[:3])
+    return binary if version < sqlite3.sqlite_version_info else None
+
+
+def test_every_migration_parses_on_an_older_sqlite(tmp_path):
+    """Apply the whole sequence with an older SQLite than this process's.
+
+    A compatibility claim that is only ever checked by the library making
+    the claim is not a check.  When the host has no older CLI to offer,
+    this skips and :func:`test_no_migration_uses_a_non_literal_raise_message`
+    plus :func:`test_the_declared_sqlite_floor_is_the_one_the_schema_needs`
+    carry the guarantee statically.
+    """
+
+    binary = _older_sqlite_cli()
+    if binary is None:
+        pytest.skip(
+            f"no sqlite3 CLI older than this process's {sqlite3.sqlite_version}"
+        )
+
+    database = tmp_path / "legacy.sqlite3"
+    for migration in ALL_MIGRATIONS:
+        result = subprocess.run(
+            [binary, str(database)],
+            input=migration.sql,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert (
+            result.returncode == 0 and not result.stderr
+        ), f"{migration.name} does not apply on {binary}: {result.stderr}"
+
+    # Applying it is half the claim; the resulting schema also has to be
+    # readable, which is the half that a non-literal RAISE() destroys.
+    readback = subprocess.run(
+        [binary, str(database)],
+        input="PRAGMA integrity_check;\nSELECT count(*) FROM sqlite_master;\n",
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
-    # It builds here, which is what the rest of the suite depends on.
-    assert migrated(tmp_path).schema_version() == LATEST_VERSION
+    assert readback.returncode == 0 and not readback.stderr, readback.stderr
+    assert readback.stdout.splitlines()[0] == "ok"
+
+
+def test_the_declared_sqlite_floor_is_the_one_the_schema_needs():
+    """The floor is a promise, so nothing may quietly outgrow it."""
+
+    assert MINIMUM_SQLITE_VERSION == (3, 38, 0)
+    # What the migrations actually use sits at or below the floor: ON
+    # CONFLICT DO UPDATE (3.24) and the JSON1 CHECK constraints (a default
+    # build option from 3.38).  The keywords below are the ones that would
+    # raise the floor and that can be recognized unambiguously in text; the
+    # binding check is
+    # :func:`test_every_migration_parses_on_an_older_sqlite`, since only an
+    # older SQLite can prove an older SQLite copes.
+    combined = "\n".join(path.read_text() for path in EVERY_MIGRATION_FILE)
+    for feature, introduced in (
+        (r"\bSTRICT\s*(?:,|;|$)", "3.37 strict tables"),
+        (r"\bRETURNING\b", "3.35 RETURNING"),
+        (r"\bDROP\s+COLUMN\b", "3.35 ALTER TABLE DROP COLUMN"),
+        (r"\bGENERATED\s+ALWAYS\b", "3.31 generated columns"),
+        (r"\bMATERIALIZED\b", "3.35 materialized CTE hints"),
+    ):
+        assert not re.search(feature, combined, re.IGNORECASE), (
+            f"a migration uses {introduced}, above the declared floor "
+            f"{'.'.join(str(part) for part in MINIMUM_SQLITE_VERSION)}"
+        )
+    assert sqlite3.sqlite_version_info >= MINIMUM_SQLITE_VERSION
 
 
 def test_fresh_database_has_every_object_and_records_its_history(tmp_path):
@@ -1471,6 +1542,8 @@ def test_story_reconciliation_reports_every_outcome(tmp_path):
         "invalidated": 0,
         "removed_members": 0,
         "invalidated_themes": 0,
+        # Story reconciliation owns no output outside these ids.
+        "changed_outputs": 0,
     }
 
     changed = reconcile_stories(
@@ -1940,6 +2013,7 @@ def test_an_equivalent_story_replay_is_still_unchanged(tmp_path):
         "invalidated": 0,
         "removed_members": 0,
         "invalidated_themes": 0,
+        "changed_outputs": 0,
     }
 
 
@@ -2240,6 +2314,398 @@ def test_every_theme_column_is_owned_or_deliberately_exempt(tmp_path):
     assert set(Phase0Repository._theme_column_values(prepared)) == set(
         THEME_RECONCILED_COLUMNS
     )
+
+
+# ----------------------------------------------------------------------
+# What a reconciliation report has to account for
+#
+# The id tuples only describe themes.  A theme set also owns its own
+# metadata row, the day's Other Coverage, and the day's exclusions —
+# outputs with no theme id to report them under.  Leaving them out let a
+# reconciliation rewrite a whole day's coverage and report, truthfully as
+# far as themes went and falsely as a whole, that nothing had changed.
+#
+# The contract these tests hold to has two directions, and both matter:
+# `changed` is True whenever any owned table would come out different,
+# and False *only* when the reconciliation wrote nothing at all.
+# ----------------------------------------------------------------------
+
+
+#: Every table ``reconcile_themes`` owns.  A replay reported unchanged has
+#: to leave all of them byte-identical, timestamps included.
+THEME_OWNED_TABLES = (
+    "theme_sets",
+    "themes",
+    "theme_stories",
+    "theme_citations",
+    "theme_other_coverage",
+    "theme_excluded_stories",
+)
+
+
+def owned_snapshot(repository, tables=THEME_OWNED_TABLES) -> dict:
+    with repository.admin.connect_writable() as connection:
+        return {
+            table: [
+                tuple(row)
+                for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            ]
+            for table in tables
+        }
+
+
+def themed_day(repository, **overrides):
+    """One settled theme set, plus the knobs to settle it differently."""
+
+    day = build_day(repository)
+    payload = {
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "theme_set": theme_set(),
+        "themes": [
+            ThemeRecord(
+                fingerprint="tf1",
+                theme_key="k1",
+                label="Chip demand",
+                story_ids=(day["stories"]["cf1"],),
+                citation_item_ids=(day["items"][0],),
+                method="hdbscan",
+            )
+        ],
+        "other_coverage": (
+            OtherCoverageRecord(day["stories"]["cf2"], "clustering_noise"),
+        ),
+        "excluded": (ExcludedStoryRecord(day["stories"]["cf3"], "no_encodable_text"),),
+    }
+    payload.update(overrides)
+    return day, payload
+
+
+#: One change to each auxiliary output, and the output it must be reported
+#: under.  Every case leaves the theme itself word-for-word identical, so
+#: the theme comparison contributes nothing and the report is carried
+#: entirely by the auxiliary contract.
+AUXILIARY_CHANGES = [
+    (
+        "other-coverage reason",
+        "other_coverage",
+        lambda d: {
+            "other_coverage": (
+                OtherCoverageRecord(d["stories"]["cf2"], "narrative_mismatch"),
+            )
+        },
+    ),
+    (
+        "other-coverage position",
+        "other_coverage",
+        lambda d: {
+            "other_coverage": (
+                OtherCoverageRecord(d["stories"]["cf2"], "clustering_noise", 7),
+            )
+        },
+    ),
+    (
+        "other-coverage entry removed",
+        "other_coverage",
+        lambda d: {"other_coverage": ()},
+    ),
+    (
+        "exclusion removed",
+        "excluded",
+        lambda d: {"excluded": ()},
+    ),
+    (
+        "exclusion reason kept but story swapped",
+        "excluded",
+        lambda d: {
+            "other_coverage": (),
+            "excluded": (
+                ExcludedStoryRecord(d["stories"]["cf2"], "no_encodable_text"),
+            ),
+        },
+    ),
+    (
+        "theme-set quality",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(quality={"theme_count": 99})},
+    ),
+    (
+        "theme-set trust metadata",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(trust_metadata={"reviewed": True})},
+    ),
+    (
+        "theme-set method",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(method="agglomerative")},
+    ),
+    (
+        "theme-set method reason",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(method_reason="fell back")},
+    ),
+    (
+        "theme-set source metadata",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(source_metadata={"origin": "rerun"})},
+    ),
+    (
+        "theme-set config fingerprint",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(config_fingerprint="cfg2")},
+    ),
+    (
+        "theme-set algorithm version",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(algorithm_version="m5.2")},
+    ),
+    (
+        "theme-set model name",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(model_name="other")},
+    ),
+    (
+        "theme-set model revision",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(model_revision="r2")},
+    ),
+    (
+        "theme-set embedding dimension",
+        "theme_set",
+        lambda d: {"theme_set": theme_set(embedding_dimension=8)},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "output, change",
+    [pytest.param(o, c, id=label) for label, o, c in AUXILIARY_CHANGES],
+)
+def test_an_auxiliary_only_change_is_never_reported_unchanged(tmp_path, output, change):
+    """Every theme is identical; something else moved; the report says so."""
+
+    repository = migrated(tmp_path)
+    day, payload = themed_day(repository)
+    reconcile_themes(repository, **payload)
+    before = owned_snapshot(repository)
+
+    report = reconcile_themes(repository, **{**payload, **change(day)})
+    after = owned_snapshot(repository)
+
+    assert before != after, "the case does not actually change anything"
+    # Not one theme moved — so nothing but the auxiliary contract can be
+    # carrying this report.
+    assert report.counts["unchanged"] == 1
+    assert report.counts["inserted"] == report.counts["updated"] == 0
+    assert report.changed
+    assert output in report.changed_outputs
+    assert report.counts["changed_outputs"] == len(report.changed_outputs)
+
+
+def test_several_auxiliary_outputs_change_at_once(tmp_path):
+    repository = migrated(tmp_path)
+    day, payload = themed_day(repository)
+    reconcile_themes(repository, **payload)
+
+    report = reconcile_themes(
+        repository,
+        **{
+            **payload,
+            "theme_set": theme_set(quality={"theme_count": 42}),
+            "other_coverage": (
+                OtherCoverageRecord(day["stories"]["cf2"], "narrative_mismatch"),
+            ),
+            "excluded": (),
+        },
+    )
+
+    assert report.changed_outputs == ("excluded", "other_coverage", "theme_set")
+    assert report.counts["changed_outputs"] == 3
+    assert report.counts["unchanged"] == 1
+    assert report.changed
+
+
+def test_an_exact_theme_replay_writes_nothing_at_all(tmp_path):
+    """`changed is False` has to mean the database was not touched.
+
+    Timestamps included: the theme-set row used to bump ``updated_at`` on
+    every settlement, so two databases fed identical inputs disagreed and
+    a report claiming "unchanged" was contradicted by the row itself.
+    """
+
+    repository = migrated(tmp_path)
+    _, payload = themed_day(repository)
+    reconcile_themes(repository, **payload)
+    before = owned_snapshot(repository)
+
+    report = reconcile_themes(repository, **payload)
+
+    assert owned_snapshot(repository) == before
+    assert not report.changed
+    assert report.changed_outputs == ()
+    assert report.counts["unchanged"] == 1
+
+
+def test_reordering_coverage_alone_is_not_a_change(tmp_path):
+    """Order is not meaning here; ``position`` is, and it is a value.
+
+    Both lists are sets of rows, so listing the same rows in a different
+    sequence is the same output — as long as the persisted ``position``
+    each row carries stays the same, which is why it is given explicitly.
+    """
+
+    repository = migrated(tmp_path)
+    items = seed_raw_items(repository, 5)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story(f"cf{n}", items[n - 1 : n]) for n in range(1, 6)],
+    )
+    ids = {
+        row["cluster_fingerprint"]: row["id"]
+        for row in repository.stories_for_day(DAY, "NVDA")
+    }
+    # Positions are stated, and non-zero: `_prepare_coverage` reads a
+    # falsy position as "unset" and substitutes the caller's index, which
+    # would make this test measure ordering after all.
+    entries = (
+        OtherCoverageRecord(ids["cf2"], "clustering_noise", 1),
+        OtherCoverageRecord(ids["cf3"], "narrative_mismatch", 2),
+    )
+    exclusions = (
+        ExcludedStoryRecord(ids["cf4"], "no_encodable_text"),
+        ExcludedStoryRecord(ids["cf5"], "no_encodable_text"),
+    )
+    settled = {
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "theme_set": theme_set(),
+        "themes": [
+            ThemeRecord(
+                fingerprint="tf1",
+                theme_key="k1",
+                label="Chip demand",
+                story_ids=(ids["cf1"],),
+                citation_item_ids=(items[0],),
+                method="hdbscan",
+            )
+        ],
+        "other_coverage": entries,
+        "excluded": exclusions,
+    }
+    reconcile_themes(repository, **settled)
+    before = owned_snapshot(repository)
+
+    report = reconcile_themes(
+        repository,
+        **{
+            **settled,
+            "other_coverage": tuple(reversed(entries)),
+            "excluded": tuple(reversed(exclusions)),
+        },
+    )
+
+    assert owned_snapshot(repository) == before
+    assert report.changed_outputs == ()
+    assert not report.changed
+
+
+def test_every_theme_set_column_is_owned_or_deliberately_exempt(tmp_path):
+    """The theme-set third of the rule that keeps this from rotting."""
+
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(theme_sets)")
+        }
+
+    not_owned = {
+        "id",
+        "ticker",
+        "trading_day",
+        "pipeline_version",  # partition identity: what pairs the rows up
+        "updated_at",  # bookkeeping about the write, not an output
+    }
+
+    assert columns == set(THEME_SET_RECONCILED_COLUMNS) | not_owned
+    assert not set(THEME_SET_RECONCILED_COLUMNS) & not_owned
+    prepared = Phase0Repository._prepare_theme_set(theme_set())
+    assert set(Phase0Repository._theme_set_column_values(prepared)) == set(
+        THEME_SET_RECONCILED_COLUMNS
+    )
+    assert sorted(AUXILIARY_OUTPUTS) == list(AUXILIARY_OUTPUTS)
+
+
+def test_the_run_log_records_an_auxiliary_only_reconciliation(tmp_path):
+    """A coverage rewrite is work, and the run log has to show it."""
+
+    repository = migrated(tmp_path)
+    day, payload = themed_day(repository)
+    reconcile_themes(repository, **payload)
+
+    with repository.stage_run(
+        run_id="run-aux",
+        stage="m5.themes",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.reconcile_themes(
+            run=run,
+            **{
+                **{k: v for k, v in payload.items() if k != "theme_set"},
+                "theme_set": theme_set(),
+                "other_coverage": (
+                    OtherCoverageRecord(day["stories"]["cf2"], "narrative_mismatch"),
+                ),
+            },
+        )
+
+    logged = repository.read.run_log_rows(run_id="run-aux")
+    assert len(logged) == 1
+    counts = json.loads(logged[0]["counts"])
+    assert counts["changed_outputs"] == 1
+    # Counted as work done, not as an idle replay: the coverage rewrite is
+    # the only thing that happened, and success_count has to see it.
+    assert logged[0]["success_count"] == 1
+
+
+def test_reconcile_stories_reports_every_write_it_makes(tmp_path):
+    """The adjacent path, checked for the same reporting hole.
+
+    ``reconcile_stories`` owns only stories and their child rows, every
+    one of which reaches the per-story signature — so it has no output
+    outside the id tuples.  This pins that: an exact replay must leave
+    all of it untouched, which is the property the theme path lacked.
+    """
+
+    repository = migrated(tmp_path)
+    items = seed_raw_items(repository, 3)
+    payload = {
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "stories": [story("cf1", items[:2]), story("cf2", items[2:])],
+    }
+    reconcile_stories(repository, **payload)
+    tables = (
+        "stories",
+        "story_members",
+        "story_provider_conflicts",
+        "story_semantic_merges",
+    )
+    before = owned_snapshot(repository, tables)
+
+    report = reconcile_stories(repository, **payload)
+
+    assert owned_snapshot(repository, tables) == before
+    assert not report.changed
+    assert report.changed_outputs == ()
+    assert report.counts["unchanged"] == 2
 
 
 def test_failed_theme_reconciliation_writes_nothing(tmp_path):

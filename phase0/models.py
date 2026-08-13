@@ -143,7 +143,17 @@ class ThemeSetRecord:
 
 @dataclass(frozen=True)
 class ReconciliationReport:
-    """What one atomic reconciliation actually changed."""
+    """What one atomic reconciliation actually changed.
+
+    The id tuples cover the rows a reconciliation keys by fingerprint —
+    stories, or themes.  They are not everything an operation writes:
+    ``reconcile_themes`` also owns the ``theme_sets`` row and the day's
+    Other Coverage and exclusion lists, none of which are themes and none
+    of which have an id a caller could match against these tuples.  Those
+    land in :attr:`changed_outputs`, and :attr:`changed` counts them,
+    because a report that says "nothing changed" while the stored output
+    is different is worse than no report at all.
+    """
 
     inserted: tuple[int, ...] = ()
     updated: tuple[int, ...] = ()
@@ -152,6 +162,9 @@ class ReconciliationReport:
     invalidated: tuple[int, ...] = ()
     removed_members: int = 0
     invalidated_theme_ids: tuple[int, ...] = ()
+    #: Names of the non-row-keyed outputs this reconciliation rewrote,
+    #: sorted.  See :data:`AUXILIARY_OUTPUTS` for the vocabulary.
+    changed_outputs: tuple[str, ...] = ()
 
     @property
     def counts(self) -> dict[str, int]:
@@ -165,16 +178,36 @@ class ReconciliationReport:
             "invalidated": len(self.invalidated),
             "removed_members": self.removed_members,
             "invalidated_themes": len(self.invalidated_theme_ids),
+            "changed_outputs": len(self.changed_outputs),
         }
 
     @property
     def changed(self) -> bool:
-        """True when anything at all moved."""
+        """True when this reconciliation wrote anything different.
 
-        return bool(self.inserted or self.updated or self.deleted or self.invalidated)
+        False therefore means a genuine replay: every owned table already
+        holds exactly what this settlement would have written, and nothing
+        was written at all.
+        """
+
+        return bool(
+            self.inserted
+            or self.updated
+            or self.deleted
+            or self.invalidated
+            or self.changed_outputs
+        )
+
+
+#: The outputs a reconciliation owns that are not keyed by a row id, and so
+#: cannot be reported as one.  ``theme_set`` is the ``theme_sets`` row's own
+#: metadata (method, quality, trust, and the model/config fingerprints);
+#: the other two are the day's Other Coverage and exclusion lists.
+AUXILIARY_OUTPUTS = ("excluded", "other_coverage", "theme_set")
 
 
 __all__ = [
+    "AUXILIARY_OUTPUTS",
     "ExcludedStoryRecord",
     "OtherCoverageRecord",
     "ProviderConflictRecord",

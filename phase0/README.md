@@ -283,6 +283,39 @@ conflicts by provider identity, merges by story-key pair, memberships and
 the denormalized `themes.citations` list sorted — so equivalent inputs
 compare equal however the stage happened to order them.
 
+**A report accounts for everything the operation writes, not only what it
+can name by id.** `ReconciliationReport`'s tuples hold row ids, so they
+can only describe rows keyed by a fingerprint: stories, or themes.
+`reconcile_themes` also owns three outputs with no theme id to report them
+under — the `theme_sets` metadata row, the day's Other Coverage, and the
+day's exclusions — and those used to be rewritten unconditionally and
+reported not at all. A run could replace a whole day's coverage and the
+report would say, truthfully about themes and falsely about the day, that
+nothing had changed.
+
+They are now settled the same way everything else is: compared first,
+written only if different, and named in `changed_outputs` (from
+`AUXILIARY_OUTPUTS`: `theme_set`, `other_coverage`, `excluded`) when they
+are. `changed` counts them, so it means what it says in both directions —
+true whenever any owned table would come out different, and false *only*
+when the reconciliation wrote nothing at all. `theme_sets.updated_at` is
+part of that: it is bookkeeping about the write, so it moves only when one
+of the owned columns does, and two databases fed identical input stay
+identical.
+
+Both auxiliary lists are compared as *sets of rows*, keyed by story,
+because neither table has an inherent row order. `position` is compared as
+a value — it is a persisted column that ranking reads back — but the
+sequence a caller happened to list two entries in is not a difference.
+`THEME_SET_RECONCILED_COLUMNS` is checked against `theme_sets` itself by
+`test_every_theme_set_column_is_owned_or_deliberately_exempt`, the same
+way the story and theme lists are.
+
+`reconcile_stories` has no equivalent: every table it owns is a story or a
+story's child, and all of them already reach the per-story signature.
+`test_reconcile_stories_reports_every_write_it_makes` pins that rather
+than assuming it.
+
 **An embedding source identity means what the schema says it means — and
 only a run may use the partition-scoped half of it.** Migration 007's
 ownership triggers define the identities the table accepts: a raw item by
@@ -409,10 +442,12 @@ names are checked against the live schema before they are ever
 interpolated, and no method accepts SQL.
 
 `reconcile_stories` and `reconcile_themes` report
-`inserted / updated / unchanged / deleted / invalidated`. A structural
-story change (a story added, removed, or re-membered) drops the day's
-theme set in the same transaction, because a theme whose membership no
-longer exists is not a theme that can be replayed.
+`inserted / updated / unchanged / deleted / invalidated`, plus
+`changed_outputs` for what `reconcile_themes` owns outside the theme rows
+themselves. A structural story change (a story added, removed, or
+re-membered) drops the day's theme set in the same transaction, because a
+theme whose membership no longer exists is not a theme that can be
+replayed.
 
 ## Historical lineages
 
@@ -593,47 +628,49 @@ ran, which is the whole of what the excusal was ever able to be abused
 for. Anyone with write access to the file could always corrupt it
 directly; the compatibility path grants no capability beyond that.
 
-## A known, currently unfixable constraint: SQLite 3.47
+## The SQLite version this schema is written against
 
-**This schema requires SQLite 3.47 or newer.** Migrations 010 and 011
-build three trigger messages by concatenation —
-`RAISE(ABORT, 'a ' || 'b')`. `RAISE()` accepted only a string *literal*
-until SQLite 3.47 (October 2024); earlier releases reject that with a
-syntax error.
+**The floor is SQLite 3.38**, declared as
+`phase0.schema.MINIMUM_SQLITE_VERSION`. It comes from what the migrations
+actually use — `ON CONFLICT ... DO UPDATE` (3.24) and the
+`json_valid`/`json_type` CHECK constraints, JSON1 having become a default
+build option in 3.38 — and nothing here needs anything newer. That is
+worth keeping deliberately: several current distributions ship Python
+against a SQLite in the 3.4x range.
 
-The consequence is worse than a migration that fails. SQLite parses the
-whole schema when a connection first touches it, so on an older library
-an already-migrated database is **entirely unopenable** — not merely for
-statements that would fire the trigger. Measured on 3.43.2, even
-`SELECT count(*) FROM schema_migrations` returns
-`malformed database schema (trg_story_partition_locked)`, and so does
-`DROP TRIGGER`, so the database cannot even be repaired in place from
-that runtime.
+The trap the floor exists to catch is `RAISE()`. Its message had to be a
+string *literal* until 3.47 (October 2024), so
+`RAISE(ABORT, 'a ' || 'b')` is a syntax error on anything older. The
+consequence is far worse than one broken statement: SQLite parses the
+whole schema the first time a connection touches it, so a single trigger
+it cannot parse makes the entire database **unopenable**. Measured on
+3.43.2, `SELECT count(*) FROM schema_migrations` returns
+`malformed database schema (trg_story_partition_locked)` — and so does
+`DROP TRIGGER`, which means such a database cannot even be repaired from
+the runtime that cannot open it.
 
-**It cannot be fixed by editing 010 or 011.** They are released. Their
-checksums are in every `schema_migrations` ledger that applied them, and
-`_verify_history` refuses a database whose stored checksum no longer
-matches the file — with, precisely, *"was modified after it was applied;
-add a new additive migration instead of rewriting history"*. Editing them
-would brick every existing database in order to support older SQLite.
+Migrations 010 and 011 originally carried three concatenated messages and
+were corrected in place, before release, to single literals with the same
+text. That is a pre-release correction, not a rewrite of released history:
+010 and 011 have never existed outside this local branch — the published
+I1 head carries migrations 001–004 only — so no database anywhere records
+their old checksums. Once this branch lands they become immutable like
+every other migration, and the only remaining route would be an additive
+one. (An additive migration would only half-help anyway: it can re-create
+a *persisted* trigger, but it cannot help fresh creation, because 010 must
+parse before 012 exists.)
 
-**And an additive migration only half-helps.** A `012` that dropped and
-re-created the one *persisted* offender (`trg_story_partition_locked`,
-whose text is the only concatenated message that survives into
-`sqlite_master`) does make an existing database openable on 3.43 —
-verified: after rewriting it, 3.43 reads the ledger and the 011
-pipeline-version trigger still fires with its semantics intact. But it
-does nothing for *fresh* creation, because 010 and 011 must parse before
-012 exists, and it must be applied from a modern runtime, because an old
-one cannot open the database to run it.
+Three tests hold the line, and they are complementary:
 
-So the honest statement is: existing databases can be made portable by an
-additive migration; fresh databases on SQLite < 3.47 cannot be created at
-all without rewriting released history. `test_the_schema_records_the_sqlite_version_it_needs`
-asserts the requirement, and
-`test_no_new_migration_uses_a_non_literal_raise_message` pins the three
-known sites so a fourth cannot be added to a migration that could still
-be written differently today.
+- `test_no_migration_uses_a_non_literal_raise_message` — statically, in
+  every migration including the compatibility one.
+- `test_every_migration_parses_on_an_older_sqlite` — applies the whole
+  sequence through an older `sqlite3` CLI than the one this process is
+  linked against, then reads the resulting schema back, because a
+  compatibility claim checked only by the library making the claim is not
+  a check. It skips when the host has no older CLI to offer.
+- `test_the_declared_sqlite_floor_is_the_one_the_schema_needs` — pins the
+  floor and refuses the keywords that would raise it.
 
 ## Recovery
 

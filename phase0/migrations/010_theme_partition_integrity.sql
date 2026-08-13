@@ -214,10 +214,12 @@ AND (
     OR EXISTS (SELECT 1 FROM theme_excluded_stories WHERE story_id = OLD.id)
 )
 BEGIN
+    -- One literal, not a concatenation: RAISE() took only a string literal
+    -- before SQLite 3.47, and a trigger it cannot parse makes the whole
+    -- schema unreadable, not just this statement.
     SELECT RAISE(
         ABORT,
-        'a story referenced by a theme set cannot change ticker, day, '
-        || 'or pipeline version'
+        'a story referenced by a theme set cannot change ticker, day, or pipeline version'
     );
 END;
 

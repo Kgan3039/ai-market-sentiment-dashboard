@@ -46,6 +46,24 @@ LEGACY_SCHEMA_VERSION = 2
 
 LEGACY_UPGRADE_MIGRATION = "003_integrity_leases_and_upgrade.sql"
 
+#: The oldest SQLite these migrations are written against.
+#:
+#: Chosen from what the schema actually uses, not from what happens to be
+#: installed: ``ON CONFLICT ... DO UPDATE`` needs 3.24, and the ``json_valid``
+#: / ``json_type`` CHECK constraints need JSON1, which became a default build
+#: option in 3.38.  Nothing here needs anything newer, and that is a
+#: constraint worth keeping — several current distributions ship Python
+#: against a SQLite in the 3.4x range.
+#:
+#: The one trap this floor exists to catch is ``RAISE()``: before 3.47 its
+#: message had to be a string *literal*, and because SQLite parses the whole
+#: schema the first time a connection touches it, a single trigger it cannot
+#: parse makes the entire database unopenable rather than merely breaking the
+#: statement that would have fired.  ``tests/test_phase0_persistence_contracts``
+#: enforces both halves: no migration may use a non-literal message, and every
+#: migration must apply on the oldest SQLite the test host can offer.
+MINIMUM_SQLITE_VERSION = (3, 38, 0)
+
 
 @dataclass(frozen=True)
 class Migration:
@@ -463,6 +481,7 @@ __all__ = [
     "LEGACY_SCHEMA_VERSION",
     "LEGACY_UPGRADE_MIGRATION",
     "LINEAGE_TABLE",
+    "MINIMUM_SQLITE_VERSION",
     "Migration",
     "apply_migrations",
     "load_migrations",

@@ -188,6 +188,24 @@ THEME_RECONCILED_COLUMNS: tuple[str, ...] = (
     "theme_key",
 )
 
+#: ``theme_sets`` columns one reconciliation owns; see
+#: :meth:`Phase0Repository._theme_set_column_values`.  The theme set is not
+#: a theme, so none of these reach the per-theme comparison — they need
+#: their own, or a reconciliation that rewrites the day's quality and trust
+#: metadata reports that nothing happened.
+THEME_SET_RECONCILED_COLUMNS: tuple[str, ...] = (
+    "algorithm_version",
+    "config_fingerprint",
+    "embedding_dimension",
+    "method",
+    "method_reason",
+    "model_name",
+    "model_revision",
+    "quality",
+    "source_metadata",
+    "trust_metadata",
+)
+
 #: Columns whose stored value is compared as an ``int``.  SQLite returns
 #: the right type for a declared INTEGER column, but a comparison that
 #: silently depends on that is a comparison waiting to go wrong.
@@ -3391,7 +3409,15 @@ class Phase0Repository:
                 connection=connection,
             )
             context._record_outcome(
-                success=len(report.inserted) + len(report.updated),
+                # Rewriting the day's coverage, exclusions, or theme-set
+                # metadata is work this run did, whether or not any theme
+                # moved with it; leaving it out logged a real write as an
+                # idle replay.
+                success=(
+                    len(report.inserted)
+                    + len(report.updated)
+                    + len(report.changed_outputs)
+                ),
                 partial=len(report.unchanged),
             )
             context._merge_counts(report.counts)
@@ -3494,17 +3520,36 @@ class Phase0Repository:
             # block a raw item from moving to the theme that now owns it.
             self._delete_themes(connection, obsolete)
 
-            theme_set_id = self._upsert_theme_set(
+            theme_set_id, set_changed = self._upsert_theme_set(
                 connection, normalized_ticker, day, version, set_values
             )
-            connection.execute(
-                "DELETE FROM theme_other_coverage WHERE theme_set_id = ?",
-                (theme_set_id,),
+            changed_outputs: set[str] = {"theme_set"} if set_changed else set()
+
+            # Coverage and exclusions are compared before they are rewritten,
+            # for two reasons: an unchanged list must not be reported as a
+            # change, and a changed one must not go unreported just because
+            # it holds no themes.  The delete stays ahead of the theme loop
+            # whenever it happens at all, so a story moving out of coverage
+            # and into a theme does not trip the "already accounted for"
+            # trigger on its way.
+            stored_coverage = self._stored_coverage(connection, theme_set_id)
+            incoming_coverage = self._incoming_coverage(coverage)
+            rewrite_other = stored_coverage["other"] != incoming_coverage["other"]
+            rewrite_excluded = (
+                stored_coverage["excluded"] != incoming_coverage["excluded"]
             )
-            connection.execute(
-                "DELETE FROM theme_excluded_stories WHERE theme_set_id = ?",
-                (theme_set_id,),
-            )
+            if rewrite_other:
+                changed_outputs.add("other_coverage")
+                connection.execute(
+                    "DELETE FROM theme_other_coverage WHERE theme_set_id = ?",
+                    (theme_set_id,),
+                )
+            if rewrite_excluded:
+                changed_outputs.add("excluded")
+                connection.execute(
+                    "DELETE FROM theme_excluded_stories WHERE theme_set_id = ?",
+                    (theme_set_id,),
+                )
 
             inserted: list[int] = []
             updated: list[int] = []
@@ -3534,35 +3579,38 @@ class Phase0Repository:
                 self._update_reconciled_theme(connection, theme_id, values)
                 updated.append(theme_id)
 
-            for entry in coverage["other"]:
-                connection.execute(
-                    """
-                    INSERT INTO theme_other_coverage (
-                        theme_set_id, story_id, reason, position
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (
-                        theme_set_id,
-                        entry["story_id"],
-                        entry["reason"],
-                        entry["position"],
-                    ),
-                )
-            for entry in coverage["excluded"]:
-                connection.execute(
-                    """
-                    INSERT INTO theme_excluded_stories (
-                        theme_set_id, story_id, reason
-                    ) VALUES (?, ?, ?)
-                    """,
-                    (theme_set_id, entry["story_id"], entry["reason"]),
-                )
+            if rewrite_other:
+                for entry in coverage["other"]:
+                    connection.execute(
+                        """
+                        INSERT INTO theme_other_coverage (
+                            theme_set_id, story_id, reason, position
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            theme_set_id,
+                            entry["story_id"],
+                            entry["reason"],
+                            entry["position"],
+                        ),
+                    )
+            if rewrite_excluded:
+                for entry in coverage["excluded"]:
+                    connection.execute(
+                        """
+                        INSERT INTO theme_excluded_stories (
+                            theme_set_id, story_id, reason
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (theme_set_id, entry["story_id"], entry["reason"]),
+                    )
 
             return ReconciliationReport(
                 inserted=tuple(inserted),
                 updated=tuple(updated),
                 unchanged=tuple(unchanged),
                 deleted=tuple(obsolete),
+                changed_outputs=tuple(sorted(changed_outputs)),
             )
 
     @staticmethod
@@ -3626,57 +3674,118 @@ class Phase0Repository:
         return {"other": other, "excluded": excluded_entries}
 
     @staticmethod
+    def _theme_set_column_values(values: Mapping[str, Any]) -> dict[str, Any]:
+        """The exact ``theme_sets`` columns one reconciliation owns.
+
+        Same rule as :meth:`_story_column_values` and
+        :meth:`_theme_column_values`: this mapping drives the insert, the
+        update, *and* the equality test, so a column the stage writes
+        cannot become invisible to the next settlement's comparison.
+
+        Absent on purpose: the partition identity (``ticker``,
+        ``trading_day``, ``pipeline_version``), the surrogate ``id``, and
+        ``updated_at`` — which is bookkeeping about the write rather than
+        an output, and is only touched when one of these actually moves.
+        """
+
+        return {column: values[column] for column in THEME_SET_RECONCILED_COLUMNS}
+
+    @classmethod
     def _upsert_theme_set(
+        cls,
         connection: sqlite3.Connection,
         ticker: str,
         day: str,
         version: str,
         values: Mapping[str, Any],
-    ) -> int:
-        connection.execute(
-            """
-            INSERT INTO theme_sets (
-                ticker, trading_day, pipeline_version, method, method_reason,
-                quality, source_metadata, trust_metadata, config_fingerprint,
-                algorithm_version, model_name, model_revision,
-                embedding_dimension, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(ticker, trading_day, pipeline_version) DO UPDATE SET
-                method = excluded.method,
-                method_reason = excluded.method_reason,
-                quality = excluded.quality,
-                source_metadata = excluded.source_metadata,
-                trust_metadata = excluded.trust_metadata,
-                config_fingerprint = excluded.config_fingerprint,
-                algorithm_version = excluded.algorithm_version,
-                model_name = excluded.model_name,
-                model_revision = excluded.model_revision,
-                embedding_dimension = excluded.embedding_dimension,
-                updated_at = excluded.updated_at
-            """,
-            (
-                ticker,
-                day,
-                version,
-                values["method"],
-                values["method_reason"],
-                values["quality"],
-                values["source_metadata"],
-                values["trust_metadata"],
-                values["config_fingerprint"],
-                values["algorithm_version"],
-                values["model_name"],
-                values["model_revision"],
-                values["embedding_dimension"],
-                utc_now(),
-            ),
-        )
-        row = connection.execute(
-            "SELECT id FROM theme_sets WHERE ticker = ? AND trading_day = ? "
+    ) -> tuple[int, bool]:
+        """Settle the theme-set row; report whether that changed anything.
+
+        Returns the row id and whether this call wrote.  An identical
+        replay writes nothing at all — not even ``updated_at`` — because
+        "unchanged" has to mean the stored row already is what a
+        settlement would produce, and a bumped timestamp would make that
+        claim false the moment anyone compared two databases.
+        """
+
+        columns = cls._theme_set_column_values(values)
+        stored = connection.execute(
+            "SELECT * FROM theme_sets WHERE ticker = ? AND trading_day = ? "
             "AND pipeline_version = ?",
             (ticker, day, version),
         ).fetchone()
-        return int(row["id"])
+        if stored is not None:
+            theme_set_id = int(stored["id"])
+            if all(stored[column] == value for column, value in columns.items()):
+                return theme_set_id, False
+            assignments = ", ".join(f"{column} = ?" for column in columns)
+            connection.execute(
+                f"UPDATE theme_sets SET {assignments}, updated_at = ? WHERE id = ?",
+                (*columns.values(), utc_now(), theme_set_id),
+            )
+            return theme_set_id, True
+
+        names = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        cursor = connection.execute(
+            f"INSERT INTO theme_sets (ticker, trading_day, pipeline_version, "
+            f"{names}, updated_at) "
+            f"VALUES (?, ?, ?, {placeholders}, ?)",
+            (ticker, day, version, *columns.values(), utc_now()),
+        )
+        return int(cursor.lastrowid), True
+
+    @staticmethod
+    def _stored_coverage(
+        connection: sqlite3.Connection, theme_set_id: int
+    ) -> dict[str, list[tuple[Any, ...]]]:
+        """The day's stored Other Coverage and exclusions, canonicalized.
+
+        Both tables are *sets* of rows — neither has an inherent order, so
+        the comparison is keyed by story and the rows are sorted by it.
+        ``position`` is compared as a value because it is a persisted
+        column that ranking reads back; the order the caller happened to
+        list two entries in is not.
+        """
+
+        other = [
+            (int(row["story_id"]), str(row["reason"]), int(row["position"]))
+            for row in connection.execute(
+                "SELECT story_id, reason, position FROM theme_other_coverage "
+                "WHERE theme_set_id = ? ORDER BY story_id",
+                (theme_set_id,),
+            )
+        ]
+        excluded = [
+            (int(row["story_id"]), str(row["reason"]))
+            for row in connection.execute(
+                "SELECT story_id, reason FROM theme_excluded_stories "
+                "WHERE theme_set_id = ? ORDER BY story_id",
+                (theme_set_id,),
+            )
+        ]
+        return {"other": other, "excluded": excluded}
+
+    @staticmethod
+    def _incoming_coverage(
+        coverage: Mapping[str, Sequence[Mapping[str, Any]]]
+    ) -> dict[str, list[tuple[Any, ...]]]:
+        """The same shape as :meth:`_stored_coverage`, from the payload."""
+
+        return {
+            "other": sorted(
+                (
+                    int(entry["story_id"]),
+                    str(entry["reason"]),
+                    int(entry["position"]),
+                )
+                for entry in coverage["other"]
+            ),
+            "excluded": sorted(
+                (int(entry["story_id"]), str(entry["reason"]))
+                for entry in coverage["excluded"]
+            ),
+        }
 
     @staticmethod
     def _theme_column_values(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -5451,6 +5560,7 @@ __all__ = [
     "StoryMemberRecord",
     "StoryRecord",
     "THEME_RECONCILED_COLUMNS",
+    "THEME_SET_RECONCILED_COLUMNS",
     "THEME_STATUSES",
     "TICKER_UNIVERSE",
     "ThemeRecord",

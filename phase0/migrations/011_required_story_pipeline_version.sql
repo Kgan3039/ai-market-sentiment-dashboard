@@ -50,10 +50,10 @@ CREATE TEMPORARY TRIGGER trg_legacy_version_ambiguity
 BEFORE INSERT ON legacy_version_guard
 WHEN EXISTS (SELECT 1 FROM legacy_story_versions WHERE version_count > 1)
 BEGIN
+    -- One literal, not a concatenation; see 010 for why.
     SELECT RAISE(
         ABORT,
-        'cannot infer pipeline_version: a legacy story is referenced by more '
-        || 'than one pipeline version; resolve it before upgrading'
+        'cannot infer pipeline_version: a legacy story is referenced by more than one pipeline version; resolve it before upgrading'
     );
 END;
 
@@ -98,10 +98,10 @@ AND (
     OR EXISTS (SELECT 1 FROM theme_excluded_stories WHERE story_id = OLD.id)
 )
 BEGIN
+    -- One literal, not a concatenation; see 010 for why.
     SELECT RAISE(
         ABORT,
-        'a story referenced by a theme set cannot change ticker, day, '
-        || 'or pipeline version'
+        'a story referenced by a theme set cannot change ticker, day, or pipeline version'
     );
 END;
 
