@@ -4412,6 +4412,14 @@ class Phase0Repository:
         normalized_ticker = normalize_ticker(ticker, optional=True)
         day = _normalize_day(trading_day)
         version = _require_text(pipeline_version, "pipeline_version")
+        self._assert_run_identity_partition(
+            connection,
+            run_id=_require_text(run_id, "run_id"),
+            stage=_require_text(stage, "stage"),
+            ticker=normalized_ticker,
+            trading_day=day,
+            pipeline_version=version,
+        )
         connection.execute(
             """
             INSERT INTO run_log (
@@ -4426,7 +4434,6 @@ class Phase0Repository:
                 errors = excluded.errors,
                 completed_at = excluded.completed_at,
                 status = excluded.status,
-                ticker = excluded.ticker,
                 success_count = excluded.success_count,
                 partial_count = excluded.partial_count,
                 failure_count = excluded.failure_count,
@@ -4460,6 +4467,69 @@ class Phase0Repository:
         if stage_key is not None:
             self._link_stage_key(connection, run_log_id, stage_key)
         return run_log_id
+
+    #: The run-log columns that say *which partition a run belongs to*.
+    #: They are settled by the first write of a ``(run_id, stage)`` and
+    #: are never rewritten; everything else on the row is outcome.
+    RUN_IDENTITY_COLUMNS: tuple[str, ...] = (
+        "ticker",
+        "trading_day",
+        "pipeline_version",
+    )
+
+    @classmethod
+    def _assert_run_identity_partition(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str,
+        stage: str,
+        ticker: str | None,
+        trading_day: str,
+        pipeline_version: str,
+    ) -> None:
+        """``(run_id, stage)`` names exactly one partition, permanently.
+
+        The row is an upsert keyed on ``(run_id, stage)``, and the
+        conflict branch used to rewrite ``ticker`` while leaving
+        ``trading_day`` and ``pipeline_version`` alone.  Either half is
+        wrong in its own direction: reusing the identity under a second
+        ticker silently relabelled the first run's row, and reusing it
+        under a second day or pipeline version logged the new run under
+        the old one's partition.  In both cases one run-log row ends up
+        describing work no single run did.
+
+        So the partition is settled by whoever writes first and is
+        immutable thereafter.  Retrying or replaying the same identity in
+        the *same* partition is untouched — that is the documented
+        lifecycle, and it is the only thing this identity is for.
+        """
+
+        stored = connection.execute(
+            "SELECT ticker, trading_day, pipeline_version FROM run_log "
+            "WHERE run_id = ? AND stage = ?",
+            (run_id, stage),
+        ).fetchone()
+        if stored is None:
+            return
+        incoming = (ticker, trading_day, pipeline_version)
+        existing = (
+            None if stored["ticker"] is None else str(stored["ticker"]),
+            str(stored["trading_day"]),
+            str(stored["pipeline_version"]),
+        )
+        if existing == incoming:
+            return
+        differences = ", ".join(
+            f"{column} {was!r} -> {now!r}"
+            for column, was, now in zip(cls.RUN_IDENTITY_COLUMNS, existing, incoming)
+            if was != now
+        )
+        raise Phase0RunContextError(
+            f"run {run_id!r} stage {stage!r} is already recorded in a "
+            f"different partition ({differences}); a run identity names one "
+            f"partition and cannot be reused for another"
+        )
 
     @staticmethod
     def _link_stage_key(

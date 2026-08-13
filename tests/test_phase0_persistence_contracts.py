@@ -24,6 +24,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Mapping, Sequence
 from unittest import mock
 
 import numpy as np
@@ -757,6 +758,156 @@ def test_rewriting_an_applied_migration_is_refused(tmp_path):
 
     with pytest.raises(Phase0MigrationError, match="rewriting history"):
         repository.migrate()
+
+
+# ----------------------------------------------------------------------
+# Migration 009 canonicalizes the ticker table from *any* prior ordering
+#
+# `supported_tickers.position` is UNIQUE and SQLite enforces it per row,
+# so repositioning the table in place aborts whenever some ticker has to
+# pass through a position another ticker still holds.  Before 009 the
+# table is not yet sealed, so any ordering is a legitimate prior state —
+# and 119 of the 120 orderings collided.
+# ----------------------------------------------------------------------
+
+APPROVED_TICKERS = ("AAPL", "AMD", "META", "NVDA", "TSLA")
+
+#: What 009 must produce, whatever it started from.
+CANONICAL_TICKER_ORDER = [
+    ("TSLA", 1),
+    ("NVDA", 2),
+    ("AMD", 3),
+    ("AAPL", 4),
+    ("META", 5),
+]
+
+
+def ticker_rows(repository) -> list[tuple[str, int]]:
+    with repository.admin.connect_writable() as connection:
+        return [
+            (str(row["ticker"]), int(row["position"]))
+            for row in connection.execute(
+                "SELECT ticker, position FROM supported_tickers ORDER BY position"
+            )
+        ]
+
+
+def pre_009_database(tmp_path: Path, rows: Sequence[tuple[str, int]]) -> Path:
+    """A database at the exact pre-009 schema holding ``rows``."""
+
+    database = tmp_path / f"pre009_{abs(hash(tuple(rows)))}.sqlite3"
+    seeded = Phase0Repository(database, migrations_path=partial_migrations(tmp_path, 8))
+    seeded.migrate()
+    with seeded.admin.connect_writable() as connection:
+        connection.execute("DELETE FROM supported_tickers")
+        for ticker, position in rows:
+            connection.execute(
+                "INSERT INTO supported_tickers (ticker, display_name, position) "
+                "VALUES (?, ?, ?)",
+                (ticker, ticker.title(), position),
+            )
+        connection.commit()
+    return database
+
+
+def test_009_converges_every_ordering_of_the_approved_tickers(tmp_path):
+    """All 120 permutations, exhaustively — 119 of them used to abort."""
+
+    failures = []
+    for order in itertools.permutations(APPROVED_TICKERS):
+        rows = list(zip(order, itertools.count(1)))
+        database = pre_009_database(tmp_path, rows)
+        try:
+            upgraded = Phase0Repository(database)
+            upgraded.migrate()
+            if ticker_rows(upgraded) != CANONICAL_TICKER_ORDER:
+                failures.append((order, ticker_rows(upgraded)))
+        except Exception as exc:  # noqa: BLE001
+            failures.append((order, f"{type(exc).__name__}: {exc}"))
+    assert failures == []
+
+
+#: Prior states that are not permutations: partial, dirty, or holding
+#: unsupported rows in the positions the approved five need.
+DIRTY_TICKER_STATES = [
+    ("reordered subset", [("NVDA", 1), ("TSLA", 2), ("AMD", 3)]),
+    ("single row out of place", [("META", 1)]),
+    ("sparse positions", [("TSLA", 10), ("NVDA", 20), ("AMD", 30)]),
+    (
+        "unsupported rows occupying canonical positions",
+        [("GOOG", 1), ("MSFT", 2), ("NVDA", 3), ("TSLA", 4)],
+    ),
+    ("only unsupported rows", [("GOOG", 1), ("MSFT", 2)]),
+    ("empty table", []),
+    (
+        "reverse canonical",
+        [("META", 1), ("AAPL", 2), ("AMD", 3), ("NVDA", 4), ("TSLA", 5)],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "rows", [pytest.param(r, id=label) for label, r in DIRTY_TICKER_STATES]
+)
+def test_009_converges_dirty_and_partial_ticker_tables(tmp_path, rows):
+    database = pre_009_database(tmp_path, rows)
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+
+    assert ticker_rows(upgraded) == CANONICAL_TICKER_ORDER
+    # The universe is sealed again afterwards, and nothing unsupported
+    # survived the cleanup.
+    with upgraded.admin.connect_writable() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "INSERT INTO supported_tickers (ticker, display_name, position) "
+                "VALUES ('GOOG', 'Alphabet', 6)"
+            )
+
+
+def test_009_rolls_the_ticker_rebuild_back_when_009_itself_fails(tmp_path):
+    """The rebuild empties the table first, so rollback has to restore it.
+
+    Injected *inside* 009's own transaction — a failure in some later
+    migration would prove nothing, since 009 is entitled to have
+    committed by then.
+    """
+
+    original = [("NVDA", 1), ("TSLA", 2), ("AMD", 3), ("AAPL", 4), ("META", 5)]
+    database = pre_009_database(tmp_path, original)
+    before = database_state(database)
+    assert before["user_version"] == 8
+
+    directory = partial_migrations(tmp_path, 8)
+    name = "009_immutable_domain_and_update_integrity.sql"
+    (directory / name).write_text(
+        (MIGRATIONS_PATH / name).read_text(encoding="utf-8")
+        + "\nINSERT INTO supported_tickers (ticker, display_name, position)\n"
+        "VALUES ('TSLA', 'Duplicate', 99);\n",
+        encoding="utf-8",
+    )
+    with pytest.raises((sqlite3.Error, Phase0MigrationError)):
+        Phase0Repository(database, migrations_path=directory).migrate()
+
+    assert database_state(database) == before
+    reopened = Phase0Repository(
+        database, migrations_path=partial_migrations(tmp_path, 8)
+    )
+    assert ticker_rows(reopened) == original
+
+
+def test_009_matches_a_fresh_database_however_it_started(tmp_path):
+    """An upgraded table is indistinguishable from a freshly built one."""
+
+    database = pre_009_database(
+        tmp_path, [("META", 1), ("AAPL", 2), ("AMD", 3), ("NVDA", 4), ("TSLA", 5)]
+    )
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+    fresh = migrated(tmp_path, "fresh.db")
+
+    assert ticker_rows(upgraded) == ticker_rows(fresh)
+    assert schema_snapshot(upgraded) == schema_snapshot(fresh)
 
 
 def test_migrating_is_idempotent_and_survives_reconnection(tmp_path):
@@ -1615,6 +1766,178 @@ def test_run_log_links_to_a_claimed_stage_key(tmp_path):
     assert repository.count("run_log_stage_keys") == 1
     repository.admin.clear_derived_for_day(DAY)
     assert repository.count("run_log_stage_keys") == 0
+
+
+# ----------------------------------------------------------------------
+# A run identity names exactly one partition, permanently
+#
+# `run_log` is an upsert keyed on `(run_id, stage)`.  The conflict branch
+# rewrote `ticker` and left `trading_day` and `pipeline_version` alone,
+# so reusing an identity under a second ticker relabelled the first
+# run's row, and reusing it under a second day or version logged the new
+# run under the old one's partition.  Either way one row ends up
+# describing work no single run did.
+# ----------------------------------------------------------------------
+
+
+def settle_run(repository, **overrides):
+    """One complete logged run, doing nothing but writing its own log."""
+
+    kwargs = {
+        "run_id": "shared-run",
+        "stage": "m3.semantic",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "ticker": "NVDA",
+    }
+    kwargs.update(overrides)
+    with repository.stage_run(**kwargs) as run:
+        repository.ingest_raw_items([], run=run, terminal=True)
+
+
+#: Each way a caller can reuse `(run_id, stage)` under a different
+#: partition.  `ticker` was the one that silently *moved*; the other two
+#: were silently *kept*, which reads the same in the log and is just as
+#: wrong.
+FOREIGN_RUN_PARTITIONS = [
+    ("different ticker", {"ticker": "AMD"}),
+    ("different trading day", {"trading_day": "2026-07-24"}),
+    ("different pipeline version", {"pipeline_version": "v2"}),
+    ("different ticker and day", {"ticker": "AMD", "trading_day": "2026-07-24"}),
+    ("ticker dropped", {"ticker": None}),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [pytest.param(o, id=label) for label, o in FOREIGN_RUN_PARTITIONS],
+)
+def test_a_run_identity_cannot_be_reused_in_another_partition(tmp_path, overrides):
+    repository = migrated(tmp_path)
+    settle_run(repository)
+    before = [dict(row) for row in repository.read.run_log_rows()]
+    assert len(before) == 1
+
+    with pytest.raises(Phase0RunContextError, match="cannot be reused"):
+        settle_run(repository, **overrides)
+
+    # Field for field, the persisted row is what it was — the rejection
+    # neither overwrote it nor added a second one.
+    assert [dict(row) for row in repository.read.run_log_rows()] == before
+
+
+def test_the_same_identity_in_the_same_partition_is_an_ordinary_replay(tmp_path):
+    repository = migrated(tmp_path)
+    settle_run(repository)
+    first = dict(repository.read.run_log_rows()[0])
+
+    settle_run(repository)
+    rows = repository.read.run_log_rows()
+
+    assert len(rows) == 1
+    second = dict(rows[0])
+    assert second["id"] == first["id"]
+    for column in ("ticker", "trading_day", "pipeline_version", "stage"):
+        assert second[column] == first[column]
+
+
+def test_a_different_stage_is_a_different_identity(tmp_path):
+    """`stage` is half the key, so it partitions rather than collides."""
+
+    repository = migrated(tmp_path)
+    settle_run(repository)
+    settle_run(repository, stage="m5.themes", ticker="AMD")
+
+    rows = sorted(
+        (dict(row) for row in repository.read.run_log_rows()),
+        key=lambda row: row["stage"],
+    )
+    assert [(row["stage"], row["ticker"]) for row in rows] == [
+        ("m3.semantic", "NVDA"),
+        ("m5.themes", "AMD"),
+    ]
+
+
+def test_rejected_reuse_mutates_no_data(tmp_path):
+    """The rejection happens inside the run's transaction, so nothing lands."""
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="shared-run",
+        stage="m0.ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+    items_before = repository.count("raw_items")
+    log_before = [dict(row) for row in repository.read.run_log_rows()]
+
+    with pytest.raises(Phase0RunContextError, match="cannot be reused"):
+        with repository.stage_run(
+            run_id="shared-run",
+            stage="m0.ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="AMD",
+        ) as run:
+            repository.ingest_raw_items([raw_item(2, "AMD")], run=run, terminal=True)
+
+    assert repository.count("raw_items") == items_before
+    assert [dict(row) for row in repository.read.run_log_rows()] == log_before
+
+
+def test_one_run_identity_never_links_to_two_stage_keys(tmp_path):
+    repository = migrated(tmp_path)
+    keys = {
+        ticker: {
+            "stage": "m3.semantic",
+            "ticker": ticker,
+            "trading_day": DAY,
+            "pipeline_version": "v1",
+        }
+        for ticker in ("NVDA", "AMD")
+    }
+    for key in keys.values():
+        repository.claim_stage_key(**key, run_id="shared-run")
+
+    settle_run(repository, stage_key=keys["NVDA"])
+    with pytest.raises(Phase0RunContextError, match="cannot be reused"):
+        settle_run(repository, ticker="AMD", stage_key=keys["AMD"])
+
+    with repository.admin.connect_writable() as connection:
+        linked = [
+            (str(row["ticker"]), str(row["trading_day"]), str(row["pipeline_version"]))
+            for row in connection.execute(
+                "SELECT ticker, trading_day, pipeline_version FROM run_log_stage_keys"
+            )
+        ]
+    assert linked == [("NVDA", DAY, "v1")]
+
+
+def test_the_admin_log_path_enforces_the_same_run_identity(tmp_path):
+    """Not only `stage_run` — the row itself may only be written one way."""
+
+    repository = migrated(tmp_path)
+    entry = {
+        "run_id": "admin-run",
+        "stage": "cluster",
+        "counts": {},
+        "duration_ms": 1,
+        "errors": [],
+        "started_at": f"{DAY}T12:00:00+00:00",
+        "completed_at": f"{DAY}T12:00:01+00:00",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "ticker": "NVDA",
+    }
+    repository.admin.log_stage(**entry)
+    before = [dict(row) for row in repository.read.run_log_rows()]
+
+    with pytest.raises(Phase0RunContextError, match="cannot be reused"):
+        repository.admin.log_stage(**{**entry, "ticker": "AMD"})
+
+    assert [dict(row) for row in repository.read.run_log_rows()] == before
 
 
 # ----------------------------------------------------------------------
@@ -6682,6 +7005,245 @@ def test_persist_embeddings_still_refuses_another_day_and_version(tmp_path):
             )
 
     assert repository.count("embeddings") == 0
+
+
+# ----------------------------------------------------------------------
+# A parent's deletion may not take another parent's vector with it
+#
+# The cleanup triggers deleted by every identity form migration 007
+# accepts, including `cluster_fingerprint`, `fingerprint`, and
+# `theme_key` — which are unique only within one partition.  So the
+# ordering that matters is: A writes its vector by a handle while it is
+# still the only owner, B *later* creates its own row bearing the same
+# handle, and B's delete then takes A's vector.  Nothing B did was
+# invalid, and A never heard about it.
+# ----------------------------------------------------------------------
+
+
+def one_handled_partition(repository, ticker: str, shared: Mapping[str, str]) -> dict:
+    """One partition's story and theme, bearing the shared handles."""
+
+    items = seed_raw_items(repository, 1, ticker=ticker)
+    reconcile_stories(
+        repository,
+        ticker=ticker,
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story(shared["story_fingerprint"], items)],
+    )
+    story_id = [
+        row["id"]
+        for row in repository.stories_for_day(DAY, ticker)
+        if row["cluster_fingerprint"] == shared["story_fingerprint"]
+    ][0]
+    reconcile_themes(
+        repository,
+        ticker=ticker,
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint=shared["theme_fingerprint"],
+                theme_key=shared["theme_key"],
+                label=f"{ticker} theme",
+                story_ids=(story_id,),
+                citation_item_ids=(items[0],),
+                method="hdbscan",
+            )
+        ],
+    )
+    theme_id = repository.theme_set(
+        ticker=ticker, trading_day=DAY, pipeline_version="v1"
+    )["themes"][0]["id"]
+    return {"items": items, "story_id": story_id, "theme_id": theme_id}
+
+
+SHARED_HANDLE_VALUES = {
+    "story_fingerprint": "shared-cluster-fingerprint",
+    "theme_fingerprint": "c" * 64,
+    "theme_key": "shared-theme-key",
+}
+
+
+def cached(repository, kind: str, source_id: str) -> bool:
+    with repository.admin.connect_writable() as connection:
+        return (
+            connection.execute(
+                "SELECT 1 FROM embeddings WHERE source_kind = ? AND source_id = ?",
+                (kind, source_id),
+            ).fetchone()
+            is not None
+        )
+
+
+def drop_parent(repository, kind: str, parent_id: int) -> None:
+    """Delete one parent, clearing what references it first.
+
+    Ordinary reconciliation reaches the same state — an obsolete story or
+    theme is deleted once nothing cites it — but going through the tables
+    directly keeps these tests about the cleanup trigger rather than
+    about how reconciliation decided to get there.
+    """
+
+    with repository.admin.connect_writable() as connection:
+        if kind == "theme":
+            connection.execute(
+                "DELETE FROM theme_citations WHERE theme_id = ?", (parent_id,)
+            )
+            connection.execute(
+                "DELETE FROM theme_stories WHERE theme_id = ?", (parent_id,)
+            )
+            connection.execute("DELETE FROM themes WHERE id = ?", (parent_id,))
+        else:
+            connection.execute(
+                "DELETE FROM theme_citations WHERE theme_id IN ("
+                "SELECT theme_id FROM theme_stories WHERE story_id = ?)",
+                (parent_id,),
+            )
+            for table in (
+                "theme_stories",
+                "theme_other_coverage",
+                "theme_excluded_stories",
+            ):
+                connection.execute(
+                    f"DELETE FROM {table} WHERE story_id = ?", (parent_id,)
+                )
+            # `story_members` cascades, and the canonical-member guard only
+            # fires while the story is still there — so the story goes
+            # first and its members follow it, which is also the order
+            # `_delete_story` produces.
+            connection.execute("DELETE FROM stories WHERE id = ?", (parent_id,))
+        connection.commit()
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-survives" for case in SHARED_HANDLES],
+)
+def test_deleting_one_owner_keeps_another_partitions_embedding(
+    tmp_path, label, kind, handle
+):
+    repository = migrated(tmp_path)
+    identity = SHARED_HANDLE_VALUES[handle]
+
+    # 1. NVDA is the only owner, so its write is unambiguous and allowed.
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    with nvda_run(repository, stage="m1.embed") as run:
+        repository.persist_embeddings(
+            [sample_embedding(identity, source_kind=kind)], run=run
+        )
+    assert cached(repository, kind, identity)
+
+    # 2. AMD legitimately produces a row bearing the same handle later.
+    amd = one_handled_partition(repository, "AMD", SHARED_HANDLE_VALUES)
+
+    # 3. AMD's parent goes away.
+    drop_parent(repository, kind, amd["theme_id" if kind == "theme" else "story_id"])
+
+    # NVDA still owns its parent, so it must still have its vector.
+    survivor = nvda["theme_id" if kind == "theme" else "story_id"]
+    assert repository.read.story(survivor) is not None or kind == "theme"
+    assert cached(repository, kind, identity), "the surviving owner lost its vector"
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-orphan-goes" for case in SHARED_HANDLES],
+)
+def test_deleting_the_last_owner_still_removes_the_embedding(
+    tmp_path, label, kind, handle
+):
+    """The other half of the contract: no vector outlives every owner."""
+
+    repository = migrated(tmp_path)
+    identity = SHARED_HANDLE_VALUES[handle]
+
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    with nvda_run(repository, stage="m1.embed") as run:
+        repository.persist_embeddings(
+            [sample_embedding(identity, source_kind=kind)], run=run
+        )
+    amd = one_handled_partition(repository, "AMD", SHARED_HANDLE_VALUES)
+
+    key = "theme_id" if kind == "theme" else "story_id"
+    drop_parent(repository, kind, amd[key])
+    assert cached(repository, kind, identity)
+    drop_parent(repository, kind, nvda[key])
+    assert not cached(repository, kind, identity), "an orphan vector survived"
+
+
+def test_a_durable_id_cleanup_still_needs_no_survivor_check(tmp_path):
+    """A row id is globally unique, so its deletion is unconditional."""
+
+    repository = migrated(tmp_path)
+    nvda = one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    one_handled_partition(repository, "AMD", SHARED_HANDLE_VALUES)
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        repository.persist_embeddings(
+            [sample_embedding(str(nvda["story_id"]), source_kind="story")], run=run
+        )
+    assert cached(repository, "story", str(nvda["story_id"]))
+
+    drop_parent(repository, "story", nvda["story_id"])
+    assert not cached(repository, "story", str(nvda["story_id"]))
+
+
+def test_a_raw_item_cleanup_removes_its_own_vector(tmp_path):
+    """Raw items are only ever addressed by id; nothing here changed."""
+
+    repository = migrated(tmp_path)
+    day = embedded_day(repository)
+    item = str(day["items"][0])
+    with nvda_run(repository, stage="m1.embed") as run:
+        repository.persist_embeddings(
+            [sample_embedding(item, source_kind="raw_item")], run=run
+        )
+    assert cached(repository, "raw_item", item)
+
+    with repository.admin.connect_writable() as connection:
+        owners = [
+            int(row["story_id"])
+            for row in connection.execute(
+                "SELECT story_id FROM story_members WHERE raw_item_id = ?", (item,)
+            )
+        ]
+    for story_id in owners:
+        drop_parent(repository, "story", story_id)
+    with repository.admin.connect_writable() as connection:
+        connection.execute("DELETE FROM raw_items WHERE id = ?", (item,))
+        connection.commit()
+
+    assert not cached(repository, "raw_item", item)
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[f"{case[0]}-delete-refused" for case in SHARED_HANDLES],
+)
+def test_a_partition_cannot_delete_a_shared_handle_through_the_api(
+    tmp_path, label, kind, handle
+):
+    """The repository-side delete is unchanged: durable ids only."""
+
+    repository = migrated(tmp_path)
+    identity = SHARED_HANDLE_VALUES[handle]
+    one_handled_partition(repository, "NVDA", SHARED_HANDLE_VALUES)
+    with nvda_run(repository, stage="m1.embed") as run:
+        repository.persist_embeddings(
+            [sample_embedding(identity, source_kind=kind)], run=run
+        )
+    one_handled_partition(repository, "AMD", SHARED_HANDLE_VALUES)
+
+    with pytest.raises(Phase0ValidationError, match="not a durable"):
+        repository.delete_embedding(kind, identity)
+    with pytest.raises(Phase0ValidationError, match="not a durable"):
+        repository.upsert_embedding(sample_embedding(identity, source_kind=kind))
+    assert cached(repository, kind, identity)
 
 
 def test_record_source_state_rejects_another_days_fetch(tmp_path):

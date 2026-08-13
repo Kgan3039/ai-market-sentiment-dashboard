@@ -103,9 +103,41 @@ readable projection of that constant and is sealed against insert, update,
 and delete — inserting `GOOG` there no longer widens anything, because
 nothing consults it.
 
+Migration 009 restores that projection by *rebuilding* the table rather
+than repositioning it. `position` is `UNIQUE` and SQLite enforces it per
+row, so moving TSLA to position 1 while NVDA still holds position 1
+aborts the migration — and before 009 the table is not yet sealed, so any
+ordering is a legitimate prior state. 119 of the 120 orderings collided.
+No write order avoids that in general (any permutation with a cycle has a
+row that must pass through an occupied position), so 009 empties the
+table first and leaves nothing to collide with. Nothing references
+`supported_tickers`, so emptying it costs nothing, and it converges from
+any prior state: reordered, partial, sparse, duplicated, or carrying
+unsupported rows.
+
 **Stage logging cannot be switched off.** `stage_run()` writes a `run_log`
 row in a `finally` block, including when the stage body raises. No public
 method takes a `persist_run_log`-style flag.
+
+**A run identity names exactly one partition, permanently.** `run_log` is
+an upsert keyed on `(run_id, stage)`, and its conflict branch rewrote
+`ticker` while leaving `trading_day` and `pipeline_version` alone. Both
+halves were wrong in their own direction: reusing an identity under a
+second ticker silently relabelled the first run's row, and reusing it
+under a second day or pipeline version logged the new run under the old
+one's partition. Either way one row described work no single run did, and
+one run identity could accumulate two stage keys.
+
+The partition is now settled by whoever writes first and is immutable
+after that — `RUN_IDENTITY_COLUMNS` is `ticker`, `trading_day`,
+`pipeline_version` — and reuse under a different one fails closed with a
+`Phase0RunContextError` before anything is written. The check lives in
+`_write_run_log`, the single place the row is written, so it holds for
+`stage_run` and the admin log path alike; because settlement runs inside
+the run's own transaction, a rejection rolls back the data too. Retrying
+or replaying the same identity in the *same* partition is untouched —
+that is the documented lifecycle, and it is the only thing this identity
+is for.
 
 **Pipeline mutations carry their run.** `ingest_raw_items`,
 `reconcile_stories`, `reconcile_themes`, `persist_embeddings`, and
@@ -366,18 +398,30 @@ The M1 protocol is unaffected. `EmbeddingRepository` types `source_id` as
 text and says nothing about which text, so this narrows which values are
 cache keys, not the shape of any call.
 
-**A residual, stated rather than hidden.** Migration 007's cleanup
-triggers delete by every identity form — dropping a story deletes
-embeddings whose `source_id` is its `cluster_fingerprint`. So a
-fingerprint-keyed row written through the run-scoped batch can still be
-*evicted* when a different partition's like-fingerprinted parent is
-deleted. That is over-eager eviction of a recomputable cache entry, not a
-wrong vector and not a cross-partition write: no API can overwrite or
-delete another partition's row, and no read can return one. Closing it
-would mean rewriting a released migration, which this layer does not do;
-the alternative that needs no migration is to narrow `persist_embeddings`
-to durable ids too, at the cost of the fingerprint support the batch path
-deliberately offers.
+**A vector dies with its last owner, not with its first.** Migration
+007's cleanup triggers used to delete by every identity form
+unconditionally, so dropping *any* story deleted embeddings keyed on its
+`cluster_fingerprint` — including one another partition's still-live
+story owned. The ordering that made this reachable is the ordinary one:
+partition A caches a vector under a handle while it is the only owner,
+partition B later produces its own row bearing the same handle, and B's
+deletion takes A's vector. Nothing B did was invalid, and A was never
+told.
+
+The durable id needs no guard — it is globally unique, so nothing else
+can be addressed by it. Every handle-shaped identity is now deleted only
+once no live row still carries that handle, which the `AFTER DELETE`
+triggers can ask directly: the row being deleted is already gone, so
+`NOT EXISTS (SELECT 1 FROM stories WHERE cluster_fingerprint = …)` means
+exactly "is anyone left". The orphan half of the contract still holds —
+deleting the *last* owner removes the row — and the repository-side
+`upsert_embedding` / `delete_embedding` are untouched, so a partition
+still cannot reach another's cache entry through the API.
+
+This was previously recorded here as an accepted residual, on the
+reasoning that closing it meant rewriting a released migration. That
+reasoning was wrong about the premise: migration 007 has never left this
+branch, so it was corrected in place before release, like 010 and 011.
 
 ## The boundaries downstream stages use
 
@@ -673,6 +717,17 @@ every other migration, and the only remaining route would be an additive
 one. (An additive migration would only half-help anyway: it can re-create
 a *persisted* trigger, but it cannot help fresh creation, because 010 must
 parse before 012 exists.)
+
+**Which migrations are actually released.** The rule is the same one
+every time and it is worth stating once: a migration is released when a
+database somewhere could have recorded its checksum, which means it
+exists in an authoritative published lineage — not merely in an approved
+local branch. Migrations **001–004 are released**: they are on
+`origin/agent/phase0-i1-persistence` at `836e8b5`, and 004's checksum is
+pinned in `lineages.py` as the remote-v4 lineage's migration. Migrations
+**005–011 are not**: each exists on exactly one local commit and on no
+remote at all. That is why 007, 009, 010, and 011 could be corrected in
+place, and why nothing here has ever edited 001–004.
 
 Three tests hold the line, and they are complementary:
 

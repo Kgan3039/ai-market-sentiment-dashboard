@@ -111,7 +111,21 @@ BEGIN
     SELECT RAISE(ABORT, 'embedding source does not exist');
 END;
 
--- Lifecycle: an embedding never outlives the row it describes.
+-- Lifecycle: an embedding never outlives the row it describes — but it
+-- also never dies while some *other* row still describes it.
+--
+-- `embeddings` is globally unique on (source_kind, source_id), while
+-- `cluster_fingerprint`, `fingerprint`, and `theme_key` are unique only
+-- within one ticker/trading-day/pipeline-version.  Two partitions may
+-- therefore hold different rows bearing the same handle, and deleting
+-- either one used to take the shared embedding with it, leaving the
+-- surviving owner without its vector.
+--
+-- The durable id needs no such guard: it is globally unique, so nothing
+-- else can be addressed by it.  Every handle-shaped identity is deleted
+-- only once no live row still carries that handle.  These are AFTER
+-- DELETE triggers, so the row being deleted is already gone and the
+-- NOT EXISTS below asks exactly the right question: is anyone left?
 
 CREATE TRIGGER IF NOT EXISTS trg_embedding_raw_item_cleanup
 AFTER DELETE ON raw_items
@@ -128,7 +142,13 @@ BEGIN
     WHERE source_kind = 'story'
       AND (
         source_id = CAST(OLD.id AS TEXT)
-        OR source_id = OLD.cluster_fingerprint
+        OR (
+            source_id = OLD.cluster_fingerprint
+            AND NOT EXISTS (
+                SELECT 1 FROM stories
+                WHERE cluster_fingerprint = OLD.cluster_fingerprint
+            )
+        )
       );
 END;
 
@@ -139,7 +159,17 @@ BEGIN
     WHERE source_kind = 'theme'
       AND (
         source_id = CAST(OLD.id AS TEXT)
-        OR source_id = OLD.fingerprint
-        OR source_id = OLD.theme_key
+        OR (
+            source_id = OLD.fingerprint
+            AND NOT EXISTS (
+                SELECT 1 FROM themes WHERE fingerprint = OLD.fingerprint
+            )
+        )
+        OR (
+            source_id = OLD.theme_key
+            AND NOT EXISTS (
+                SELECT 1 FROM themes WHERE theme_key = OLD.theme_key
+            )
+        )
       );
 END;

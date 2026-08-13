@@ -94,8 +94,24 @@ WHERE ticker IS NOT NULL
 -- so it has to go before the table is restored to the approved five.
 DROP TRIGGER IF EXISTS trg_supported_ticker_delete;
 
-DELETE FROM supported_tickers
-WHERE ticker NOT IN ('AAPL', 'AMD', 'META', 'NVDA', 'TSLA');
+-- Rebuild the table rather than reposition it in place.
+--
+-- `position` is UNIQUE and SQLite enforces that per row, so an upsert
+-- that moves TSLA to position 1 while NVDA still holds position 1 aborts
+-- the whole migration.  That is not an edge case: of the 120 orderings a
+-- valid pre-009 database could legitimately be in, 119 collide, because
+-- before 009 this table is not yet sealed and anything could have
+-- reordered it.  No ordering of the writes avoids it in general — any
+-- permutation with a cycle has some row that must pass through an
+-- occupied position — so the fix is to leave no occupied positions to
+-- collide with.
+--
+-- Emptying it first loses nothing: no table references
+-- `supported_tickers`, and the five rows below are the whole approved
+-- universe, so this converges to the canonical set and ordering from any
+-- prior state — reordered, partial, duplicated, or carrying unsupported
+-- rows the cleanup above already handles elsewhere.
+DELETE FROM supported_tickers;
 
 INSERT INTO supported_tickers (ticker, display_name, position)
 VALUES
@@ -103,10 +119,7 @@ VALUES
     ('NVDA', 'NVIDIA', 2),
     ('AMD', 'Advanced Micro Devices', 3),
     ('AAPL', 'Apple', 4),
-    ('META', 'Meta Platforms', 5)
-ON CONFLICT(ticker) DO UPDATE SET
-    display_name = excluded.display_name,
-    position = excluded.position;
+    ('META', 'Meta Platforms', 5);
 
 -- ------------------------------------------------------------------
 -- The universe is a constant, not a row set.
