@@ -275,6 +275,72 @@ def legacy_v2_database(tmp_path: Path) -> Path:
 # ----------------------------------------------------------------------
 
 
+#: RAISE() took only a string *literal* until SQLite 3.47 (2024-10);
+#: earlier releases reject a concatenated message with a syntax error, and
+#: because SQLite parses the whole schema when a connection first uses it,
+#: one such trigger makes the entire database unopenable — not merely the
+#: statement that would fire it.
+#:
+#: These three sites shipped in released migrations, so they cannot be
+#: rewritten: the checksum ledger refuses any database whose stored
+#: checksum no longer matches the file ("add a new additive migration
+#: instead of rewriting history").  This test pins the known set so the
+#: cost is visible and, above all, so no *new* one is added — a fourth
+#: would extend the same defect into a migration that could still be
+#: written differently today.
+KNOWN_NON_LITERAL_RAISE_SITES = {
+    ("010_theme_partition_integrity.sql", "trg_story_partition_locked"),
+    ("011_required_story_pipeline_version.sql", "trg_legacy_version_ambiguity"),
+    ("011_required_story_pipeline_version.sql", "trg_story_partition_locked"),
+}
+
+
+def _non_literal_raise_sites() -> set[tuple[str, str]]:
+    """Every ``RAISE(..., <expression>)`` in the released migrations."""
+
+    found: set[tuple[str, str]] = set()
+    for migration in ALL_MIGRATIONS:
+        trigger = None
+        statement: list[str] = []
+        for line in migration.sql.splitlines():
+            match = re.search(
+                r"CREATE\s+(?:TEMPORARY\s+)?TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+                r"([A-Za-z_][A-Za-z0-9_]*)",
+                line,
+                re.IGNORECASE,
+            )
+            if match:
+                trigger = match.group(1)
+            if "RAISE(" in line.replace(" ", "") or statement:
+                statement.append(line)
+                if ";" in line:
+                    if "||" in " ".join(statement):
+                        found.add((migration.name, trigger or "?"))
+                    statement = []
+    return found
+
+
+def test_no_new_migration_uses_a_non_literal_raise_message(tmp_path):
+    assert _non_literal_raise_sites() == KNOWN_NON_LITERAL_RAISE_SITES
+
+
+def test_the_schema_records_the_sqlite_version_it_needs(tmp_path):
+    """A fresh database is only buildable on SQLite >= 3.47, and says so.
+
+    Stated as a test rather than a comment because it is a real
+    deployment constraint: several current distributions ship Python
+    against an older SQLite, and on those the migration fails to parse.
+    """
+
+    assert KNOWN_NON_LITERAL_RAISE_SITES, "the constraint would be gone"
+    assert sqlite3.sqlite_version_info >= (3, 47), (
+        f"this SQLite ({sqlite3.sqlite_version}) cannot parse migrations "
+        f"{sorted({name for name, _ in KNOWN_NON_LITERAL_RAISE_SITES})}"
+    )
+    # It builds here, which is what the rest of the suite depends on.
+    assert migrated(tmp_path).schema_version() == LATEST_VERSION
+
+
 def test_fresh_database_has_every_object_and_records_its_history(tmp_path):
     repository = migrated(tmp_path)
 
@@ -868,6 +934,113 @@ def test_heartbeat_extends_only_the_owners_lease(tmp_path):
     assert not repository.claim_stage_key(
         **STAGE_KEY, run_id="thief", claimed_at=f"{DAY}T12:05:00Z"
     )
+
+
+#: A 60-second lease claimed at 12:00:00 expires at 12:01:00.  The
+#: heartbeat is probed on either side of that instant and exactly on it.
+LEASE_BOUNDARIES = [
+    ("well before expiry", f"{DAY}T12:00:30Z", True),
+    ("one second before expiry", f"{DAY}T12:00:59Z", True),
+    ("exactly at expiry", f"{DAY}T12:01:00Z", False),
+    ("one second after expiry", f"{DAY}T12:01:01Z", False),
+    ("long after expiry", f"{DAY}T13:00:00Z", False),
+]
+
+
+@pytest.mark.parametrize(
+    "label, moment, renewable",
+    LEASE_BOUNDARIES,
+    ids=[case[0] for case in LEASE_BOUNDARIES],
+)
+def test_a_heartbeat_cannot_revive_a_lease_that_has_expired(
+    tmp_path, label, moment, renewable
+):
+    """Expiry ends ownership; it is not a suggestion the owner may decline.
+
+    A lapsed lease is one another worker is entitled to reclaim.  An owner
+    that could push it forward anyway would keep working on a partition
+    someone else was about to take, and the two would hold it at once —
+    the exact state the lease exists to prevent.
+    """
+
+    repository = migrated(tmp_path)
+    repository.claim_stage_key(
+        **STAGE_KEY, run_id="owner", lease_seconds=60, claimed_at=f"{DAY}T12:00:00Z"
+    )
+
+    assert (
+        repository.heartbeat_stage_key(
+            **STAGE_KEY, run_id="owner", lease_seconds=60, now=moment
+        )
+        is renewable
+    )
+
+    state = repository.stage_key_state(**STAGE_KEY)
+    if renewable:
+        assert state["lease_expires_at"] > f"{DAY}T12:01:00"
+    else:
+        # Untouched: the refusal wrote nothing, so the key is exactly as
+        # reclaimable as it was a moment ago.
+        assert state["lease_expires_at"].startswith(f"{DAY}T12:01:00")
+        assert repository.claim_stage_key(
+            **STAGE_KEY, run_id="next-owner", claimed_at=moment
+        )
+
+
+def test_heartbeat_and_reclaim_are_exact_complements(tmp_path):
+    """At every instant a lease is renewable or reclaimable, never both.
+
+    They are two readings of one predicate, so drift between them is the
+    bug: an overlap lets two workers own the key, and a gap strands it.
+    """
+
+    for moment in [case[1] for case in LEASE_BOUNDARIES]:
+        renew = migrated(tmp_path, f"renew-{moment.replace(':', '')}.sqlite3")
+        reclaim = migrated(tmp_path, f"reclaim-{moment.replace(':', '')}.sqlite3")
+        for repository in (renew, reclaim):
+            repository.claim_stage_key(
+                **STAGE_KEY,
+                run_id="owner",
+                lease_seconds=60,
+                claimed_at=f"{DAY}T12:00:00Z",
+            )
+        renewed = renew.heartbeat_stage_key(
+            **STAGE_KEY, run_id="owner", lease_seconds=60, now=moment
+        )
+        reclaimed = reclaim.claim_stage_key(
+            **STAGE_KEY, run_id="other", claimed_at=moment
+        )
+        assert renewed is not reclaimed, moment
+
+
+def test_an_owner_cannot_heartbeat_back_a_lease_another_worker_reclaimed(tmp_path):
+    repository = migrated(tmp_path)
+    repository.claim_stage_key(
+        **STAGE_KEY, run_id="crashed", lease_seconds=60, claimed_at=f"{DAY}T12:00:00Z"
+    )
+    assert repository.claim_stage_key(
+        **STAGE_KEY, run_id="recovered", claimed_at=f"{DAY}T12:05:00Z"
+    )
+
+    assert not repository.heartbeat_stage_key(
+        **STAGE_KEY, run_id="crashed", now=f"{DAY}T12:05:30Z"
+    )
+    assert repository.stage_key_state(**STAGE_KEY)["run_id"] == "recovered"
+
+
+def test_a_heartbeat_cannot_revive_a_lease_with_no_expiry(tmp_path):
+    """A NULL expiry is reclaimable, so it is not renewable either."""
+
+    repository = migrated(tmp_path)
+    repository.claim_stage_key(**STAGE_KEY, run_id="owner", lease_seconds=60)
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "UPDATE pipeline_stage_keys SET lease_expires_at = NULL "
+            "WHERE run_id = 'owner'"
+        )
+
+    assert not repository.heartbeat_stage_key(**STAGE_KEY, run_id="owner")
+    assert repository.claim_stage_key(**STAGE_KEY, run_id="next")
 
 
 # ----------------------------------------------------------------------
@@ -3849,6 +4022,91 @@ def stage_key_for(ticker="NVDA", day=DAY, version="v1", stage="ingest") -> dict:
     }
 
 
+def test_a_run_holding_a_stage_key_adopts_that_keys_ticker(tmp_path):
+    """Omitting the ticker takes the key's; it never means "any ticker".
+
+    A stage key always names a ticker.  Skipping the comparison when the
+    caller named none let an NVDA lease open a ticker-less run — and a
+    ticker-less run's partition checks pass for *every* ticker, so the
+    NVDA key silently authorized AMD work by saying nothing at all.
+    """
+
+    repository = migrated(tmp_path)
+    key = stage_key_for(ticker="NVDA")
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage=key["stage"],
+        trading_day=key["trading_day"],
+        pipeline_version=key["pipeline_version"],
+        stage_key=key,
+    ) as run:
+        assert run.ticker == "NVDA"
+
+    # And the adopted ticker is load-bearing, not cosmetic: the run is now
+    # constrained by it exactly as if it had been passed.
+    assert repository.claim_stage_key(**key, run_id="run-2")
+    with pytest.raises(Phase0RunContextError, match="AMD"):
+        with repository.stage_run(
+            run_id="run-2",
+            stage=key["stage"],
+            trading_day=key["trading_day"],
+            pipeline_version=key["pipeline_version"],
+            stage_key=key,
+        ) as run:
+            repository.ingest_raw_items([{**raw_item(1), "ticker": "AMD"}], run=run)
+    assert repository.count("raw_items") == 0
+
+
+TICKER_BINDINGS = [
+    ("omitted", None, "NVDA"),
+    ("correct", "NVDA", "NVDA"),
+]
+
+
+@pytest.mark.parametrize(
+    "label, supplied, expected",
+    TICKER_BINDINGS,
+    ids=[case[0] for case in TICKER_BINDINGS],
+)
+def test_a_stage_key_binds_its_ticker_however_the_run_names_it(
+    tmp_path, label, supplied, expected
+):
+    repository = migrated(tmp_path)
+    key = stage_key_for(ticker="NVDA")
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with repository.stage_run(
+        run_id="run-1",
+        stage=key["stage"],
+        trading_day=key["trading_day"],
+        pipeline_version=key["pipeline_version"],
+        ticker=supplied,
+        stage_key=key,
+    ) as run:
+        assert run.ticker == expected
+
+
+def test_a_wrong_ticker_never_binds_a_stage_key(tmp_path):
+    repository = migrated(tmp_path)
+    key = stage_key_for(ticker="NVDA")
+    assert repository.claim_stage_key(**key, run_id="run-1")
+
+    with pytest.raises(Phase0RunContextError, match="stage key covers ticker"):
+        with repository.stage_run(
+            run_id="run-1",
+            stage=key["stage"],
+            trading_day=key["trading_day"],
+            pipeline_version=key["pipeline_version"],
+            ticker="AMD",
+            stage_key=key,
+        ):
+            pass
+
+    assert repository.run_log_entries() == []
+
+
 def test_an_impostor_cannot_even_open_a_run_on_someone_elses_key(tmp_path):
     """Ownership is proved before the context exists, not at first write.
 
@@ -4754,7 +5012,12 @@ def test_reconcile_stories_rejects_a_member_from_another_partition(tmp_path):
     amd = seed_raw_items(repository, 1, ticker="AMD")
 
     with nvda_run(repository, stage="m3.semantic") as run:
-        with pytest.raises(Phase0RunContextError, match="belongs to AMD"):
+        # Refused on the association rule, which names what does claim it.
+        with pytest.raises(
+            Phase0RunContextError,
+            match=r"no accepted association with NVDA \(it is associated "
+            r"with \['AMD'\]\)",
+        ):
             repository.reconcile_stories(
                 run=run,
                 ticker="NVDA",
@@ -4765,6 +5028,148 @@ def test_reconcile_stories_rejects_a_member_from_another_partition(tmp_path):
 
     assert repository.count("stories") == 0
     assert repository.run_log_entries(run_id=run.run_id)[0]["status"] == "failed"
+
+
+# ----------------------------------------------------------------------
+# Ticker membership is membership, not exclusivity
+#
+# One article can be about two companies.  ``raw_item_tickers`` is the
+# table that records which tickers claim an item, and ``raw_items.ticker``
+# is the primary attribution beside it — not a veto over the others.  A
+# path that read the primary as exclusive refused evidence the association
+# table had already accepted.
+# ----------------------------------------------------------------------
+
+
+def multi_ticker_item(repository: Phase0Repository, primary="AMD") -> int:
+    """One article attributed to AMD that is also, accepted, about NVDA."""
+
+    return repository.admin.insert_raw_items(
+        [{**raw_item(1), "ticker": primary, "tickers": ["AMD", "NVDA"]}]
+    )[0].item_id
+
+
+def test_a_secondary_association_makes_an_item_this_tickers_evidence(tmp_path):
+    repository = migrated(tmp_path)
+    item_id = multi_ticker_item(repository)
+    assert repository.raw_item_tickers(item_id) == ["AMD", "NVDA"]
+
+    with nvda_run(repository, stage="m3.semantic") as run:
+        report = repository.reconcile_stories(
+            run=run,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", [item_id])],
+        )
+
+    assert len(report.inserted) == 1
+    assert repository.run_log_entries(run_id=run.run_id)[0]["status"] == "success"
+    # And the same item is still AMD's evidence too — independently.
+    with repository.stage_run(
+        run_id=f"amd-{next(_RUN_IDS)}",
+        stage="m3.semantic",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="AMD",
+    ) as run:
+        assert (
+            len(
+                repository.reconcile_stories(
+                    run=run,
+                    ticker="AMD",
+                    trading_day=DAY,
+                    pipeline_version="v1",
+                    stories=[story("amd-cf", [item_id])],
+                ).inserted
+            )
+            == 1
+        )
+
+
+def test_a_secondary_association_also_makes_it_embeddable(tmp_path):
+    """The adjacent path carried the identical defect."""
+
+    repository = migrated(tmp_path)
+    item_id = multi_ticker_item(repository)
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        assert repository.persist_embeddings([sample_embedding(item_id)], run=run) == 1
+
+    assert repository.count("embeddings") == 1
+
+
+UNASSOCIATED_ITEMS = [
+    # AMD's alone: no NVDA association exists.
+    ("amd-only", {"ticker": "AMD"}, r"associated with \['AMD'\]"),
+    # Genuinely unattributed: still refused, and still says so.
+    ("unattributed", {"ticker": None}, "it is unattributed"),
+    # A *candidate* is a suggestion nothing accepted; it is not membership.
+    (
+        "candidate-only",
+        {"ticker": "AMD", "candidate_tickers": ["NVDA"]},
+        r"associated with \['AMD'\]",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label, overrides, message",
+    UNASSOCIATED_ITEMS,
+    ids=[case[0] for case in UNASSOCIATED_ITEMS],
+)
+def test_without_an_accepted_association_the_item_stays_out(
+    tmp_path, label, overrides, message
+):
+    repository = migrated(tmp_path)
+    item_id = repository.admin.insert_raw_items([{**raw_item(1), **overrides}])[
+        0
+    ].item_id
+    assert "NVDA" not in repository.raw_item_tickers(item_id)
+
+    with nvda_run(repository, stage="m3.semantic") as run:
+        with pytest.raises(Phase0RunContextError, match=message):
+            repository.reconcile_stories(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                stories=[story("cf1", [item_id])],
+            )
+    assert repository.count("stories") == 0
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        with pytest.raises(Phase0RunContextError, match=message):
+            repository.persist_embeddings([sample_embedding(item_id)], run=run)
+    assert repository.count("embeddings") == 0
+
+
+def test_a_secondary_association_does_not_relax_the_day(tmp_path):
+    """Membership settles the ticker only; every other axis still holds."""
+
+    repository = migrated(tmp_path)
+    item_id = repository.admin.insert_raw_items(
+        [
+            {
+                **raw_item(1),
+                "ticker": "AMD",
+                "tickers": ["AMD", "NVDA"],
+                "published_at": "2026-07-24T12:00:00+00:00",
+                "fetched_at": "2026-07-24T12:30:00+00:00",
+            }
+        ]
+    )[0].item_id
+
+    with nvda_run(repository, stage="m3.semantic") as run:
+        with pytest.raises(Phase0RunContextError, match="falls on 2026-07-24"):
+            repository.reconcile_stories(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                stories=[story("cf1", [item_id])],
+            )
+    assert repository.count("stories") == 0
 
 
 @pytest.mark.parametrize("axis", ["ticker", "trading_day", "pipeline_version"])
@@ -4844,7 +5249,11 @@ def test_persist_embeddings_rejects_a_source_from_another_partition(tmp_path):
     amd = seed_raw_items(repository, 1, ticker="AMD")
 
     with nvda_run(repository, stage="m1.embed") as run:
-        with pytest.raises(Phase0RunContextError, match="belongs to AMD"):
+        with pytest.raises(
+            Phase0RunContextError,
+            match=r"no accepted association with NVDA \(it is associated "
+            r"with \['AMD'\]\)",
+        ):
             repository.persist_embeddings([sample_embedding(amd[0])], run=run)
 
     assert repository.count("embeddings") == 0

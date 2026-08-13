@@ -185,6 +185,42 @@ disagrees with the run: an NVDA run cannot ingest an AMD item, a v1 theme
 set cannot cite a v2 story, and an embedding cannot name a source from
 another ticker-day.
 
+**A stage key names a ticker, so a run holding one is never ticker-less.**
+Omitting `ticker` on a `stage_run` that supplies a `stage_key` *adopts*
+the key's ticker; it never means "any". The other reading is what the
+code used to do — skip the ticker comparison when the run named none —
+and it was a hole, because a ticker-less run's partition checks pass for
+every ticker. An NVDA lease could open a ticker-less run and that run
+could do AMD work, the key having authorized it by saying nothing.
+Supplying a ticker that disagrees with the key is still refused, and
+every other axis is compared as before.
+
+**A lease is renewable or reclaimable, never both.** `heartbeat_stage_key`
+extends only a lease that is still live: its condition is the exact
+complement of the one `claim_stage_key` reclaims under (`lease_expires_at
+IS NULL OR lease_expires_at <= now`). Expiry is the moment ownership
+ends, not a suggestion the previous owner may decline — an owner able to
+push a lapsed lease forward would keep working on a partition another
+worker was already entitled to take, and both would hold it at once.
+
+**Ticker membership is membership, not exclusivity.** One article can be
+about two companies. `raw_item_tickers` is the authoritative table for
+which tickers claim a raw item, and `raw_items.ticker` is the primary
+attribution stored *beside* it — not a veto over the rest. So an
+AMD-primary article carrying an accepted NVDA association is NVDA's
+evidence as well as AMD's, and each ticker's derived output is built
+independently from it. `_assert_raw_item_association` is the single rule;
+paths that carried a second, stricter test against `raw_items.ticker`
+were refusing evidence the association table had already accepted, and
+disagreeing with `raw_items_for_day`, which had always read it correctly.
+
+None of that loosens anything: an item with no association for this
+ticker is refused, unattributed evidence is refused, a `raw_item_candidates`
+row is a suggestion and still does not count, and day and pipeline-version
+checks are untouched. A story's or a theme's `ticker` **is** exclusive —
+those rows belong to exactly one partition — and is still compared as
+such.
+
 **Raw evidence is preserved; operational metadata is redacted.** These are
 different serializers, not a flag: `serialize_raw_evidence` stores a
 publisher payload exactly as supplied, and `serialize_operational_metadata`
@@ -556,6 +592,48 @@ unknown schema, a stale one, a partial ledger, or a migration that never
 ran, which is the whole of what the excusal was ever able to be abused
 for. Anyone with write access to the file could always corrupt it
 directly; the compatibility path grants no capability beyond that.
+
+## A known, currently unfixable constraint: SQLite 3.47
+
+**This schema requires SQLite 3.47 or newer.** Migrations 010 and 011
+build three trigger messages by concatenation —
+`RAISE(ABORT, 'a ' || 'b')`. `RAISE()` accepted only a string *literal*
+until SQLite 3.47 (October 2024); earlier releases reject that with a
+syntax error.
+
+The consequence is worse than a migration that fails. SQLite parses the
+whole schema when a connection first touches it, so on an older library
+an already-migrated database is **entirely unopenable** — not merely for
+statements that would fire the trigger. Measured on 3.43.2, even
+`SELECT count(*) FROM schema_migrations` returns
+`malformed database schema (trg_story_partition_locked)`, and so does
+`DROP TRIGGER`, so the database cannot even be repaired in place from
+that runtime.
+
+**It cannot be fixed by editing 010 or 011.** They are released. Their
+checksums are in every `schema_migrations` ledger that applied them, and
+`_verify_history` refuses a database whose stored checksum no longer
+matches the file — with, precisely, *"was modified after it was applied;
+add a new additive migration instead of rewriting history"*. Editing them
+would brick every existing database in order to support older SQLite.
+
+**And an additive migration only half-helps.** A `012` that dropped and
+re-created the one *persisted* offender (`trg_story_partition_locked`,
+whose text is the only concatenated message that survives into
+`sqlite_master`) does make an existing database openable on 3.43 —
+verified: after rewriting it, 3.43 reads the ledger and the 011
+pipeline-version trigger still fires with its semantics intact. But it
+does nothing for *fresh* creation, because 010 and 011 must parse before
+012 exists, and it must be applied from a modern runtime, because an old
+one cannot open the database to run it.
+
+So the honest statement is: existing databases can be made portable by an
+additive migration; fresh databases on SQLite < 3.47 cannot be created at
+all without rewriting released history. `test_the_schema_records_the_sqlite_version_it_needs`
+asserts the requirement, and
+`test_no_new_migration_uses_a_non_literal_raise_message` pins the three
+known sites so a fourth cannot be added to a migration that could still
+be written differently today.
 
 ## Recovery
 

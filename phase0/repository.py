@@ -2588,10 +2588,24 @@ class Phase0Repository:
         ).fetchone()
         if associated is not None:
             return
+        # Name the associations it *does* have.  This is the message a
+        # caller sees for a genuinely foreign item, and "belongs to AMD"
+        # was the old wording for a case that turned out to include
+        # legitimately multi-ticker evidence; saying which tickers claim
+        # it is both truer and more useful.
+        held = [
+            str(row["ticker"])
+            for row in connection.execute(
+                f"SELECT ticker FROM {RAW_ITEM_ASSOCIATION_TABLE} "
+                "WHERE raw_item_id = ? ORDER BY ticker",
+                (raw_item_id,),
+            )
+        ]
+        belongs = f"it is associated with {held}" if held else "it is unattributed"
         raise Phase0RunContextError(
             f"{operation}: raw item {raw_item_id} has no accepted association "
-            f"with {ticker}; associate it explicitly before using it in "
-            f"{ticker}'s derived output"
+            f"with {ticker} ({belongs}); associate it explicitly before using "
+            f"it in {ticker}'s derived output"
         )
 
     @classmethod
@@ -2603,7 +2617,22 @@ class Phase0Repository:
         ticker: str,
         trading_day: str,
     ) -> None:
-        """Every member raw item must sit in this ticker-day already."""
+        """Every member raw item must sit in this ticker-day already.
+
+        Ticker membership is decided by
+        :meth:`_assert_raw_item_association` and nowhere else.  There used
+        to be a second, stricter test here — ``raw_items.ticker`` had to
+        be this ticker or nothing — which read the primary ticker as
+        *exclusive* and so refused an AMD-primary article that also
+        carried an accepted NVDA association.  One article about two
+        companies is ordinary, ``raw_item_tickers`` is the table that
+        records it, and ``raw_items_for_day`` already read it that way;
+        this path was the one disagreeing.
+
+        Nothing is loosened by removing it: an item with no NVDA
+        association is still refused, and unattributed evidence is still
+        refused, both by the rule immediately below.
+        """
 
         for story in stories:
             for member in getattr(story, "members", ()):  # validated later
@@ -2611,18 +2640,12 @@ class Phase0Repository:
                 if raw_item_id is None:
                     continue
                 row = connection.execute(
-                    "SELECT ticker, "
-                    "substr(COALESCE(published_at, fetched_at), 1, 10) AS day "
-                    "FROM raw_items WHERE id = ?",
+                    "SELECT substr(COALESCE(published_at, fetched_at), 1, 10) "
+                    "AS day FROM raw_items WHERE id = ?",
                     (raw_item_id,),
                 ).fetchone()
                 if row is None:
                     continue  # the foreign key reports this one precisely.
-                if row["ticker"] is not None and str(row["ticker"]) != ticker:
-                    raise Phase0RunContextError(
-                        f"raw item {raw_item_id} belongs to {row['ticker']} but "
-                        f"this reconciliation covers {ticker}"
-                    )
                 if str(row["day"]) != trading_day:
                     raise Phase0RunContextError(
                         f"raw item {raw_item_id} falls on {row['day']} but this "
@@ -3981,7 +4004,19 @@ class Phase0Repository:
         lease_seconds: int = 300,
         now: str | datetime | None = None,
     ) -> bool:
-        """Extend the caller's own lease; ``False`` when it no longer owns it."""
+        """Extend the caller's own lease; ``False`` when it no longer owns it.
+
+        Only a lease that is still *live* can be extended.  The condition
+        below is the exact complement of the one
+        :meth:`claim_stage_key` reclaims under — that treats a key as
+        available when ``lease_expires_at IS NULL OR lease_expires_at <=
+        now`` — so at any instant a lease is renewable or reclaimable and
+        never both.  Without that, an owner whose lease had already
+        lapsed could push it forward and keep working while another
+        worker was entitled to take it, and the two would then hold the
+        same partition at once.  Expiry is the moment ownership ends, not
+        a suggestion the previous owner may decline.
+        """
 
         if _require_int(lease_seconds, "lease_seconds") <= 0:
             raise Phase0ValidationError("lease_seconds must be positive")
@@ -3998,6 +4033,8 @@ class Phase0Repository:
                 SET updated_at = ?, lease_expires_at = ?
                 WHERE stage = ? AND ticker = ? AND trading_day = ?
                   AND pipeline_version = ? AND run_id = ? AND status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
                 """,
                 (
                     moment,
@@ -4007,6 +4044,7 @@ class Phase0Repository:
                     day,
                     pipeline_version,
                     run_id,
+                    moment,
                 ),
             )
             return cursor.rowcount == 1
@@ -4388,6 +4426,15 @@ class Phase0Repository:
         normalized_run_id = _require_text(run_id, "run_id")
         key = self._normalize_stage_key(stage_key) if stage_key is not None else None
         if key is not None:
+            # A key always names a ticker, so a run holding one is never
+            # ticker-less: omitting it *adopts* the key's ticker rather
+            # than meaning "any".  Read the other way round, an omitted
+            # ticker used to skip the ticker comparison entirely, so an
+            # NVDA lease opened a run with no ticker — and a ticker-less
+            # run's partition checks pass for every ticker, which is an
+            # NVDA key authorizing AMD work by saying nothing at all.
+            if normalized_ticker is None:
+                normalized_ticker = key["ticker"]
             # The stage key and the run must describe the same work, or the
             # lease being held is a lease on something else entirely.
             self._assert_stage_key_matches(
@@ -4753,6 +4800,10 @@ class Phase0Repository:
         Checked field by field so the error names the one that is wrong —
         an AMD stage key silently authorizing an NVDA run is exactly the
         class of bug this exists to make impossible.
+
+        Every field is compared, ``ticker`` included.  It reaches here
+        already resolved: :meth:`stage_run` adopts the key's ticker when
+        the caller omitted one, so ``None`` never means "unconstrained".
         """
 
         expected = {
@@ -4762,8 +4813,6 @@ class Phase0Repository:
             "pipeline_version": pipeline_version,
         }
         for field, want in expected.items():
-            if want is None:
-                continue
             got = key.get(field)
             if got != want:
                 raise Phase0RunContextError(
@@ -5203,7 +5252,14 @@ class Phase0Repository:
                     f"{sorted(int(match['id']) for match in matches)}"
                 )
             row = matches[0]
-            if row["ticker"] is not None and run.ticker is not None:
+            # A story or a theme belongs to exactly one partition, so its
+            # ticker column *is* exclusive.  A raw item's is not: it is
+            # the primary attribution beside an association table that may
+            # legitimately name several tickers, so membership for one is
+            # settled below by ``_assert_raw_item_association`` rather than
+            # by refusing anything whose primary ticker reads differently.
+            exclusive = values["source_kind"] != "raw_item"
+            if exclusive and row["ticker"] is not None and run.ticker is not None:
                 if str(row["ticker"]) != run.ticker:
                     raise Phase0RunContextError(
                         f"persist_embeddings source {position} belongs to "
