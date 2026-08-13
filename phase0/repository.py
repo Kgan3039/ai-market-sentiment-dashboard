@@ -5191,7 +5191,12 @@ class Phase0Repository:
 
         The item's trading day, derived as the spec does from
         ``published_at`` falling back to ``fetched_at``, must equal the
-        run's trading day.
+        run's trading day — and so must the day of any *stored* item the
+        payload duplicates.  A duplicate ``(source, canonical_url)`` does
+        not create a row, it names one, and this path then writes that
+        row's ticker associations and candidate reasons.  Validating only
+        the incoming payload let a run for day D mutate evidence that
+        belongs to D-1 while the run log recorded the work as D's.
 
         Preparation and partition checks both run *inside* the logged
         mutation.  Anything that can reject the batch has to, or a caller
@@ -5203,7 +5208,7 @@ class Phase0Repository:
             run, operation="ingest_raw_items", terminal=terminal
         ) as (connection, context):
             prepared = [self._prepare_raw_item(item) for item in items]
-            self._assert_raw_item_partition(prepared, context)
+            self._assert_raw_item_partition(connection, prepared, context)
             results = [self._insert_raw_item(connection, values) for values in prepared]
             if source_state is not None:
                 self._set_source_state(connection, source_state)
@@ -5216,7 +5221,9 @@ class Phase0Repository:
 
     @staticmethod
     def _assert_raw_item_partition(
-        prepared: Sequence[Mapping[str, Any]], run: StageRunContext
+        connection: sqlite3.Connection,
+        prepared: Sequence[Mapping[str, Any]],
+        run: StageRunContext,
     ) -> None:
         """Reject a mixed or foreign-partition ingestion batch before writing.
 
@@ -5224,6 +5231,10 @@ class Phase0Repository:
         checked exactly like ``{"ticker": "AMD"}``.  When this walked the
         raw values it understood only the mapping form, and the string form
         went straight through into an NVDA run.
+
+        Every item in the batch is checked before any of them is written,
+        so one bad duplicate rolls the whole batch back rather than
+        leaving the items ahead of it persisted.
         """
 
         for position, values in enumerate(prepared):
@@ -5249,6 +5260,29 @@ class Phase0Repository:
                 raise Phase0RunContextError(
                     f"ingest_raw_items item {position} falls on {day} but the "
                     f"run covers {run.trading_day}"
+                )
+
+            # A payload that duplicates `(source, canonical_url)` does not
+            # create a row — it *names* one, and that row has its own
+            # effective day, which need not be the day the payload claims.
+            # Checking only the payload let a run for D reach back and add
+            # associations and candidate reasons to evidence belonging to
+            # D-1, while the run log recorded the work as D's.
+            #
+            # The stored day is derived here exactly as `raw_items_for_day`
+            # derives it, in SQL, so "which day is this evidence on" has one
+            # definition and not two that can drift apart.
+            stored = connection.execute(
+                "SELECT id, substr(COALESCE(published_at, fetched_at), 1, 10) "
+                "AS day FROM raw_items WHERE source = ? AND canonical_url = ?",
+                (values["source"], values["canonical_url"]),
+            ).fetchone()
+            if stored is not None and str(stored["day"]) != run.trading_day:
+                raise Phase0RunContextError(
+                    f"ingest_raw_items item {position} duplicates stored raw "
+                    f"item {int(stored['id'])}, which belongs to "
+                    f"{stored['day']}, but the run covers {run.trading_day}; "
+                    f"a run may not mutate another day's evidence"
                 )
 
     def persist_embeddings(

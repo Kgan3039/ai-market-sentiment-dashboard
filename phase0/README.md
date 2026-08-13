@@ -74,6 +74,20 @@ one `BEGIN IMMEDIATE` that also advances `user_version`, so a failure
 leaves the schema, the ledger, and `user_version` untouched. The one
 documented exception is a *registered historical lineage*; see below.
 
+That guarantee now covers the bootstrap too. `schema_migrations` and
+`schema_lineage` used to be created and *committed* before the first
+migration ran, and a pre-ledger database's truthful backfill committed on
+its own as well — so a brand-new database whose first migration failed
+kept two tables describing an attempt that never happened, and a v2
+database kept a ledger it had not earned. Both now land inside the first
+migration's transaction, which restores "a failed attempt changes
+nothing" without weakening what follows: every later migration still
+commits on its own, so a failure at step *n* still leaves a database
+honestly at step *n-1*. The one thing a rollback cannot undo is the
+file's *existence* — opening a connection creates it, before any
+migration logic runs — so what a failed first attempt leaves behind is an
+empty database, with no schema objects and `user_version` still 0.
+
 **The database enforces the contracts, not just the API.** Direct SQL
 cannot store an unsupported ticker, cite a raw item that is not in one of
 the theme's member stories, cite one raw item from two themes in the same
@@ -766,6 +780,24 @@ symbol, so replays compare equal. Validation and persistence read the same
 normalized output: two parsers is how `candidate_tickers=["AMD"]` came to
 be stored under an NVDA run, because the validator understood only the
 mapping form.
+
+**A duplicate names stored evidence, and that evidence has its own day.**
+`(source, canonical_url)` is unique, so re-offering an item does not
+create a row — it resolves to one that already exists, and the ingestion
+path then writes *that* row's ticker associations and candidate reasons.
+The partition check read only the incoming payload's timestamps, so a run
+for day D could resolve to a row belonging to D-1 and mutate it while the
+run log recorded the work as D's. It now derives the stored row's
+effective day too — in SQL, with the same `COALESCE(published_at,
+fetched_at)` the reader uses, so "which day is this evidence on" has one
+definition rather than two that can drift — and refuses the whole batch
+before anything is written when it is not the run's day. The stored
+timestamp is never rewritten to make the partition match: the write is
+refused, the evidence is left alone.
+
+Inside the run's own day the duplicate path is unchanged, associations
+and candidate updates included, so an idempotent replay still costs
+nothing and still returns the existing id.
 
 **Ticker-scoped derived processing needs an explicit association.**
 Tickerless raw evidence is storable — a fetcher legitimately keeps what it

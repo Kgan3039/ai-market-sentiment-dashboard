@@ -156,6 +156,11 @@ def _backfill_ledger(
     Writing the local checksum would be the worst thing here: it is a
     silent claim that the approved migration ran, on a database where a
     different one did.
+
+    The caller owns the transaction.  This used to open and commit its
+    own, which meant a backfilled ledger outlived the attempt that
+    produced it: on a database whose first migration then failed, the
+    rollback had nothing left to undo.
     """
 
     applied = _applied_migrations(connection)
@@ -164,23 +169,15 @@ def _backfill_ledger(
     pending = [
         migration for migration in migrations if migration.version <= user_version
     ]
-    if not pending:
-        return
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        for migration in pending:
-            checksum = migration.checksum
-            if lineage is not None and migration.name == lineage.migration:
-                checksum = lineage.checksum
-            connection.execute(
-                f"INSERT INTO {LEDGER_TABLE} (name, version, checksum, applied_at) "
-                "VALUES (?, ?, ?, ?)",
-                (migration.name, migration.version, checksum, _utc_now()),
-            )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
+    for migration in pending:
+        checksum = migration.checksum
+        if lineage is not None and migration.name == lineage.migration:
+            checksum = lineage.checksum
+        connection.execute(
+            f"INSERT INTO {LEDGER_TABLE} (name, version, checksum, applied_at) "
+            "VALUES (?, ?, ?, ?)",
+            (migration.name, migration.version, checksum, _utc_now()),
+        )
 
 
 def _verify_history(
@@ -256,36 +253,45 @@ def apply_migrations(
     if lineage is not None:
         return _converge(connection, migrations, lineage)
 
-    connection.execute(LEDGER_DDL)
-    connection.execute(lineages.LINEAGE_DDL)
-    connection.commit()
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-    _backfill_ledger(connection, migrations, user_version, None)
-    _verify_history(connection, migrations, None)
-
-    applied = set(_applied_migrations(connection))
     newly_applied: list[str] = []
-    for migration in migrations:
-        if migration.name in applied:
-            continue
-        statements = list(split_statements(migration.sql))
+
+    # The bootstrap tables, and any truthful backfill of them, belong to
+    # the *first* attempt rather than preceding it.  They used to be
+    # created and committed up front, so a brand-new database whose first
+    # migration then failed was left carrying `schema_migrations` and
+    # `schema_lineage` — metadata describing an attempt that, by the
+    # contract this module opens with, never happened.  Folding them into
+    # the first migration's transaction restores "a failed attempt changes
+    # nothing" without weakening the per-migration atomicity that follows:
+    # every later migration still commits on its own, so a failure at step
+    # *n* still leaves a database honestly at step *n-1*.
+    pending: list[Migration] = []
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(LEDGER_DDL)
+        connection.execute(lineages.LINEAGE_DDL)
+        _backfill_ledger(connection, migrations, user_version, None)
+        _verify_history(connection, migrations, None)
+
+        applied = set(_applied_migrations(connection))
+        pending = [
+            migration for migration in migrations if migration.name not in applied
+        ]
+        if pending:
+            _apply_one(connection, pending[0], user_version, legacy_upgrade)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    if pending:
+        user_version = max(user_version, pending[0].version)
+        newly_applied.append(pending[0].name)
+
+    for migration in pending[1:]:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            if (
-                migration.name == LEGACY_UPGRADE_MIGRATION
-                and legacy_upgrade is not None
-                and user_version == LEGACY_SCHEMA_VERSION
-            ):
-                legacy_upgrade(connection)
-            for statement in statements:
-                connection.execute(statement)
-            connection.execute(
-                f"INSERT INTO {LEDGER_TABLE} (name, version, checksum, applied_at) "
-                "VALUES (?, ?, ?, ?)",
-                (migration.name, migration.version, migration.checksum, _utc_now()),
-            )
-            target = max(user_version, migration.version)
-            connection.execute(f"PRAGMA user_version = {int(target)}")
+            _apply_one(connection, migration, user_version, legacy_upgrade)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -293,6 +299,40 @@ def apply_migrations(
         user_version = max(user_version, migration.version)
         newly_applied.append(migration.name)
     return newly_applied
+
+
+def _apply_one(
+    connection: sqlite3.Connection,
+    migration: Migration,
+    user_version: int,
+    legacy_upgrade: Callable[[sqlite3.Connection], None] | None,
+) -> None:
+    """Run one migration, its ledger row, and its ``user_version`` bump.
+
+    The caller owns the transaction, so all three land together or none
+    of them does — including a migration whose text will not parse, which
+    is why the file is only split here and not up front: parsing every
+    file eagerly would reject an *already applied* migration that a later
+    edit left unparseable, before the checksum check could report the far
+    more useful "rewriting history".
+    """
+
+    if (
+        migration.name == LEGACY_UPGRADE_MIGRATION
+        and legacy_upgrade is not None
+        and user_version == LEGACY_SCHEMA_VERSION
+    ):
+        legacy_upgrade(connection)
+    for statement in split_statements(migration.sql):
+        connection.execute(statement)
+    connection.execute(
+        f"INSERT INTO {LEDGER_TABLE} (name, version, checksum, applied_at) "
+        "VALUES (?, ?, ?, ?)",
+        (migration.name, migration.version, migration.checksum, _utc_now()),
+    )
+    connection.execute(
+        f"PRAGMA user_version = {int(max(user_version, migration.version))}"
+    )
 
 
 def _converge(

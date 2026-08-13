@@ -73,7 +73,11 @@ from phase0.repository import (
     serialize_operational_metadata,
     serialize_raw_evidence,
 )
-from phase0.schema import MINIMUM_SQLITE_VERSION, load_migrations
+from phase0.schema import (
+    LEGACY_SCHEMA_VERSION,
+    MINIMUM_SQLITE_VERSION,
+    load_migrations,
+)
 from phase0.tickers import SUPPORTED_TICKERS
 
 
@@ -516,6 +520,229 @@ def test_failed_migration_rolls_back_and_leaves_version_and_data_intact(tmp_path
     assert schema_snapshot(repository) == before
     assert repository.count("raw_items") == 1
     assert repository.raw_items_for_day(DAY)[0]["id"] == item_id
+
+
+# ----------------------------------------------------------------------
+# A failed attempt leaves no trace of itself
+#
+# The module's own contract is that a migration lands completely or not
+# at all.  The bootstrap tables were the exception nobody had looked at:
+# `schema_migrations` and `schema_lineage` were created and *committed*
+# before the first migration ran, so a brand-new database whose first
+# migration failed kept two tables describing an attempt that, by that
+# contract, never happened.
+# ----------------------------------------------------------------------
+
+
+def database_state(path: Path) -> dict:
+    """Everything a failed attempt must leave exactly as it found it."""
+
+    if not path.exists() or path.stat().st_size == 0:
+        return {"exists": False}
+    connection = sqlite3.connect(path)
+    connection.row_factory = sqlite3.Row
+    try:
+        objects = sorted(
+            (row["type"], row["name"], row["sql"])
+            for row in connection.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%'"
+            )
+        )
+        names = {name for _, name, _ in objects}
+        state = {
+            "exists": True,
+            "sqlite_master": objects,
+            "user_version": int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            ),
+            "schema_migrations": None,
+            "schema_lineage": None,
+        }
+        for table in ("schema_migrations", "schema_lineage"):
+            if table in names:
+                state[table] = [
+                    tuple(row) for row in connection.execute(f"SELECT * FROM {table}")
+                ]
+        return state
+    finally:
+        connection.close()
+
+
+def broken_migrations(tmp_path: Path, *, upto: int, failing_sql: str) -> Path:
+    """The real migrations up to ``upto``, then one that fails."""
+
+    directory = partial_migrations(tmp_path, upto)
+    version = max(upto + 1, 1)
+    (directory / f"{version:03d}_broken.sql").write_text(failing_sql, encoding="utf-8")
+    return directory
+
+
+#: Ways a migration can fail, so the rollback is not shown to work for
+#: only one of them.  Each aborts *after* some of its own statements have
+#: already run, which is the case a rollback has to actually undo.
+FAILURE_MODES = [
+    (
+        "statement error",
+        "CREATE TABLE half_applied (id INTEGER PRIMARY KEY);\n"
+        "INSERT INTO half_applied SELECT missing_column FROM half_applied;\n",
+    ),
+    (
+        "constraint violation",
+        "CREATE TABLE half_applied (id INTEGER PRIMARY KEY);\n"
+        "INSERT INTO half_applied (id) VALUES (1);\n"
+        "INSERT INTO half_applied (id) VALUES (1);\n",
+    ),
+    (
+        "unparseable tail",
+        "CREATE TABLE half_applied (id INTEGER PRIMARY KEY);\n"
+        "CREATE TABLE never_finished (;\n",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "failing_sql", [pytest.param(sql, id=label) for label, sql in FAILURE_MODES]
+)
+def test_a_failed_first_migration_leaves_a_fresh_database_untouched(
+    tmp_path, failing_sql
+):
+    """Nothing at all — no ledger, no lineage table, no version."""
+
+    directory = tmp_path / "only_broken"
+    directory.mkdir()
+    (directory / "001_broken.sql").write_text(failing_sql, encoding="utf-8")
+    database = tmp_path / "phase0.sqlite3"
+    assert database_state(database) == {"exists": False}
+
+    repository = Phase0Repository(database, migrations_path=directory)
+    with pytest.raises((sqlite3.Error, Phase0MigrationError)):
+        repository.migrate()
+
+    # The file itself is created by *opening* a connection, before any
+    # migration logic runs, and no rollback can undo that.  What must not
+    # survive is content: an empty file is a database that has had nothing
+    # done to it, which is exactly what a failed attempt should leave.
+    after = database_state(database)
+    assert after["sqlite_master"] == []
+    assert after["user_version"] == 0
+    assert after["schema_migrations"] is None
+    assert after["schema_lineage"] is None
+
+
+def test_a_failed_first_migration_leaves_no_bootstrap_tables(tmp_path):
+    """Named explicitly, because these two were the whole defect."""
+
+    directory = tmp_path / "only_broken"
+    directory.mkdir()
+    (directory / "001_broken.sql").write_text(
+        "CREATE TABLE ok (id INTEGER PRIMARY KEY);\nCREATE TABLE bad (;\n",
+        encoding="utf-8",
+    )
+    database = tmp_path / "phase0.sqlite3"
+    repository = Phase0Repository(database, migrations_path=directory)
+    with pytest.raises((sqlite3.Error, Phase0MigrationError)):
+        repository.migrate()
+
+    state = database_state(database)
+    if state["exists"]:
+        names = {name for _, name, _ in state["sqlite_master"]}
+        assert "schema_migrations" not in names
+        assert "schema_lineage" not in names
+        assert names == set()
+
+
+@pytest.mark.parametrize("upto", [1, 4, 7, LATEST_VERSION])
+def test_a_failed_later_migration_leaves_the_database_at_the_step_before(
+    tmp_path, upto
+):
+    """Per-migration atomicity, which the bootstrap fix must not weaken."""
+
+    good = partial_migrations(tmp_path, upto)
+    repository = Phase0Repository(tmp_path / "phase0.sqlite3", migrations_path=good)
+    repository.migrate()
+    before = database_state(tmp_path / "phase0.sqlite3")
+    assert before["schema_migrations"], "the good run must have written a ledger"
+
+    directory = broken_migrations(
+        tmp_path,
+        upto=upto,
+        failing_sql=(
+            "CREATE TABLE half_applied (id INTEGER PRIMARY KEY);\n"
+            "CREATE TABLE never_finished (;\n"
+        ),
+    )
+    broken = Phase0Repository(tmp_path / "phase0.sqlite3", migrations_path=directory)
+    with pytest.raises((sqlite3.Error, Phase0MigrationError)):
+        broken.migrate()
+
+    assert database_state(tmp_path / "phase0.sqlite3") == before
+
+
+def test_a_failed_legacy_backfill_leaves_the_legacy_database_untouched(tmp_path):
+    """A pre-ledger database must not keep a ledger it did not earn.
+
+    The backfill writes rows describing history the database already
+    lived.  It used to commit them on its own, so a failure in the very
+    next migration left a v2 database carrying a ledger, a lineage table,
+    and no way to tell that the upgrade had never happened.
+    """
+
+    database = legacy_v2_database(tmp_path)
+    before = database_state(database)
+    assert before["schema_migrations"] is None, "the fixture drops the ledger"
+
+    directory = broken_migrations(
+        tmp_path,
+        upto=LEGACY_SCHEMA_VERSION,
+        failing_sql="CREATE TABLE half_applied (id INTEGER PRIMARY KEY);\n"
+        "CREATE TABLE never_finished (;\n",
+    )
+    repository = Phase0Repository(database, migrations_path=directory)
+    with pytest.raises((sqlite3.Error, Phase0MigrationError)):
+        repository.migrate()
+
+    assert database_state(database) == before
+
+
+def test_a_failed_attempt_can_be_retried_successfully(tmp_path):
+    """The point of rolling back: the next attempt starts from clean."""
+
+    database = tmp_path / "phase0.sqlite3"
+    directory = tmp_path / "migrations"
+    directory.mkdir()
+    (directory / "001_broken.sql").write_text(
+        "CREATE TABLE ok (id INTEGER PRIMARY KEY);\nCREATE TABLE bad (;\n",
+        encoding="utf-8",
+    )
+    repository = Phase0Repository(database, migrations_path=directory)
+    with pytest.raises((sqlite3.Error, Phase0MigrationError)):
+        repository.migrate()
+
+    # Repair the migration set and try again against the same file.
+    (directory / "001_broken.sql").unlink()
+    for migration in ALL_MIGRATIONS:
+        shutil.copy(MIGRATIONS_PATH / migration.name, directory / migration.name)
+    retried = Phase0Repository(database, migrations_path=directory)
+    retried.migrate()
+
+    assert retried.schema_version() == LATEST_VERSION
+    assert schema_snapshot(retried) == schema_snapshot(migrated(tmp_path, "fresh.db"))
+    assert [row["name"] for row in retried.applied_migrations()] == [
+        migration.name for migration in ALL_MIGRATIONS
+    ]
+
+
+def test_a_successful_migration_still_writes_both_bootstrap_tables(tmp_path):
+    """The fix moved the bootstrap; it did not remove it."""
+
+    assert migrated(tmp_path).schema_version() == LATEST_VERSION
+    state = database_state(tmp_path / "phase0.sqlite3")
+    names = {name for _, name, _ in state["sqlite_master"]}
+    assert {"schema_migrations", "schema_lineage"} <= names
+    assert state["user_version"] == LATEST_VERSION
+    assert len(state["schema_migrations"]) == len(ALL_MIGRATIONS)
+    assert state["schema_lineage"] == []
 
 
 def test_rewriting_an_applied_migration_is_refused(tmp_path):
@@ -5438,6 +5665,199 @@ def test_a_raw_item_from_another_trading_day_is_rejected(tmp_path):
             repository.ingest_raw_items([raw_item(2), stray], run=run)
 
     assert repository.count("raw_items") == 0
+
+
+# ----------------------------------------------------------------------
+# A duplicate names stored evidence, and that evidence has its own day
+#
+# `(source, canonical_url)` is unique, so a re-ingested payload does not
+# create a row — it resolves to one that already exists.  The partition
+# check read only the incoming payload's timestamps, so a run for day D
+# could resolve to a row belonging to D-1 and then write that row's
+# ticker associations and candidate reasons, while the run log recorded
+# the work as D's.
+# ----------------------------------------------------------------------
+
+PRIOR_DAY = "2026-07-22"
+
+
+def stored_on(repository, day: str, index: int = 1, **overrides):
+    """One raw item already persisted on ``day``, through the admin path."""
+
+    values = {
+        **raw_item(index),
+        "published_at": f"{day}T12:00:00+00:00",
+        "fetched_at": f"{day}T12:30:00+00:00",
+    }
+    values.update(overrides)
+    return repository.admin.insert_raw_items([values])[0].item_id, values
+
+
+def replay_of(values, day: str, **overrides):
+    """The same canonical item, offered again with ``day``'s timestamps."""
+
+    payload = {
+        **values,
+        "published_at": f"{day}T12:00:00+00:00",
+        "fetched_at": f"{day}T12:30:00+00:00",
+    }
+    payload.update(overrides)
+    return payload
+
+
+#: The mutations the duplicate path can perform on a row it resolved to.
+#: Each has to be refused when that row is another day's, and each is a
+#: real write: an association row, or a candidate reason overwritten.
+DUPLICATE_MUTATIONS = [
+    ("plain replay", {}),
+    ("new ticker association", {"ticker": None, "tickers": ["NVDA"]}),
+    (
+        "candidate reason update",
+        {"candidate_tickers": [{"ticker": "NVDA", "reason": "headline_symbol"}]},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "mutation", [pytest.param(m, id=label) for label, m in DUPLICATE_MUTATIONS]
+)
+def test_a_duplicate_cannot_mutate_another_days_evidence(tmp_path, mutation):
+    repository = migrated(tmp_path)
+    item_id, values = stored_on(repository, PRIOR_DAY, ticker=None)
+    before = evidence_state(repository, item_id)
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match=r"belongs to 2026-07-22"):
+            repository.ingest_raw_items([replay_of(values, DAY, **mutation)], run=run)
+
+    assert evidence_state(repository, item_id) == before
+    assert repository.count("raw_items") == 1
+
+
+def evidence_state(repository, item_id: int) -> dict:
+    """Everything the duplicate path could have written for one item."""
+
+    row = repository.read.raw_item(item_id)
+    return {
+        "row": dict(row),
+        "tickers": repository.raw_item_tickers(item_id),
+        "candidates": sorted(
+            (str(entry["ticker"]), str(entry["reason"]))
+            for entry in repository.read.raw_item_candidates(item_id)
+        ),
+    }
+
+
+def test_a_duplicate_on_the_same_day_is_still_an_idempotent_replay(tmp_path):
+    """The rule is about the *day*, not about duplicates."""
+
+    repository = migrated(tmp_path)
+    item_id, values = stored_on(repository, DAY)
+
+    with nvda_run(repository) as run:
+        results = repository.ingest_raw_items([replay_of(values, DAY)], run=run)
+
+    assert [(r.item_id, r.inserted) for r in results] == [(item_id, False)]
+    assert repository.count("raw_items") == 1
+
+
+def test_a_same_day_duplicate_may_still_add_an_association(tmp_path):
+    """Within the partition, the duplicate path keeps working as before."""
+
+    repository = migrated(tmp_path)
+    item_id, values = stored_on(repository, DAY, ticker=None)
+    assert repository.raw_item_tickers(item_id) == []
+
+    with nvda_run(repository) as run:
+        repository.ingest_raw_items(
+            [
+                replay_of(
+                    values,
+                    DAY,
+                    tickers=["NVDA"],
+                    candidate_tickers=[{"ticker": "NVDA", "reason": "headline_symbol"}],
+                )
+            ],
+            run=run,
+        )
+
+    assert repository.raw_item_tickers(item_id) == ["NVDA"]
+    assert [
+        (entry["ticker"], entry["reason"])
+        for entry in repository.read.raw_item_candidates(item_id)
+    ] == [("NVDA", "headline_symbol")]
+
+
+@pytest.mark.parametrize(
+    "stamps, described",
+    [
+        pytest.param(
+            {
+                "published_at": f"{PRIOR_DAY}T23:00:00+00:00",
+                "fetched_at": f"{DAY}T01:00:00+00:00",
+            },
+            PRIOR_DAY,
+            id="day derives from published_at",
+        ),
+        pytest.param(
+            {"published_at": None, "fetched_at": f"{PRIOR_DAY}T23:00:00+00:00"},
+            PRIOR_DAY,
+            id="day falls back to fetched_at",
+        ),
+    ],
+)
+def test_the_stored_days_derivation_matches_the_readers(tmp_path, stamps, described):
+    """`published_at` wins; `fetched_at` is the fallback — one rule, in SQL.
+
+    The second case is the one a Python-side ``a or b`` would get right
+    only by accident, and it is also the case the reader
+    (`raw_items_for_day`, via ``COALESCE``) has always used.
+    """
+
+    repository = migrated(tmp_path)
+    values = {**raw_item(1), **stamps}
+    item_id = repository.admin.insert_raw_items([values])[0].item_id
+    # The reader agrees this item is on `described`.
+    assert [row["id"] for row in repository.raw_items_for_day(described)] == [item_id]
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match=f"belongs to {described}"):
+            repository.ingest_raw_items([replay_of(values, DAY)], run=run)
+
+
+def test_one_cross_day_duplicate_rolls_back_the_whole_batch(tmp_path):
+    """All-or-nothing, checked before the first row is written."""
+
+    repository = migrated(tmp_path)
+    stale_id, stale = stored_on(repository, PRIOR_DAY, index=1)
+    before = evidence_state(repository, stale_id)
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError, match="belongs to 2026-07-22"):
+            repository.ingest_raw_items(
+                [raw_item(2), raw_item(3), replay_of(stale, DAY), raw_item(4)],
+                run=run,
+            )
+
+    # Not one of the three otherwise-valid items landed, and the stale
+    # item is exactly as it was.
+    assert repository.count("raw_items") == 1
+    assert evidence_state(repository, stale_id) == before
+
+
+def test_a_rejected_duplicate_does_not_rewrite_the_stored_timestamp(tmp_path):
+    """The fix refuses the write; it does not move the evidence to suit it."""
+
+    repository = migrated(tmp_path)
+    item_id, values = stored_on(repository, PRIOR_DAY)
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0RunContextError):
+            repository.ingest_raw_items([replay_of(values, DAY)], run=run)
+
+    row = repository.read.raw_item(item_id)
+    assert str(row["published_at"]).startswith(PRIOR_DAY)
+    assert str(row["fetched_at"]).startswith(PRIOR_DAY)
 
 
 def test_an_unassigned_raw_item_is_allowed_evidence(tmp_path):
