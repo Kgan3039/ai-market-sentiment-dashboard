@@ -35,7 +35,23 @@ class EmbeddingPersistenceError(Phase0Error, EmbeddingStorageError):
 
 SOURCE_KINDS = frozenset({"raw_item", "story", "theme"})
 
+#: The table each source kind's durable id comes from, for error messages
+#: that name the column a caller should have passed.
+SOURCE_TABLES = {
+    "raw_item": "raw_items",
+    "story": "stories",
+    "theme": "themes",
+}
+
 _FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+#: A durable row id as the schema writes it — ``CAST(id AS TEXT)`` of an
+#: AUTOINCREMENT key, so a positive integer with no padding, sign, point,
+#: or exponent.  Deliberately exact rather than ``str.isdigit()``: ``'01'``
+#: and ``'1.0'`` are ids SQLite's integer affinity would match but the
+#: ownership triggers' text comparison would not, and an identity that two
+#: layers read differently is not an identity.
+_DURABLE_ID_PATTERN = re.compile(r"^[1-9][0-9]*$")
 
 
 def normalize_source_id(value: Any) -> str:
@@ -48,6 +64,44 @@ def normalize_source_id(value: Any) -> str:
     normalized = str(value).strip()
     if not normalized:
         raise Phase0ValidationError("embedding source_id must be non-empty")
+    return normalized
+
+
+def require_durable_source_id(source_kind: str, value: Any) -> str:
+    """The single-vector cache's identity: a durable row id, nothing else.
+
+    ``embeddings`` is globally unique on ``(source_kind, source_id)``,
+    while ``stories.cluster_fingerprint``, ``themes.fingerprint``, and
+    ``themes.theme_key`` are unique only *within* one
+    ticker/trading-day/pipeline-version partition.  A fingerprint is
+    therefore not a cache key: two partitions may legitimately produce the
+    same one, and then one partition's vector is what the other's text
+    reads back.
+
+    Nor is "unambiguous right now" enough to make one safe.  The single
+    vector API has no run and no partition, so the identity it is handed
+    is all it knows; and an identity that names one story today names two
+    the moment another ticker-day clusters to the same fingerprint, with
+    no write to this table in between to notice.  Only a globally unique
+    identity is stable under that, and the durable row id is the one the
+    schema guarantees.
+
+    This is the repository's own rule, applied where it had not been:
+    fingerprints are change-detection handles stored *beside* the durable
+    ids, never instead of them.  The partition-aware batch
+    (``persist_embeddings``) still accepts the wider identity set the
+    ownership triggers define, because it has a run to check them against.
+    """
+
+    kind = normalize_source_kind(source_kind)
+    normalized = normalize_source_id(value)
+    if not _DURABLE_ID_PATTERN.match(normalized):
+        raise Phase0ValidationError(
+            f"embedding source_id {normalized!r} is not a durable {kind} id; "
+            f"the single-vector cache is keyed globally, so it takes "
+            f"{SOURCE_TABLES[kind]}.id and not a partition-scoped fingerprint "
+            f"or key (the run-scoped persist_embeddings batch takes those)"
+        )
     return normalized
 
 
@@ -163,5 +217,6 @@ __all__ = [
     "embedding_from_row",
     "normalize_source_id",
     "normalize_source_kind",
+    "require_durable_source_id",
     "validate_embedding",
 ]

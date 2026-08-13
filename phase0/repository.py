@@ -44,8 +44,8 @@ from nlp.embeddings import PersistedEmbedding
 from .embeddings import (
     EmbeddingPersistenceError,
     embedding_from_row,
-    normalize_source_id,
     normalize_source_kind,
+    require_durable_source_id,
     validate_embedding,
 )
 from .errors import (
@@ -2042,10 +2042,17 @@ class Phase0Repository:
     def get_embedding(
         self, source_kind: str, source_id: str
     ) -> PersistedEmbedding | None:
-        """Return the current embedding for a source, or ``None``."""
+        """Return the current embedding for a source, or ``None``.
+
+        Takes a durable row id; see :func:`~phase0.embeddings
+        .require_durable_source_id` for why a fingerprint is refused
+        rather than looked up.  A *missing* id is an ordinary cache miss
+        and returns ``None``; a partition-scoped one is a caller error and
+        is raised, because silently missing forever would be worse.
+        """
 
         kind = normalize_source_kind(source_kind)
-        identity = normalize_source_id(source_id)
+        identity = require_durable_source_id(kind, source_id)
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM embeddings WHERE source_kind = ? AND source_id = ?",
@@ -2062,9 +2069,19 @@ class Phase0Repository:
         not a pipeline stage: it writes a single derived vector that can be
         recomputed from the raw item at any time.  The batch that *is* a
         pipeline stage is :meth:`persist_embeddings`, which carries a run.
+
+        Because it carries no run, it has no partition to judge an
+        identity against, so it takes only the identity that needs none: a
+        durable row id.  See :func:`~phase0.embeddings
+        .require_durable_source_id`.  The protocol is unchanged — its
+        ``source_id`` is text either way — and this narrows which text is
+        a cache key, not the shape of the call.
         """
 
         values = validate_embedding(embedding)
+        values["source_id"] = require_durable_source_id(
+            values["source_kind"], values["source_id"]
+        )
         with self._connect() as connection:
             self._write_embedding(connection, values)
 
@@ -2099,10 +2116,16 @@ class Phase0Repository:
             raise EmbeddingPersistenceError(str(exc)) from exc
 
     def delete_embedding(self, source_kind: str, source_id: str) -> bool:
-        """Drop one source's embedding; ``True`` when a row was removed."""
+        """Drop one source's embedding; ``True`` when a row was removed.
+
+        Durable ids only, and here the reason is sharper than for a read:
+        a fingerprint two partitions share names one row, so honouring it
+        would let either partition delete the other's cache entry by
+        asking for its own.
+        """
 
         kind = normalize_source_kind(source_kind)
-        identity = normalize_source_id(source_id)
+        identity = require_durable_source_id(kind, source_id)
         with self._connect() as connection:
             cursor = connection.execute(
                 "DELETE FROM embeddings WHERE source_kind = ? AND source_id = ?",

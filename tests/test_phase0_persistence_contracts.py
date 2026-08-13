@@ -4904,24 +4904,27 @@ def embedded_day(repository: Phase0Repository) -> dict:
     return day
 
 
-#: (label, source kind, how to read the legal identity out of the day).
+#: (label, source kind, how to read the identity out of the day, whether
+#: it is a *durable* row id).  The run-scoped batch takes all of them; the
+#: single-vector cache API takes only the durable ones, because it has no
+#: run and so no partition to judge a partition-scoped handle against.
 EMBEDDING_IDENTITIES = [
-    ("raw-item-id", "raw_item", lambda day: str(day["items"][0])),
-    ("story-id", "story", lambda day: str(day["stories"]["cf1"])),
-    ("story-cluster-fingerprint", "story", lambda day: "cf1"),
-    ("theme-id", "theme", lambda day: str(day["theme"]["id"])),
-    ("theme-fingerprint", "theme", lambda day: str(day["theme"]["fingerprint"])),
-    ("theme-key", "theme", lambda day: str(day["theme"]["theme_key"])),
+    ("raw-item-id", "raw_item", lambda day: str(day["items"][0]), True),
+    ("story-id", "story", lambda day: str(day["stories"]["cf1"]), True),
+    ("story-cluster-fingerprint", "story", lambda day: "cf1", False),
+    ("theme-id", "theme", lambda day: str(day["theme"]["id"]), True),
+    ("theme-fingerprint", "theme", lambda day: str(day["theme"]["fingerprint"]), False),
+    ("theme-key", "theme", lambda day: str(day["theme"]["theme_key"]), False),
 ]
 
 
 @pytest.mark.parametrize(
-    "label, kind, identity",
+    "label, kind, identity, durable",
     EMBEDDING_IDENTITIES,
     ids=[case[0] for case in EMBEDDING_IDENTITIES],
 )
 def test_persist_embeddings_resolves_every_legal_source_identity(
-    tmp_path, label, kind, identity
+    tmp_path, label, kind, identity, durable
 ):
     repository = migrated(tmp_path)
     day = embedded_day(repository)
@@ -4936,25 +4939,34 @@ def test_persist_embeddings_resolves_every_legal_source_identity(
         )
 
     assert repository.count("embeddings") == 1
-    assert repository.get_embedding(kind, source_id) is not None
     assert repository.run_log_entries(run_id=run.run_id)[0]["status"] == "success"
+    with repository.admin.connect_writable() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) AS n FROM embeddings "
+                "WHERE source_kind = ? AND source_id = ?",
+                (kind, source_id),
+            ).fetchone()["n"]
+            == 1
+        )
 
 
 @pytest.mark.parametrize(
-    "label, kind, identity",
+    "label, kind, identity, durable",
     EMBEDDING_IDENTITIES,
     ids=[case[0] for case in EMBEDDING_IDENTITIES],
 )
-def test_the_logged_and_durable_embedding_contracts_agree(
-    tmp_path, label, kind, identity
+def test_the_single_vector_cache_takes_durable_ids_only(
+    tmp_path, label, kind, identity, durable
 ):
-    """Neither path may accept an identity the other refuses.
+    """Where the two paths diverge, and why the divergence is the point.
 
-    The unlogged cache protocol writes straight through the ownership
-    trigger, so it *is* the database's answer.  A logged batch that
-    disagreed would make the run-carrying entrypoint — the only one a
-    pipeline stage may use — strictly less capable than the contract it
-    implements.
+    The run-scoped batch may take a fingerprint because it has a run: it
+    resolves the identity, checks the resolved row is this run's, and
+    refuses an identity that names more than one row.  The single-vector
+    cache API has none of that — no run, no partition, nothing to judge
+    against — so a partition-scoped handle reaching it is a caller error
+    and is named as one rather than guessed at.
     """
 
     repository = migrated(tmp_path)
@@ -4962,11 +4974,250 @@ def test_the_logged_and_durable_embedding_contracts_agree(
     source_id = identity(day)
     embedding = sample_embedding(source_id, source_kind=kind)
 
-    repository.upsert_embedding(embedding)
-    with nvda_run(repository, stage="m1.embed") as run:
-        repository.persist_embeddings([embedding], run=run)
+    if durable:
+        repository.upsert_embedding(embedding)
+        assert repository.get_embedding(kind, source_id) is not None
+        assert repository.delete_embedding(kind, source_id) is True
+        assert repository.count("embeddings") == 0
+        return
 
+    for call in (
+        lambda: repository.upsert_embedding(embedding),
+        lambda: repository.get_embedding(kind, source_id),
+        lambda: repository.delete_embedding(kind, source_id),
+    ):
+        with pytest.raises(Phase0ValidationError, match="is not a durable"):
+            call()
+    assert repository.count("embeddings") == 0
+
+
+#: Text that is not a durable id, however much it looks like one.  These
+#: are refused by the single-vector API on their shape alone, before any
+#: lookup: a cache key the schema and this module would read differently
+#: is not a key at all.
+NON_DURABLE_IDENTITIES = [
+    ("zero", "0"),
+    ("zero-padded", "01"),
+    ("float-shaped", "1.0"),
+    ("signed", "+1"),
+    ("negative", "-1"),
+    ("exponent", "1e0"),
+    ("hex-fingerprint", "f" * 64),
+    ("word-key", "nvda-chip-demand"),
+    ("id-with-suffix", "1x"),
+]
+
+
+@pytest.mark.parametrize(
+    "label, source_id",
+    NON_DURABLE_IDENTITIES,
+    ids=[case[0] for case in NON_DURABLE_IDENTITIES],
+)
+def test_the_cache_refuses_anything_that_is_not_a_durable_id(
+    tmp_path, label, source_id
+):
+    repository = migrated(tmp_path)
+    embedded_day(repository)
+
+    with pytest.raises(Phase0ValidationError, match="is not a durable"):
+        repository.upsert_embedding(sample_embedding(source_id, source_kind="story"))
+    with pytest.raises(Phase0ValidationError, match="is not a durable"):
+        repository.get_embedding("story", source_id)
+    with pytest.raises(Phase0ValidationError, match="is not a durable"):
+        repository.delete_embedding("story", source_id)
+    assert repository.count("embeddings") == 0
+
+
+def test_a_durable_id_that_names_nothing_is_a_miss_not_a_write(tmp_path):
+    """Unknown identities fail closed, each in the way its verb allows."""
+
+    repository = migrated(tmp_path)
+    embedded_day(repository)
+
+    assert repository.get_embedding("story", "99999") is None
+    assert repository.delete_embedding("story", "99999") is False
+    with pytest.raises(EmbeddingPersistenceError, match="source does not exist"):
+        repository.upsert_embedding(sample_embedding("99999", source_kind="story"))
+    assert repository.count("embeddings") == 0
+
+
+def shared_identity_day(repository: Phase0Repository) -> dict:
+    """Two partitions that deliberately agree on every public handle.
+
+    NVDA and AMD each get a story with the same ``cluster_fingerprint``
+    and a theme with the same ``fingerprint`` *and* the same
+    ``theme_key``.  Nothing here is a schema violation: those columns are
+    unique only within a ticker/trading-day/pipeline-version, and two
+    tickers clustering to the same handle on the same day is ordinary.
+    """
+
+    shared = {
+        "story_fingerprint": "shared-cluster-fingerprint",
+        "theme_fingerprint": "c" * 64,
+        "theme_key": "shared-theme-key",
+    }
+    for ticker in ("NVDA", "AMD"):
+        items = seed_raw_items(repository, 1, ticker=ticker)
+        reconcile_stories(
+            repository,
+            ticker=ticker,
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story(shared["story_fingerprint"], items)],
+        )
+        story_id = repository.stories_for_day(DAY, ticker)[0]["id"]
+        reconcile_themes(
+            repository,
+            ticker=ticker,
+            trading_day=DAY,
+            pipeline_version="v1",
+            theme_set=theme_set(),
+            themes=[
+                ThemeRecord(
+                    fingerprint=shared["theme_fingerprint"],
+                    theme_key=shared["theme_key"],
+                    label=f"{ticker} theme",
+                    story_ids=(story_id,),
+                    citation_item_ids=(items[0],),
+                    method="hdbscan",
+                )
+            ],
+        )
+        with repository.admin.connect_writable() as connection:
+            theme = dict(
+                connection.execute(
+                    "SELECT * FROM themes WHERE ticker = ?", (ticker,)
+                ).fetchone()
+            )
+        shared[ticker] = {"items": items, "story_id": story_id, "theme": theme}
+    return shared
+
+
+SHARED_HANDLES = [
+    ("story-fingerprint", "story", "story_fingerprint"),
+    ("theme-fingerprint", "theme", "theme_fingerprint"),
+    ("theme-key", "theme", "theme_key"),
+]
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[case[0] for case in SHARED_HANDLES],
+)
+def test_one_partition_cannot_overwrite_anothers_cache_row(
+    tmp_path, label, kind, handle
+):
+    """The collision this contract exists to prevent, run end to end.
+
+    Both partitions cache their own vector under the handle they share.
+    Before, the second write silently replaced the first and every later
+    read of *either* partition returned the survivor — one ticker's text
+    embedded, both tickers' answer.
+    """
+
+    repository = migrated(tmp_path)
+    shared = shared_identity_day(repository)
+    identity = shared[handle]
+
+    nvda = sample_embedding(
+        identity,
+        source_kind=kind,
+        vector_blob=serialize_vector(np.ones(4, dtype=EMBEDDING_DTYPE)),
+    )
+    amd = sample_embedding(
+        identity,
+        source_kind=kind,
+        input_fingerprint="b" * 64,
+        vector_blob=serialize_vector(np.full(4, 0.5, dtype=EMBEDDING_DTYPE)),
+    )
+
+    for embedding in (nvda, amd):
+        with pytest.raises(Phase0ValidationError, match="is not a durable"):
+            repository.upsert_embedding(embedding)
+    assert repository.count("embeddings") == 0
+
+    # The run-scoped batch refuses it too, on the stronger ground that it
+    # can see both rows and so knows the identity means neither.
+    for ticker in ("NVDA", "AMD"):
+        with repository.stage_run(
+            run_id=f"run-{ticker}-{next(_RUN_IDS)}",
+            stage="m1.embed",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker=ticker,
+        ) as run:
+            with pytest.raises(Phase0RunContextError, match="is ambiguous"):
+                repository.persist_embeddings([nvda], run=run)
+    assert repository.count("embeddings") == 0
+
+    # And each partition's *durable* ids remain perfectly usable, keeping
+    # one vector each — which is the whole point of refusing the handle.
+    for ticker in ("NVDA", "AMD"):
+        durable = (
+            str(shared[ticker]["story_id"])
+            if kind == "story"
+            else str(shared[ticker]["theme"]["id"])
+        )
+        repository.upsert_embedding(sample_embedding(durable, source_kind=kind))
+    assert repository.count("embeddings") == 2
+
+
+@pytest.mark.parametrize(
+    "label, kind, handle",
+    SHARED_HANDLES,
+    ids=[case[0] for case in SHARED_HANDLES],
+)
+def test_one_partition_cannot_delete_anothers_cache_row(tmp_path, label, kind, handle):
+    """Deletion by a shared handle would be deletion of someone else's row."""
+
+    repository = migrated(tmp_path)
+    shared = shared_identity_day(repository)
+    durable = {
+        ticker: (
+            str(shared[ticker]["story_id"])
+            if kind == "story"
+            else str(shared[ticker]["theme"]["id"])
+        )
+        for ticker in ("NVDA", "AMD")
+    }
+    for identity in durable.values():
+        repository.upsert_embedding(sample_embedding(identity, source_kind=kind))
+    assert repository.count("embeddings") == 2
+
+    with pytest.raises(Phase0ValidationError, match="is not a durable"):
+        repository.delete_embedding(kind, shared[handle])
+
+    assert repository.count("embeddings") == 2
+    # Deleting by one partition's durable id takes exactly that row.
+    assert repository.delete_embedding(kind, durable["AMD"]) is True
+    assert repository.get_embedding(kind, durable["NVDA"]) is not None
     assert repository.count("embeddings") == 1
+
+
+def test_a_shared_handle_still_reaches_the_right_row_when_it_is_unshared(tmp_path):
+    """The contract narrows the cache API, not the run-scoped batch.
+
+    One partition, one story: the fingerprint names exactly one row, and
+    ``persist_embeddings`` — which has a run to check it against — still
+    accepts it, as the schema's ownership triggers do.
+    """
+
+    repository = migrated(tmp_path)
+    day = embedded_day(repository)
+
+    with nvda_run(repository, stage="m1.embed") as run:
+        assert (
+            repository.persist_embeddings(
+                [sample_embedding("cf1", source_kind="story")], run=run
+            )
+            == 1
+        )
+
+    with repository.admin.connect_writable() as connection:
+        row = connection.execute("SELECT * FROM embeddings").fetchone()
+    assert (row["source_kind"], row["source_id"]) == ("story", "cf1")
+    assert day["stories"]["cf1"]
 
 
 #: Identities that are not this partition's, are nobody's, or are two

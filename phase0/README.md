@@ -247,25 +247,54 @@ conflicts by provider identity, merges by story-key pair, memberships and
 the denormalized `themes.citations` list sorted — so equivalent inputs
 compare equal however the stage happened to order them.
 
-**An embedding source identity means what the schema says it means.**
-Migration 007's ownership triggers are the durable contract: a raw item
-is named by `id`; a story by `id` *or* `cluster_fingerprint`; a theme by
-`id` *or* `fingerprint` *or* `theme_key`. The logged `persist_embeddings`
-partition check resolves exactly that set — no fewer, since rejecting a
-legal fingerprint as "does not exist" would make the only entrypoint a
-pipeline stage may use strictly less capable than the contract it
-implements, and no more, since the comparisons mirror the triggers'
-`CAST(id AS TEXT) = …` rather than leaning on SQLite's integer affinity
-(`'01'` does not become story 1 here and then get refused by the trigger
-a moment later).
+**An embedding source identity means what the schema says it means — and
+only a run may use the partition-scoped half of it.** Migration 007's
+ownership triggers define the identities the table accepts: a raw item by
+`id`; a story by `id` *or* `cluster_fingerprint`; a theme by `id` *or*
+`fingerprint` *or* `theme_key`. But `embeddings` is globally unique on
+`(source_kind, source_id)`, while those fingerprints and keys are unique
+only *within* one ticker/trading-day/pipeline-version. So the two halves
+of that set are not equally safe, and the two entrypoints differ:
 
-Widening *identity* widened nothing else. The resolved row still has to
-be in the run's ticker, day, and pipeline version; a raw-item source
-still needs its explicit ticker association. And because fingerprints and
-theme keys are unique only *within* a ticker-day while `embeddings` keys
-globally on `(source_kind, source_id)`, an identity that resolves to more
-than one row is ambiguous rather than resolvable: there is no partition
-that vector could honestly belong to, so the batch is refused.
+* **`persist_embeddings`** — run-scoped — resolves the whole set. It can
+  afford to: it resolves the identity to a row, checks that row is the
+  run's own ticker, day, and pipeline version, and refuses an identity
+  that resolves to *more than one* row, since there is then no partition
+  the vector could honestly belong to. The comparisons mirror the
+  triggers' `CAST(id AS TEXT) = …` rather than leaning on SQLite's
+  integer affinity, so `'01'` does not become story 1 here and get
+  refused by the trigger a moment later.
+* **`get_embedding` / `upsert_embedding` / `delete_embedding`** — M1's
+  single-vector cache protocol — take **durable row ids only**. They
+  carry no run, so they have no partition to judge a partition-scoped
+  handle against; and "unambiguous right now" would not be enough anyway,
+  because an identity that names one story today names two the moment
+  another ticker-day clusters to the same fingerprint, with no write to
+  this table in between to notice. A fingerprint reaching them is a
+  caller error and is named as one.
+
+This is the fingerprint rule above, applied where it had not been. Left
+unapplied it was not theoretical: two tickers clustering to the same
+fingerprint on the same day is ordinary, and the second `upsert_embedding`
+silently replaced the first — after which *both* partitions read back one
+ticker's vector for the other's text.
+
+The M1 protocol is unaffected. `EmbeddingRepository` types `source_id` as
+text and says nothing about which text, so this narrows which values are
+cache keys, not the shape of any call.
+
+**A residual, stated rather than hidden.** Migration 007's cleanup
+triggers delete by every identity form — dropping a story deletes
+embeddings whose `source_id` is its `cluster_fingerprint`. So a
+fingerprint-keyed row written through the run-scoped batch can still be
+*evicted* when a different partition's like-fingerprinted parent is
+deleted. That is over-eager eviction of a recomputable cache entry, not a
+wrong vector and not a cross-partition write: no API can overwrite or
+delete another partition's row, and no read can return one. Closing it
+would mean rewriting a released migration, which this layer does not do;
+the alternative that needs no migration is to narrow `persist_embeddings`
+to durable ids too, at the cost of the fingerprint support the batch path
+deliberately offers.
 
 ## The boundaries downstream stages use
 
