@@ -88,6 +88,46 @@ file's *existence* — opening a connection creates it, before any
 migration logic runs — so what a failed first attempt leaves behind is an
 empty database, with no schema objects and `user_version` still 0.
 
+**`user_version` is a claim, and a claim needs evidence.** The pre-ledger
+backfill records every migration numbered at or below `user_version`, on
+the reasoning that a database predating the ledger has already lived that
+history. Nothing bounded the number. A database stamped 999 therefore had
+its whole ledger *synthesized*, left nothing pending, and reported a
+successful migration over a file whose Phase 0 schema had never been
+created — after which every later run agreed it was finished. Reading a
+high version as "all of this ran" is backwards: the further ahead a
+database is, the less of it this code can vouch for.
+
+Three read-only questions now bound that inference, and each refusal is
+typed and total — schema, rows, both bootstrap tables, and `user_version`
+exactly as they were:
+
+- **Newer than this code.** `user_version` above the newest bundled
+  migration means a later release wrote it. Refused first of all, before
+  lineage recognition, because the answer must not depend on how far
+  recognition gets.
+- **Unledgered above the pre-ledger watermark.** The rule above stops one
+  short on its own: at *equality* the same backfill claims everything and
+  leaves nothing pending, so an empty file stamped with the current
+  version was accepted as silently as one stamped 999. Every database this
+  code creates keeps a ledger, written in the same transaction as its
+  first migration, so an unledgered database is either the v2 schema or a
+  registered lineage — and below that watermark the backfill is not a
+  guess, because migration 003 checks what it inferred against the tables
+  a real v2 database has.
+- **A ledger out of step with the version.** The two are written together,
+  so once a database keeps its own history they can only disagree if
+  something outside this module moved one. A version *behind* its ledger
+  used to be accepted outright, leaving the database reporting a version
+  it had long since passed; a version *ahead* re-ran applied migrations
+  and died on whatever they collided with, which is an untyped SQLite
+  error rather than a refusal. This one runs after the checksum rule, not
+  before it: a tampered ledger is usually also out of step, and "this
+  migration was edited" says more than "these two numbers differ".
+
+The convergence path has always asked the third question of the
+historical lineages. This is the ordinary path catching up to it.
+
 **The database enforces the contracts, not just the API.** Direct SQL
 cannot store an unsupported ticker, cite a raw item that is not in one of
 the theme's member stories, cite one raw item from two themes in the same

@@ -134,6 +134,133 @@ def _applied_migrations(connection: sqlite3.Connection) -> dict[str, str]:
     }
 
 
+def latest_version(migrations: Sequence[Migration]) -> int:
+    """The newest schema version this code knows how to produce."""
+
+    return max((migration.version for migration in migrations), default=0)
+
+
+def _has_ledger_rows(connection: sqlite3.Connection) -> bool:
+    """Whether this database keeps its own history — read-only.
+
+    Asked before the ledger table is created, so it cannot go through
+    :func:`_applied_migrations`: the question is precisely whether that
+    table is there yet.
+    """
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (LEDGER_TABLE,),
+    ).fetchone()
+    if exists is None:
+        return False
+    return (
+        connection.execute(f"SELECT 1 FROM {LEDGER_TABLE} LIMIT 1").fetchone()
+        is not None
+    )
+
+
+def _assert_version_is_known(
+    connection: sqlite3.Connection, migrations: Sequence[Migration]
+) -> None:
+    """Refuse a database newer than anything this code can produce.
+
+    Read-only, and deliberately the first thing that happens — before
+    lineage recognition, before the ledger exists, before any decision
+    about what to write.  A database this code does not understand has to
+    be exactly as it was when we say so.
+
+    ``user_version`` is not a claim about *which* files ran, only about how
+    far some build of this schema got, so a version above the newest
+    bundled migration was written by code we do not have.  Proceeding meant
+    ``_backfill_ledger`` recording every migration as applied — each one is
+    numerically ``<= user_version``, which was the only test it had —
+    leaving nothing pending and reporting success over a database whose
+    Phase 0 schema had never been created.  Reading a high number as "all
+    of this ran" is exactly backwards: the further ahead a database is, the
+    less of it we can vouch for.
+    """
+
+    user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    latest = latest_version(migrations)
+    if user_version > latest:
+        raise Phase0MigrationError(
+            f"database reports schema version {user_version}, which is newer "
+            f"than the newest migration this code has ({latest}); it was "
+            "written by a later release and cannot be migrated backwards or "
+            "reinterpreted. Nothing has been changed."
+        )
+
+
+def _assert_ledger_agrees_with_version(
+    connection: sqlite3.Connection, user_version: int
+) -> None:
+    """Refuse a ledger and a ``user_version`` that describe different databases.
+
+    The two are written together, in one transaction, by ``_apply_one``:
+    a ledger row and the version bump that goes with it.  So once a
+    database keeps its own history the two can only disagree if something
+    outside this module moved one of them, and either direction is a
+    silent wrong answer rather than a loud one.
+
+    A version *behind* the ledger was accepted outright — nothing is
+    pending, so ``migrate()`` reported success and left the database
+    reporting a schema version it had long since passed.  A version
+    *ahead* of the ledger sent already-applied migrations through again
+    and died on whatever they collided with, which fails closed only by
+    luck and only after the attempt is under way.
+
+    The convergence path asks this same question of the historical
+    lineages and always has; this is the ordinary path catching up to it.
+    """
+
+    if not _has_ledger_rows(connection):
+        return
+    reached = int(
+        connection.execute(f"SELECT max(version) FROM {LEDGER_TABLE}").fetchone()[0]
+    )
+    if reached != user_version:
+        raise Phase0MigrationError(
+            f"database reports schema version {user_version} but its ledger "
+            f"reaches {reached}; the two are written together, so one of them "
+            "has been changed outside this module and neither can be trusted "
+            "to say what ran. Nothing has been changed."
+        )
+
+
+def _assert_history_is_evidenced(
+    connection: sqlite3.Connection, user_version: int
+) -> None:
+    """Refuse an unledgered database claiming a post-ledger version.
+
+    The "newer than this code" rule alone stops one short of the hole,
+    because at *equality* the same backfill claims every migration and
+    leaves nothing pending: an empty file stamped with the current version
+    was accepted just as silently as one stamped 999.
+
+    Every database this code has ever created carries a ledger, written in
+    the same transaction as its first migration.  So an unledgered
+    database is either the pre-ledger v2 schema or a registered historical
+    lineage — which has already been recognized and returned by the time
+    this runs — and anything else claiming a later version is asserting a
+    history with nothing behind it.
+
+    At or below the watermark the backfill is not a guess: what it infers
+    from the version, migration 003 then checks against the tables a real
+    v2 database has, and a database that merely claims to be v2 is refused
+    there by name.
+    """
+
+    if user_version > LEGACY_SCHEMA_VERSION and not _has_ledger_rows(connection):
+        raise Phase0MigrationError(
+            f"database reports schema version {user_version} but keeps no "
+            f"migration ledger; only the pre-ledger v{LEGACY_SCHEMA_VERSION} "
+            "schema and registered historical lineages may claim a version "
+            "without one, so nothing here is evidence that any migration "
+            "ran. Nothing has been changed."
+        )
+
+
 def _backfill_ledger(
     connection: sqlite3.Connection,
     migrations: Sequence[Migration],
@@ -237,6 +364,11 @@ def apply_migrations(
     transaction per migration, exactly as before.
     """
 
+    # Read-only, and first: a version this code cannot have produced is
+    # unsupportable whatever the database turns out to look like, and the
+    # answer must not depend on how far recognition gets.
+    _assert_version_is_known(connection, migrations)
+
     # Read-only.  Recognition must not create the ledger, must not
     # backfill, and must not advance anything: a database that turns out
     # not to be a known lineage has to be untouched when we find out.
@@ -254,6 +386,12 @@ def apply_migrations(
         return _converge(connection, migrations, lineage)
 
     user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+
+    # Still read-only, and still before the transaction opens: the
+    # historical lineages are the only unledgered databases with a
+    # provenance this code can stand behind, and they have returned above.
+    _assert_history_is_evidenced(connection, user_version)
+
     newly_applied: list[str] = []
 
     # The bootstrap tables, and any truthful backfill of them, belong to
@@ -273,6 +411,13 @@ def apply_migrations(
         connection.execute(lineages.LINEAGE_DDL)
         _backfill_ledger(connection, migrations, user_version, None)
         _verify_history(connection, migrations, None)
+        # After the checksum rule, not before it: a tampered ledger is
+        # usually *also* out of step with the version, and "this migration
+        # was edited" says more about what happened than "these two
+        # numbers differ".  Inside the transaction for the same reason
+        # `_verify_history` is — the raise rolls it back, so a refusal
+        # still leaves the database exactly as it was.
+        _assert_ledger_agrees_with_version(connection, user_version)
 
         applied = set(_applied_migrations(connection))
         pending = [

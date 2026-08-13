@@ -75,6 +75,7 @@ from phase0.repository import (
     serialize_raw_evidence,
 )
 from phase0.schema import (
+    LEDGER_TABLE,
     LEGACY_SCHEMA_VERSION,
     MINIMUM_SQLITE_VERSION,
     load_migrations,
@@ -732,6 +733,276 @@ def test_a_failed_attempt_can_be_retried_successfully(tmp_path):
     assert [row["name"] for row in retried.applied_migrations()] == [
         migration.name for migration in ALL_MIGRATIONS
     ]
+
+
+# ----------------------------------------------------------------------
+# A version this code did not write is not a version it can honour
+#
+# `_backfill_ledger` records every migration whose number is `<=
+# user_version`, on the reasoning that a pre-ledger database has already
+# lived that history.  Nothing bounded the number.  A database stamped
+# 999 — or 13, or anything at all — therefore had its whole ledger
+# synthesized, left nothing pending, and reported a successful migration
+# over a file whose Phase 0 schema had never been created.  Every later
+# run then agreed it was done.
+# ----------------------------------------------------------------------
+
+
+def stamped_database(path: Path, version: int, setup=None) -> Path:
+    """A database carrying a `user_version` nobody earned."""
+
+    connection = sqlite3.connect(path)
+    try:
+        if setup is not None:
+            setup(connection)
+        connection.execute(f"PRAGMA user_version = {int(version)}")
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def unrelated_tables(connection: sqlite3.Connection) -> None:
+    connection.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)")
+    connection.execute("INSERT INTO widgets (name) VALUES ('not ours')")
+
+
+def phase0_looking_tables(connection: sqlite3.Connection) -> None:
+    """Names Phase 0 uses, shapes it does not — the tempting near-miss."""
+
+    connection.execute("CREATE TABLE raw_items (id INTEGER PRIMARY KEY, source TEXT)")
+    connection.execute("INSERT INTO raw_items (source) VALUES ('yahoo')")
+    connection.execute("CREATE TABLE stories (id INTEGER PRIMARY KEY)")
+
+
+def malformed_ledger(connection: sqlite3.Connection) -> None:
+    """A ledger table that exists and says nothing."""
+
+    connection.execute("CREATE TABLE raw_items (id INTEGER PRIMARY KEY, source TEXT)")
+    connection.execute(
+        f"CREATE TABLE {LEDGER_TABLE} (name TEXT PRIMARY KEY, version INTEGER, "
+        "checksum TEXT, applied_at TEXT)"
+    )
+
+
+def full_state(path: Path) -> dict:
+    """`database_state`, plus every application row the database holds.
+
+    The snapshot a rejection has to leave untouched is not only schema and
+    metadata: a database that belongs to something else entirely still has
+    its rows, and those must survive being handed to the wrong migrator.
+    """
+
+    state = database_state(path)
+    if not state.get("exists"):
+        return state
+    connection = sqlite3.connect(path)
+    try:
+        state["data"] = {
+            name: sorted(
+                tuple(row) for row in connection.execute(f"SELECT * FROM {name}")
+            )
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+    finally:
+        connection.close()
+    return state
+
+
+FUTURE_DATABASES = [
+    ("bare-one-ahead", LATEST_VERSION + 1, None),
+    ("bare-999", 999, None),
+    ("unrelated-tables", LATEST_VERSION + 5, unrelated_tables),
+    ("phase0-looking-no-ledger", LATEST_VERSION + 1, phase0_looking_tables),
+    ("empty-ledger-table", LATEST_VERSION + 2, malformed_ledger),
+    ("far-future-with-data", 2**31 - 1, unrelated_tables),
+]
+
+
+@pytest.mark.parametrize(
+    "label, version, setup",
+    FUTURE_DATABASES,
+    ids=[case[0] for case in FUTURE_DATABASES],
+)
+def test_a_future_version_database_is_refused_untouched(
+    tmp_path, label, version, setup
+):
+    """Hostile cases 1-5 and 8, asserted as one snapshot each.
+
+    The refusal has to be typed *and* total: sqlite_master, application
+    rows, both bootstrap tables, and `user_version` all exactly as they
+    were. A database this code cannot account for is a database it must
+    not have written to.
+    """
+
+    database = stamped_database(tmp_path / f"{label}.sqlite3", version, setup)
+    before = full_state(database)
+
+    with pytest.raises(Phase0MigrationError, match="newer than the newest migration"):
+        Phase0Repository(database).migrate()
+
+    assert full_state(database) == before
+    assert before["user_version"] == version
+    # Named individually too, because "the dict matched" is easy to
+    # satisfy accidentally and these five are the whole contract.
+    after = full_state(database)
+    assert after["sqlite_master"] == before["sqlite_master"]
+    assert after["data"] == before["data"]
+    assert after["schema_migrations"] == before["schema_migrations"]
+    assert after["schema_lineage"] == before["schema_lineage"]
+    assert after["user_version"] == version
+
+
+def test_the_refusal_names_both_versions(tmp_path):
+    """An operator needs to know how far ahead, not merely that it is."""
+
+    database = stamped_database(tmp_path / "ahead.sqlite3", 999)
+    with pytest.raises(Phase0MigrationError) as caught:
+        Phase0Repository(database).migrate()
+
+    message = str(caught.value)
+    assert "999" in message and str(LATEST_VERSION) in message
+    assert "Nothing has been changed." in message
+
+
+@pytest.mark.parametrize("version", [LEGACY_SCHEMA_VERSION + 1, 7, LATEST_VERSION])
+def test_an_unledgered_database_may_not_claim_a_post_ledger_version(tmp_path, version):
+    """The boundary the `>` rule alone leaves open.
+
+    At `user_version == LATEST_VERSION` the same backfill claims every
+    migration and leaves nothing pending, so an empty file stamped with
+    the current version was accepted exactly as silently as one stamped
+    999. Every database this code creates keeps a ledger, so an unledgered
+    one claiming a post-ledger version is asserting a history with nothing
+    behind it.
+    """
+
+    database = stamped_database(tmp_path / f"claim{version}.sqlite3", version)
+    before = full_state(database)
+
+    with pytest.raises(Phase0MigrationError, match="keeps no migration ledger"):
+        Phase0Repository(database).migrate()
+
+    assert full_state(database) == before
+    assert database_state(database)["schema_migrations"] is None
+
+
+def test_a_refused_database_migrates_once_it_is_supported_again(tmp_path):
+    """The refusal is a refusal, not damage.
+
+    Returning the file to a version this code understands is enough; the
+    rejection left nothing behind that a real migration has to work
+    around.
+    """
+
+    database = stamped_database(tmp_path / "retry.sqlite3", 999)
+    with pytest.raises(Phase0MigrationError):
+        Phase0Repository(database).migrate()
+
+    stamped_database(database, 0)
+    repository = Phase0Repository(database)
+    repository.migrate()
+
+    assert repository.schema_version() == LATEST_VERSION
+    assert schema_snapshot(repository) == schema_snapshot(
+        migrated(tmp_path, "fresh.db")
+    )
+    assert [row["name"] for row in repository.applied_migrations()] == [
+        migration.name for migration in ALL_MIGRATIONS
+    ]
+
+
+def test_the_current_version_is_supported_and_idempotent(tmp_path):
+    """Hostile case 6: `LATEST_VERSION` itself is a valid resting state."""
+
+    repository = migrated(tmp_path)
+    assert repository.schema_version() == LATEST_VERSION
+
+    again = Phase0Repository(tmp_path / "phase0.sqlite3")
+    assert again.migrate() == []
+    assert again.schema_version() == LATEST_VERSION
+    assert schema_snapshot(again) == schema_snapshot(repository)
+
+
+@pytest.mark.parametrize("upto", list(range(1, LATEST_VERSION)))
+def test_every_supported_older_version_still_upgrades(tmp_path, upto):
+    """Hostile case 7: the guard bounds the top and moves nothing else."""
+
+    database = tmp_path / "phase0.sqlite3"
+    Phase0Repository(
+        database, migrations_path=partial_migrations(tmp_path, upto)
+    ).migrate()
+    assert Phase0Repository(database).schema_version() == upto
+
+    upgraded = Phase0Repository(database)
+    applied = upgraded.migrate()
+
+    assert [migration.name for migration in ALL_MIGRATIONS if migration.version > upto]
+    assert applied == [
+        migration.name for migration in ALL_MIGRATIONS if migration.version > upto
+    ]
+    assert upgraded.schema_version() == LATEST_VERSION
+    assert schema_snapshot(upgraded) == schema_snapshot(migrated(tmp_path, "fresh.db"))
+
+
+# The inverse mistakes, from the same family: a ledger and a
+# `user_version` are written together by one transaction, so once a
+# database keeps its own history they can only disagree if something
+# outside this module moved one of them.
+
+
+LEDGER_DISAGREEMENTS = [
+    ("version-behind-ledger", "PRAGMA user_version = 4"),
+    ("version-at-zero", "PRAGMA user_version = 0"),
+    ("ledger-truncated", f"DELETE FROM {LEDGER_TABLE} WHERE version > 5"),
+]
+
+
+@pytest.mark.parametrize(
+    "label, tamper",
+    LEDGER_DISAGREEMENTS,
+    ids=[case[0] for case in LEDGER_DISAGREEMENTS],
+)
+def test_a_ledger_out_of_step_with_the_version_is_refused(tmp_path, label, tamper):
+    """Neither direction may pass, and neither may write.
+
+    A version behind its ledger used to be accepted outright — nothing was
+    pending, so `migrate()` reported success and left the database
+    reporting a schema version it had long since passed. A version ahead
+    of its ledger re-ran applied migrations and died on whatever they
+    collided with, which is an untyped SQLite error rather than a refusal.
+    """
+
+    repository = migrated(tmp_path)
+    database = tmp_path / "phase0.sqlite3"
+    with repository.admin.connect_writable() as connection:
+        connection.execute(tamper)
+        connection.commit()
+    before = full_state(database)
+
+    with pytest.raises(Phase0MigrationError, match="but its ledger reaches"):
+        Phase0Repository(database).migrate()
+
+    assert full_state(database) == before
+
+
+def test_an_emptied_ledger_is_refused_rather_than_resynthesized(tmp_path):
+    """Deleting the history must not be a way of re-earning it."""
+
+    repository = migrated(tmp_path)
+    database = tmp_path / "phase0.sqlite3"
+    with repository.admin.connect_writable() as connection:
+        connection.execute(f"DELETE FROM {LEDGER_TABLE}")
+        connection.commit()
+    before = full_state(database)
+
+    with pytest.raises(Phase0MigrationError, match="keeps no migration ledger"):
+        Phase0Repository(database).migrate()
+
+    assert full_state(database) == before
 
 
 def test_a_successful_migration_still_writes_both_bootstrap_tables(tmp_path):
