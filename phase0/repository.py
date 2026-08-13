@@ -1965,7 +1965,17 @@ class Phase0Repository:
         status = state.get("status")
         successful = state.get("successful")
         if status is None:
-            resolved_status = "success" if bool(successful) else "failed"
+            # ``None`` is "not stated", which is not an explicit ``False``.
+            # Collapsing the two with ``bool(successful)`` made a payload
+            # that said nothing resolve to *failed* here while
+            # ``record_source_state`` — which patched the default at its
+            # own call site — resolved the same payload to *success*.  The
+            # default belongs in the one resolver, so every entrypoint
+            # inherits it: saying nothing means success.
+            if successful is None:
+                resolved_status = "success"
+            else:
+                resolved_status = "success" if successful else "failed"
         else:
             resolved_status = str(status).strip().lower()
             if resolved_status not in SOURCE_STATE_STATUSES:
@@ -5667,10 +5677,11 @@ class Phase0Repository:
                 "etag": etag,
                 "last_modified": last_modified,
                 "checked_at": moment,
-                # Neither stated is the documented default: success.
-                "successful": True
-                if (successful is None and status is None)
-                else successful,
+                # Passed through as given, `None` included: the default
+                # for an unstated outcome lives in
+                # `validate_source_state`, so every entrypoint inherits
+                # the same one instead of each patching it locally.
+                "successful": successful,
                 "metadata": metadata or {},
                 "status": status,
                 "error": error,

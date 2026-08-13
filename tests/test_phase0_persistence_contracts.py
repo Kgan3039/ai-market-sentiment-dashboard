@@ -7671,6 +7671,207 @@ def test_the_unlogged_source_state_path_shares_the_contract(tmp_path):
     assert repository.source_state("rss:test") is None
 
 
+# ----------------------------------------------------------------------
+# Every entrypoint resolves the outcome identically
+#
+# The default for an unstated outcome was patched at `record_source_state`'s
+# own call site while `validate_source_state` still collapsed `None` into
+# `False`.  So a payload that said nothing resolved to *success* through
+# one entrypoint and *failed* through the other three — `None` is "not
+# stated", which is not the same claim as an explicit `False`.
+# ----------------------------------------------------------------------
+
+SOURCE_CHECKED_AT = f"{DAY}T12:00:00+00:00"
+
+
+def _via_record_source_state(repository, **kwargs):
+    with repository.stage_run(
+        run_id="run-src",
+        stage="m0.ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.record_source_state(
+            "rss:test", run=run, checked_at=SOURCE_CHECKED_AT, terminal=True, **kwargs
+        )
+
+
+def _via_admin_set(repository, **kwargs):
+    repository.admin.set_source_state(
+        "rss:test",
+        etag=None,
+        last_modified=None,
+        checked_at=SOURCE_CHECKED_AT,
+        **kwargs,
+    )
+
+
+def _via_ingest(repository, **kwargs):
+    with repository.stage_run(
+        run_id="run-src",
+        stage="m0.ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items(
+            [],
+            run=run,
+            terminal=True,
+            source_state={
+                "source": "rss:test",
+                "checked_at": SOURCE_CHECKED_AT,
+                **kwargs,
+            },
+        )
+
+
+def _via_admin_ingest(repository, **kwargs):
+    repository.admin.insert_raw_items(
+        [],
+        source_state={
+            "source": "rss:test",
+            "checked_at": SOURCE_CHECKED_AT,
+            **kwargs,
+        },
+    )
+
+
+#: Every public way a source state reaches the database.  The last two
+#: are the ones the finding did not name: they hand a raw payload
+#: straight to the shared resolver, so they inherited its default too.
+SOURCE_STATE_ENTRYPOINTS = [
+    ("record_source_state", _via_record_source_state),
+    ("admin.set_source_state", _via_admin_set),
+    ("ingest_raw_items(source_state=)", _via_ingest),
+    ("admin.insert_raw_items(source_state=)", _via_admin_ingest),
+]
+
+#: The whole truth table, including the shapes that only exist because
+#: `None` and `False` are different statements.
+SOURCE_OUTCOME_TRUTH_TABLE = [
+    ("omit both", {}, "success"),
+    ("successful=True", {"successful": True}, "success"),
+    ("successful=False", {"successful": False}, "failed"),
+    ("successful=None", {"successful": None}, "success"),
+    ("status=success", {"status": "success"}, "success"),
+    ("status=failed", {"status": "failed"}, "failed"),
+    ("status=partial", {"status": "partial"}, "partial"),
+    ("status=empty", {"status": "empty"}, "empty"),
+    ("status=unknown", {"status": "unknown"}, "unknown"),
+    ("status=None", {"status": None}, "success"),
+    ("both None", {"successful": None, "status": None}, "success"),
+    ("None + failed", {"successful": None, "status": "failed"}, "failed"),
+    ("None + partial", {"successful": None, "status": "partial"}, "partial"),
+    ("True + success", {"successful": True, "status": "success"}, "success"),
+    ("False + failed", {"successful": False, "status": "failed"}, "failed"),
+    ("False + unknown", {"successful": False, "status": "unknown"}, "unknown"),
+]
+
+CONFLICTING_SOURCE_OUTCOMES = [
+    ("True + failed", {"successful": True, "status": "failed"}),
+    ("True + unknown", {"successful": True, "status": "unknown"}),
+    ("False + success", {"successful": False, "status": "success"}),
+    ("False + partial", {"successful": False, "status": "partial"}),
+    ("False + empty", {"successful": False, "status": "empty"}),
+    ("invalid status", {"status": "banana"}),
+]
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [pytest.param(f, id=n) for n, f in SOURCE_STATE_ENTRYPOINTS],
+)
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [pytest.param(k, s, id=label) for label, k, s in SOURCE_OUTCOME_TRUTH_TABLE],
+)
+def test_every_source_state_entrypoint_resolves_the_same_outcome(
+    tmp_path, entrypoint, kwargs, expected
+):
+    repository = migrated(tmp_path)
+    entrypoint(repository, **kwargs)
+
+    succeeded = expected in SUCCEEDED_STATUSES
+    state = repository.source_state("rss:test")
+    assert state["status"] == expected
+    # The derived columns follow the resolved status, not the input shape.
+    assert (state["last_success_at"] is not None) is succeeded
+    assert state["consecutive_failures"] == (0 if succeeded else 1)
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [pytest.param(f, id=n) for n, f in SOURCE_STATE_ENTRYPOINTS],
+)
+@pytest.mark.parametrize(
+    "kwargs",
+    [pytest.param(k, id=label) for label, k in CONFLICTING_SOURCE_OUTCOMES],
+)
+def test_every_source_state_entrypoint_refuses_the_same_conflicts(
+    tmp_path, entrypoint, kwargs
+):
+    """The checks added in 295666b hold on every path, unweakened."""
+
+    repository = migrated(tmp_path)
+    with pytest.raises(Phase0ValidationError):
+        entrypoint(repository, **kwargs)
+    assert repository.source_state("rss:test") is None
+    assert repository.count("source_state") == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [pytest.param(k, s, id=label) for label, k, s in SOURCE_OUTCOME_TRUTH_TABLE],
+)
+def test_the_shared_resolver_is_the_one_that_decides(kwargs, expected):
+    """No entrypoint may reach a different answer than the resolver.
+
+    Asserted against `validate_source_state` directly, because it is
+    public — #61 and #62 build payloads and ask it what the repository
+    will do before committing, so a caller-side default would make that
+    answer wrong for exactly the payloads that state nothing.
+    """
+
+    resolved = Phase0Repository.validate_source_state(
+        {"source": "rss:test", "checked_at": SOURCE_CHECKED_AT, **kwargs}
+    )
+    assert resolved["status"] == expected
+    assert resolved["failed"] == (0 if expected in SUCCEEDED_STATUSES else 1)
+    assert (resolved["success_at"] is not None) is (expected in SUCCEEDED_STATUSES)
+
+
+def test_an_unstated_outcome_keeps_the_run_and_the_state_agreeing(tmp_path):
+    """Omitting everything is a success on both sides of the record."""
+
+    repository = migrated(tmp_path)
+    _via_record_source_state(repository)
+
+    assert repository.source_state("rss:test")["status"] == "success"
+    entry = dict(repository.read.run_log_rows(run_id="run-src")[0])
+    assert entry["status"] == "success"
+    assert entry["success_count"] == 1
+    assert entry["partial_count"] == 0
+    assert json.loads(entry["counts"])["source_state_status"] == "success"
+
+
+def test_the_default_lives_in_the_resolver_and_not_at_a_call_site(tmp_path):
+    """A payload with no outcome resolves before any entrypoint sees it.
+
+    Pinned as a property so the default cannot drift back to being
+    patched per-caller: the resolver's answer for the empty statement is
+    what every path must store.
+    """
+
+    empty = {"source": "rss:test", "checked_at": SOURCE_CHECKED_AT}
+    resolved = Phase0Repository.validate_source_state(empty)["status"]
+    for name, entrypoint in SOURCE_STATE_ENTRYPOINTS:
+        repository = migrated(tmp_path, f"{abs(hash(name))}.db")
+        entrypoint(repository)
+        assert repository.source_state("rss:test")["status"] == resolved, name
+
+
 def test_a_run_logged_as_success_cannot_carry_errors(tmp_path):
     """The adjacent instance of the same "two answers" shape.
 

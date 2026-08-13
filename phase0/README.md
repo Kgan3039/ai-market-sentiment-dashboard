@@ -164,8 +164,23 @@ is refused before anything is written. Whichever way it resolves, the
 stored status, the `last_success_at` stamp, `consecutive_failures`, and
 the run's own counters all derive from that one answer, using the same
 succeeded set (`success`, `partial`, `empty`) the schema itself uses.
-Omitting both still means success. `admin.set_source_state` shares the
-contract, since both go through `validate_source_state`.
+Omitting both means success — and that default lives in
+`validate_source_state`, not at any call site. It briefly did live at one:
+`record_source_state` substituted the default itself while the resolver
+still collapsed `None` into `False`, so a payload that stated nothing
+resolved to *success* through that one entrypoint and *failed* through
+every other. `None` is "not stated", which is not the claim an explicit
+`False` makes, and the resolver now keeps them apart.
+
+There are four public ways a source state reaches the database —
+`record_source_state`, `admin.set_source_state`, and the `source_state=`
+argument of `ingest_raw_items` and `admin.insert_raw_items`, the last two
+handing a raw payload straight through. All four resolve through
+`validate_source_state`, so they agree by construction rather than by
+four matching copies of the same rule; the truth table is asserted
+against every one of them and against the resolver itself, which is
+public precisely so a caller can ask what the repository will do before
+committing.
 
 The same shape appeared once more, in `_write_run_log`: an unstated status
 *means* degraded when there are errors, so a caller stating `success`
