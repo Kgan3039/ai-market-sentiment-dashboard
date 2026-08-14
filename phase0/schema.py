@@ -242,23 +242,41 @@ def _assert_history_is_evidenced(
     the same transaction as its first migration.  So an unledgered
     database is either the pre-ledger v2 schema or a registered historical
     lineage — which has already been recognized and returned by the time
-    this runs — and anything else claiming a later version is asserting a
+    this runs — and anything claiming any *other* version is asserting a
     history with nothing behind it.
 
-    At or below the watermark the backfill is not a guess: what it infers
+    Any other version, in both directions.  ``> 2`` was refused from the
+    start; ``0 < user_version < 2`` was not, and that gap had teeth: a
+    database stamped ``1`` had migration 001 backfilled from the number
+    alone, then 002 *committed* on its own, and only then did 003 look at
+    the schema and refuse it.  The attempt failed and the database had
+    still been changed — left at version 2 carrying four tables it never
+    asked for.  There is no recognizer for a pre-ledger v1: the one
+    pre-ledger schema this code knows how to check is v2, and 003 is what
+    checks it.  A version this code cannot recognize is refused instead of
+    partly upgraded.
+
+    Zero is the exception, and not really one: it means nothing has run,
+    so there is no history to be evidence *of* and every migration is
+    pending.
+
+    At the watermark itself the backfill is not a guess: what it infers
     from the version, migration 003 then checks against the tables a real
-    v2 database has, and a database that merely claims to be v2 is refused
-    there by name.
+    v2 database has, and it is the *first* pending migration there — so a
+    database that merely claims to be v2 is refused inside the same
+    transaction that bootstrapped the ledger, and rolls back whole.
     """
 
-    if user_version > LEGACY_SCHEMA_VERSION and not _has_ledger_rows(connection):
-        raise Phase0MigrationError(
-            f"database reports schema version {user_version} but keeps no "
-            f"migration ledger; only the pre-ledger v{LEGACY_SCHEMA_VERSION} "
-            "schema and registered historical lineages may claim a version "
-            "without one, so nothing here is evidence that any migration "
-            "ran. Nothing has been changed."
-        )
+    if _has_ledger_rows(connection) or user_version in (0, LEGACY_SCHEMA_VERSION):
+        return
+    raise Phase0MigrationError(
+        f"database reports schema version {user_version} but keeps no "
+        f"migration ledger; the only unledgered schema this code can "
+        f"recognize is the pre-ledger v{LEGACY_SCHEMA_VERSION} one (and the "
+        "registered historical lineages), so nothing here is evidence that "
+        "any migration ran and nothing may be inferred from the number "
+        "alone. Nothing has been changed."
+    )
 
 
 def _backfill_ledger(

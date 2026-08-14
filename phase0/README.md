@@ -106,15 +106,31 @@ exactly as they were:
   migration means a later release wrote it. Refused first of all, before
   lineage recognition, because the answer must not depend on how far
   recognition gets.
-- **Unledgered above the pre-ledger watermark.** The rule above stops one
-  short on its own: at *equality* the same backfill claims everything and
-  leaves nothing pending, so an empty file stamped with the current
-  version was accepted as silently as one stamped 999. Every database this
-  code creates keeps a ledger, written in the same transaction as its
-  first migration, so an unledgered database is either the v2 schema or a
-  registered lineage — and below that watermark the backfill is not a
-  guess, because migration 003 checks what it inferred against the tables
-  a real v2 database has.
+- **Unledgered at any version but the one recognizer this code has.** The
+  rule above stops one short on its own: at *equality* the same backfill
+  claims everything and leaves nothing pending, so an empty file stamped
+  with the current version was accepted as silently as one stamped 999.
+  Every database this code creates keeps a ledger, written in the same
+  transaction as its first migration, so an unledgered database is either
+  the pre-ledger v2 schema or a registered lineage — and anything claiming
+  any *other* version is asserting a history with nothing behind it.
+
+  In both directions, which took two passes to get right. `> 2` was
+  refused from the start; `0 < user_version < 2` was not, and that gap had
+  teeth. A database stamped `1` had migration 001 backfilled from the
+  number alone, then 002 **committed on its own**, and only then did 003
+  look at the schema and refuse it — the attempt failed and the database
+  had still been changed, left at version 2 carrying four tables it never
+  asked for. There is no recognizer for a pre-ledger v1: the one
+  pre-ledger schema this code knows how to check is v2, and 003 is what
+  checks it. A version this code cannot recognize is now refused rather
+  than partly upgraded. Zero is the exception and barely one — it means
+  nothing has run, so there is no history to be evidence *of*.
+
+  At the watermark itself the backfill is not a guess, and 003 is the
+  *first* pending migration there, so a database that merely claims to be
+  v2 is refused inside the same transaction that bootstrapped the ledger
+  and rolls back whole.
 - **A ledger out of step with the version.** The two are written together,
   so once a database keeps its own history they can only disagree if
   something outside this module moved one. A version *behind* its ledger
@@ -1082,8 +1098,18 @@ against the run, and rejects the whole batch on any mismatch:
 * `reconcile_themes` — every story named in membership, Other Coverage, or
   exclusions must match the run's ticker, day, *and* pipeline version.
 * `persist_embeddings` — every source must belong to the run's partition.
-* `record_source_state` — an explicit `checked_at` must fall on the run's
-  trading day; omitting it means "now" and asserts no day.
+* `record_source_state` **and `ingest_raw_items(source_state=…)`** — a
+  stated `checked_at` must fall on the run's trading day. Only
+  `record_source_state` enforced this; the `source_state=` argument
+  reaches the same write and did not, so one run could stamp another
+  day's fetch as its own while its run log recorded the work as today's.
+  The check now lives in `_set_source_state`, which both go through, so
+  neither can drift from the other again. Omitting it still means "now"
+  and asserts no day — though only `record_source_state` can omit it, as
+  the mapping form requires `checked_at`. The comparison is on the
+  *normalized* instant, so a stated offset that moves the day moves the
+  answer with it. `admin.insert_raw_items` writes without a run and so
+  has no day to check against; that is unchanged.
 
 **`candidate_tickers` has two accepted forms and one parser.** A bare
 symbol — `"NVDA"`, `" nvda "` — which records the reason

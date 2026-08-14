@@ -2014,18 +2014,52 @@ class Phase0Repository:
     # Backwards-compatible alias for the pre-review private helper.
     _prepare_source_state = validate_source_state
 
+    @staticmethod
+    def _assert_source_state_day(
+        checked_at: str, context: StageRunContext, operation: str
+    ) -> None:
+        """A stated fetch time must fall on the run's trading day.
+
+        Source state is keyed by feed, not by ticker-day, so there is no
+        ticker to cross-check — but the coupling to a run is still a
+        claim about when the fetch happened, and a run may only speak for
+        its own day.
+        """
+
+        if checked_at[:10] != context.trading_day:
+            raise Phase0RunContextError(
+                f"{operation} checked {checked_at[:10]} but the run covers "
+                f"{context.trading_day}"
+            )
+
     @classmethod
     def _set_source_state(
-        cls, connection: sqlite3.Connection, state: Mapping[str, Any]
+        cls,
+        connection: sqlite3.Connection,
+        state: Mapping[str, Any],
+        *,
+        context: StageRunContext | None = None,
+        operation: str = "source state",
     ) -> dict[str, Any]:
         """Write one source state; return the values actually persisted.
 
         Returning them is what lets the caller's run outcome be derived
         from the *resolved* status rather than from its own second copy
         of the same question.
+
+        ``context``, when a run is attached, is checked against the stated
+        ``checked_at`` before anything is written.  That rule belongs here
+        rather than at a call site for the same reason the unstated-outcome
+        default does: ``record_source_state`` enforced it and
+        ``ingest_raw_items`` — which reaches this same write through its
+        ``source_state=`` argument — did not, so one run could stamp
+        another day's fetch as its own while its run log recorded the work
+        as today's.  Both now inherit the one rule.
         """
 
         values = cls.validate_source_state(state)
+        if context is not None:
+            cls._assert_source_state_day(values["checked_at"], context, operation)
         connection.execute(
             """
             INSERT INTO source_state (
@@ -5452,7 +5486,12 @@ class Phase0Repository:
             self._assert_raw_item_partition(connection, prepared, context)
             results = [self._insert_raw_item(connection, values) for values in prepared]
             if source_state is not None:
-                self._set_source_state(connection, source_state)
+                self._set_source_state(
+                    connection,
+                    source_state,
+                    context=context,
+                    operation="ingest_raw_items source state",
+                )
             inserted = sum(1 for result in results if result.inserted)
             context._record_outcome(success=inserted, partial=len(results) - inserted)
             context._merge_counts(
@@ -5717,11 +5756,11 @@ class Phase0Repository:
             run, operation="record_source_state", terminal=terminal
         ) as (connection, context):
             moment = _normalize_datetime(checked_at or utc_now(), "checked_at")
-            if checked_at is not None and moment[:10] != context.trading_day:
-                raise Phase0RunContextError(
-                    f"record_source_state checked {moment[:10]} but the run covers "
-                    f"{context.trading_day}"
-                )
+            if checked_at is not None:
+                # Omitting it means "now", which asserts no day; stating
+                # it is a claim, and goes through the one check that
+                # `ingest_raw_items` now shares.
+                self._assert_source_state_day(moment, context, "record_source_state")
             state = {
                 "source": source,
                 "etag": etag,

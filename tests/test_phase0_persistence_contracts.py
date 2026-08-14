@@ -890,6 +890,111 @@ def test_an_unledgered_database_may_not_claim_a_post_ledger_version(tmp_path, ve
     assert database_state(database)["schema_migrations"] is None
 
 
+#: Unledgered databases stamped below the pre-ledger watermark.  There is
+#: no recognizer for a pre-ledger v1 — the one pre-ledger schema this code
+#: knows how to check is v2, and migration 003 is what checks it.
+PRE_LEDGER_DATABASES = [
+    ("empty-v1", 1, None),
+    ("unrelated-tables-v1", 1, unrelated_tables),
+    ("phase0-looking-v1", 1, phase0_looking_tables),
+    ("empty-ledger-table-v1", 1, malformed_ledger),
+]
+
+
+@pytest.mark.parametrize(
+    "label, version, setup",
+    PRE_LEDGER_DATABASES,
+    ids=[case[0] for case in PRE_LEDGER_DATABASES],
+)
+def test_an_unrecognized_pre_ledger_version_is_refused_untouched(
+    tmp_path, label, version, setup
+):
+    """The gap under the watermark, which had teeth.
+
+    `> 2` was refused from the start; `0 < user_version < 2` was not. A
+    database stamped `1` had migration 001 backfilled from the number
+    alone, then 002 *committed* on its own, and only then did 003 look at
+    the schema and refuse it — so the attempt failed and the database had
+    still been changed, left at version 2 carrying four tables it never
+    asked for.
+    """
+
+    database = stamped_database(tmp_path / f"{label}.sqlite3", version, setup)
+    before = full_state(database)
+
+    with pytest.raises(Phase0MigrationError, match="keeps no migration ledger"):
+        Phase0Repository(database).migrate()
+
+    after = full_state(database)
+    assert after == before
+    # Named individually too: "the dict matched" is easy to satisfy by
+    # accident, and these five are the whole contract.  One fixture
+    # arrives with an empty ledger *table*, so the assertion is that
+    # nothing moved, not that nothing is there.
+    assert after["sqlite_master"] == before["sqlite_master"]
+    assert after["data"] == before["data"]
+    assert after["schema_migrations"] == before["schema_migrations"]
+    assert after["schema_lineage"] == before["schema_lineage"]
+    assert after["user_version"] == version
+    assert not any(row for row in (after["schema_migrations"] or []))
+
+
+def test_a_malformed_v2_is_refused_without_writing_anything(tmp_path):
+    """v2 *is* recognized — by migration 003, inside the first transaction.
+
+    So a database that merely claims to be v2 is refused on the schema
+    rather than on the number, and because 003 is the first pending
+    migration there, the bootstrap and the backfill roll back with it.
+    """
+
+    database = stamped_database(
+        tmp_path / "malformed-v2.sqlite3", LEGACY_SCHEMA_VERSION, phase0_looking_tables
+    )
+    before = full_state(database)
+
+    with pytest.raises(Phase0MigrationError, match="missing required tables"):
+        Phase0Repository(database).migrate()
+
+    after = full_state(database)
+    assert after == before
+    assert after["schema_migrations"] is None
+    assert after["schema_lineage"] is None
+    assert after["user_version"] == LEGACY_SCHEMA_VERSION
+
+
+def test_the_exact_legacy_v2_schema_still_upgrades(tmp_path):
+    """The one unledgered schema this code recognizes, end to end."""
+
+    database = legacy_v2_database(tmp_path)
+    assert database_state(database)["schema_migrations"] is None
+
+    repository = Phase0Repository(database)
+    repository.migrate()
+
+    assert repository.schema_version() == LATEST_VERSION
+    assert [row["name"] for row in repository.applied_migrations()] == [
+        migration.name for migration in ALL_MIGRATIONS
+    ]
+
+
+def test_a_refused_pre_ledger_database_migrates_once_it_is_supported(tmp_path):
+    """The refusal leaves nothing a real migration has to work around."""
+
+    database = stamped_database(tmp_path / "retry-v1.sqlite3", 1)
+    with pytest.raises(Phase0MigrationError, match="keeps no migration ledger"):
+        Phase0Repository(database).migrate()
+
+    # Back to a version this code understands: nothing has run.
+    stamped_database(database, 0)
+    repository = Phase0Repository(database)
+    repository.migrate()
+
+    assert repository.schema_version() == LATEST_VERSION
+    assert schema_snapshot(repository) == schema_snapshot(
+        migrated(tmp_path, "fresh.db")
+    )
+
+
 def test_a_refused_database_migrates_once_it_is_supported_again(tmp_path):
     """The refusal is a refusal, not damage.
 
@@ -9322,6 +9427,197 @@ def test_record_source_state_rejects_another_days_fetch(tmp_path):
             )
 
     assert repository.source_state("rss:test") is None
+
+
+# ----------------------------------------------------------------------
+# A stated fetch time belongs to the run's day, whichever door it came in
+#
+# `record_source_state` checked that a stated `checked_at` falls on the
+# run's trading day.  `ingest_raw_items(source_state=...)` reaches the
+# same write through its own argument and did not, so one run could stamp
+# another day's fetch as its own while its run log recorded the work as
+# today's.  The check now lives in `_set_source_state`, which both go
+# through, so neither can drift from the other again.
+# ----------------------------------------------------------------------
+
+
+#: One table for both entrypoints: the moment, and whether the run's day
+#: can honestly claim it.  `27` is the day the run covers.
+CHECKED_AT_DAYS = [
+    ("same-day-midday", f"{DAY}T12:00:00+00:00", True),
+    ("same-day-first-instant", f"{DAY}T00:00:00+00:00", True),
+    ("same-day-last-instant", f"{DAY}T23:59:59.999999+00:00", True),
+    ("previous-day", "2026-07-22T23:59:59+00:00", False),
+    ("next-day", "2026-07-24T00:00:00+00:00", False),
+    # Normalization is to UTC, so the *instant* decides, not the text.
+    # These two are the interesting direction: each one's literal prefix
+    # says the opposite of where it actually lands.
+    ("offset-text-says-previous-lands-on-run-day", "2026-07-22T23:00:00-02:00", True),
+    ("offset-text-says-run-day-lands-on-previous", f"{DAY}T01:00:00+03:00", False),
+    ("offset-text-says-run-day-lands-on-next", f"{DAY}T23:00:00-02:00", False),
+]
+
+
+def _ingest_with_state(repository, source, moment):
+    with nvda_run(repository) as run:
+        repository.ingest_raw_items(
+            [raw_item(1, "NVDA")],
+            run=run,
+            source_state={"source": source, "checked_at": moment},
+        )
+
+
+def _record_with_state(repository, source, moment):
+    with nvda_run(repository) as run:
+        repository.record_source_state(source, run=run, checked_at=moment)
+
+
+SOURCE_STATE_DAY_ENTRYPOINTS = [
+    ("ingest_raw_items", _ingest_with_state),
+    ("record_source_state", _record_with_state),
+]
+
+
+@pytest.mark.parametrize(
+    "entrypoint, call",
+    SOURCE_STATE_DAY_ENTRYPOINTS,
+    ids=[case[0] for case in SOURCE_STATE_DAY_ENTRYPOINTS],
+)
+@pytest.mark.parametrize(
+    "label, moment, accepted",
+    CHECKED_AT_DAYS,
+    ids=[case[0] for case in CHECKED_AT_DAYS],
+)
+def test_both_source_state_entrypoints_judge_a_day_the_same_way(
+    tmp_path, entrypoint, call, label, moment, accepted
+):
+    """The same table of moments, answered identically by both doors.
+
+    The offset rows are the ones worth having: normalization is to UTC,
+    so a stated offset can move the *day* the moment lands on, and the
+    two entrypoints have to agree about that too.
+    """
+
+    repository = migrated(tmp_path, f"{entrypoint}-{label}.db")
+    source = "yahoo:NVDA"
+
+    if accepted:
+        call(repository, source, moment)
+        stored = repository.source_state(source)
+        assert stored is not None
+        assert str(stored["last_checked_at"])[:10] == DAY
+    else:
+        with pytest.raises(Phase0RunContextError, match="but the run covers"):
+            call(repository, source, moment)
+        assert repository.source_state(source) is None
+
+
+def test_a_rejected_ingest_source_state_leaves_the_whole_batch_undone(tmp_path):
+    """The batch is one transaction, and the day check is inside it.
+
+    Raw items, their ticker associations, their candidate reasons, the
+    source-state row, and the run log all have to be as they were — and
+    the stage key has to end up settled, because the rejection is this
+    run's recorded failure rather than an exception thrown past it.
+    """
+
+    repository = migrated(tmp_path)
+    key = {
+        "stage": "m0.ingest",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+    }
+    assert repository.claim_stage_key(**key, run_id="run-day") is True
+
+    with pytest.raises(Phase0RunContextError, match="but the run covers"):
+        with repository.stage_run(
+            run_id="run-day",
+            stage="m0.ingest",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+            stage_key=key,
+        ) as run:
+            repository.ingest_raw_items(
+                [raw_item(1, "NVDA"), raw_item(2, "NVDA")],
+                run=run,
+                source_state={
+                    "source": "yahoo:NVDA",
+                    "checked_at": "2026-07-22T12:00:00+00:00",
+                },
+                terminal=True,
+            )
+
+    for table in (
+        "raw_items",
+        "raw_item_tickers",
+        "raw_item_candidates",
+        "source_state",
+    ):
+        assert repository.count(table) == 0, table
+
+    logged = repository.read.run_log_rows(run_id="run-day")
+    assert [row["status"] for row in logged] == ["failed"]
+    assert int(logged[0]["success_count"]) == 0
+    assert repository.stage_key_state(**key)["status"] == "failed"
+
+
+def test_a_rejected_day_does_not_disturb_an_earlier_good_source_state(tmp_path):
+    """A refusal rolls back to what was there, not to nothing."""
+
+    repository = migrated(tmp_path)
+    _ingest_with_state(repository, "yahoo:NVDA", f"{DAY}T09:00:00+00:00")
+    before = dict(repository.source_state("yahoo:NVDA"))
+
+    with pytest.raises(Phase0RunContextError, match="but the run covers"):
+        _ingest_with_state(repository, "yahoo:NVDA", "2026-07-24T09:00:00+00:00")
+
+    assert dict(repository.source_state("yahoo:NVDA")) == before
+
+
+def test_an_omitted_checked_at_still_asserts_no_day(tmp_path):
+    """Omission keeps meaning "now"; only a stated time is a claim.
+
+    `ingest_raw_items` has no omission to test — `validate_source_state`
+    requires `checked_at` in the mapping — so this pins the half of the
+    contract that belongs to `record_source_state`, and that the mapping
+    form really does require it.
+    """
+
+    repository = migrated(tmp_path)
+    with nvda_run(repository) as run:
+        repository.record_source_state("yahoo:NVDA", run=run)
+    assert repository.source_state("yahoo:NVDA") is not None
+
+    with nvda_run(repository) as run:
+        with pytest.raises(Phase0ValidationError, match="checked_at"):
+            repository.ingest_raw_items(
+                [raw_item(1, "NVDA")],
+                run=run,
+                source_state={"source": "yahoo:NVDA"},
+            )
+
+
+def test_the_runless_admin_path_still_has_no_day_to_check(tmp_path):
+    """`admin.insert_raw_items` writes without a run, so it asserts none.
+
+    The check is the run's, not the payload's: with no run there is no
+    day the state could contradict, and narrowing this door was never
+    part of the contract.
+    """
+
+    repository = migrated(tmp_path)
+    repository.admin.insert_raw_items(
+        [raw_item(1, "NVDA")],
+        source_state={
+            "source": "yahoo:NVDA",
+            "checked_at": "2026-07-22T12:00:00+00:00",
+        },
+    )
+
+    stored = repository.source_state("yahoo:NVDA")
+    assert str(stored["last_checked_at"])[:10] == "2026-07-22"
 
 
 # ----------------------------------------------------------------------
