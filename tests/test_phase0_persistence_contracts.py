@@ -2556,6 +2556,457 @@ def test_model_and_input_changes_invalidate_the_cache(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# Zero is a position, not a silence
+#
+# `StoryMemberRecord.position` and `OtherCoverageRecord.position` both
+# defaulted to `0`, and both call sites read them as
+# `value if value else index`.  Zero is the *first* position, so a field
+# defaulting to it could not say "I did not state this" and an explicit
+# `0` on anything but the first element was replaced by that element's
+# index in the list.  Both fields are now unset-by-default and both call
+# sites ask `is None`.
+# ----------------------------------------------------------------------
+
+
+def member_positions(repository, story_id: int) -> list[tuple[int, int]]:
+    with repository.admin.connect_writable() as connection:
+        return [
+            (int(row["raw_item_id"]), int(row["position"]))
+            for row in connection.execute(
+                "SELECT raw_item_id, position FROM story_members "
+                "WHERE story_id = ? ORDER BY raw_item_id",
+                (story_id,),
+            )
+        ]
+
+
+def member_order(repository, story_id: int) -> list[int]:
+    """Members in the order their positions put them in."""
+
+    with repository.admin.connect_writable() as connection:
+        return [
+            int(row["raw_item_id"])
+            for row in connection.execute(
+                "SELECT raw_item_id FROM story_members WHERE story_id = ? "
+                "ORDER BY position, raw_item_id",
+                (story_id,),
+            )
+        ]
+
+
+def positioned_story(repository, positions, *, fingerprint="cf-pos"):
+    """One story whose members carry exactly the positions given.
+
+    A `None` in `positions` means the caller said nothing about that
+    member, which is the only case an inferred index is allowed.
+    """
+
+    items = seed_raw_items(repository, len(positions), ticker="NVDA")
+    members = tuple(
+        StoryMemberRecord(raw_item_id=item, position=position, outlet=f"O{item}")
+        for item, position in zip(items, positions)
+    )
+    record = StoryRecord(
+        cluster_fingerprint=fingerprint,
+        canonical_title="Positioned",
+        members=members,
+        canonical_item_id=items[0],
+        outlet_count=len(items),
+        content_hash="h-pos",
+        stage="m3.semantic",
+    )
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[record],
+    )
+    story_id = [
+        int(row["id"])
+        for row in repository.stories_for_day(DAY, "NVDA")
+        if row["cluster_fingerprint"] == fingerprint
+    ][0]
+    return items, story_id, report, record
+
+
+MEMBER_POSITION_CASES = [
+    # label, supplied, expected
+    ("first-explicit-zero", [0, 3, 9], [0, 3, 9]),
+    ("later-explicit-zero", [7, 0, 5], [7, 0, 5]),
+    ("last-explicit-zero", [4, 8, 0], [4, 8, 0]),
+    ("every-position-explicit", [4, 5, 6], [4, 5, 6]),
+    ("all-omitted-are-enumerated", [None, None, None], [0, 1, 2]),
+    ("omitted-among-explicit", [7, None, 5], [7, 1, 5]),
+    ("explicit-zero-beside-omitted", [None, 0, None], [0, 0, 2]),
+]
+
+
+@pytest.mark.parametrize(
+    "label, supplied, expected",
+    MEMBER_POSITION_CASES,
+    ids=[case[0] for case in MEMBER_POSITION_CASES],
+)
+def test_story_member_positions_are_stored_as_supplied(
+    tmp_path, label, supplied, expected
+):
+    """Cases 1-4: stated positions survive, unstated ones are numbered.
+
+    `all-omitted-are-enumerated` pins the documented fallback, which is
+    the list index — and `omitted-among-explicit` shows the fallback is
+    per member, not a mode the whole list is in.
+    """
+
+    repository = migrated(tmp_path)
+    items, story_id, _, _ = positioned_story(repository, supplied)
+
+    assert member_positions(repository, story_id) == list(zip(items, expected))
+
+
+def test_omitting_the_position_argument_entirely_is_what_unset_means(tmp_path):
+    """The default has to *be* unset, not a value that looks like one.
+
+    Everything above hands `position=None` explicitly, which exercises
+    the `is None` check but not the default behind it. A caller who never
+    mentions `position` must land in the same place — otherwise the field
+    still has no way to stay silent, and an explicit zero is
+    indistinguishable from absence all over again.
+    """
+
+    repository = migrated(tmp_path)
+    items = seed_raw_items(repository, 3, ticker="NVDA")
+    record = StoryRecord(
+        cluster_fingerprint="cf-omitted",
+        canonical_title="Omitted",
+        # No `position` anywhere.
+        members=tuple(
+            StoryMemberRecord(raw_item_id=item, outlet=f"O{item}") for item in items
+        ),
+        canonical_item_id=items[0],
+        outlet_count=len(items),
+        content_hash="h-omitted",
+        stage="m3.semantic",
+    )
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[record],
+    )
+
+    story_id = int(repository.stories_for_day(DAY, "NVDA")[0]["id"])
+    assert StoryMemberRecord(raw_item_id=items[0]).position is None
+    assert member_positions(repository, story_id) == list(zip(items, [0, 1, 2]))
+
+
+def test_omitting_a_coverage_position_entirely_is_what_unset_means(tmp_path):
+    """The same, for the coverage record's default."""
+
+    repository = migrated(tmp_path)
+    items = seed_raw_items(repository, 3, ticker="NVDA")
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story(f"cf{index}", [item]) for index, item in enumerate(items)],
+    )
+    by_fingerprint = {
+        str(row["cluster_fingerprint"]): int(row["id"])
+        for row in repository.stories_for_day(DAY, "NVDA")
+    }
+    ids = [by_fingerprint[f"cf{index}"] for index in range(3)]
+
+    assert OtherCoverageRecord(story_id=ids[1], reason="clustering_noise").position is (
+        None
+    )
+    reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint="T",
+                theme_key="T",
+                label="Theme",
+                story_ids=(ids[0],),
+                citation_item_ids=(items[0],),
+                method="hdbscan",
+                salience_rank=1,
+            )
+        ],
+        # No `position` anywhere.
+        other_coverage=(
+            OtherCoverageRecord(story_id=ids[1], reason="clustering_noise"),
+            OtherCoverageRecord(story_id=ids[2], reason="clustering_noise"),
+        ),
+    )
+
+    assert coverage_positions(repository) == [(ids[1], 0), (ids[2], 1)]
+
+
+def test_a_stated_member_position_decides_the_stored_order(tmp_path):
+    """Case 6: the point of a position is the order it produces.
+
+    `[1, 5, 0]` is the shape where the old fallback actually reordered
+    the story: the third member's explicit `0` became its index `2`, so
+    the member the caller put first came back second.
+    """
+
+    repository = migrated(tmp_path)
+    items, story_id, _, _ = positioned_story(repository, [1, 5, 0])
+
+    assert member_order(repository, story_id) == [items[2], items[0], items[1]]
+
+
+def test_a_replayed_explicit_zero_is_unchanged(tmp_path):
+    """Case 5: an identical settlement stays identical."""
+
+    repository = migrated(tmp_path)
+    items, story_id, first, record = positioned_story(repository, [7, 0, 5])
+    assert len(first.inserted) == 1
+    before = member_positions(repository, story_id)
+
+    replay = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[record],
+    )
+
+    assert replay.inserted == () and replay.updated == ()
+    assert len(replay.unchanged) == 1
+    assert member_positions(repository, story_id) == before
+
+
+def test_a_drifted_member_position_is_seen_and_repaired(tmp_path):
+    """Position is part of story equality, in both directions.
+
+    This is the half that made the defect self-concealing: the write and
+    the comparison mangled an explicit zero the same way, so a replay
+    agreed with itself. Against a stored zero the two disagree — which is
+    what "an identical replay appears changed" looks like from the
+    outside, and what the repair now does about it.
+    """
+
+    repository = migrated(tmp_path)
+    items, story_id, _, record = positioned_story(repository, [7, 0, 5])
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "UPDATE story_members SET position = 1 "
+            "WHERE story_id = ? AND raw_item_id = ?",
+            (story_id, items[1]),
+        )
+        connection.commit()
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[record],
+    )
+
+    assert len(report.updated) == 1 and report.unchanged == ()
+    assert member_positions(repository, story_id) == [
+        (items[0], 7),
+        (items[1], 0),
+        (items[2], 5),
+    ]
+
+
+def test_a_negative_member_position_is_still_refused(tmp_path):
+    """The `is None` check replaced the fallback, not the validation."""
+
+    repository = migrated(tmp_path)
+    with pytest.raises(Phase0ValidationError, match="member position must be >= 0"):
+        positioned_story(repository, [0, -1])
+
+
+def coverage_positions(repository) -> list[tuple[int, int]]:
+    with repository.admin.connect_writable() as connection:
+        return [
+            (int(row["story_id"]), int(row["position"]))
+            for row in connection.execute(
+                "SELECT story_id, position FROM theme_other_coverage "
+                "ORDER BY story_id"
+            )
+        ]
+
+
+def covered_day(repository, positions):
+    """A themed day whose Other Coverage carries exactly these positions."""
+
+    items = seed_raw_items(repository, 1 + len(positions), ticker="NVDA")
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story(f"cf{index}", [item]) for index, item in enumerate(items)],
+    )
+    by_fingerprint = {
+        str(row["cluster_fingerprint"]): int(row["id"])
+        for row in repository.stories_for_day(DAY, "NVDA")
+    }
+    ids = [by_fingerprint[f"cf{index}"] for index in range(len(items))]
+    other = tuple(
+        OtherCoverageRecord(
+            story_id=ids[1 + index], reason="clustering_noise", position=position
+        )
+        for index, position in enumerate(positions)
+    )
+    themes = [
+        ThemeRecord(
+            fingerprint="T",
+            theme_key="T",
+            label="Theme",
+            story_ids=(ids[0],),
+            citation_item_ids=(items[0],),
+            method="hdbscan",
+            salience_rank=1,
+        )
+    ]
+    report = reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=themes,
+        other_coverage=other,
+    )
+    return ids, themes, other, report
+
+
+COVERAGE_POSITION_CASES = [
+    ("first-explicit-zero", [0, 3, 9], [0, 3, 9]),
+    ("later-explicit-zero", [7, 0, 5], [7, 0, 5]),
+    ("last-explicit-zero", [4, 8, 0], [4, 8, 0]),
+    ("every-position-explicit", [4, 5, 6], [4, 5, 6]),
+    ("all-omitted-are-enumerated", [None, None, None], [0, 1, 2]),
+    ("omitted-among-explicit", [7, None, 5], [7, 1, 5]),
+]
+
+
+@pytest.mark.parametrize(
+    "label, supplied, expected",
+    COVERAGE_POSITION_CASES,
+    ids=[case[0] for case in COVERAGE_POSITION_CASES],
+)
+def test_other_coverage_positions_are_stored_as_supplied(
+    tmp_path, label, supplied, expected
+):
+    """Cases 7-10, the same table of shapes as the story members."""
+
+    repository = migrated(tmp_path)
+    ids, _, _, _ = covered_day(repository, supplied)
+
+    assert coverage_positions(repository) == list(zip(ids[1:], expected))
+
+
+def test_theme_set_reads_coverage_back_in_the_stated_order(tmp_path):
+    """Case 12: the order a stated position was for.
+
+    `[1, 5, 0]` is the shape the old fallback reordered — the third entry
+    said it came first and was filed third.
+    """
+
+    repository = migrated(tmp_path)
+    ids, _, _, _ = covered_day(repository, [1, 5, 0])
+
+    day = repository.theme_set(ticker="NVDA", trading_day=DAY, pipeline_version="v1")
+    assert [int(row["story_id"]) for row in day["other_coverage"]] == [
+        ids[3],
+        ids[1],
+        ids[2],
+    ]
+
+
+def test_replayed_coverage_with_an_explicit_zero_is_unchanged(tmp_path):
+    """Case 11, including `changed_outputs`.
+
+    Coverage is compared before it is rewritten, so an unchanged list has
+    to be reported as unchanged *and* left alone — a replay that rewrote
+    it would be the auxiliary-output defect all over again.
+    """
+
+    repository = migrated(tmp_path)
+    ids, themes, other, first = covered_day(repository, [7, 0, 5])
+    assert "other_coverage" in first.changed_outputs
+    before = coverage_positions(repository)
+
+    replay = reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=themes,
+        other_coverage=other,
+    )
+
+    assert replay.changed_outputs == ()
+    assert replay.updated == () and len(replay.unchanged) == 1
+    assert coverage_positions(repository) == before
+
+
+def test_a_drifted_coverage_position_is_seen_and_repaired(tmp_path):
+    """`position` is compared as a value, so drift is a change."""
+
+    repository = migrated(tmp_path)
+    ids, themes, other, _ = covered_day(repository, [7, 0, 5])
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "UPDATE theme_other_coverage SET position = 1 WHERE story_id = ?",
+            (ids[2],),
+        )
+        connection.commit()
+
+    report = reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=themes,
+        other_coverage=other,
+    )
+
+    assert "other_coverage" in report.changed_outputs
+    assert coverage_positions(repository) == [
+        (ids[1], 7),
+        (ids[2], 0),
+        (ids[3], 5),
+    ]
+
+
+def test_no_optional_field_reads_a_valid_falsy_value_as_absence(tmp_path):
+    """The audit, kept honest as a test rather than a claim.
+
+    Both defects were the same three tokens — `x if x else fallback` on a
+    field whose falsy value is real data. This refuses that shape
+    anywhere in the package, so the next optional field cannot quietly
+    acquire it.
+    """
+
+    pattern = re.compile(r"\b(\w+(?:\.\w+)*)\s+if\s+\1\s+else\s+")
+    offenders = []
+    for path in sorted(MIGRATIONS_PATH.parent.rglob("*.py")):
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if pattern.search(line):
+                offenders.append(f"{path.name}:{number}: {line.strip()}")
+
+    assert offenders == [], "truthiness fallback on a possibly-valid falsy value"
+
+
+# ----------------------------------------------------------------------
 # Story reconciliation
 # ----------------------------------------------------------------------
 

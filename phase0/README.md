@@ -506,6 +506,34 @@ sequence a caller happened to list two entries in is not a difference.
 `test_every_theme_set_column_is_owned_or_deliberately_exempt`, the same
 way the story and theme lists are.
 
+**Zero is a position, not a silence.** `StoryMemberRecord.position` and
+`OtherCoverageRecord.position` both defaulted to `0`, and both call sites
+read them as `value if value else index`. Zero is the *first* position, so
+a field defaulting to it had no way to say "I did not state this", and an
+explicit `0` on anything but the first element was replaced by that
+element's index in the list. `[1, 5, 0]` is where it shows: the member the
+caller put first came back second.
+
+Both fields are now unset by default and both call sites ask `is None`.
+Unset means "number these in the order given" — per element, not as a mode
+the whole list is in — and anything stated is stored exactly. Making the
+default `None` rather than `0` is what made the two distinguishable at
+all; a caller who omits the field lands exactly where it used to, so the
+only behaviour that changes is the one that was wrong.
+
+The defect was self-concealing, which is worth recording: `position` is
+part of story equality on *both* sides, and the write and the comparison
+mangled an explicit zero identically, so a replay agreed with itself.
+Only against a stored zero do the two disagree — and then the identical
+input reports *changed*, forever.
+
+That shape — `x if x else fallback` on an optional field whose falsy value
+is real data — is now refused across the package by
+`test_no_optional_field_reads_a_valid_falsy_value_as_absence`, so the next
+optional field cannot quietly acquire it. Those two sites were the only
+ones; every other optional value already goes through `_optional_text`,
+`_optional_float`, or an explicit `is None`.
+
 `reconcile_stories` has no equivalent: every table it owns is a story or a
 story's child, and all of them already reach the per-story signature.
 `test_reconcile_stories_reports_every_write_it_makes` pins that rather

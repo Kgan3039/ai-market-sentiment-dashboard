@@ -2275,10 +2275,14 @@ class Phase0Repository:
             members.append(
                 {
                     "raw_item_id": raw_item_id,
-                    "position": _require_int(
-                        member.position if member.position else position,
-                        "member position",
-                        minimum=0,
+                    # `is None`, not truthiness: zero is the first
+                    # position, so a member that states it is stating
+                    # something, and reading that as "unset" replaced it
+                    # with the member's index in the list.
+                    "position": (
+                        position
+                        if member.position is None
+                        else _require_int(member.position, "member position", minimum=0)
                     ),
                     "outlet": _optional_text(member.outlet),
                     "url": _optional_text(member.url),
@@ -3729,10 +3733,14 @@ class Phase0Repository:
                 {
                     "story_id": story_id,
                     "reason": reason,
-                    "position": _require_int(
-                        entry.position if entry.position else position,
-                        "position",
-                        minimum=0,
+                    # Same rule as a story member's, and the same reason:
+                    # zero is a position, not a silence.  Here it also
+                    # decides the order `theme_set()` reads the day back
+                    # in, so losing it reordered the list.
+                    "position": (
+                        position
+                        if entry.position is None
+                        else _require_int(entry.position, "position", minimum=0)
                     ),
                 }
             )

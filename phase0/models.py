@@ -16,10 +16,18 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True)
 class StoryMemberRecord:
-    """One raw item retained inside a canonical story, with its link."""
+    """One raw item retained inside a canonical story, with its link.
+
+    ``position`` is unset by default, not zero.  Zero is a perfectly good
+    position — it is the *first* one — so a field that defaulted to it had
+    no way to say "I did not state this", and the reconciliation path read
+    the two as the same thing: an explicit ``0`` on any member but the
+    first was replaced by that member's index in the list.  Unset means
+    "number these in the order given"; anything stated is kept exactly.
+    """
 
     raw_item_id: int
-    position: int = 0
+    position: int | None = None
     outlet: str | None = None
     url: str | None = None
     canonical_url: str | None = None
@@ -110,11 +118,18 @@ class ThemeRecord:
 
 @dataclass(frozen=True)
 class OtherCoverageRecord:
-    """One story shown under "Other coverage", with its stated reason."""
+    """One story shown under "Other coverage", with its stated reason.
+
+    ``position`` follows :class:`StoryMemberRecord`'s rule exactly: unset
+    means "number these in the order given", and an explicit value —
+    ``0`` included — is kept.  Here it is also what the day is read back
+    in, so losing an explicit zero reordered the list a caller had
+    deliberately arranged.
+    """
 
     story_id: int
     reason: str
-    position: int = 0
+    position: int | None = None
 
 
 @dataclass(frozen=True)
