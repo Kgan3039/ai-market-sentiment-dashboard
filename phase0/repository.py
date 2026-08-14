@@ -3535,6 +3535,7 @@ class Phase0Repository:
             raise Phase0ValidationError(
                 f"duplicate theme keys: {sorted(duplicate_keys)}"
             )
+        self._assert_themes_are_disjoint(prepared)
         coverage = self._prepare_coverage(other_coverage, excluded, prepared)
         incoming = dict(zip(fingerprints, prepared))
 
@@ -3650,6 +3651,47 @@ class Phase0Repository:
                 unchanged=tuple(unchanged),
                 deleted=tuple(obsolete),
                 changed_outputs=tuple(sorted(changed_outputs)),
+            )
+
+    @staticmethod
+    def _assert_themes_are_disjoint(themes: Sequence[Mapping[str, Any]]) -> None:
+        """No story may be claimed by two themes in one reconciliation.
+
+        The accounting rule is that each canonical story in a partition is
+        placed exactly once — in one theme, in Other Coverage, or in
+        exclusions.  Coverage and exclusions were checked against the
+        themes; the themes were never checked against each other, and
+        :meth:`_prepare_coverage` flattens them into a *set*, so the very
+        step that looks at every member is the step that discards how many
+        themes claimed it.
+
+        Nothing downstream caught it either.  A theme's citations must
+        belong to its member stories and no two themes in a partition may
+        cite the same raw item, which blocks the obvious case — two themes
+        sharing a single-item story would have to share its citation — but
+        a story with two members lets each theme cite a different one and
+        every remaining rule is satisfied.
+
+        Raised before any write, so a batch that is invalid anywhere
+        writes nothing anywhere.
+        """
+
+        owners: dict[int, list[str]] = {}
+        for values in themes:
+            for story_id in values["story_ids"]:
+                owners.setdefault(story_id, []).append(values["fingerprint"])
+        shared = {
+            story_id: sorted(fingerprints)
+            for story_id, fingerprints in owners.items()
+            if len(fingerprints) > 1
+        }
+        if shared:
+            detail = "; ".join(
+                f"story {story_id} in themes {fingerprints}"
+                for story_id, fingerprints in sorted(shared.items())
+            )
+            raise Phase0ValidationError(
+                f"a story belongs to exactly one theme, but {detail}"
             )
 
     @staticmethod

@@ -1837,10 +1837,23 @@ def test_a_raw_item_cannot_be_citable_from_two_themes_in_one_ticker_day(tmp_path
         pipeline_version="v1",
     )
 
+    # A raw item may belong to two stories — `story_members` is keyed on
+    # the pair — so two themes holding *different* stories can both have a
+    # legitimate claim to cite it.  That is the route this rule exists for.
+    # Handing `second` the story `first` already owns is no longer a route
+    # at all: migration 014 refuses it before the citation rule is reached.
+    with repository.admin.connect_writable() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="member of another theme"):
+            connection.execute(
+                "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
+                (second, day["stories"]["cf1"]),
+            )
+
     with repository.admin.connect_writable() as connection:
         connection.execute(
-            "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
-            (second, day["stories"]["cf1"]),
+            "INSERT INTO story_members (story_id, raw_item_id, position) "
+            "VALUES (?, ?, ?)",
+            (day["stories"]["cf2"], day["items"][0], 1),
         )
         with pytest.raises(sqlite3.IntegrityError, match="already citable"):
             connection.execute(
@@ -7974,6 +7987,518 @@ def test_a_handle_that_is_some_live_rows_id_is_still_owned(tmp_path):
     assert cached(repository, "story", durable), "story 1 lost its own vector"
 
 
+# ----------------------------------------------------------------------
+# One story, one accounting bucket — including "theme" against itself
+#
+# The M5 accounting rules are pairwise, and five of the six pairs were
+# written. The one nobody wrote is the one where both sides are the same
+# table: a story in two themes of one partition. `_prepare_coverage`
+# flattens every theme's members into a *set* to check coverage and
+# exclusions against, so the step that looks at every member is the step
+# that discards how many themes claimed it.
+#
+# The citation rules block the obvious attempt — two themes sharing a
+# one-item story would have to share its citation, and no two themes in a
+# partition may cite the same raw item. Give that story a second member
+# and the collision goes away: each theme cites a different item, both
+# claim the story, and every other rule is satisfied.
+# ----------------------------------------------------------------------
+
+
+def split_partition(
+    repository, sizes, ticker="NVDA"
+) -> tuple[list[int], list[list[int]]]:
+    """One partition where `sizes[i]` raw items belong to story `i`.
+
+    Story sizes are the point: a story with two member raw items lets two
+    themes cite it without colliding on a citation, which is the only way
+    to reach the overlap this contract is about.
+    """
+
+    items = seed_raw_items(repository, sum(sizes), ticker=ticker)
+    groups, offset = [], 0
+    for size in sizes:
+        groups.append(items[offset : offset + size])
+        offset += size
+    reconcile_stories(
+        repository,
+        ticker=ticker,
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story(f"cf-{index}", group) for index, group in enumerate(groups)],
+    )
+    by_fingerprint = {
+        str(row["cluster_fingerprint"]): int(row["id"])
+        for row in repository.stories_for_day(DAY, ticker)
+    }
+    return [by_fingerprint[f"cf-{index}"] for index in range(len(sizes))], groups
+
+
+def a_theme(fingerprint, story_ids, citation_ids, rank=1) -> ThemeRecord:
+    return ThemeRecord(
+        fingerprint=fingerprint,
+        theme_key=fingerprint,
+        label=f"Theme {fingerprint}",
+        story_ids=tuple(story_ids),
+        citation_item_ids=tuple(citation_ids),
+        method="hdbscan",
+        salience_rank=rank,
+    )
+
+
+def settle_themes(repository, themes, *, other=(), excluded=(), ticker="NVDA"):
+    return reconcile_themes(
+        repository,
+        ticker=ticker,
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=themes,
+        other_coverage=other,
+        excluded=excluded,
+    )
+
+
+def theme_membership(repository) -> list[tuple[int, int]]:
+    with repository.admin.connect_writable() as connection:
+        return sorted(
+            (int(row["theme_id"]), int(row["story_id"]))
+            for row in connection.execute(
+                "SELECT theme_id, story_id FROM theme_stories"
+            )
+        )
+
+
+def test_two_themes_may_not_share_a_story(tmp_path):
+    """Hostile case 1, built so no citation collision hides it."""
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [2])
+
+    with pytest.raises(
+        Phase0ValidationError, match="a story belongs to exactly one theme"
+    ):
+        settle_themes(
+            repository,
+            [
+                a_theme("A", [stories[0]], [groups[0][0]], 1),
+                a_theme("B", [stories[0]], [groups[0][1]], 2),
+            ],
+        )
+
+    assert theme_membership(repository) == []
+    assert repository.count("themes") == 0
+
+
+def test_one_overlapping_pair_rejects_the_whole_batch(tmp_path):
+    """Hostile case 2: the valid themes do not get in either.
+
+    Reconciliation settles a partition as a unit, so a batch that is
+    wrong anywhere has to write nothing anywhere — otherwise the day is
+    left half-settled by an input that was never acceptable.
+    """
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [2, 1])
+
+    with pytest.raises(Phase0ValidationError, match="story .* in themes"):
+        settle_themes(
+            repository,
+            [
+                a_theme("A", [stories[0]], [groups[0][0]], 1),
+                a_theme("B", [stories[1]], [groups[1][0]], 2),
+                a_theme("C", [stories[0]], [groups[0][1]], 3),
+            ],
+        )
+
+    assert theme_membership(repository) == []
+    assert repository.count("themes") == 0
+    assert repository.count("theme_sets") == 0
+
+
+def test_the_error_names_every_story_and_theme_involved(tmp_path):
+    """An operator has to know which cards to look at."""
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [2, 2])
+
+    with pytest.raises(Phase0ValidationError) as caught:
+        settle_themes(
+            repository,
+            [
+                a_theme("A", [stories[0], stories[1]], [groups[0][0]], 1),
+                a_theme("B", [stories[0], stories[1]], [groups[0][1]], 2),
+            ],
+        )
+
+    message = str(caught.value)
+    assert f"story {stories[0]}" in message and f"story {stories[1]}" in message
+    assert "'A'" in message and "'B'" in message
+
+
+def test_a_story_repeated_inside_one_theme_is_canonicalized(tmp_path):
+    """Hostile case 3, and the answer is *canonicalize*, not fail.
+
+    `_prepare_theme` runs both `story_ids` and `citation_item_ids` through
+    `dict.fromkeys`, so a repeat inside one record is deduplicated with
+    order preserved — the existing model contract, and `story_count`
+    defaults from the deduplicated list. Only repeats *across* themes are
+    an accounting error, because only those name two owners.
+    """
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [1])
+
+    report = settle_themes(
+        repository,
+        [a_theme("A", [stories[0], stories[0], stories[0]], [groups[0][0]], 1)],
+    )
+
+    assert len(report.inserted) == 1
+    assert theme_membership(repository) == [(report.inserted[0], stories[0])]
+    stored = repository.theme_set(
+        ticker="NVDA", trading_day=DAY, pipeline_version="v1"
+    )["themes"]
+    assert stored[0]["story_count"] == 1
+
+
+ACCOUNTING_CONFLICTS = [
+    ("theme-and-other-coverage", "other", "is in a theme and in other coverage"),
+    ("theme-and-excluded", "excluded", "already accounted for in this theme set"),
+]
+
+
+@pytest.mark.parametrize(
+    "label, bucket, message",
+    ACCOUNTING_CONFLICTS,
+    ids=[case[0] for case in ACCOUNTING_CONFLICTS],
+)
+def test_a_themed_story_may_not_also_be_covered_or_excluded(
+    tmp_path, label, bucket, message
+):
+    """Hostile cases 4 and 5 — already held, and pinned here beside the rest."""
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [1, 1])
+    themes = [a_theme("A", [stories[0]], [groups[0][0]], 1)]
+    kwargs = (
+        {"other": [OtherCoverageRecord(stories[0], "clustering_noise")]}
+        if bucket == "other"
+        else {"excluded": [ExcludedStoryRecord(stories[0], "no_encodable_text")]}
+    )
+
+    with pytest.raises(Phase0ValidationError, match=message):
+        settle_themes(repository, themes, **kwargs)
+
+    assert theme_membership(repository) == []
+
+
+def test_disjoint_themes_settle_and_replay_unchanged(tmp_path):
+    """Hostile cases 6 and 7: the rule costs valid input nothing."""
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [1, 1])
+    themes = [
+        a_theme("A", [stories[0]], [groups[0][0]], 1),
+        a_theme("B", [stories[1]], [groups[1][0]], 2),
+    ]
+
+    first = settle_themes(repository, themes)
+    assert len(first.inserted) == 2
+    settled = theme_membership(repository)
+    assert sorted(story_id for _, story_id in settled) == sorted(stories)
+
+    replay = settle_themes(repository, themes)
+    assert replay.inserted == () and replay.updated == ()
+    assert len(replay.unchanged) == 2
+    assert replay.changed_outputs == ()
+    assert theme_membership(repository) == settled
+
+
+def test_a_story_may_move_between_themes_across_settlements(tmp_path):
+    """Hostile case 10: rebuilding a day is not the thing being refused.
+
+    The rule is about one settlement's *input*, so a later reconciliation
+    is free to place a story on a different card — and the `UPDATE`
+    trigger has to let a membership move without colliding with the row
+    it is moving.
+    """
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [1, 1])
+    settle_themes(
+        repository,
+        [
+            a_theme("A", [stories[0]], [groups[0][0]], 1),
+            a_theme("B", [stories[1]], [groups[1][0]], 2),
+        ],
+    )
+
+    # One theme now holds both stories; the other is gone.
+    settle_themes(
+        repository,
+        [a_theme("A", stories, [groups[0][0], groups[1][0]], 1)],
+    )
+
+    membership = theme_membership(repository)
+    assert sorted(story_id for _, story_id in membership) == sorted(stories)
+    assert len({theme_id for theme_id, _ in membership}) == 1
+
+
+def test_direct_sql_cannot_put_a_story_in_a_second_theme(tmp_path):
+    """Hostile cases 8 and 9: the rule is in the database, not only above it."""
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [1, 1])
+    settle_themes(
+        repository,
+        [
+            a_theme("A", [stories[0]], [groups[0][0]], 1),
+            a_theme("B", [stories[1]], [groups[1][0]], 2),
+        ],
+    )
+    with repository.admin.connect_writable() as connection:
+        theme_ids = [
+            int(row["id"])
+            for row in connection.execute("SELECT id FROM themes ORDER BY id")
+        ]
+    before = theme_membership(repository)
+
+    with repository.admin.connect_writable() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="member of another theme"):
+            connection.execute(
+                "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
+                (theme_ids[1], stories[0]),
+            )
+
+    # The update path, isolated from the citation rule that would
+    # otherwise refuse the move for an unrelated reason.
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "DELETE FROM theme_citations WHERE theme_id = ?", (theme_ids[1],)
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="member of another theme"):
+            connection.execute(
+                "UPDATE theme_stories SET story_id = ? "
+                "WHERE theme_id = ? AND story_id = ?",
+                (stories[0], theme_ids[1], stories[1]),
+            )
+        connection.rollback()
+
+    assert theme_membership(repository) == before
+
+
+def test_direct_sql_may_still_move_a_membership_that_collides_with_nobody(tmp_path):
+    """The update guard excludes the row it is judging.
+
+    `BEFORE UPDATE` still sees the old row, so a membership moving from
+    one theme to another would collide with itself if the trigger did not
+    say so explicitly — which would make the rule refuse the very
+    operation it is meant to allow.
+    """
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [1, 1])
+    settle_themes(
+        repository,
+        [
+            a_theme("A", [stories[0]], [groups[0][0]], 1),
+            a_theme("B", [stories[1]], [groups[1][0]], 2),
+        ],
+    )
+    with repository.admin.connect_writable() as connection:
+        theme_ids = [
+            int(row["id"])
+            for row in connection.execute("SELECT id FROM themes ORDER BY id")
+        ]
+        connection.execute(
+            "DELETE FROM theme_citations WHERE theme_id = ?", (theme_ids[1],)
+        )
+        connection.execute(
+            "UPDATE theme_stories SET theme_id = ? "
+            "WHERE theme_id = ? AND story_id = ?",
+            (theme_ids[0], theme_ids[1], stories[1]),
+        )
+        connection.commit()
+
+    assert theme_membership(repository) == [
+        (theme_ids[0], stories[0]),
+        (theme_ids[0], stories[1]),
+    ]
+
+
+SINGLETON_BUCKETS = [
+    (
+        "other-coverage",
+        "INSERT INTO theme_other_coverage "
+        "(theme_set_id, story_id, reason, position) VALUES (?, ?, ?, ?)",
+        ("clustering_noise", 9),
+    ),
+    (
+        "exclusions",
+        "INSERT INTO theme_excluded_stories (theme_set_id, story_id, reason) "
+        "VALUES (?, ?, ?)",
+        ("no_encodable_text",),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label, statement, extra",
+    SINGLETON_BUCKETS,
+    ids=[case[0] for case in SINGLETON_BUCKETS],
+)
+def test_the_other_two_buckets_are_closed_by_their_primary_keys(
+    tmp_path, label, statement, extra
+):
+    """Why "same bucket twice" was a gap for themes and only for themes.
+
+    `theme_sets` is unique per partition and both coverage tables are
+    keyed on `(theme_set_id, story_id)`, so one story cannot appear twice
+    in either — the primary key already says it. `theme_stories` is keyed
+    on `(theme_id, story_id)`, and a partition holds *many* themes, so the
+    same key permits exactly the state migration 014 forbids.
+    """
+
+    repository = migrated(tmp_path)
+    stories, groups = split_partition(repository, [1, 1, 1])
+    settle_themes(
+        repository,
+        [a_theme("A", [stories[0]], [groups[0][0]], 1)],
+        other=[OtherCoverageRecord(stories[1], "clustering_noise")],
+        excluded=[ExcludedStoryRecord(stories[2], "no_encodable_text")],
+    )
+
+    with repository.admin.connect_writable() as connection:
+        set_id = int(connection.execute("SELECT id FROM theme_sets").fetchone()["id"])
+        story_id = stories[1] if label == "other-coverage" else stories[2]
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+            connection.execute(statement, (set_id, story_id, *extra))
+
+
+def v13_repository(tmp_path, name="v13.sqlite3"):
+    """A database stopped one migration short of the overlap rule."""
+
+    database = tmp_path / name
+    Phase0Repository(
+        database, migrations_path=partial_migrations(tmp_path, LATEST_VERSION - 1)
+    ).migrate()
+    repository = Phase0Repository(database)
+    assert repository.schema_version() == LATEST_VERSION - 1
+    return repository, database
+
+
+def test_a_clean_v13_database_upgrades_with_its_data_intact(tmp_path):
+    """Hostile case 11."""
+
+    repository, database = v13_repository(tmp_path)
+    stories, groups = split_partition(repository, [1, 1])
+    settle_themes(
+        repository,
+        [
+            a_theme("A", [stories[0]], [groups[0][0]], 1),
+            a_theme("B", [stories[1]], [groups[1][0]], 2),
+        ],
+    )
+    before = theme_membership(repository)
+
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+
+    assert upgraded.schema_version() == LATEST_VERSION
+    assert theme_membership(upgraded) == before
+    assert upgraded.count("themes") == 2
+    # And the rule is live on the upgraded database, not just on fresh ones.
+    with upgraded.admin.connect_writable() as connection:
+        theme_ids = [
+            int(row["id"])
+            for row in connection.execute("SELECT id FROM themes ORDER BY id")
+        ]
+        with pytest.raises(sqlite3.IntegrityError, match="member of another theme"):
+            connection.execute(
+                "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
+                (theme_ids[1], stories[0]),
+            )
+
+
+def test_a_v13_database_already_carrying_a_duplicate_refuses_to_upgrade(tmp_path):
+    """Hostile case 12: fail closed, and do not pick a winner.
+
+    Choosing between two themes that both claim a story is a content
+    decision — which card the story belongs on — and a migration cannot
+    make it. Migration 011 set the policy when it could not infer a
+    legacy `pipeline_version` unambiguously: abort, roll back whole, and
+    leave the operator to resolve it. This follows that policy.
+    """
+
+    repository, database = v13_repository(tmp_path)
+    stories, groups = split_partition(repository, [1, 1])
+    settle_themes(
+        repository,
+        [
+            a_theme("A", [stories[0]], [groups[0][0]], 1),
+            a_theme("B", [stories[1]], [groups[1][0]], 2),
+        ],
+    )
+    with repository.admin.connect_writable() as connection:
+        theme_ids = [
+            int(row["id"])
+            for row in connection.execute("SELECT id FROM themes ORDER BY id")
+        ]
+        # Legal at v13, which is exactly the point.
+        connection.execute(
+            "INSERT INTO theme_stories (theme_id, story_id) VALUES (?, ?)",
+            (theme_ids[1], stories[0]),
+        )
+        connection.commit()
+    before = database_state(database)
+
+    with pytest.raises(sqlite3.IntegrityError, match="resolve which theme owns it"):
+        Phase0Repository(database).migrate()
+
+    # Whole: still at 13, ledger unchanged, the duplicate still there for
+    # the operator to look at.
+    assert database_state(database) == before
+    assert before["user_version"] == LATEST_VERSION - 1
+    assert Phase0Repository(database).schema_version() == LATEST_VERSION - 1
+
+    # And once resolved, the upgrade goes through.
+    with Phase0Repository(database).admin.connect_writable() as connection:
+        connection.execute(
+            "DELETE FROM theme_stories WHERE theme_id = ? AND story_id = ?",
+            (theme_ids[1], stories[0]),
+        )
+        connection.commit()
+    resolved = Phase0Repository(database)
+    resolved.migrate()
+    assert resolved.schema_version() == LATEST_VERSION
+
+
+def test_a_cross_partition_duplicate_does_not_block_the_upgrade(tmp_path):
+    """The migration's check is partition-scoped, like the rule it installs.
+
+    Two tickers on the same day each have their own stories, so two themes
+    naming *different* stories is not a duplicate however similar the days
+    look. A check that asked only "does this story_id appear twice" would
+    be the same mistake in the other direction.
+    """
+
+    repository, database = v13_repository(tmp_path)
+    for ticker in ("NVDA", "AMD"):
+        stories, groups = split_partition(repository, [1], ticker=ticker)
+        settle_themes(
+            repository,
+            [a_theme(f"{ticker}-A", [stories[0]], [groups[0][0]], 1)],
+            ticker=ticker,
+        )
+
+    upgraded = Phase0Repository(database)
+    upgraded.migrate()
+
+    assert upgraded.schema_version() == LATEST_VERSION
+    assert len(theme_membership(upgraded)) == 2
+
+
 def test_reconciling_a_theme_under_a_new_key_drops_the_old_keys_vector(tmp_path):
     """The path a caller actually reaches, with no raw SQL anywhere.
 
@@ -8279,7 +8804,7 @@ def test_an_existing_database_gains_the_complete_predicate_on_upgrade(tmp_path):
 
     upgraded = Phase0Repository(database)
     upgraded.migrate()
-    assert upgraded.schema_version() == 13
+    assert upgraded.schema_version() == LATEST_VERSION
 
     # The pre-existing vector is still there, and now correctly guarded.
     assert cached(upgraded, "story", identity)

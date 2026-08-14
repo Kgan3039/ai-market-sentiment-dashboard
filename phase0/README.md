@@ -427,6 +427,57 @@ conflicts by provider identity, merges by story-key pair, memberships and
 the denormalized `themes.citations` list sorted — so equivalent inputs
 compare equal however the stage happened to order them.
 
+**One story, one accounting bucket — and "theme" counts against itself.**
+Each canonical story in a partition is placed exactly once: in one theme,
+in Other Coverage, or in exclusions. The rules enforcing that are
+pairwise, and five of the six pairs were written — coverage against
+themes, themes against coverage, exclusions against themes, exclusions
+against coverage, coverage against exclusions — each on `INSERT` and on
+`UPDATE`. The pair nobody wrote is the one where both sides are the same
+table: a story in **two themes**.
+
+`_prepare_coverage` flattens every theme's members into a *set* to check
+coverage and exclusions against, so the one step that looks at every
+member is the step that discards how many themes claimed it. Nothing
+downstream caught it either. A theme's citations must belong to its member
+stories and no two themes in a partition may cite the same raw item,
+which blocks the obvious attempt — two themes sharing a one-item story
+would have to share its citation. Give that story a second member and the
+collision goes away: each theme cites a different item, both claim the
+story, every remaining rule is satisfied, and the day's theme cards
+double-count a story while its Other Coverage arithmetic stops adding up.
+
+`reconcile_themes` now checks the incoming themes against each other
+before any write, so a batch that overlaps anywhere writes nothing
+anywhere, and the error names each shared story with the themes claiming
+it. A repeat *inside* one record is a different thing and keeps its
+existing treatment: `story_ids` and `citation_item_ids` both run through
+`dict.fromkeys`, so duplicates are canonicalized rather than refused —
+one owner named twice is not two owners.
+
+Migration **014** puts the same rule in the database, on `INSERT` and on
+`UPDATE`. The `UPDATE` guard excludes the row it is judging by its own
+`(theme_id, story_id)`, because `BEFORE UPDATE` still sees the old row and
+a membership merely moving between themes would otherwise collide with
+itself. The invariant is stated per partition, matching the M5 triggers —
+and that is the whole of it, because 011 made `stories.pipeline_version`
+required and the partition triggers demand a member share its theme's
+ticker, day, and version exactly. A story therefore belongs to one
+partition, and the only themes that can claim it are in that partition.
+
+The other two buckets never had this gap, for a structural reason worth
+recording: `theme_sets` is unique per partition and both coverage tables
+are keyed on `(theme_set_id, story_id)`, so their primary keys already say
+"once". `theme_stories` is keyed on `(theme_id, story_id)`, and a
+partition holds *many* themes — so the same shape of key permits exactly
+the state 014 forbids.
+
+A v13 database already carrying such a pair **refuses to upgrade** and
+stays at 13, whole. Choosing which theme owns the story is a content
+decision, and 011 set the policy when it could not infer a legacy
+`pipeline_version`: abort, roll back, and leave it to an operator. Once
+resolved, the upgrade goes through.
+
 **A report accounts for everything the operation writes, not only what it
 can name by id.** `ReconciliationReport`'s tuples hold row ids, so they
 can only describe rows keyed by a fingerprint: stories, or themes.
