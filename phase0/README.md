@@ -1254,3 +1254,41 @@ identity the evidence decides, not a label a caller supplies; an override
 could only be ignored or fatal. The aggregate counters `fetch()` returns
 are a summary for its caller — the durable audit is one `run_log` row per
 ticker-day, written inside the same transaction as the data.
+
+## What `request_timeout_seconds` bounds
+
+yfinance cannot cancel a request in flight: `Ticker.news` takes no timeout
+and the library hard-codes `timeout=30` into its own session calls. Timing
+out therefore cannot mean "the request stopped" — only "we stopped
+waiting". The first cut treated those as the same thing, and the cost was
+unbounded: each attempt started its own daemon thread, so a hung provider
+left one live request *per attempt per scheduled fetch*, growing without
+limit for as long as the hang lasted.
+
+`YahooProviderGate` bounds the work instead of pretending to stop it.
+
+- **A ceiling.** `max_concurrent` requests may be outstanding — by default
+  one per approved ticker, which is the most the sequential fetch loop can
+  ever want. A request that cannot claim a slot is refused with
+  `YahooProviderBusyError` rather than queued, so a hang degrades the next
+  fetch immediately instead of parking work behind it.
+- **Single flight.** Slots are keyed by ticker. A caller asking for a
+  ticker whose request is still outstanding *joins* it. This is what keeps
+  a retry — and the next scheduled fetch — from multiplying live requests
+  against a provider that is already struggling. Retry counts and backoff
+  are unchanged; what a retry now repeats is the wait, not the request.
+- **The request frees its own slot.** Only the worker releases, in a
+  `finally`, so a request abandoned at the timeout keeps counting against
+  the ceiling for exactly as long as it is really running.
+
+The gate is deliberately not a `ThreadPoolExecutor`: its workers are
+non-daemon and joined at interpreter shutdown, so one hung provider call
+would leave a scheduled job unable to exit. These workers are daemons,
+capped by the same semaphore that caps the slots.
+
+A fetcher built without an explicit gate uses the module-level
+`SHARED_PROVIDER_GATE`, so a scheduler that builds a fresh fetcher per run
+cannot escape the ceiling by bringing its own slots. Pass a private gate to
+opt out. A refusal settles like any other exhausted request: a `failed`
+checkpoint and a `degraded` run, with `counts["provider_busy"]` separating
+it from a timeout.

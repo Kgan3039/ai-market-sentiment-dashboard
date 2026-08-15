@@ -10,7 +10,9 @@ as the data.
 
 from datetime import datetime, timedelta, timezone
 import inspect
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,9 +21,13 @@ from phase0.repository import Phase0Reader, Phase0Repository, StageRunContext
 from phase0.tickers import TICKER_UNIVERSE
 from phase0 import yahoo as yahoo_module
 from phase0.yahoo import (
+    DEFAULT_MAX_CONCURRENT_REQUESTS,
+    SHARED_PROVIDER_GATE,
     STAGE,
     TICKERS,
     YahooFinanceFetcher,
+    YahooProviderBusyError,
+    YahooProviderGate,
     effective_day,
     normalize_yahoo_item,
     partition_run_id,
@@ -70,7 +76,93 @@ def migrated(tmp_path, name="phase0.sqlite3"):
 
 def fetcher(repository, factory, **options):
     options.setdefault("max_retries", 0)
+    # A private gate per fetcher: the production default is the process-wide
+    # one, and tests that leave a request outstanding must not be able to
+    # hand their provider's answer to the next test that asks for the same
+    # ticker.  ``test_a_fetcher_built_without_a_gate_shares_the_process_one``
+    # is what holds the default itself.
+    options.setdefault("provider_gate", YahooProviderGate())
     return YahooFinanceFetcher(repository, ticker_factory=factory, **options)
+
+
+@pytest.fixture(autouse=True)
+def shared_gate_is_left_clean():
+    """No test may abandon work on the process-wide gate."""
+
+    yield
+    assert SHARED_PROVIDER_GATE.outstanding == 0
+
+
+def wait_for(predicate, timeout=5.0):
+    """Poll *predicate* rather than sleeping a guessed interval."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+def provider_threads():
+    """Live threads actually running Yahoo provider work, by name."""
+
+    return [
+        thread
+        for thread in threading.enumerate()
+        if thread.name.startswith("yahoo-provider") and thread.is_alive()
+    ]
+
+
+class HangingProvider:
+    """A provider whose calls block until the test lets them finish.
+
+    This is the shape of the defect under repair: a call that outlives the
+    caller's patience.  ``entered`` counts calls that really reached the
+    provider body, so tests can distinguish "a second request was issued"
+    from "a second caller joined the first request".
+    """
+
+    def __init__(self, *, raises=None, news=None):
+        self.calls = []
+        self.released = threading.Event()
+        self._entered = threading.Semaphore(0)
+        self._lock = threading.Lock()
+        self._raises = raises
+        self._news = news
+
+    def __call__(self, ticker):
+        with self._lock:
+            self.calls.append(ticker)
+        self._entered.release()
+        if not self.released.wait(10):  # pragma: no cover - only on a hang
+            raise AssertionError("hanging provider was never released")
+        if self._raises is not None:
+            raise self._raises
+        news = self._news if self._news is not None else [legacy_item(ticker)]
+        return SimpleNamespace(news=list(news))
+
+    def wait_until_entered(self, count=1, timeout=5.0):
+        for _ in range(count):
+            assert self._entered.acquire(timeout=timeout), "provider was never called"
+
+
+@pytest.fixture
+def hanging():
+    """Build hanging providers and guarantee their workers are let go."""
+
+    built = []
+
+    def build(**options):
+        built.append(HangingProvider(**options))
+        return built[-1]
+
+    yield build
+    for provider_ in built:
+        provider_.released.set()
+    assert wait_for(
+        lambda: not provider_threads()
+    ), "a provider worker outlived its test"
 
 
 def provider(news_by_ticker=None, *, news=None, raises=None):
@@ -1111,3 +1203,390 @@ def test_a_credential_in_an_item_error_is_redacted_before_it_is_stored(tmp_path)
     assert "leaked-secret" not in str(repository.source_state("yahoo:NVDA"))
     stored = repository.raw_items_for_day(today(), "NVDA")[0]
     assert "leaked-secret" not in stored["validation_errors"]
+
+
+# ---------------------------------------------------------------------------
+# Bounded provider work: what a timeout actually stops
+# ---------------------------------------------------------------------------
+#
+# A timeout used to bound only the caller's wait.  The request it gave up on
+# kept running, and every retry started another one, so a provider that hung
+# cost one live request per attempt per scheduled fetch — without limit.
+# yfinance cannot cancel a request in flight, so these tests do not assert
+# that a timed-out call stops.  They assert the guarantee that is actually
+# available: the work outstanding at any moment has a ceiling, and neither
+# retries nor later fetches raise it.
+
+
+def test_a_provider_that_answers_within_the_budget_is_unaffected(tmp_path):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = provider()
+
+    counts, errors = fetcher(
+        repository, factory, provider_gate=gate, request_timeout_seconds=5
+    ).fetch(["NVDA"])
+
+    assert counts["inserted"] == 1
+    assert counts["timeouts"] == 0
+    assert not errors
+    assert repository.source_state("yahoo:NVDA")["status"] == "success"
+    # The slot is handed back by the request, so a healthy fetch leaves none held.
+    assert gate.outstanding == 0
+    assert gate.live_workers == 0
+    assert gate.joined == 0
+
+
+def test_a_provider_that_exceeds_the_budget_times_out_while_its_call_runs_on(
+    tmp_path, hanging
+):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = hanging()
+
+    counts, errors = fetcher(
+        repository, factory, provider_gate=gate, request_timeout_seconds=0.05
+    ).fetch(["NVDA"])
+
+    assert counts["timeouts"] == 1
+    assert counts["tickers_failed"] == 1
+    assert "exceeded" in errors[0]["error"]
+    # The honest part: the request is still running.  It is bounded, not stopped.
+    assert gate.outstanding == 1
+    assert gate.live_workers == 1
+    assert gate.outstanding_keys == ("NVDA",)
+
+
+def test_a_retry_joins_the_outstanding_request_instead_of_adding_one(tmp_path, hanging):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = hanging()
+
+    counts, _ = fetcher(
+        repository,
+        factory,
+        provider_gate=gate,
+        request_timeout_seconds=0.05,
+        max_retries=2,
+        retry_backoff_seconds=0,
+    ).fetch(["NVDA"])
+
+    factory.wait_until_entered(1)
+    assert counts["retries"] == 2  # three attempts were made
+    # ...against one live request.  Occupancy, not invocation counting: the
+    # gate accounts for the slot and the thread is really there.
+    assert gate.outstanding == 1
+    assert gate.live_workers == 1
+    assert len(provider_threads()) == 1
+    assert gate.joined == 2
+    assert factory.calls == ["NVDA"]
+
+
+def test_repeated_timeouts_never_exceed_the_configured_ceiling(tmp_path, hanging):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate(2)
+    factory = hanging()
+
+    counts, errors = fetcher(
+        repository,
+        factory,
+        provider_gate=gate,
+        request_timeout_seconds=0.05,
+        max_retries=1,
+        retry_backoff_seconds=0,
+    ).fetch(["TSLA", "NVDA", "AMD", "AAPL", "META"])
+
+    factory.wait_until_entered(2)
+    assert gate.outstanding == 2 == gate.max_concurrent
+    assert gate.live_workers == 2
+    assert len(provider_threads()) == 2
+    assert factory.calls == ["TSLA", "NVDA"]
+    # Five tickers, ten attempts, two live requests: the rest were refused
+    # outright rather than queued behind a provider that is already stuck.
+    assert counts["timeouts"] == 2
+    assert counts["provider_busy"] == 3
+    assert counts["tickers_failed"] == 5
+    assert {error["ticker"] for error in errors} == set(TICKERS)
+
+
+def test_a_refused_request_names_the_ceiling_and_settles_as_a_failed_check(
+    tmp_path, hanging
+):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate(1)
+    factory = hanging()
+
+    counts, errors = fetcher(
+        repository, factory, provider_gate=gate, request_timeout_seconds=0.05
+    ).fetch(["TSLA", "NVDA"])
+
+    assert counts["provider_busy"] == 1
+    refusal = [error for error in errors if error["ticker"] == "NVDA"][0]["error"]
+    assert "1 Yahoo provider slots" in refusal
+    state = repository.source_state("yahoo:NVDA")
+    assert state["status"] == "failed"
+    assert state["metadata"]["error_type"] == "YahooProviderBusyError"
+    assert partitions(repository)[("NVDA", today())]["status"] == "degraded"
+
+
+def test_a_later_scheduled_fetch_during_a_hang_starts_no_second_worker(
+    tmp_path, hanging
+):
+    """A scheduler builds a fresh fetcher per run; the ceiling is the process's."""
+
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = hanging()
+
+    fetcher(
+        repository, factory, provider_gate=gate, request_timeout_seconds=0.05
+    ).fetch(["NVDA"])
+    factory.wait_until_entered(1)
+    assert gate.live_workers == 1
+
+    for _ in range(4):
+        fetcher(
+            repository, factory, provider_gate=gate, request_timeout_seconds=0.05
+        ).fetch(["NVDA"])
+        assert gate.outstanding == 1
+        assert gate.live_workers == 1
+        assert len(provider_threads()) == 1
+
+    assert factory.calls == ["NVDA"]
+
+
+def test_a_fetcher_built_without_a_gate_shares_the_process_one(tmp_path):
+    repository = migrated(tmp_path)
+
+    first = YahooFinanceFetcher(repository)
+    second = YahooFinanceFetcher(repository)
+
+    assert first.provider_gate is SHARED_PROVIDER_GATE
+    assert second.provider_gate is first.provider_gate
+    assert SHARED_PROVIDER_GATE.max_concurrent == DEFAULT_MAX_CONCURRENT_REQUESTS
+    assert DEFAULT_MAX_CONCURRENT_REQUESTS == len(TICKERS)
+
+
+def test_the_next_fetch_recovers_once_the_hung_request_finally_returns(
+    tmp_path, hanging
+):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = hanging()
+
+    timed_out, _ = fetcher(
+        repository, factory, provider_gate=gate, request_timeout_seconds=0.05
+    ).fetch(["NVDA"])
+    assert timed_out["timeouts"] == 1
+
+    factory.released.set()
+    assert wait_for(lambda: gate.outstanding == 0)
+    assert gate.live_workers == 0
+
+    recovered, errors = fetcher(
+        repository, provider(), provider_gate=gate, request_timeout_seconds=5
+    ).fetch(["NVDA"])
+
+    assert recovered["inserted"] == 1
+    assert not errors
+    assert repository.source_state("yahoo:NVDA")["status"] == "success"
+    assert gate.outstanding == 0
+
+
+def test_an_ordinary_timeout_and_recovery_leaks_no_threads(tmp_path, hanging):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    baseline = threading.active_count()
+
+    for _ in range(5):
+        factory = hanging()
+        fetcher(
+            repository,
+            factory,
+            provider_gate=gate,
+            request_timeout_seconds=0.05,
+            max_retries=2,
+            retry_backoff_seconds=0,
+        ).fetch(["NVDA"])
+        assert gate.live_workers == 1
+        factory.released.set()
+        assert wait_for(lambda: gate.outstanding == 0)
+
+    assert gate.live_workers == 0
+    assert not provider_threads()
+    assert wait_for(lambda: threading.active_count() == baseline)
+
+
+def test_provider_workers_are_daemons_so_a_hang_cannot_wedge_shutdown(
+    tmp_path, hanging
+):
+    """Why this is not a ThreadPoolExecutor: its workers are joined at exit."""
+
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+
+    fetcher(
+        repository, hanging(), provider_gate=gate, request_timeout_seconds=0.05
+    ).fetch(["NVDA"])
+
+    workers = provider_threads()
+    assert workers
+    assert all(worker.daemon for worker in workers)
+
+
+def test_retry_count_and_backoff_survive_the_bounded_design(tmp_path, hanging):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    delays = []
+    factory = hanging()
+
+    counts, _ = fetcher(
+        repository,
+        factory,
+        provider_gate=gate,
+        request_timeout_seconds=0.02,
+        max_retries=3,
+        retry_backoff_seconds=0.25,
+        sleep=delays.append,
+    ).fetch(["NVDA"])
+
+    assert delays == [0.25, 0.5, 1.0]
+    assert counts["retries"] == 3
+    assert repository.source_state("yahoo:NVDA")["metadata"]["attempts"] == 4
+    assert factory.calls == ["NVDA"]
+
+
+def test_a_timed_out_ticker_still_settles_its_source_state_and_run_log(
+    tmp_path, hanging
+):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+
+    fetcher(
+        repository,
+        hanging(),
+        provider_gate=gate,
+        request_timeout_seconds=0.05,
+        max_retries=1,
+        retry_backoff_seconds=0,
+    ).fetch(["NVDA"])
+
+    state = repository.source_state("yahoo:NVDA")
+    assert state["status"] == "failed"
+    assert state["metadata"]["attempts"] == 2
+    assert state["metadata"]["error_type"] == "TimeoutError"
+    assert state["last_success_at"] is None
+    run = partitions(repository)[("NVDA", today())]
+    assert run["status"] == "degraded"
+    assert run["counts"]["source_state_status"] == "failed"
+    assert run["completed_at"] is not None
+
+
+def test_a_credential_in_a_joined_request_is_redacted_when_it_finally_raises(
+    tmp_path, caplog, hanging
+):
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = hanging(raises=RuntimeError("Authorization: Bearer hung-secret"))
+    delays = []
+
+    def release_after_the_first_wait(_delay):
+        delays.append(_delay)
+        factory.released.set()
+
+    counts, errors = fetcher(
+        repository,
+        factory,
+        provider_gate=gate,
+        request_timeout_seconds=0.05,
+        max_retries=1,
+        sleep=release_after_the_first_wait,
+    ).fetch(["NVDA"])
+
+    # Attempt one timed out; attempt two joined the same request and got its
+    # exception.  One request, and the credential never escapes.
+    assert factory.calls == ["NVDA"]
+    assert gate.joined == 1
+    assert counts["tickers_failed"] == 1
+    assert "hung-secret" not in str(errors)
+    assert "hung-secret" not in caplog.text
+    assert "hung-secret" not in str(repository.source_state("yahoo:NVDA"))
+    assert "hung-secret" not in str(repository.run_log_entries(stage=STAGE))
+
+
+def test_a_provider_timeout_error_is_not_reported_as_our_budget_running_out(tmp_path):
+    """``wait`` and ``result`` are separated so the two cannot be confused."""
+
+    repository = migrated(tmp_path)
+
+    counts, errors = fetcher(
+        repository,
+        provider(raises=TimeoutError("provider closed the connection")),
+        request_timeout_seconds=5,
+    ).fetch(["NVDA"])
+
+    assert counts["timeouts"] == 1
+    assert errors[0]["error"] == "provider closed the connection"
+
+
+def test_the_gate_refuses_a_ceiling_below_one():
+    with pytest.raises(ValueError, match="at least 1"):
+        YahooProviderGate(0)
+
+
+def test_the_gate_reports_the_refusal_as_its_own_error_type(tmp_path, hanging):
+    gate = YahooProviderGate(1)
+    factory = hanging()
+
+    gate.call("TSLA", lambda: factory("TSLA"))
+    factory.wait_until_entered(1)
+
+    with pytest.raises(YahooProviderBusyError):
+        gate.call("NVDA", lambda: factory("NVDA"))
+    assert gate.outstanding == 1
+
+
+def test_a_finished_request_is_never_served_to_the_next_caller(tmp_path):
+    """A retry must re-ask the provider, not inherit the last answer.
+
+    The gate retires a request before it completes it, so a caller that has
+    seen an outcome cannot still find that request outstanding.  Without
+    that ordering a provider failing instantly is "retried" against a
+    cached exception and called exactly once.
+    """
+
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = provider(raises=RuntimeError("instant failure"))
+
+    counts, _ = fetcher(
+        repository,
+        factory,
+        provider_gate=gate,
+        max_retries=4,
+        retry_backoff_seconds=0,
+    ).fetch(["NVDA"])
+
+    assert factory.calls == ["NVDA"] * 5
+    assert counts["retries"] == 4
+    assert gate.joined == 0
+    assert gate.outstanding == 0
+
+
+def test_a_request_is_retired_before_its_answer_reaches_the_caller():
+    """The ordering that makes the previous test's guarantee airtight.
+
+    Completion is the only thing a caller observes, so retiring the request
+    first is what makes "I have an outcome" imply "that request is no longer
+    outstanding".  Asserting the retry count alone would only catch this
+    intermittently — the losing interleaving is a few microseconds wide —
+    so this checks the invariant itself, on every one of many calls.
+    """
+
+    gate = YahooProviderGate()
+
+    for index in range(200):
+        answered = gate.call(f"KEY{index}", lambda: "answer")
+        assert answered.result(timeout=5) == "answer"
+        assert gate.outstanding == 0, "answered while still holding its slot"
+        assert gate.live_workers == 0

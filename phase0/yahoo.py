@@ -32,18 +32,24 @@ wrote a ``failed`` source state from outside any transaction; here the
 failure is already durable — it is the partition's ``failed`` run-log row
 — and writing a checkpoint on top of it would claim a check that never
 completed.
+
+**What a request timeout bounds.**  ``request_timeout_seconds`` bounds the
+outstanding provider work, not merely how long the caller waits.  yfinance
+offers no way to cancel a request in flight, so the timeout cannot end the
+call; :class:`YahooProviderGate` bounds it instead, and every request goes
+through one.  See that class for the reasoning.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import Future, wait
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import logging
 import os
-from queue import Empty, Queue
 import threading
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -76,6 +82,163 @@ class YahooFetchError(RuntimeError):
         self.ticker = ticker
         self.attempts = attempts
         self.original = original
+
+
+class YahooProviderBusyError(RuntimeError):
+    """Every bounded provider slot is held by a request that has not returned."""
+
+
+#: One outstanding provider request per approved ticker.  The fetch loop is
+#: sequential, so a healthy run never holds more than one slot at a time;
+#: this is the ceiling on how much work a *hang* can leave behind.
+DEFAULT_MAX_CONCURRENT_REQUESTS = len(TICKERS)
+
+
+class YahooProviderGate:
+    """Bound the provider work outstanding at any moment.
+
+    A timeout on the caller's side does not stop the request it gave up on.
+    yfinance exposes no cancellation and no per-call timeout — ``Ticker.news``
+    takes no such argument and the library hard-codes ``timeout=30`` into its
+    own session calls — so an abandoned request keeps running until the
+    network answers it.  Timing out therefore cannot mean "the request
+    stopped"; it can only mean "we stopped waiting".  What is left to
+    guarantee is that the work we stopped waiting on cannot pile up, and
+    that is this class's whole job:
+
+    * **A hard ceiling.**  ``max_concurrent`` requests may be outstanding.
+      A request that cannot claim a slot is refused with
+      :class:`YahooProviderBusyError` rather than queued, so a hang degrades
+      the next fetch immediately instead of parking work behind it.
+    * **Single flight.**  Slots are keyed by ticker, and a caller asking for
+      a ticker whose request is still outstanding *joins* that request
+      instead of issuing an equivalent second one.  This is what keeps a
+      retry — and the next scheduled fetch — from multiplying live requests
+      against a provider that is already struggling.
+    * **A slot is freed by the request, not by the caller.**  Only the
+      worker releases its slot, in a ``finally``, so a request abandoned at
+      the timeout still counts against the ceiling for exactly as long as it
+      is really running.
+
+    The gate is deliberately not a :class:`~concurrent.futures.ThreadPoolExecutor`.
+    Its workers are non-daemon and joined at interpreter shutdown, so a hung
+    provider call would leave the process unable to exit — for a scheduled
+    job that trades a thread leak for a stuck process.  These workers are
+    daemons, capped by the same semaphore that caps the slots, so live
+    worker threads never exceed ``max_concurrent`` either.
+
+    Instances are safe to share across threads and are meant to be shared:
+    the module-level :data:`SHARED_PROVIDER_GATE` is what bounds a *process*
+    rather than a single fetcher, which is what repeated scheduled fetches
+    need.  Pass a private gate to isolate a fetcher from that ceiling.
+    """
+
+    def __init__(
+        self,
+        max_concurrent: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
+        *,
+        name: str = "yahoo-provider",
+    ) -> None:
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be at least 1")
+        self.max_concurrent = int(max_concurrent)
+        self._name = name
+        self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(self.max_concurrent)
+        self._inflight: dict[str, Future] = {}
+        self._workers: dict[str, threading.Thread] = {}
+        self._joined = 0
+
+    def call(self, key: str, work: Callable[[], Any]) -> Future:
+        """Return the outstanding request for *key*, starting one if needed.
+
+        Raises :class:`YahooProviderBusyError` when no slot is free.  The
+        returned future is shared by every caller that joined it, so waiting
+        on it must never mutate it.
+        """
+
+        with self._lock:
+            pending = self._inflight.get(key)
+            if pending is not None:
+                # Joining is the point: an equivalent request is already
+                # consuming a slot, and a second one would not make the
+                # provider answer sooner.
+                self._joined += 1
+                return pending
+            if not self._slots.acquire(blocking=False):
+                raise YahooProviderBusyError(
+                    f"all {self.max_concurrent} Yahoo provider slots are held by "
+                    f"requests that have not returned; refused {key}"
+                )
+            future: Future = Future()
+            worker = threading.Thread(
+                target=self._run,
+                args=(key, work, future),
+                name=f"{self._name}-{key}",
+                daemon=True,
+            )
+            # Registered before the worker can reach its cleanup, which needs
+            # this same lock, so the entry can never outlive the request.
+            self._inflight[key] = future
+            self._workers[key] = worker
+            worker.start()
+            return future
+
+    def _run(self, key: str, work: Callable[[], Any], future: Future) -> None:
+        future.set_running_or_notify_cancel()
+        try:
+            outcome, failure = work(), None
+        except BaseException as exc:  # surfaced to whoever is still waiting
+            outcome, failure = None, exc
+        # Retire the request *before* answering it.  A caller only learns the
+        # outcome once the future completes, so completing last means the
+        # registry entry is always gone by then — and a retry can never be
+        # handed the previous attempt's answer without the provider being
+        # asked again.  Joining is for requests that are genuinely still in
+        # flight, which is the only case where a second one would be waste.
+        with self._lock:
+            self._inflight.pop(key, None)
+            self._workers.pop(key, None)
+        self._slots.release()
+        if failure is not None:
+            future.set_exception(failure)
+        else:
+            future.set_result(outcome)
+
+    # -- Introspection ---------------------------------------------------
+
+    @property
+    def outstanding(self) -> int:
+        """Requests holding a slot, including ones their caller gave up on."""
+
+        with self._lock:
+            return len(self._inflight)
+
+    @property
+    def outstanding_keys(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._inflight))
+
+    @property
+    def live_workers(self) -> int:
+        """Worker threads still executing provider work."""
+
+        with self._lock:
+            workers = tuple(self._workers.values())
+        return sum(1 for worker in workers if worker.is_alive())
+
+    @property
+    def joined(self) -> int:
+        """Calls served by an already-outstanding request instead of a new one."""
+
+        with self._lock:
+            return self._joined
+
+
+#: Process-wide ceiling.  A fetcher constructed without a gate uses this one,
+#: so a fresh fetcher per scheduled run cannot escape the bound by bringing
+#: its own slots.
+SHARED_PROVIDER_GATE = YahooProviderGate()
 
 
 def partition_run_id(base_run_id: str, ticker: str, trading_day: str) -> str:
@@ -252,6 +415,7 @@ class YahooFinanceFetcher:
         throttle_seconds: float = 0,
         sleep: Callable[[float], None] = time.sleep,
         pipeline_version: str = "phase0-v1",
+        provider_gate: YahooProviderGate | None = None,
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -269,6 +433,11 @@ class YahooFinanceFetcher:
         self.throttle_seconds = float(throttle_seconds)
         self._sleep = sleep
         self.pipeline_version = pipeline_version.strip()
+        # Shared by default: a scheduler that builds a fetcher per run must
+        # not get a fresh set of slots with it.
+        self.provider_gate = (
+            SHARED_PROVIDER_GATE if provider_gate is None else provider_gate
+        )
 
     # -- Provider access -------------------------------------------------
 
@@ -287,30 +456,33 @@ class YahooFinanceFetcher:
         return list(factory(ticker).news or [])
 
     def _news_with_timeout(self, ticker: str) -> list[Any]:
-        outcomes: Queue[tuple[bool, Any]] = Queue(maxsize=1)
+        """Wait out this attempt's budget on the gate's request for *ticker*.
 
-        def load() -> None:
-            try:
-                outcomes.put((True, self._news(ticker)))
-            except Exception as exc:
-                outcomes.put((False, exc))
+        The request is not ours to stop.  Giving up on it only ends our
+        wait; the gate goes on accounting for it until it really returns,
+        which is what stops the next attempt from starting another one.
+        """
 
-        threading.Thread(
-            target=load,
-            name=f"yahoo-{ticker}",
-            daemon=True,
-        ).start()
-        try:
-            succeeded, result = outcomes.get(timeout=self.request_timeout_seconds)
-        except Empty as exc:
+        request = self.provider_gate.call(ticker, lambda: self._news(ticker))
+        finished, _ = wait([request], timeout=self.request_timeout_seconds)
+        if not finished:
             raise TimeoutError(
                 f"Yahoo request exceeded {self.request_timeout_seconds:g}s"
-            ) from exc
-        if not succeeded:
-            raise result
-        return result
+            )
+        # Distinct from the branch above on purpose: a provider that raises
+        # ``TimeoutError`` of its own must not be reported as our budget
+        # running out.
+        return request.result()
 
     def _news_with_retry(self, ticker: str) -> tuple[list[Any], int]:
+        """Retry the *wait*, not the request.
+
+        Attempt counting and backoff are unchanged, but a retry that finds
+        the previous request still outstanding joins it rather than issuing
+        a second one — so a provider that hangs costs one live request per
+        ticker no matter how many attempts are configured.
+        """
+
         attempts = self.max_retries + 1
         for attempt in range(1, attempts + 1):
             try:
@@ -485,6 +657,8 @@ class YahooFinanceFetcher:
             counts["tickers_failed"] += 1
             if isinstance(exc.original, TimeoutError):
                 counts["timeouts"] += 1
+            elif isinstance(exc.original, YahooProviderBusyError):
+                counts["provider_busy"] += 1
             message = redact_secrets(str(exc.original))
             errors.append({"ticker": ticker, "error": message})
             LOGGER.error(
@@ -647,6 +821,7 @@ class YahooFinanceFetcher:
             "invalid_evidence_duplicates": 0,
             "retries": 0,
             "timeouts": 0,
+            "provider_busy": 0,
             "partitions": 0,
             "tickers_succeeded": 0,
             "tickers_partial": 0,
@@ -678,10 +853,14 @@ class YahooFinanceFetcher:
 
 
 __all__ = [
+    "DEFAULT_MAX_CONCURRENT_REQUESTS",
+    "SHARED_PROVIDER_GATE",
     "STAGE",
     "TICKERS",
     "YahooFetchError",
     "YahooFinanceFetcher",
+    "YahooProviderBusyError",
+    "YahooProviderGate",
     "effective_day",
     "normalize_yahoo_item",
     "partition_run_id",
