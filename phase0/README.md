@@ -22,6 +22,8 @@ AC-8 replayability would have had to be built on top of it anyway.
 | `scalars.py` | the two scalar policies: redact diagnostics, reject identity |
 | `embeddings.py` | validation for M1's durable embedding cache |
 | `errors.py` | typed errors (`Phase0ValidationError` is a `ValueError`) |
+| `yahoo.py` | issue #61's Yahoo headline fetch, settled through `stage_run` |
+| `urls.py` | URL canonicalization applied before a raw item is inserted |
 
 ## Guarantees
 
@@ -1198,3 +1200,57 @@ Two more things to expect on rebase:
   their relationships, or to `legacy-v0` when they have none; a row
   attached to two different versions fails the migration rather than being
   assigned one arbitrarily.
+
+## How #82 (Yahoo, issue #61) was ported onto this contract
+
+`yahoo.py` is the first consumer rebased onto the final surface, so it is
+also the worked example of the table above. Everything it used is gone:
+`insert_raw_items`, `set_source_state`, `log_stage`, and the public
+`connect()` its tests read through.
+
+**One response fans out into several partitions.** A single request for a
+single symbol routinely returns articles published across several days,
+and a run may speak for exactly one ticker-day. So the fetcher groups the
+normalized batch by the *same* day derivation the repository uses —
+`published_at` falling back to `fetched_at`, spelled once in
+`yahoo.effective_day` — and opens one run per group. If those two
+derivations ever drift, batches this module considers same-day get
+rejected on arrival, which is the failure mode to look for.
+
+**The run identity carries the partition.** `run_log` is
+`UNIQUE(run_id, stage)` and recording one identity against a second
+partition is refused, not merged — so a base id shared across the days of
+one response would fail to persist the second day at all.
+`yahoo.partition_run_id` spells the identity `<base>:<ticker>:<day>`.
+
+**The source-state checkpoint rides on the fetch-day partition.** Source
+state is keyed by feed and answers "when did we last check this feed",
+which is the fetch day, not the day an article was published — and a
+stated `checked_at` must fall on its run's day anyway, so no other
+partition would accept it. It is written last, as that run's `terminal`
+mutation, which is what makes the feed's checkpoint and the run that
+wrote it commit together. Published-day partitions settle first, so the
+checkpoint never claims the feed was checked before the evidence it
+describes is durable.
+
+**Handled provider outcomes use the repository's own vocabulary.**
+`success`, `partial`, `empty`, and `failed` are `SOURCE_STATE_STATUSES`,
+so the checkpoint and the run describe one event in one language. A
+failed checkpoint resolves to a `degraded` run — `record_source_state`
+counts a failed state as partial — and never to `success`. That is the
+contradiction worth guarding: a run claiming clean success over a
+checkpoint that says the fetch failed.
+
+**A failed persist leaves the checkpoint alone.** The old code wrote a
+`failed` source state from outside any transaction. Here the failure is
+already durable — it is the partition's `failed` run-log row — and
+stamping the feed on top of it would claim a check that never completed.
+A complete *provider* failure is different: there is no evidence to
+ingest, so the checkpoint is the run's only mutation and therefore its
+terminal one. That is the path that used to call `log_stage`.
+
+**`fetch()` no longer takes a `trading_day`.** A run's day is a partition
+identity the evidence decides, not a label a caller supplies; an override
+could only be ignored or fatal. The aggregate counters `fetch()` returns
+are a summary for its caller — the durable audit is one `run_log` row per
+ticker-day, written inside the same transaction as the data.
