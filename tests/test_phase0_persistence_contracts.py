@@ -8801,6 +8801,364 @@ def test_a_story_may_move_between_themes_across_settlements(tmp_path):
     assert len({theme_id for theme_id, _ in membership}) == 1
 
 
+# ----------------------------------------------------------------------
+# A reallocation is one move, not two halves
+#
+# A story and a citation each belong to one theme in a partition, and the
+# database enforces that on every insert. Settling theme by theme asked
+# it to accept a *partial* rearrangement: the theme gaining a story
+# inserted while the theme losing it still held it. That is a valid
+# outcome half-applied, and a trigger sees only the row in front of it.
+#
+# One-way moves worked when the donor happened to come first in the
+# caller's list and failed when it came second; a swap had no ordering
+# that worked at all. The settlement now decides, then releases every
+# relation that is moving, then writes — three passes inside the one
+# transaction that already covered the whole reconciliation.
+# ----------------------------------------------------------------------
+
+
+def shared_item_partition(repository, memberships, ticker="NVDA"):
+    """A partition of stories, each owning the raw items listed by index.
+
+    `memberships` maps a fingerprint to raw-item *indices*, so one item
+    can deliberately belong to two stories — which is what makes a
+    citation move between themes possible without a story moving with it.
+    """
+
+    total = 1 + max(index for indices in memberships.values() for index in indices)
+    items = seed_raw_items(repository, total, ticker=ticker)
+    records = [
+        StoryRecord(
+            cluster_fingerprint=fingerprint,
+            canonical_title=f"Story {fingerprint}",
+            members=tuple(
+                StoryMemberRecord(
+                    raw_item_id=items[index], position=slot, outlet=f"O{index}"
+                )
+                for slot, index in enumerate(indices)
+            ),
+            canonical_item_id=items[indices[0]],
+            outlet_count=len(indices),
+            content_hash=f"h-{fingerprint}",
+            stage="m3.semantic",
+        )
+        for fingerprint, indices in memberships.items()
+    ]
+    reconcile_stories(
+        repository,
+        ticker=ticker,
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=records,
+    )
+    ids = {
+        str(row["cluster_fingerprint"]): int(row["id"])
+        for row in repository.stories_for_day(DAY, ticker)
+    }
+    return ids, items
+
+
+def relations(repository) -> dict[str, list[tuple[str, int]]]:
+    """Memberships and citations keyed by theme *fingerprint*.
+
+    By fingerprint rather than by row id, because a settlement that
+    rebuilt a theme instead of updating it would still look right under
+    ids alone.
+    """
+
+    with repository.admin.connect_writable() as connection:
+        names = {
+            int(row["id"]): str(row["fingerprint"])
+            for row in connection.execute("SELECT id, fingerprint FROM themes")
+        }
+        return {
+            "stories": sorted(
+                (names[int(row["theme_id"])], int(row["story_id"]))
+                for row in connection.execute(
+                    "SELECT theme_id, story_id FROM theme_stories"
+                )
+            ),
+            "citations": sorted(
+                (names[int(row["theme_id"])], int(row["raw_item_id"]))
+                for row in connection.execute(
+                    "SELECT theme_id, raw_item_id FROM theme_citations"
+                )
+            ),
+        }
+
+
+#: label, story layout, themes before, themes after — each theme given as
+#: (fingerprint, story fingerprints, raw-item indices).
+REALLOCATIONS = [
+    (
+        "one-way-story-move",
+        {"X": [0], "Y": [1], "Z": [2]},
+        [("A", ["X", "Z"], [0, 2]), ("B", ["Y"], [1])],
+        [("A", ["Z"], [2]), ("B", ["Y", "X"], [1, 0])],
+    ),
+    (
+        "one-way-citation-move",
+        {"X": [0, 1], "Y": [0, 2]},
+        [("A", ["X"], [0, 1]), ("B", ["Y"], [2])],
+        [("A", ["X"], [1]), ("B", ["Y"], [2, 0])],
+    ),
+    (
+        "story-swap",
+        {"X": [0], "Y": [1]},
+        [("A", ["X"], [0]), ("B", ["Y"], [1])],
+        [("A", ["Y"], [1]), ("B", ["X"], [0])],
+    ),
+    (
+        "citation-swap",
+        {"X": [0, 1], "Y": [0, 1]},
+        [("A", ["X"], [0]), ("B", ["Y"], [1])],
+        [("A", ["X"], [1]), ("B", ["Y"], [0])],
+    ),
+    (
+        "three-way-rotation",
+        {"X": [0], "Y": [1], "Z": [2]},
+        [("A", ["X"], [0]), ("B", ["Y"], [1]), ("C", ["Z"], [2])],
+        [("A", ["Y"], [1]), ("B", ["Z"], [2]), ("C", ["X"], [0])],
+    ),
+]
+
+
+def build_themes(spec, ids, items):
+    return [
+        a_theme(
+            fingerprint,
+            [ids[name] for name in story_names],
+            [items[index] for index in item_indices],
+            rank + 1,
+        )
+        for rank, (fingerprint, story_names, item_indices) in enumerate(spec)
+    ]
+
+
+def expected_relations(spec, ids, items):
+    return {
+        "stories": sorted(
+            (fingerprint, ids[name])
+            for fingerprint, story_names, _ in spec
+            for name in story_names
+        ),
+        "citations": sorted(
+            (fingerprint, items[index])
+            for fingerprint, _, item_indices in spec
+            for index in item_indices
+        ),
+    }
+
+
+@pytest.mark.parametrize("order", ["as-given", "reversed"])
+@pytest.mark.parametrize(
+    "label, layout, before, after",
+    REALLOCATIONS,
+    ids=[case[0] for case in REALLOCATIONS],
+)
+def test_a_reallocation_between_live_themes_settles(
+    tmp_path, label, layout, before, after, order
+):
+    """Cases 1-6, each run with the themes listed both ways round.
+
+    The reversal is not decoration: before this fix the one-way move
+    settled with the donor listed first and failed with it listed second,
+    so the same valid reallocation succeeded or failed on input order
+    alone.
+    """
+
+    repository = migrated(tmp_path, f"{label}-{order}.db")
+    ids, items = shared_item_partition(repository, layout)
+    settle_themes(repository, build_themes(before, ids, items))
+
+    moved = build_themes(after, ids, items)
+    if order == "reversed":
+        moved = list(reversed(moved))
+    report = settle_themes(repository, moved)
+
+    assert relations(repository) == expected_relations(after, ids, items)
+    # Every theme changed, and each was updated in place rather than
+    # dropped and recreated.
+    assert report.inserted == () and report.deleted == ()
+    assert len(report.updated) == len(after)
+
+
+@pytest.mark.parametrize(
+    "label, layout, before, after",
+    REALLOCATIONS,
+    ids=[case[0] for case in REALLOCATIONS],
+)
+def test_a_reallocation_replays_unchanged(tmp_path, label, layout, before, after):
+    """Case 7: having moved, the same input moves nothing."""
+
+    repository = migrated(tmp_path)
+    ids, items = shared_item_partition(repository, layout)
+    settle_themes(repository, build_themes(before, ids, items))
+    settle_themes(repository, build_themes(after, ids, items))
+    settled = relations(repository)
+
+    replay = settle_themes(repository, build_themes(after, ids, items))
+
+    assert replay.inserted == () and replay.updated == () and replay.deleted == ()
+    assert len(replay.unchanged) == len(after)
+    assert replay.changed_outputs == ()
+    assert relations(repository) == settled
+
+
+def test_an_unchanged_theme_is_not_rebuilt_while_others_move(tmp_path):
+    """Only what is moving is released.
+
+    A theme whose stored relations already are the answer keeps them —
+    nothing can be waiting on them, because a final state where two themes
+    want the same story never reaches the write.
+    """
+
+    repository = migrated(tmp_path)
+    ids, items = shared_item_partition(
+        repository, {"X": [0], "Y": [1], "Z": [2], "W": [3]}
+    )
+    settle_themes(
+        repository,
+        build_themes(
+            [("A", ["X"], [0]), ("B", ["Y"], [1]), ("STILL", ["W"], [3])], ids, items
+        ),
+    )
+
+    report = settle_themes(
+        repository,
+        build_themes(
+            [("A", ["Y"], [1]), ("B", ["X"], [0]), ("STILL", ["W"], [3])], ids, items
+        ),
+    )
+
+    assert len(report.updated) == 2 and len(report.unchanged) == 1
+    assert relations(repository)["stories"] == sorted(
+        [("A", ids["Y"]), ("B", ids["X"]), ("STILL", ids["W"])]
+    )
+
+
+INVALID_FINAL_STATES = [
+    (
+        "duplicate-membership",
+        {"X": [0, 1], "Y": [2]},
+        [("A", ["X"], [0]), ("B", ["Y"], [2])],
+        [("A", ["X"], [0]), ("B", ["X", "Y"], [1, 2])],
+        "a story belongs to exactly one theme",
+    ),
+    (
+        "duplicate-citation",
+        {"X": [0, 1], "Y": [0, 2]},
+        [("A", ["X"], [0]), ("B", ["Y"], [2])],
+        [("A", ["X"], [0]), ("B", ["Y"], [0, 2])],
+        "citable",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label, layout, before, after, message",
+    INVALID_FINAL_STATES,
+    ids=[case[0] for case in INVALID_FINAL_STATES],
+)
+def test_an_invalid_final_state_is_still_refused(
+    tmp_path, label, layout, before, after, message
+):
+    """Cases 8 and 9: staging the writes did not soften the outcome.
+
+    The triggers were never wrong — they were being shown a valid answer
+    half-applied. Shown a genuinely invalid one, they still refuse, and
+    the reconciliation leaves the partition exactly as it was.
+    """
+
+    repository = migrated(tmp_path)
+    ids, items = shared_item_partition(repository, layout)
+    settle_themes(repository, build_themes(before, ids, items))
+    settled = relations(repository)
+
+    with pytest.raises((Phase0ValidationError, sqlite3.IntegrityError), match=message):
+        settle_themes(repository, build_themes(after, ids, items))
+
+    assert relations(repository) == settled
+
+
+def test_a_failure_after_the_release_rolls_back_to_the_original(tmp_path):
+    """Case 10: the release is inside the transaction, not ahead of it.
+
+    The window this fix opens — relations cleared, replacements not yet
+    written — is the one that must not survive a failure. The injected
+    error lands squarely in it.
+    """
+
+    repository = migrated(tmp_path)
+    ids, items = shared_item_partition(repository, {"X": [0], "Y": [1]})
+    settle_themes(
+        repository, build_themes([("A", ["X"], [0]), ("B", ["Y"], [1])], ids, items)
+    )
+    before = relations(repository)
+    theme_rows = repository.theme_set(
+        ticker="NVDA", trading_day=DAY, pipeline_version="v1"
+    )
+
+    boom = RuntimeError("injected between the release and the rewrite")
+    original = Phase0Repository._update_reconciled_theme
+    calls = {"count": 0}
+
+    def explode(self, connection, theme_id, values):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # The first rewrite, after *both* themes have been released.
+            raise boom
+        return original(self, connection, theme_id, values)
+
+    with mock.patch.object(Phase0Repository, "_update_reconciled_theme", explode):
+        with pytest.raises(RuntimeError, match="injected between"):
+            settle_themes(
+                repository,
+                build_themes([("A", ["Y"], [1]), ("B", ["X"], [0])], ids, items),
+            )
+
+    assert calls["count"] == 1
+    assert relations(repository) == before
+    assert (
+        repository.theme_set(ticker="NVDA", trading_day=DAY, pipeline_version="v1")
+        == theme_rows
+    )
+
+
+def test_coverage_and_exclusions_survive_a_reallocation(tmp_path):
+    """Case 11: the other two buckets are untouched by the move."""
+
+    repository = migrated(tmp_path)
+    ids, items = shared_item_partition(
+        repository, {"X": [0], "Y": [1], "OTHER": [2], "GONE": [3]}
+    )
+    accounting = {
+        "other": [OtherCoverageRecord(ids["OTHER"], "clustering_noise")],
+        "excluded": [ExcludedStoryRecord(ids["GONE"], "no_encodable_text")],
+    }
+    settle_themes(
+        repository,
+        build_themes([("A", ["X"], [0]), ("B", ["Y"], [1])], ids, items),
+        **accounting,
+    )
+    before = repository.theme_set(ticker="NVDA", trading_day=DAY, pipeline_version="v1")
+
+    report = settle_themes(
+        repository,
+        build_themes([("A", ["Y"], [1]), ("B", ["X"], [0])], ids, items),
+        **accounting,
+    )
+
+    after = repository.theme_set(ticker="NVDA", trading_day=DAY, pipeline_version="v1")
+    assert report.changed_outputs == ()
+    assert after["other_coverage"] == before["other_coverage"]
+    assert after["excluded"] == before["excluded"]
+    assert relations(repository)["stories"] == sorted(
+        [("A", ids["Y"]), ("B", ids["X"])]
+    )
+
+
 def test_direct_sql_cannot_put_a_story_in_a_second_theme(tmp_path):
     """Hostile cases 8 and 9: the rule is in the database, not only above it."""
 

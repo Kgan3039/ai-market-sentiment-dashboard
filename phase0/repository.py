@@ -3629,9 +3629,34 @@ class Phase0Repository:
                     (theme_set_id,),
                 )
 
+            # Decide everything, then clear, then write.
+            #
+            # A story or a citation belongs to one theme in a partition,
+            # and the database enforces that on every insert.  Settling
+            # theme by theme therefore asks it to accept a *partial*
+            # rearrangement: the theme gaining a story inserts while the
+            # theme losing it still holds it.  That is not an invalid
+            # outcome, it is a valid outcome half-applied — but a trigger
+            # sees only the row in front of it, and rightly refuses.
+            #
+            # One-way moves happened to work when the donor came first in
+            # the caller's list and failed when it came second, so the
+            # same reallocation succeeded or failed on input order alone.
+            # A swap has no ordering that works: whichever theme goes
+            # first claims what the other still holds.
+            #
+            # Three passes fix it without touching a single trigger.
+            # Classification reads stored relations, so it must finish
+            # before anything is cleared; the clear must finish before
+            # anything is inserted; and both live in the transaction that
+            # already covers the whole reconciliation, so a failure in
+            # any pass rolls all of them back together.
             inserted: list[int] = []
             updated: list[int] = []
             unchanged: list[int] = []
+            reallocated: list[tuple[int, Mapping[str, Any]]] = []
+            new_themes: list[Mapping[str, Any]] = []
+
             for fingerprint, values in incoming.items():
                 self._assert_story_membership(
                     connection,
@@ -3642,20 +3667,42 @@ class Phase0Repository:
                 )
                 row = existing.get(fingerprint)
                 if row is None:
-                    inserted.append(
-                        self._insert_reconciled_theme(
-                            connection, normalized_ticker, day, version, values
-                        )
-                    )
+                    new_themes.append(values)
                     continue
                 theme_id = int(row["id"])
                 if self._stored_theme_signature(connection, row) == (
                     self._theme_signature(values)
                 ):
+                    # Its stored relations already are the answer, so they
+                    # are left alone rather than rebuilt — and nothing else
+                    # can be waiting on them, because a final state where
+                    # two themes want the same story never gets this far.
                     unchanged.append(theme_id)
                     continue
+                reallocated.append((theme_id, values))
+
+            # Every relation that is moving is released before any of it is
+            # claimed.  Citations go first for the same reason they do in
+            # `_delete_themes`: a citation is guarded against losing the
+            # member story underneath it.
+            for theme_id, _ in reallocated:
+                connection.execute(
+                    "DELETE FROM theme_citations WHERE theme_id = ?", (theme_id,)
+                )
+            for theme_id, _ in reallocated:
+                connection.execute(
+                    "DELETE FROM theme_stories WHERE theme_id = ?", (theme_id,)
+                )
+
+            for theme_id, values in reallocated:
                 self._update_reconciled_theme(connection, theme_id, values)
                 updated.append(theme_id)
+            for values in new_themes:
+                inserted.append(
+                    self._insert_reconciled_theme(
+                        connection, normalized_ticker, day, version, values
+                    )
+                )
 
             if rewrite_other:
                 for entry in coverage["other"]:
@@ -4041,10 +4088,18 @@ class Phase0Repository:
         theme_id: int,
         values: Mapping[str, Any],
     ) -> None:
-        connection.execute(
-            "DELETE FROM theme_citations WHERE theme_id = ?", (theme_id,)
-        )
-        connection.execute("DELETE FROM theme_stories WHERE theme_id = ?", (theme_id,))
+        """Rewrite one theme's columns and relations.
+
+        **The caller must already have released this theme's stories and
+        citations.**  This used to clear them itself, which read as
+        self-contained and was the whole defect: clearing per theme means
+        the theme gaining a story inserts while the theme losing it still
+        holds it, and the partition's one-theme-per-story rule refuses the
+        half-applied state.  The release is now a pass of its own in
+        `_reconcile_themes_unlogged`, across every theme that is changing,
+        and doing it here as well would only hide that it has to.
+        """
+
         columns = self._theme_column_values(values)
         assignments = ", ".join(f"{column} = ?" for column in columns)
         connection.execute(

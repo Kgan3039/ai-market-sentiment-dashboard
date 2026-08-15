@@ -494,6 +494,33 @@ decision, and 011 set the policy when it could not infer a legacy
 `pipeline_version`: abort, roll back, and leave it to an operator. Once
 resolved, the upgrade goes through.
 
+**A reallocation is one move, not two halves.** Because a story and a
+citation each belong to one theme, settling theme by theme asks the
+database to accept a *partial* rearrangement: the theme gaining a story
+inserts while the theme losing it still holds it. That is not an invalid
+outcome, it is a valid outcome half-applied — and a trigger sees only the
+row in front of it, so it rightly refuses. One-way moves worked when the
+donor happened to come first in the caller's list and failed when it came
+second, so the same reallocation succeeded or failed on input order
+alone; a swap had no ordering that worked at all.
+
+The fix is in the write order, not in the rules. `reconcile_themes` makes
+three passes: classify every incoming theme against what is stored,
+**then** release the stories and citations of every theme that is
+changing, **then** write the replacements. Citations are released before
+memberships, for the same reason `_delete_themes` releases them in that
+order — a citation is guarded against losing the member story underneath
+it. All three passes sit in the transaction that already covered the
+whole reconciliation, so the window where relations are released and not
+yet rewritten cannot outlive a failure.
+
+A theme whose stored relations already are the answer is left alone
+rather than rebuilt, and nothing can be waiting on it: a final state
+where two themes want the same story is refused before any of this, by
+the check above. `_update_reconciled_theme` no longer clears anything
+itself — reading as self-contained is exactly what made the interleaving
+easy to write.
+
 **A report accounts for everything the operation writes, not only what it
 can name by id.** `ReconciliationReport`'s tuples hold row ids, so they
 can only describe rows keyed by a fingerprint: stories, or themes.
