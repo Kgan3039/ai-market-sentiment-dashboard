@@ -8,11 +8,13 @@ where I1 puts it, in ``run_log`` rows written inside the same transaction
 as the data.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import inspect
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -1590,3 +1592,265 @@ def test_a_request_is_retired_before_its_answer_reaches_the_caller():
         assert answered.result(timeout=5) == "answer"
         assert gate.outstanding == 0, "answered while still holding its slot"
         assert gate.live_workers == 0
+
+
+# ---------------------------------------------------------------------------
+# A worker that never starts
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def thread_start_fails(error=None):
+    """Make ``Thread.start`` fail the way an exhausted process makes it fail.
+
+    This is the one path where the worker never reaches ``_run``, so nothing
+    but ``call`` itself can undo the registration and the slot ``call``
+    already took.
+    """
+
+    failure = error if error is not None else RuntimeError("can't start new thread")
+    with patch.object(threading.Thread, "start", side_effect=failure):
+        yield failure
+
+
+def free_slots(gate, build_hanging):
+    """Requests *gate* will really start right now, and gives them back.
+
+    Occupancy is the thing under test, so this counts the slots the gate
+    actually hands out.  A mock's call count would prove only that ``call``
+    reached the semaphore, which is exactly what a leaked slot also does.
+    """
+
+    held = gate.outstanding
+    factory = build_hanging()
+    started = 0
+    while True:
+        key = f"CAPACITY{started}"
+        try:
+            gate.call(key, lambda key=key: factory(key))
+        except YahooProviderBusyError:
+            break
+        started += 1
+    factory.wait_until_entered(started)
+    factory.released.set()
+    assert wait_for(
+        lambda: gate.outstanding == held
+    ), "measuring capacity leaked a slot of its own"
+    return started
+
+
+def test_a_worker_that_fails_to_start_leaves_no_trace_on_the_gate(hanging):
+    """The reserved slot and both registries are undone by the failure itself.
+
+    ``call`` takes a slot and registers the request before it has a running
+    worker.  If starting that worker raises, the request it registered will
+    never run and never retire itself, so ``call`` is the only code left
+    that can give the slot back.
+    """
+
+    gate = YahooProviderGate(2)
+
+    with thread_start_fails() as failure:
+        with pytest.raises(RuntimeError) as raised:
+            gate.call("NVDA", lambda: "never asked for")
+
+    assert raised.value is failure
+    assert gate.outstanding == 0
+    assert gate.outstanding_keys == ()
+    assert gate.live_workers == 0
+    assert free_slots(gate, hanging) == 2
+
+
+def test_the_same_ticker_starts_normally_after_a_failed_start():
+    """A failed start must not become a permanent refusal for its ticker."""
+
+    gate = YahooProviderGate(2)
+
+    with thread_start_fails():
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "never asked for")
+
+    answered = gate.call("NVDA", lambda: "answer")
+
+    assert answered.result(timeout=5) == "answer"
+    assert gate.outstanding == 0
+    assert gate.live_workers == 0
+
+
+def test_an_unrelated_ticker_starts_normally_after_a_failed_start():
+    """One ticker's failed start must not cost another ticker its capacity."""
+
+    gate = YahooProviderGate(2)
+
+    with thread_start_fails():
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "never asked for")
+
+    answered = gate.call("TSLA", lambda: "answer")
+
+    assert answered.result(timeout=5) == "answer"
+    assert gate.outstanding == 0
+
+
+def test_repeated_failed_starts_never_erode_the_ceiling(hanging):
+    """The leak's real cost: a gate that refuses everything, one call later.
+
+    A single lost slot is survivable; losing one per failed start is what
+    turns a transient thread-exhaustion into a fetcher that reports every
+    later ticker as provider-busy for the life of the process.
+    """
+
+    gate = YahooProviderGate(2)
+
+    for _ in range(20):
+        with thread_start_fails():
+            with pytest.raises(RuntimeError):
+                gate.call("NVDA", lambda: "never asked for")
+
+    assert gate.outstanding == 0
+    assert gate.live_workers == 0
+    assert free_slots(gate, hanging) == 2
+
+
+def test_a_failed_start_frees_its_own_slot_and_only_its_own(hanging):
+    """Cleanup is scoped to the failed request, not to the gate."""
+
+    gate = YahooProviderGate(3)
+    factory = hanging()
+
+    gate.call("TSLA", lambda: factory("TSLA"))
+    factory.wait_until_entered(1)
+
+    with thread_start_fails():
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "never asked for")
+
+    # The request that really is outstanding still holds exactly one slot.
+    assert gate.outstanding == 1
+    assert gate.outstanding_keys == ("TSLA",)
+    assert gate.live_workers == 1
+    assert free_slots(gate, hanging) == 2
+
+
+def test_a_started_worker_keeps_its_slot_until_the_provider_returns(hanging):
+    """The half of the contract the cleanup must not overshoot.
+
+    A slot is freed by the request, not by the caller.  Undoing a *failed*
+    start must not soften that: a worker that really started still holds its
+    slot for as long as the provider has not answered.
+    """
+
+    gate = YahooProviderGate(2)
+    factory = hanging()
+
+    request = gate.call("NVDA", lambda: factory("NVDA"))
+    factory.wait_until_entered(1)
+
+    assert gate.outstanding == 1
+    assert gate.live_workers == 1
+    assert free_slots(gate, hanging) == 1
+
+    factory.released.set()
+    assert request.result(timeout=5).news
+
+    assert wait_for(lambda: gate.outstanding == 0)
+    assert free_slots(gate, hanging) == 2
+
+
+def test_a_start_that_raises_after_the_worker_ran_still_frees_one_slot(hanging):
+    """The double-release that exactly-once retirement exists to prevent.
+
+    ``Thread.start`` raising means the worker never ran — but the gate must
+    not rest on that.  Should both the failed ``call`` and a worker that did
+    run reach for the same request's slot, freeing it twice would either
+    raise out of the ``BoundedSemaphore`` or, worse, quietly raise the
+    process-wide ceiling by one.
+    """
+
+    gate = YahooProviderGate(2)
+    real_start = threading.Thread.start
+
+    def start_then_fail(self):
+        real_start(self)
+        raise RuntimeError("can't start new thread")
+
+    with patch.object(threading.Thread, "start", start_then_fail):
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "answer")
+
+    assert wait_for(lambda: gate.outstanding == 0)
+    assert gate.live_workers == 0
+    assert free_slots(gate, hanging) == 2
+
+
+def test_a_failed_start_leaves_nothing_for_the_next_caller_to_join(hanging):
+    """Single flight must not offer a request that was never issued.
+
+    A stale registration is worse than a lost slot: the next caller is
+    handed a future no worker will ever complete, so it does not fail — it
+    waits out its whole budget against a request that does not exist.
+    """
+
+    gate = YahooProviderGate(2)
+
+    with thread_start_fails():
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "never asked for")
+
+    assert gate.outstanding_keys == ()
+
+    factory = hanging()
+    request = gate.call("NVDA", lambda: factory("NVDA"))
+    # Entering the provider is the proof: this is a new request, not the
+    # failed start's registration handed back to us.
+    factory.wait_until_entered(1)
+
+    assert gate.joined == 0
+    assert gate.outstanding_keys == ("NVDA",)
+
+    factory.released.set()
+    assert request.result(timeout=5).news
+
+
+def test_a_worker_that_never_starts_settles_the_partition_as_a_failure(
+    tmp_path, hanging
+):
+    """The startup failure reaches the caller as an ordinary failed fetch.
+
+    The gate propagates it, the retry loop wraps it like any other provider
+    error, and the partition settles through the run lifecycle — so the
+    ticker is recorded as failed rather than silently skipped.
+    """
+
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate()
+    factory = provider()
+
+    with thread_start_fails():
+        counts, errors = fetcher(
+            repository,
+            factory,
+            provider_gate=gate,
+            max_retries=1,
+            retry_backoff_seconds=0,
+        ).fetch(["NVDA"])
+
+    assert factory.calls == []  # the provider was never reached
+    assert counts["tickers_failed"] == 1
+    assert counts["partitions"] == 1
+    assert counts["timeouts"] == 0
+    assert counts["provider_busy"] == 0
+    assert errors[0]["ticker"] == "NVDA"
+
+    state = repository.source_state("yahoo:NVDA")
+    assert state["status"] == "failed"
+    assert state["metadata"]["error_type"] == "RuntimeError"
+    assert state["last_success_at"] is None
+    run = partitions(repository)[("NVDA", today())]
+    assert run["counts"] == {
+        "source_states_recorded": 1,
+        "source_state_status": "failed",
+    }
+
+    assert gate.outstanding == 0
+    assert free_slots(gate, hanging) == gate.max_concurrent

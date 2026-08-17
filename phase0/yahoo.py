@@ -157,32 +157,64 @@ class YahooProviderGate:
         on it must never mutate it.
         """
 
-        with self._lock:
-            pending = self._inflight.get(key)
-            if pending is not None:
-                # Joining is the point: an equivalent request is already
-                # consuming a slot, and a second one would not make the
-                # provider answer sooner.
-                self._joined += 1
-                return pending
-            if not self._slots.acquire(blocking=False):
-                raise YahooProviderBusyError(
-                    f"all {self.max_concurrent} Yahoo provider slots are held by "
-                    f"requests that have not returned; refused {key}"
+        free_slot = False
+        try:
+            with self._lock:
+                pending = self._inflight.get(key)
+                if pending is not None:
+                    # Joining is the point: an equivalent request is already
+                    # consuming a slot, and a second one would not make the
+                    # provider answer sooner.
+                    self._joined += 1
+                    return pending
+                if not self._slots.acquire(blocking=False):
+                    raise YahooProviderBusyError(
+                        f"all {self.max_concurrent} Yahoo provider slots are "
+                        f"held by requests that have not returned; refused {key}"
+                    )
+                future: Future = Future()
+                worker = threading.Thread(
+                    target=self._run,
+                    args=(key, work, future),
+                    name=f"{self._name}-{key}",
+                    daemon=True,
                 )
-            future: Future = Future()
-            worker = threading.Thread(
-                target=self._run,
-                args=(key, work, future),
-                name=f"{self._name}-{key}",
-                daemon=True,
-            )
-            # Registered before the worker can reach its cleanup, which needs
-            # this same lock, so the entry can never outlive the request.
-            self._inflight[key] = future
-            self._workers[key] = worker
-            worker.start()
-            return future
+                # Registered before the worker can reach its cleanup, which
+                # needs this same lock, so the entry can never outlive the
+                # request.  Starting under the same lock is what makes the
+                # request atomic: no other caller can join a registration
+                # that has not yet become a running worker.
+                self._inflight[key] = future
+                self._workers[key] = worker
+                try:
+                    worker.start()
+                except BaseException:
+                    # The thread never reached ``_run``, so nothing else will
+                    # ever retire this request.  Undo it here or the slot is
+                    # lost for the life of the process and every later
+                    # request for *key* joins a future no one will complete.
+                    free_slot = self._retire(key, future)
+                    raise
+                return future
+        finally:
+            if free_slot:
+                self._slots.release()
+
+    def _retire(self, key: str, future: Future) -> bool:
+        """Drop *future*'s registrations; ``True`` if this call retired it.
+
+        The caller must hold :attr:`_lock`, and must release exactly one slot
+        when this returns ``True``.  Identity is the token: only the call
+        that finds *future* still registered under *key* takes the entry
+        away, so a startup failure and a worker's own cleanup racing over the
+        same request free its slot once between them rather than twice.
+        """
+
+        if self._inflight.get(key) is not future:
+            return False
+        del self._inflight[key]
+        self._workers.pop(key, None)
+        return True
 
     def _run(self, key: str, work: Callable[[], Any], future: Future) -> None:
         future.set_running_or_notify_cancel()
@@ -197,9 +229,9 @@ class YahooProviderGate:
         # asked again.  Joining is for requests that are genuinely still in
         # flight, which is the only case where a second one would be waste.
         with self._lock:
-            self._inflight.pop(key, None)
-            self._workers.pop(key, None)
-        self._slots.release()
+            retired = self._retire(key, future)
+        if retired:
+            self._slots.release()
         if failure is not None:
             future.set_exception(failure)
         else:

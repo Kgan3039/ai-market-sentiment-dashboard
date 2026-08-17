@@ -1279,7 +1279,12 @@ limit for as long as the hang lasted.
   are unchanged; what a retry now repeats is the wait, not the request.
 - **The request frees its own slot.** Only the worker releases, in a
   `finally`, so a request abandoned at the timeout keeps counting against
-  the ceiling for exactly as long as it is really running.
+  the ceiling for exactly as long as it is really running. The one
+  exception is a worker that never starts: if `Thread.start` raises, no
+  worker exists to reach that `finally`, so `call` undoes its own
+  registration and frees the slot before the failure propagates. Which of
+  the two retires a request is settled by identity under the gate's lock,
+  so the slot is freed exactly once either way.
 
 The gate is deliberately not a `ThreadPoolExecutor`: its workers are
 non-daemon and joined at interpreter shutdown, so one hung provider call
