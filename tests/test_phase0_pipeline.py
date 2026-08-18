@@ -15,6 +15,7 @@ Persistence assertions go through the final public surface:
 import inspect
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import yaml
@@ -621,6 +622,210 @@ def test_a_registered_downstream_stage_is_orchestrated_in_order(
 
 
 # ---------------------------------------------------------------------------
+# Component initialization is inside the stage boundary
+# ---------------------------------------------------------------------------
+
+
+def broken(tmp_path, config, *, feeds=None, aliases=None):
+    """A config pair with one file missing or malformed."""
+
+    if feeds == "missing":
+        config = {**config, "feeds_path": tmp_path / "no-such-feeds.yaml"}
+    elif feeds == "malformed":
+        path = tmp_path / "malformed-feeds.yaml"
+        path.write_text("feeds: [[[\n", encoding="utf-8")
+        config = {**config, "feeds_path": path}
+    if aliases == "missing":
+        config = {**config, "aliases_path": tmp_path / "no-such-aliases.yaml"}
+    return config
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"feeds": "missing"},
+        {"feeds": "malformed"},
+        {"aliases": "missing"},
+    ],
+    ids=["missing-feeds", "malformed-feeds", "missing-aliases"],
+)
+def test_broken_rss_config_fails_only_the_rss_component(
+    tmp_path, config, monkeypatch, kwargs
+):
+    """A YAML problem is one component's failure, not the invocation's.
+
+    ``RSSFetcher.__init__`` reads and validates both config files. Building
+    it while assembling the stage list put that work outside
+    ``execute_stage``, so a typo in ``feeds.yaml`` raised before Yahoo had
+    run at all -- costing a day of Yahoo evidence to a mistake that had
+    nothing to do with Yahoo.
+    """
+
+    repository = migrated(tmp_path)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    result = run_live(repository, **broken(tmp_path, config, **kwargs))
+
+    assert result.status == "degraded"
+    assert result.exit_code == 1
+    assert component(result, "yahoo").status == "success"
+    assert component(result, "rss").status == "failed"
+    assert component(result, "rss").errors[0]["type"] == "component_error"
+    # Yahoo's evidence is durable, and the failed component wrote nothing.
+    assert repository.count("raw_items") == len(TICKERS)
+    assert len(repository.run_log_entries(stage="fetch_yahoo")) == len(TICKERS)
+    assert repository.run_log_entries(stage="fetch_rss") == []
+
+
+def test_an_rss_setup_exception_is_redacted_and_aggregated(
+    tmp_path, config, monkeypatch, caplog
+):
+    """A constructor is exactly where a connection string ends up."""
+
+    caplog.set_level("INFO", logger="phase0.pipeline")
+    repository = migrated(tmp_path)
+
+    class LeakingSetup:
+        def __init__(self, repository, **options):
+            raise RuntimeError("feed config rejected token=abc123secret")
+
+    wire(monkeypatch, ticker_factory=provider(), rss=LeakingSetup)
+
+    result = run_live(repository, **config)
+
+    assert component(result, "rss").status == "failed"
+    assert "abc123secret" not in json.dumps(result.as_dict())
+    assert "abc123secret" not in caplog.text
+    assert component(result, "rss").errors[0]["component"] == "rss"
+
+
+def test_a_yahoo_setup_failure_does_not_prevent_rss(tmp_path, config, monkeypatch):
+    """The same boundary, checked in the other direction.
+
+    ``YahooFinanceFetcher.__init__`` validates its arguments too -- a blank
+    ``pipeline_version`` raises there -- so the risk is not RSS-specific.
+    """
+
+    repository = migrated(tmp_path)
+
+    class ExplodingSetup:
+        def __init__(self, repository, **options):
+            raise ValueError("provider gate misconfigured")
+
+    wire(monkeypatch, yahoo=ExplodingSetup, get=responder())
+
+    result = run_live(repository, **config)
+
+    assert result.status == "degraded"
+    assert component(result, "yahoo").status == "failed"
+    assert component(result, "rss").status == "success"
+    assert repository.count("feed_snapshots") == 2
+
+
+def test_both_components_failing_setup_is_a_failed_invocation(
+    tmp_path, config, monkeypatch
+):
+    """A blank pipeline version is refused by both real constructors."""
+
+    repository = migrated(tmp_path)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    result = run_live(repository, **config, pipeline_version="   ")
+
+    assert result.status == "failed"
+    assert result.exit_code == 2
+    assert {item.status for item in result.components} == {"failed"}
+    assert repository.run_log_entries() == []
+
+
+def test_no_component_setup_exception_escapes_main(tmp_path, config, monkeypatch):
+    """The CLI answers with a documented exit code, never a traceback."""
+
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    code = main(
+        [
+            "--database",
+            str(tmp_path / "phase0.sqlite3"),
+            "--feeds",
+            str(tmp_path / "no-such-feeds.yaml"),
+            "--aliases",
+            str(config["aliases_path"]),
+            "--lock-file",
+            str(tmp_path / "phase0.lock"),
+        ]
+    )
+
+    assert code == EXIT_CODES["degraded"]
+
+
+def test_replay_setup_failure_is_a_failed_component_not_a_traceback(
+    tmp_path, config, monkeypatch
+):
+    repository = seeded(tmp_path, config, monkeypatch)
+
+    result = run_replay(repository, **broken(tmp_path, config, feeds="malformed"))
+
+    assert result.status == "failed"
+    assert result.exit_code == 2
+    assert component(result, "rss_relevance_replay").status == "failed"
+
+
+def test_a_component_is_not_constructed_until_its_stage_runs(
+    tmp_path, config, monkeypatch
+):
+    """Construction order is observable, and it is stage order.
+
+    If either component were built while the stage list was assembled, both
+    would appear before the first stage started.
+    """
+
+    repository = migrated(tmp_path)
+    order: list[str] = []
+    real_yahoo = pipeline.YahooFinanceFetcher
+    real_rss = pipeline.RSSFetcher
+
+    def build_yahoo(repository, **options):
+        order.append("yahoo built")
+        return real_yahoo(
+            repository,
+            ticker_factory=provider(),
+            max_retries=0,
+            provider_gate=YahooProviderGate(),
+            **options,
+        )
+
+    def build_rss(repository, **options):
+        order.append("rss built")
+        return real_rss(repository, max_retries=0, get=responder(), **options)
+
+    monkeypatch.setattr(pipeline, "YahooFinanceFetcher", build_yahoo)
+    monkeypatch.setattr(pipeline, "RSSFetcher", build_rss)
+    monkeypatch.setattr(
+        pipeline,
+        "execute_stage",
+        _recording(pipeline.execute_stage, order),
+    )
+
+    run_live(repository, **config)
+
+    assert order == [
+        "yahoo stage started",
+        "yahoo built",
+        "rss stage started",
+        "rss built",
+    ]
+
+
+def _recording(real_execute, order):
+    def execute_stage(stage, *, invocation_id):
+        order.append(f"{stage.name} stage started")
+        return real_execute(stage, invocation_id=invocation_id)
+
+    return execute_stage
+
+
+# ---------------------------------------------------------------------------
 # Status rules
 # ---------------------------------------------------------------------------
 
@@ -924,11 +1129,30 @@ def test_credentials_never_reach_the_structured_log(
     assert "abc123secret" not in json.dumps(result.as_dict())
 
 
-def test_a_skipped_invocation_says_so(tmp_path, config, monkeypatch, caplog):
+def test_a_skipped_invocation_says_so_and_does_nothing(
+    tmp_path, config, monkeypatch, caplog
+):
+    """Skipped is not success, and it is not work either.
+
+    The losing invocation must be distinguishable in the log, must not
+    report an outcome it never computed, and must not touch a provider or
+    a feed -- the whole point is that the winner still owns them.
+    """
+
     caplog.set_level("INFO", logger="phase0.pipeline")
     database = tmp_path / "phase0.sqlite3"
     lock = tmp_path / "phase0.lock"
-    wire(monkeypatch, ticker_factory=provider(), get=responder())
+    built: list[str] = []
+
+    class Counted:
+        def __init__(self, repository, **options):
+            built.append("constructed")
+
+        def fetch(self, **kwargs):
+            built.append("fetched")
+            return {}, []
+
+    wire(monkeypatch, yahoo=Counted, rss=Counted)
 
     with pipeline.single_instance(lock) as held:
         assert held is True
@@ -945,10 +1169,127 @@ def test_a_skipped_invocation_says_so(tmp_path, config, monkeypatch, caplog):
             ]
         )
 
-    assert code == 0
-    skipped = [p for p in logged(caplog) if p["event"] == "invocation_skipped"]
+    assert code == EXIT_CODES["skipped"] == 0
+    events = logged(caplog)
+    skipped = [
+        payload for payload in events if payload["event"] == "invocation_skipped"
+    ]
     assert len(skipped) == 1
     assert skipped[0]["mode"] == "live"
+    # A skipped invocation ran nothing, so it reports no outcome at all --
+    # an "invocation_completed" here would read as a clean run.
+    assert not [p for p in events if p["event"] == "invocation_completed"]
+    assert not [p for p in events if p["event"] == "invocation_started"]
+    assert built == []
+    assert not database.exists()
+
+
+def test_a_skipped_replay_says_replay(tmp_path, config, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="phase0.pipeline")
+    lock = tmp_path / "phase0.lock"
+
+    with pipeline.single_instance(lock) as held:
+        assert held is True
+        code = main(
+            [
+                "--database",
+                str(tmp_path / "phase0.sqlite3"),
+                "--feeds",
+                str(config["feeds_path"]),
+                "--aliases",
+                str(config["aliases_path"]),
+                "--lock-file",
+                str(lock),
+                "--replay",
+            ]
+        )
+
+    assert code == 0
+    skipped = [p for p in logged(caplog) if p["event"] == "invocation_skipped"]
+    assert [payload["mode"] for payload in skipped] == ["replay"]
+
+
+# ---------------------------------------------------------------------------
+# One authoritative lock
+# ---------------------------------------------------------------------------
+
+
+def test_two_databases_sharing_a_lock_file_still_contend(tmp_path, config, monkeypatch):
+    """The deployment case the nested-lock version got wrong.
+
+    Cron and an operator can name different ``--database`` paths -- a typo,
+    a staging copy, a relative path -- while targeting one deployment. What
+    decides contention has to be the lock file they were both told to use,
+    not a lock derived from an argument that may differ.
+    """
+
+    lock = tmp_path / "shared.lock"
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    with pipeline.single_instance(lock) as held:
+        assert held is True
+        code = main(
+            [
+                "--database",
+                str(tmp_path / "a-completely-different.sqlite3"),
+                "--feeds",
+                str(config["feeds_path"]),
+                "--aliases",
+                str(config["aliases_path"]),
+                "--lock-file",
+                str(lock),
+            ]
+        )
+
+    assert code == EXIT_CODES["skipped"]
+    assert not (tmp_path / "a-completely-different.sqlite3").exists()
+
+
+def test_the_lock_file_defaults_to_the_database_for_local_development(tmp_path):
+    """Two checkouts on one laptop should not block each other."""
+
+    args = build_parser().parse_args(["--database", str(tmp_path / "dev.sqlite3")])
+    assert args.lock_file is None
+    assert pipeline.resolve_lock_file(args) == tmp_path / "dev.sqlite3.lock"
+
+
+def test_an_explicit_lock_file_overrides_the_database_default(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "--database",
+            str(tmp_path / "dev.sqlite3"),
+            "--lock-file",
+            "/var/lock/phase0-pipeline.lock",
+        ]
+    )
+    assert pipeline.resolve_lock_file(args) == Path("/var/lock/phase0-pipeline.lock")
+
+
+@pytest.mark.parametrize(
+    "failing,expected",
+    [(set(), 0), ({"NVDA"}, 1), (set(TICKERS), 2)],
+)
+def test_the_lock_is_released_however_the_invocation_ends(
+    tmp_path, config, monkeypatch, failing, expected
+):
+    """Success, degraded, and failed all give the lock back.
+
+    A lock held past a failed run wedges every later invocation into
+    ``skipped``, which looks like a working schedule producing no data.
+    """
+
+    lock = tmp_path / "phase0.lock"
+    feed_failure = {"alpha", "beta"} if failing else set()
+    wire(
+        monkeypatch,
+        ticker_factory=provider(failing=failing),
+        get=responder(failing=feed_failure),
+    )
+
+    assert cli(tmp_path, config, []) == expected
+
+    with pipeline.single_instance(lock) as acquired:
+        assert acquired is True
 
 
 # ---------------------------------------------------------------------------

@@ -363,6 +363,105 @@ def execute_stage(stage: Stage, *, invocation_id: str) -> ComponentResult:
     return result
 
 
+def _refuse_network(*args: Any, **kwargs: Any) -> Any:
+    """The HTTP callable a replay fetcher is built with.
+
+    Replay reads persisted evidence and nothing else.  Making that
+    structural rather than documentary means a future edit that reaches for
+    the network during replay fails loudly here instead of quietly
+    refetching.
+    """
+
+    raise RuntimeError("replay must not fetch; it reads persisted evidence only")
+
+
+# -- Component stages ----------------------------------------------------
+#
+# Each builder returns a stage whose action *constructs* its component and
+# then calls it.  Construction is deliberately inside the action rather
+# than before the stage list, because both constructors do real work that
+# can fail: ``YahooFinanceFetcher`` validates its arguments, and
+# ``RSSFetcher`` reads and validates ``feeds.yaml`` and ``aliases.yaml``.
+# Building them eagerly put that work outside ``execute_stage``, where a
+# YAML typo did not fail one component -- it took the whole invocation
+# down before Yahoo had run at all, and left the process with a traceback
+# instead of an exit code.
+
+
+def yahoo_stage(repository: Phase0Repository, *, pipeline_version: str) -> Stage:
+    """The Yahoo component, built when it runs rather than before."""
+
+    def action(base_run_id: str) -> tuple[dict[str, Any], list[Any]]:
+        fetcher = YahooFinanceFetcher(repository, pipeline_version=pipeline_version)
+        return fetcher.fetch(run_id=base_run_id)
+
+    return Stage(
+        "yahoo",
+        action,
+        settled=("tickers_succeeded", "tickers_partial", "tickers_empty"),
+        unsettled=("tickers_failed", "tickers_rejected"),
+    )
+
+
+def rss_stage(
+    repository: Phase0Repository,
+    *,
+    feeds_path: Path,
+    aliases_path: Path,
+    pipeline_version: str,
+) -> Stage:
+    """The RSS component, built when it runs rather than before.
+
+    A missing or malformed ``feeds.yaml``/``aliases.yaml`` is now this
+    component's own failure: RSS is recorded ``failed``, Yahoo still runs,
+    and the invocation reports ``degraded`` with an exit code rather than
+    an uncaught traceback.
+    """
+
+    def action(base_run_id: str) -> tuple[dict[str, Any], list[Any]]:
+        fetcher = RSSFetcher(
+            repository,
+            feeds_path=feeds_path,
+            aliases_path=aliases_path,
+            pipeline_version=pipeline_version,
+        )
+        return fetcher.fetch(run_id=base_run_id)
+
+    return Stage(
+        "rss",
+        action,
+        settled=("feeds_succeeded", "feeds_partial", "feeds_not_modified"),
+        unsettled=("feeds_failed",),
+    )
+
+
+def rss_replay_stage(
+    repository: Phase0Repository,
+    *,
+    feeds_path: Path,
+    aliases_path: Path,
+    pipeline_version: str,
+) -> Stage:
+    """The replay component, built with an HTTP callable that refuses.
+
+    Lazily like the others, and for the same reason: replay reads a config
+    file too, and a broken one should be a failed component rather than a
+    traceback.
+    """
+
+    def action(base_run_id: str) -> tuple[dict[str, Any], list[Any]]:
+        fetcher = RSSFetcher(
+            repository,
+            feeds_path=feeds_path,
+            aliases_path=aliases_path,
+            pipeline_version=pipeline_version,
+            get=_refuse_network,
+        )
+        return fetcher.reclassify_persisted(run_id=base_run_id)
+
+    return Stage("rss_relevance_replay", action, settled=("updated",))
+
+
 def _finish(
     *,
     invocation_id: str,
@@ -416,25 +515,13 @@ def run_live(
     started_at = datetime.now(timezone.utc)
     correlation = new_invocation_id() if invocation_id is None else invocation_id
     day = invocation_day(now)
-    yahoo = YahooFinanceFetcher(repository, pipeline_version=pipeline_version)
-    rss = RSSFetcher(
-        repository,
-        feeds_path=feeds_path,
-        aliases_path=aliases_path,
-        pipeline_version=pipeline_version,
-    )
     stages = [
-        Stage(
-            "yahoo",
-            lambda base: yahoo.fetch(run_id=base),
-            settled=("tickers_succeeded", "tickers_partial", "tickers_empty"),
-            unsettled=("tickers_failed", "tickers_rejected"),
-        ),
-        Stage(
-            "rss",
-            lambda base: rss.fetch(run_id=base),
-            settled=("feeds_succeeded", "feeds_partial", "feeds_not_modified"),
-            unsettled=("feeds_failed",),
+        yahoo_stage(repository, pipeline_version=pipeline_version),
+        rss_stage(
+            repository,
+            feeds_path=feeds_path,
+            aliases_path=aliases_path,
+            pipeline_version=pipeline_version,
         ),
         *DOWNSTREAM_STAGES,
     ]
@@ -459,18 +546,6 @@ def run_live(
 
 
 # -- Replay --------------------------------------------------------------
-
-
-def _refuse_network(*args: Any, **kwargs: Any) -> Any:
-    """The HTTP callable a replay fetcher is built with.
-
-    Replay reads persisted evidence and nothing else.  Making that
-    structural rather than documentary means a future edit that reaches for
-    the network during replay fails loudly here instead of quietly
-    refetching.
-    """
-
-    raise RuntimeError("replay must not fetch; it reads persisted evidence only")
 
 
 def replay_capabilities() -> dict[str, Any]:
@@ -526,19 +601,13 @@ def run_replay(
     started_at = datetime.now(timezone.utc)
     correlation = new_invocation_id() if invocation_id is None else invocation_id
     day = invocation_day(now)
-    rss = RSSFetcher(
-        repository,
-        feeds_path=feeds_path,
-        aliases_path=aliases_path,
-        pipeline_version=pipeline_version,
-        get=_refuse_network,
-    )
     capabilities = replay_capabilities()
     stages = [
-        Stage(
-            "rss_relevance_replay",
-            lambda base: rss.reclassify_persisted(run_id=base),
-            settled=("updated",),
+        rss_replay_stage(
+            repository,
+            feeds_path=feeds_path,
+            aliases_path=aliases_path,
+            pipeline_version=pipeline_version,
         )
     ]
     _log_event(
@@ -610,6 +679,25 @@ def _default_database_path() -> Path:
     return Path(os.getenv("PHASE0_DATABASE_PATH", str(DEFAULT_DATABASE_PATH)))
 
 
+def resolve_lock_file(args: argparse.Namespace) -> Path:
+    """The one lock this invocation contends on.
+
+    ``<database>.lock`` is the *local development* default: two checkouts
+    on one laptop hold different databases and should not block each other.
+
+    It is the wrong default for a deployment, where cron, systemd, and an
+    operator's shell may each name the database differently while targeting
+    one pipeline. Every production entrypoint therefore passes an explicit
+    ``--lock-file``, and ``deploy/phase0-pipeline.cron`` documents the same
+    path for all of them. Acquisition lives here and nowhere else -- a
+    shell-level ``flock`` wrapped around this would be a *second*,
+    different lock, so a cron run and a manual run would each hold one and
+    both would proceed.
+    """
+
+    return args.lock_file or Path(f"{args.database}.lock")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the Phase 0 data pipeline")
     parser.add_argument("--database", type=Path, default=_default_database_path())
@@ -661,7 +749,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(database_report(repository), indent=2, sort_keys=True))
         return 0
 
-    lock_path = args.lock_file or Path(f"{args.database}.lock")
+    lock_path = resolve_lock_file(args)
     with single_instance(lock_path) as acquired:
         if not acquired:
             _log_event(
