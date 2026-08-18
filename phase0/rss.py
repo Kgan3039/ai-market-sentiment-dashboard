@@ -15,6 +15,11 @@ guarantee:
     what lets a classifier failure cost the classification and not the
     evidence.
 
+``observe_rss``
+    A story already stored, seen again.  It adds provenance under the day
+    the item has always belonged to and changes nothing about the row --
+    an undated entry a feed repeats tomorrow is still yesterday's evidence.
+
 ``classify_rss``
     One run per ``(ticker, trading_day)`` partition, holding only derived
     state: the association, the candidate row, and the match evidence for
@@ -58,6 +63,7 @@ from .urls import canonicalize_url
 #: why they are four and not one.
 STAGE_FETCH = "fetch_rss"
 STAGE_INGEST = "ingest_rss"
+STAGE_OBSERVE = "observe_rss"
 STAGE_CLASSIFY = "classify_rss"
 STAGE_CHECKPOINT = "checkpoint_rss"
 STAGE_RECLASSIFY = "reclassify_rss"
@@ -232,17 +238,44 @@ def _child_text(element: ET.Element, names: set[str]) -> str:
     return ""
 
 
-def _entry_link(entry: ET.Element) -> str:
+def _base_chain(root: ET.Element, feed_url: str | None) -> dict[ET.Element, str]:
+    """Resolve every element's XML Base, walking down from the root.
+
+    XML Base is *cumulative and relative*: each ``xml:base`` is resolved
+    against the base already in effect, and the base in effect at the root
+    is the document's own URL.  Resolving a root ``xml:base="articles/"``
+    as if it were already absolute produced a relative link that then
+    failed validation as "not absolute HTTP(S)" -- the feed's own URL is
+    what it was always meant to be relative to.
+
+    ElementTree has no parent pointers, so the chain is built in one
+    top-down pass rather than by walking up from each entry.
+    """
+
+    document_base = str(feed_url or "")
+    bases: dict[ET.Element, str] = {}
+    stack = [(root, document_base)]
+    while stack:
+        element, inherited = stack.pop()
+        declared = str(element.attrib.get(XML_BASE) or "").strip()
+        resolved = urljoin(inherited, declared) if declared else inherited
+        bases[element] = resolved
+        for child in element:
+            stack.append((child, resolved))
+    return bases
+
+
+def _entry_link(entry: ET.Element) -> tuple[str, ET.Element | None]:
     links = [child for child in entry if _local_name(child.tag) == "link"]
     for child in links:
         href = str(child.attrib.get("href") or "").strip()
         rel = str(child.attrib.get("rel") or "alternate").lower()
         if href and rel in {"", "alternate"}:
-            return href
+            return href, child
     for child in links:
         value = _element_text(child)
         if value:
-            return value
+            return value, child
     guid_element = next(
         (child for child in entry if _local_name(child.tag) == "guid"),
         None,
@@ -251,8 +284,8 @@ def _entry_link(entry: ET.Element) -> str:
         guid = _element_text(guid_element)
         is_permalink = str(guid_element.attrib.get("isPermaLink", "true")).lower()
         if is_permalink != "false" and urlsplit(guid).scheme in {"http", "https"}:
-            return guid
-    return ""
+            return guid, guid_element
+    return "", None
 
 
 def _published_iso(value: str) -> str | None:
@@ -299,16 +332,19 @@ def parse_feed(
     if len(entries) > MAX_FEED_ENTRIES:
         raise ValueError("feed contains too many entries")
     parsed: list[dict[str, Any]] = []
-    root_base = str(root.attrib.get(XML_BASE) or feed_url or "")
+    bases = _base_chain(root, feed_url)
     feed_digest = hashlib.sha256(body).digest()
     for entry_index, entry in enumerate(entries):
         entry_digest = hashlib.sha256(
             feed_digest + entry_index.to_bytes(8, "big")
         ).hexdigest()
         guid = _child_text(entry, {"guid", "id"})
-        raw_link = _entry_link(entry)
-        entry_base = urljoin(root_base, str(entry.attrib.get(XML_BASE) or ""))
-        resolved_link = urljoin(entry_base, raw_link) if raw_link else ""
+        raw_link, link_element = _entry_link(entry)
+        # The base in effect where the href was *written* -- a nested
+        # ``xml:base`` on the link element itself applies to it, not the
+        # entry's.
+        link_base = bases.get(link_element if link_element is not None else entry, "")
+        resolved_link = urljoin(link_base, raw_link) if raw_link else ""
         title = _child_text(entry, {"title"})
         description = _child_text(
             entry,
@@ -777,12 +813,34 @@ class RSSFetcher:
                         }
                     )
 
-            # 2. Raw evidence, one run per day, still unclassified.
-            by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            # 2. Raw evidence.  A first sighting is ingested under its own
+            #    day; a story already stored is *observed*, which adds
+            #    provenance under the day it has always belonged to and
+            #    changes nothing about the row.  Re-ingesting a repeat is
+            #    what used to wedge an undated entry's feed for good.
+            stored = self.repository.stored_raw_items(
+                [(entry["source"], entry["canonical_url"]) for entry in entries]
+            )
+            fresh: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            seen: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for entry in entries:
-                by_day[effective_day(entry)].append(entry)
-            persisted: list[tuple[int, str, Mapping[str, Any]]] = []
-            for day in sorted(by_day):
+                known = stored.get((entry["source"], entry["canonical_url"]))
+                if known is None:
+                    fresh[effective_day(entry)].append(entry)
+                else:
+                    seen[known["trading_day"]].append(
+                        {
+                            "raw_item_id": known["id"],
+                            "feed_provenance": entry["feed_provenance"],
+                        }
+                    )
+            item_ids: list[int] = [
+                observation["raw_item_id"]
+                for group in seen.values()
+                for observation in group
+            ]
+            counts["duplicates"] += len(item_ids)
+            for day in sorted(fresh):
                 with self.repository.stage_run(
                     run_id=partition_run_id(base_run_id, feed_id, "ingest", day),
                     stage=STAGE_INGEST,
@@ -790,41 +848,36 @@ class RSSFetcher:
                     pipeline_version=self.pipeline_version,
                 ) as run:
                     results = self.repository.ingest_raw_items(
-                        by_day[day], run=run, terminal=True
+                        fresh[day], run=run, terminal=True
                     )
                 counts["inserted"] += sum(result.inserted for result in results)
-                counts["duplicates"] += sum(not result.inserted for result in results)
-                for entry, result in zip(by_day[day], results):
-                    persisted.append((result.item_id, day, entry))
-
-            # 3. Derived relevance, one run per (ticker, day) partition.
-            classified = []
-            for item_id, day, entry in persisted:
-                classification = self._classify(entry)
-                local[classification["outcome"]] += 1
-                if classification["outcome"] == "ambiguous":
-                    local_errors.append(
-                        {
-                            "feed": feed_id,
-                            "type": "ambiguous_ticker",
-                            "url": entry.get("url"),
-                            "matches": list(classification["matches"]),
-                        }
-                    )
-                classified.append((item_id, day, classification))
-            for (ticker, day), decisions in sorted(
-                self._decisions_by_partition(classified).items()
-            ):
+                item_ids.extend(result.item_id for result in results)
+            for day in sorted(seen):
                 with self.repository.stage_run(
-                    run_id=partition_run_id(base_run_id, feed_id, ticker.lower(), day),
-                    stage=STAGE_CLASSIFY,
+                    run_id=partition_run_id(base_run_id, feed_id, "observe", day),
+                    stage=STAGE_OBSERVE,
                     trading_day=day,
                     pipeline_version=self.pipeline_version,
-                    ticker=ticker,
                 ) as run:
-                    self.repository.replace_relevance_classifications(
-                        decisions, run=run, terminal=True
+                    self.repository.record_feed_observations(
+                        seen[day], run=run, terminal=True
                     )
+
+            # 3. Derived relevance, computed from what is *persisted*.
+            #    Reading the rows back is the whole fix for a syndicated
+            #    variant: feed B's title for a story feed A already stored
+            #    is not what the row holds, so classifying B's text would
+            #    write decisions about words no reader can find -- and the
+            #    next offline replay, reading the row, would reverse them.
+            self._classify_persisted(
+                self.repository.rss_raw_items(item_ids),
+                base_run_id=base_run_id,
+                scope=feed_id,
+                stage=STAGE_CLASSIFY,
+                counts=local,
+                errors=local_errors,
+                context={"feed": feed_id},
+            )
 
             for key, value in local.items():
                 counts[key] += value
@@ -996,6 +1049,90 @@ class RSSFetcher:
             },
         )
 
+    def _classify_persisted(
+        self,
+        items: Sequence[Mapping[str, Any]],
+        *,
+        base_run_id: str,
+        scope: str,
+        stage: str,
+        counts: dict[str, int],
+        errors: list[dict[str, Any]],
+        context: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Classify persisted rows and settle each partition they fall in.
+
+        One routine for both paths on purpose.  A live fetch and an offline
+        replay reading the same stored evidence must reach the same answer,
+        and the surest way to guarantee that is for them to run the same
+        code over the same input -- rows read back from the database, never
+        a parser object that happens to be in hand.
+        """
+
+        classified: list[tuple[int, str, Mapping[str, Any]]] = []
+        for item in items:
+            day = str(item["trading_day"])
+            try:
+                classification = self._classify(item)
+            except BaseException:
+                # Attribute the failure to the day whose evidence broke the
+                # classifier.  There is no ticker to attribute it to,
+                # because deciding the ticker is precisely what failed -- so
+                # this run is ticker-less, and it is recorded before the
+                # exception leaves rather than the work failing silently.
+                with self.repository.stage_run(
+                    run_id=partition_run_id(base_run_id, scope, "scan", day),
+                    stage=stage,
+                    trading_day=day,
+                    pipeline_version=self.pipeline_version,
+                ):
+                    raise
+            counts[classification["outcome"]] += 1
+            if classification["outcome"] == "ambiguous":
+                errors.append(
+                    {
+                        **(context or {}),
+                        "type": "ambiguous_ticker",
+                        "raw_item_id": int(item["id"]),
+                        "matches": list(classification["matches"]),
+                    }
+                )
+            classified.append((int(item["id"]), day, classification))
+
+        partitions = self._decisions_by_partition(classified)
+        # A ticker that has stopped matching produces no decision above, so
+        # nothing would clear the rows it left behind -- and only that
+        # ticker's own run is allowed to.  Withdrawing is therefore an
+        # explicit empty decision in that partition, not an omission.
+        for item, (item_id, day, classification) in zip(items, classified):
+            deciding = {str(entry["ticker"]) for entry in classification["evidence"]}
+            for ticker in json.loads(item["derived_tickers"] or "[]"):
+                if ticker in deciding:
+                    continue
+                partitions[(str(ticker), day)].append(
+                    {
+                        "raw_item_id": item_id,
+                        "ticker": None,
+                        "ingest_status": classification["ingest_status"],
+                        "candidate_reason": None,
+                        "evidence": None,
+                    }
+                )
+
+        written = 0
+        for (ticker, day), decisions in sorted(partitions.items()):
+            with self.repository.stage_run(
+                run_id=partition_run_id(base_run_id, scope, ticker.lower(), day),
+                stage=stage,
+                trading_day=day,
+                pipeline_version=self.pipeline_version,
+                ticker=ticker,
+            ) as run:
+                written += self.repository.replace_relevance_classifications(
+                    decisions, run=run, terminal=True
+                )
+        return written
+
     # -- Entry points ----------------------------------------------------
 
     def fetch(
@@ -1092,66 +1229,14 @@ class RSSFetcher:
         errors: list[dict[str, Any]] = []
         items = self.repository.rss_raw_items()
         counts["scanned"] = len(items)
-        classified: list[tuple[int, str, Mapping[str, Any]]] = []
-        for item in items:
-            day = str(item["trading_day"])
-            try:
-                classification = self._classify(item)
-            except BaseException:
-                # Attribute the failure to the day whose evidence broke the
-                # classifier.  There is no ticker to attribute it to, because
-                # deciding the ticker is precisely what failed -- so this run
-                # is ticker-less, and it is recorded before the exception
-                # leaves, rather than the replay failing silently.
-                with self.repository.stage_run(
-                    run_id=partition_run_id(base_run_id, "replay", "scan", day),
-                    stage=STAGE_RECLASSIFY,
-                    trading_day=day,
-                    pipeline_version=self.pipeline_version,
-                ):
-                    raise
-            counts[classification["outcome"]] += 1
-            if classification["outcome"] == "ambiguous":
-                errors.append(
-                    {
-                        "type": "ambiguous_ticker",
-                        "raw_item_id": item["id"],
-                        "matches": list(classification["matches"]),
-                    }
-                )
-            classified.append((int(item["id"]), day, classification))
-
-        partitions = self._decisions_by_partition(classified)
-        # A ticker that has stopped matching produces no decision above, so
-        # nothing would clear the rows it left behind -- and only that
-        # ticker's own run is allowed to.  Withdrawing is therefore an
-        # explicit empty decision in that partition, not an omission.
-        for item, (item_id, day, classification) in zip(items, classified):
-            deciding = {str(entry["ticker"]) for entry in classification["evidence"]}
-            for ticker in json.loads(item["derived_tickers"] or "[]"):
-                if ticker in deciding:
-                    continue
-                partitions[(str(ticker), day)].append(
-                    {
-                        "raw_item_id": item_id,
-                        "ticker": None,
-                        "ingest_status": classification["ingest_status"],
-                        "candidate_reason": None,
-                        "evidence": None,
-                    }
-                )
-
-        for (ticker, day), decisions in sorted(partitions.items()):
-            with self.repository.stage_run(
-                run_id=partition_run_id(base_run_id, "replay", ticker.lower(), day),
-                stage=STAGE_RECLASSIFY,
-                trading_day=day,
-                pipeline_version=self.pipeline_version,
-                ticker=ticker,
-            ) as run:
-                counts["updated"] += self.repository.replace_relevance_classifications(
-                    decisions, run=run, terminal=True
-                )
+        counts["updated"] = self._classify_persisted(
+            items,
+            base_run_id=base_run_id,
+            scope="replay",
+            stage=STAGE_RECLASSIFY,
+            counts=counts,
+            errors=errors,
+        )
         return counts, redact_secrets(errors)
 
     @staticmethod

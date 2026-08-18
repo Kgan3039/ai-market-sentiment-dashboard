@@ -1334,6 +1334,7 @@ same transaction:
 |---|---|---|---|
 | `fetch_rss` | feed, fetch day, no ticker | `record_feed_snapshot` | the response bytes are durable before anything derived from them exists |
 | `ingest_rss` | one item day, no ticker | `ingest_raw_items` | normalized entries and their provenance are durable *unclassified* |
+| `observe_rss` | the stored item's day, no ticker | `record_feed_observations` | a story already stored, seen again: provenance only |
 | `classify_rss` | one ticker, one day | `replace_relevance_classifications` | derived relevance for exactly one ticker |
 | `checkpoint_rss` | feed, fetch day, no ticker | `record_source_state` | the conditional-request marker moves only over evidence that landed |
 
@@ -1376,3 +1377,44 @@ run's day is a partition identity the evidence decides, not a label a
 caller may attach. For RSS an override is not merely ignored — the
 snapshot and the checkpoint carry real fetch timestamps, and I1 refuses a
 run whose day contradicts them.
+
+### Two things the first cut of this port got wrong
+
+**A repeated undated entry is an observation, not new evidence.** An item
+with no publication date takes its day from `fetched_at`, so a feed
+repeating it tomorrow made the batch look like evidence that had *moved* to
+tomorrow, and I1 refused to let one day's run mutate another day's row. The
+refusal was right; re-ingesting was the mistake — and because most feeds
+repeat their entries, the feed then failed every run from the second day
+onward, permanently. A sighting of a story that is already stored now goes
+through `record_feed_observations`, which adds provenance under the day the
+item has always belonged to and changes nothing else. Cross-day protection
+is untouched, no second row appears, and the checkpoint keeps advancing.
+
+Provenance is immutable, like the evidence it describes: a repeat from a
+feed that already has a row keeps its original `snapshot_id`, which is the
+snapshot whose bytes produced the stored text. That is also what makes
+re-running a fetch a no-op rather than a rewrite.
+
+**Classification reads the row, never the parser.** `ingest_raw_items`
+returns the stored row for a duplicate and does not overwrite its text, so a
+second feed's variant wording for a story the first feed already stored is
+*not* what the row holds. Classifying the parsed entry therefore wrote a
+ticker justified by words no reader could find in the record — and the next
+offline replay, reading the row, silently reversed it. Which of the two
+feeds "won" depended on nothing but polling order.
+
+Both paths now call one routine over rows read back from the database:
+`rss_raw_items(item_ids)` after a fetch, `rss_raw_items()` for a replay.
+Live and replay agreeing is structural rather than a coincidence worth
+re-deriving. If per-feed variant text ever becomes part of the product, it
+has to be persisted as its own evidence unit first; classifying an ephemeral
+parser object and attaching the result to a different record is exactly what
+this replaced.
+
+**XML Base is relative until something makes it absolute.** A root
+`xml:base="articles/"` was treated as if it were already absolute, yielding
+a relative link that then failed validation as "not absolute HTTP(S)". The
+base in effect at the root is the feed's own URL, and each nested
+`xml:base` resolves against the base already in effect — including one on
+the `<link>` element itself.

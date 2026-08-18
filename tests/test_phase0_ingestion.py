@@ -10,6 +10,7 @@ setup it says so by going through ``repository.admin``.
 import inspect
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import requests
@@ -1807,3 +1808,436 @@ def test_a_partition_that_fails_mid_replay_leaves_the_others_committed(
     }
     assert ("NVDA", "failed") in statuses
     assert ("AAPL", "success") in statuses
+
+
+# ---------------------------------------------------------------------------
+# Repeated observations, authoritative evidence, and XML Base (#83 review)
+# ---------------------------------------------------------------------------
+
+
+UNDATED = (
+    b"<rss><channel><item><guid>g1</guid><title>NVIDIA update</title>"
+    b"<link>https://p.example/a</link></item></channel></rss>"
+)
+NVDA_ALIASES = "tickers:\n  - ticker: NVDA\n    strong_aliases: [NVIDIA]\n"
+
+
+def _on_day(day):
+    """Freeze the fetcher's clock, which is what dates an undated entry."""
+
+    return patch("phase0.rss.utc_now", return_value=f"{day}T10:00:00+00:00")
+
+
+def test_an_undated_entry_repeated_the_next_day_does_not_wedge_the_feed(tmp_path):
+    """The article has no date, so its day comes from when it was fetched.
+
+    Seeing it again tomorrow therefore looked like evidence that had moved
+    to tomorrow, and I1 rightly refuses to let one day's run mutate another
+    day's row.  The refusal was correct; re-ingesting was the mistake.  A
+    feed that repeats an undated entry -- which is most feeds -- failed
+    every run from the second day on, for good.
+    """
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    fetcher = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(UNDATED, headers={"ETag": '"v1"'}),
+        max_retries=0,
+    )
+
+    with _on_day("2026-07-13"):
+        first, errors = fetcher.fetch(run_id="day-d")
+    assert not errors
+    assert first["inserted"] == 1
+
+    for day in ("2026-07-14", "2026-07-15", "2026-07-16"):
+        with _on_day(day):
+            counts, errors = fetcher.fetch(run_id=f"day-{day}")
+        assert not errors, f"{day} failed: {errors}"
+        assert counts["feeds_failed"] == 0
+        assert counts["duplicates"] == 1
+        assert counts["inserted"] == 0
+        # The checkpoint keeps moving; it is not stuck on a failure.
+        assert repository.source_state("rss:test")["status"] == "success"
+
+    # One row, still filed under the day it was first seen.
+    assert repository.count("raw_items") == 1
+    item = reader(repository).raw_items()[0]
+    assert item["fetched_at"][:10] == "2026-07-13"
+    assert item["ticker"] == "NVDA"
+
+
+def test_a_repeated_undated_entry_from_another_feed_adds_provenance(tmp_path):
+    """A second feed's later sighting is provenance, not a second article."""
+
+    repository = migrated(tmp_path)
+    feeds = tmp_path / "feeds.yaml"
+    aliases = tmp_path / "aliases.yaml"
+    _write_feeds(
+        feeds,
+        "feeds:\n"
+        "  - id: alpha\n    url: https://a.example/feed\n"
+        "  - id: beta\n    url: https://b.example/feed\n",
+    )
+    aliases.write_text(NVDA_ALIASES, encoding="utf-8")
+    fetcher = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(UNDATED),
+        max_retries=0,
+    )
+
+    with _on_day("2026-07-13"):
+        fetcher.fetch(run_id="day-d")
+    read = reader(repository)
+    provenance_before = {
+        (row["feed_source"], row["snapshot_id"]) for row in read.raw_item_feeds()
+    }
+    assert provenance_before == {("rss:alpha", 1), ("rss:beta", 2)}
+
+    with _on_day("2026-07-14"):
+        counts, errors = fetcher.fetch(run_id="day-d1")
+
+    assert not errors
+    assert counts["duplicates"] == 2
+    assert repository.count("raw_items") == 1
+    read = reader(repository)
+    # Both feeds still recorded, each still pointing at the snapshot whose
+    # bytes produced the stored text.  Provenance is as immutable as the
+    # evidence it describes.
+    assert {
+        (row["feed_source"], row["snapshot_id"]) for row in read.raw_item_feeds()
+    } == provenance_before
+    assert read.raw_items()[0]["fetched_at"][:10] == "2026-07-13"
+    for source in ("rss:alpha", "rss:beta"):
+        assert repository.source_state(source)["status"] == "success"
+
+
+def test_a_later_observation_is_recorded_in_the_items_own_day(tmp_path):
+    """The run that writes it covers the day the item has always been on."""
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    fetcher = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(UNDATED),
+        max_retries=0,
+    )
+    with _on_day("2026-07-13"):
+        fetcher.fetch(run_id="day-d")
+    with _on_day("2026-07-14"):
+        fetcher.fetch(run_id="day-d1")
+
+    observe = repository.run_log_entries(stage="observe_rss")
+    assert [(row["ticker"], row["trading_day"]) for row in observe] == [
+        (None, "2026-07-13")
+    ]
+    assert all(row["status"] == "success" for row in observe)
+    # The snapshot and checkpoint of the *second* fetch still sit on the
+    # day that fetch really happened.
+    assert [
+        row["trading_day"] for row in repository.run_log_entries(stage=STAGE_FETCH)
+    ] == ["2026-07-13", "2026-07-14"]
+
+
+def test_a_syndicated_variant_never_classifies_text_that_is_not_stored(tmp_path):
+    """Feed B's words must not decide feed A's row.
+
+    ``ingest_raw_items`` returns the stored row for a duplicate and does not
+    overwrite its text, so classifying the *parsed* entry meant writing a
+    ticker justified by words the row does not contain -- and the next
+    offline replay, reading the row, silently reversed it.
+    """
+
+    repository = migrated(tmp_path)
+    feeds = tmp_path / "feeds.yaml"
+    aliases = tmp_path / "aliases.yaml"
+    _write_feeds(
+        feeds,
+        "feeds:\n"
+        "  - id: alpha\n    url: https://a.example/feed\n"
+        "  - id: beta\n    url: https://b.example/feed\n",
+    )
+    aliases.write_text(NVDA_ALIASES, encoding="utf-8")
+
+    plain = (
+        b"<rss><channel><item><guid>s1</guid><title>Quarterly results</title>"
+        b"<link>https://p.example/story</link></item></channel></rss>"
+    )
+    variant = (
+        b"<rss><channel><item><guid>s1</guid>"
+        b"<title>NVIDIA quarterly results</title>"
+        b"<link>https://p.example/story</link></item></channel></rss>"
+    )
+
+    def get(url, **kwargs):
+        body = plain if "a.example" in url else variant
+
+        class Response:
+            status_code = 200
+            headers: dict = {}
+            content = body
+
+            def raise_for_status(self):
+                return None
+
+        return Response()
+
+    RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=get,
+        max_retries=0,
+    ).fetch(run_id="live")
+
+    read = reader(repository)
+    item = read.raw_items()[0]
+    assert repository.count("raw_items") == 1
+    # Alpha got there first, so the stored words are Alpha's.
+    assert item["title"] == "Quarterly results"
+    # And the decision is about those words, not Beta's.
+    assert item["ticker"] is None
+    assert read.raw_item_associations() == []
+    assert read.raw_item_match_evidence() == []
+    # Beta's sighting is still recorded as provenance.
+    assert {row["feed_source"] for row in read.raw_item_feeds()} == {
+        "rss:alpha",
+        "rss:beta",
+    }
+
+
+@pytest.mark.parametrize(
+    "first_matches", [True, False], ids=["stored-matches", "variant-matches"]
+)
+def test_live_classification_and_offline_replay_agree_on_a_syndicated_story(
+    tmp_path, first_matches
+):
+    """The drift this pair of paths must never show, in both orderings.
+
+    Only one of the two drifts, and which one depends on nothing the code
+    can see: whichever feed is polled first owns the stored text.  When the
+    *variant* was the one mentioning the ticker, live classification wrote
+    a decision the row could not justify and the next replay took it
+    straight back off.  Both paths now read the same persisted row through
+    the same routine, so agreeing is structural rather than luck.
+    """
+
+    repository = migrated(tmp_path)
+    feeds = tmp_path / "feeds.yaml"
+    aliases = tmp_path / "aliases.yaml"
+    _write_feeds(
+        feeds,
+        "feeds:\n"
+        "  - id: alpha\n    url: https://a.example/feed\n"
+        "  - id: beta\n    url: https://b.example/feed\n",
+    )
+    aliases.write_text(NVDA_ALIASES, encoding="utf-8")
+
+    def story(title):
+        return (
+            b"<rss><channel><item><guid>s1</guid><title>"
+            + title
+            + b"</title><link>https://p.example/story</link>"
+            b"</item></channel></rss>"
+        )
+
+    matching = story(b"NVIDIA results")
+    plain = story(b"Quarterly results")
+    # Alpha is polled first, so Alpha's words are the ones the row keeps.
+    alpha, beta = (matching, plain) if first_matches else (plain, matching)
+
+    def get(url, **kwargs):
+        body = alpha if "a.example" in url else beta
+
+        class Response:
+            status_code = 200
+            headers: dict = {}
+            content = body
+
+            def raise_for_status(self):
+                return None
+
+        return Response()
+
+    RSSFetcher(
+        repository, feeds_path=feeds, aliases_path=aliases, get=get, max_retries=0
+    ).fetch(run_id="live")
+
+    def derived():
+        read = reader(repository)
+        item = read.raw_items()[0]
+        return (
+            item["title"],
+            item["ticker"],
+            [row["ticker"] for row in read.raw_item_associations()],
+            [
+                (row["ticker"], row["decision"])
+                for row in read.raw_item_match_evidence()
+            ],
+        )
+
+    live = derived()
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("replay reached for the network")
+
+    RSSFetcher(
+        repository, feeds_path=feeds, aliases_path=aliases, get=no_network
+    ).reclassify_persisted(run_id="replay")
+
+    assert derived() == live
+    # And the answer follows the stored words, whichever feed supplied them.
+    assert live[0] == ("NVIDIA results" if first_matches else "Quarterly results")
+    assert live[1] == ("NVDA" if first_matches else None)
+
+
+def test_repeated_fetches_of_the_same_feed_are_stable(tmp_path):
+    """Replaying a fetch changes nothing, so a scheduler cannot drift."""
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    fetcher = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(UNDATED),
+        max_retries=0,
+    )
+    with _on_day("2026-07-13"):
+        fetcher.fetch(run_id="first")
+
+    def snapshot_of_everything():
+        read = reader(repository)
+        return (
+            read.raw_items(),
+            read.raw_item_feeds(),
+            read.raw_item_associations(),
+            read.raw_item_match_evidence(),
+            read.raw_item_candidates(),
+            [bytes(row["body"]) for row in read.feed_snapshots()],
+        )
+
+    before = snapshot_of_everything()
+    for day, run_id in (("2026-07-14", "second"), ("2026-07-15", "third")):
+        with _on_day(day):
+            counts, errors = fetcher.fetch(run_id=run_id)
+        # Stable because it kept working, not because it failed the same
+        # way twice -- the wedged feed was "stable" in that sense too.
+        assert not errors
+        assert counts["feeds_succeeded"] == 1
+    assert snapshot_of_everything() == before
+
+
+def test_a_classifier_failure_after_a_repeat_still_keeps_the_evidence(
+    tmp_path, monkeypatch
+):
+    """The observation path must not weaken the raw-evidence guarantee."""
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    fetcher = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(UNDATED),
+        max_retries=0,
+    )
+    with _on_day("2026-07-13"):
+        fetcher.fetch(run_id="first")
+
+    monkeypatch.setattr(
+        "phase0.rss.match_ticker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    with _on_day("2026-07-14"):
+        counts, errors = fetcher.fetch(run_id="second")
+
+    assert counts["feeds_failed"] == 1
+    assert errors[0]["type"] == "processing_error"
+    # The classifier is what broke, not the repeat: a cross-day refusal
+    # here would mean this test was passing for the wrong reason.
+    assert "boom" in errors[0]["error"]
+    assert repository.count("raw_items") == 1
+    assert repository.count("raw_item_feeds") == 1
+    assert repository.count("feed_snapshots") == 1
+    # The prior decision is untouched, and the checkpoint did not advance.
+    assert reader(repository).raw_items()[0]["ticker"] == "NVDA"
+    assert repository.source_state("rss:test")["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "xml,expected",
+    [
+        pytest.param(
+            b'<rss xml:base="https://cdn.example/a/"><channel><item>'
+            b"<title>T</title><link>one</link></item></channel></rss>",
+            "https://cdn.example/a/one",
+            id="absolute-root-base",
+        ),
+        pytest.param(
+            b'<rss xml:base="articles/"><channel><item>'
+            b"<title>T</title><link>one</link></item></channel></rss>",
+            "https://example.com/news/articles/one",
+            id="relative-root-base",
+        ),
+        pytest.param(
+            b'<rss xml:base="articles/"><channel xml:base="2026/">'
+            b'<item xml:base="jul/"><title>T</title><link>one</link>'
+            b"</item></channel></rss>",
+            "https://example.com/news/articles/2026/jul/one",
+            id="nested-relative-bases",
+        ),
+        pytest.param(
+            b'<rss xml:base="articles/"><channel><item><title>T</title>'
+            b'<link xml:base="deep/">one</link></item></channel></rss>',
+            "https://example.com/news/articles/deep/one",
+            id="base-on-the-link-itself",
+        ),
+        pytest.param(
+            b"<rss><channel><item><title>T</title><link>one</link>"
+            b"</item></channel></rss>",
+            "https://example.com/news/one",
+            id="no-base-at-all",
+        ),
+        pytest.param(
+            b'<rss xml:base="articles/"><channel><item><title>T</title>'
+            b"<link>https://other.example/x</link></item></channel></rss>",
+            "https://other.example/x",
+            id="absolute-href-ignores-base",
+        ),
+    ],
+)
+def test_xml_base_resolves_against_the_feed_url(xml, expected):
+    """A base is relative until something makes it absolute.
+
+    A relative root ``xml:base`` used to be treated as if it were already
+    absolute, which produced a relative link that then failed validation as
+    "not absolute HTTP(S)" -- the feed's own URL is what it was always
+    meant to be resolved against.
+    """
+
+    entry = parse_feed(xml, feed_url="https://example.com/news/feed.xml")[0]
+
+    assert entry["url"] == expected
+    assert entry["validation_errors"] == []
+
+
+def test_an_unusable_xml_base_still_fails_safely():
+    """Nothing here may raise: a bad base is evidence, not a crash."""
+
+    entry = parse_feed(
+        b'<rss xml:base="articles/"><channel><item><title>T</title>'
+        b"<link>one</link></item></channel></rss>",
+        feed_url="not-a-url",
+    )[0]
+
+    # No absolute base to resolve against, so the link stays unusable --
+    # recorded as invalid evidence rather than thrown away or crashed on.
+    assert entry["validation_errors"] == ["link must resolve to absolute HTTP(S)"]

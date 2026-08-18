@@ -975,9 +975,10 @@ class Phase0Admin:
     runner, and issues #82 and #83, use the logged entrypoints on
     :class:`Phase0Repository` — ``ingest_raw_items``, ``reconcile_stories``,
     ``reconcile_themes``, ``persist_embeddings``, ``record_source_state``,
-    ``record_feed_snapshot``, ``replace_relevance_classifications`` — each
-    of which requires the :class:`StageRunContext` from ``stage_run`` and
-    writes its run-log row in the same transaction as the data.
+    ``record_feed_snapshot``, ``record_feed_observations``,
+    ``replace_relevance_classifications`` — each of which requires the
+    :class:`StageRunContext` from ``stage_run`` and writes its run-log row
+    in the same transaction as the data.
 
     Keeping these behind ``repository.admin`` is the whole point: an
     unlogged write cannot happen without the call site saying so, and a
@@ -1986,9 +1987,7 @@ class Phase0Repository:
                     entry_digest
                 ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(raw_item_id, feed_source, external_id)
-                DO UPDATE SET
-                    snapshot_id = excluded.snapshot_id,
-                    entry_digest = excluded.entry_digest
+                DO NOTHING
                 """,
                 (
                     item_id,
@@ -5852,6 +5851,152 @@ class Phase0Repository:
             )
             return snapshot_id
 
+    def stored_raw_items(
+        self, keys: Sequence[tuple[str, str]]
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Which of these ``(source, canonical_url)`` pairs already exist.
+
+        A read, used to tell a first sighting from a later one *before* any
+        run opens.  The day returned is the stored row's own -- derived
+        here exactly as ``raw_items_for_day`` derives it -- because that is
+        the partition the evidence belongs to, whatever day a feed happens
+        to repeat it on.
+        """
+
+        found: dict[tuple[str, str], dict[str, Any]] = {}
+        if not keys:
+            return found
+        with self._connect() as connection:
+            for source, canonical_url in keys:
+                row = connection.execute(
+                    "SELECT id, substr("
+                    "  COALESCE(published_at, fetched_at), 1, 10"
+                    ") AS trading_day "
+                    "FROM raw_items WHERE source = ? AND canonical_url = ?",
+                    (str(source), str(canonical_url)),
+                ).fetchone()
+                if row is not None:
+                    found[(str(source), str(canonical_url))] = {
+                        "id": int(row["id"]),
+                        "trading_day": str(row["trading_day"]),
+                    }
+        return found
+
+    def record_feed_observations(
+        self,
+        observations: Sequence[Mapping[str, Any]],
+        *,
+        run: Any,
+        terminal: bool = False,
+    ) -> int:
+        """Record that stored items were seen again, without moving them.
+
+        A feed repeating an entry it already published is the ordinary
+        case, and for an entry with no publication date it is the case that
+        used to wedge a feed permanently: the item's day is derived from
+        ``fetched_at``, so re-seeing it tomorrow made the batch look like
+        evidence that had moved to tomorrow, and I1 rightly refused to let
+        one day's run mutate another day's row.  The refusal was correct.
+        Re-ingesting was the mistake.
+
+        So a later sighting adds *provenance*, never evidence.  Nothing
+        about the raw item changes -- not its day, not its text, not its
+        identity -- and the run doing the writing covers the day the item
+        has always belonged to, so I1's cross-day protection is left
+        exactly as strong as it was.
+
+        Provenance is immutable, like the evidence it describes: a repeat
+        from a feed that already has a row keeps the original snapshot
+        link, which is the one whose bytes produced the stored text.  That
+        also makes replaying a fetch a no-op rather than a rewrite.
+        """
+
+        with self._logged_mutation(
+            run, operation="record_feed_observations", terminal=terminal
+        ) as (connection, context):
+            prepared = [self._prepare_feed_observation(entry) for entry in observations]
+            self._assert_observation_partition(connection, prepared, context)
+            written = 0
+            for values in prepared:
+                for provenance in values["feed_provenance"]:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO raw_item_feeds (
+                            raw_item_id, feed_source, external_id, snapshot_id,
+                            entry_digest
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(raw_item_id, feed_source, external_id)
+                        DO NOTHING
+                        """,
+                        (
+                            values["raw_item_id"],
+                            provenance["feed_source"],
+                            provenance["external_id"],
+                            provenance["snapshot_id"],
+                            provenance["entry_digest"],
+                        ),
+                    )
+                    written += cursor.rowcount or 0
+            context._record_outcome(success=len(prepared))
+            context._merge_counts(
+                {
+                    "feed_observations": len(prepared),
+                    "feed_provenance_added": written,
+                }
+            )
+            return written
+
+    @staticmethod
+    def _prepare_feed_observation(entry: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "raw_item_id": _require_int(
+                entry.get("raw_item_id"), "raw_item_id", minimum=1
+            ),
+            "feed_provenance": normalize_feed_provenance(entry.get("feed_provenance")),
+        }
+
+    @staticmethod
+    def _assert_observation_partition(
+        connection: sqlite3.Connection,
+        prepared: Sequence[Mapping[str, Any]],
+        run: StageRunContext,
+    ) -> None:
+        """An observation belongs to the day its item already belongs to."""
+
+        for position, values in enumerate(prepared):
+            stored = connection.execute(
+                "SELECT substr(COALESCE(published_at, fetched_at), 1, 10) AS day "
+                "FROM raw_items WHERE id = ?",
+                (values["raw_item_id"],),
+            ).fetchone()
+            if stored is None:
+                raise Phase0RunContextError(
+                    f"record_feed_observations observation {position} names raw "
+                    f"item {values['raw_item_id']}, which does not exist"
+                )
+            if str(stored["day"]) != run.trading_day:
+                raise Phase0RunContextError(
+                    f"record_feed_observations observation {position} names raw "
+                    f"item {values['raw_item_id']} on {stored['day']}, but the "
+                    f"run covers {run.trading_day}; a run may not mutate "
+                    f"another day's evidence"
+                )
+            for provenance in values["feed_provenance"]:
+                # Checked here rather than left to the foreign key:
+                # provenance that cannot be traced to stored bytes is a
+                # claim, and a bare IntegrityError out of the driver says
+                # far less about which observation was wrong.
+                snapshot = connection.execute(
+                    "SELECT 1 FROM feed_snapshots WHERE id = ?",
+                    (provenance["snapshot_id"],),
+                ).fetchone()
+                if snapshot is None:
+                    raise Phase0RunContextError(
+                        f"record_feed_observations observation {position} cites "
+                        f"snapshot {provenance['snapshot_id']}, which is not "
+                        f"stored"
+                    )
+
     def replace_relevance_classifications(
         self,
         decisions: Sequence[Mapping[str, Any]],
@@ -6075,12 +6220,19 @@ class Phase0Repository:
                 (item_id, run.ticker, values["decision"], values["evidence"]),
             )
 
-    def rss_raw_items(self) -> list[dict[str, Any]]:
-        """Every raw item with RSS provenance, for offline reclassification.
+    def rss_raw_items(
+        self, item_ids: Sequence[int] | None = None
+    ) -> list[dict[str, Any]]:
+        """Raw items with RSS provenance, as persisted.
 
-        A read, and only a read: reclassification replays from what is
-        already stored, so this is the whole input and no provider is
-        consulted.  Ordered by id so a replay is deterministic.
+        A read, and only a read.  This is the authoritative view of an
+        item's evidence, and both classification paths go through it: the
+        live fetch reads back the rows it just persisted (``item_ids``) and
+        a replay reads them all.  Classifying anything else -- a parser
+        object, a second feed's variant of the same story -- writes
+        decisions about text that is not what the row actually holds.
+
+        Ordered by id so a replay is deterministic.
 
         ``derived_tickers`` carries the tickers that currently hold derived
         state for the row.  A replay needs them to know what to *withdraw*:
@@ -6123,7 +6275,10 @@ class Phase0Repository:
                 ORDER BY raw_items.id
                 """
             ).fetchall()
-        return [dict(row) for row in rows]
+        if item_ids is None:
+            return [dict(row) for row in rows]
+        wanted = {_require_int(item_id, "item_id", minimum=1) for item_id in item_ids}
+        return [dict(row) for row in rows if int(row["id"]) in wanted]
 
     def persist_embeddings(
         self,

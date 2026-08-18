@@ -5325,6 +5325,7 @@ LOGGED_ENTRYPOINTS = [
     # so a key moves only in the transaction that commits the data and the
     # run log with it.
     "record_feed_snapshot",
+    "record_feed_observations",
     "replace_relevance_classifications",
 ]
 
@@ -11117,6 +11118,27 @@ def caught_validation_cases(repository: Phase0Repository) -> dict:
                 terminal=terminal,
             ),
             "feed_snapshots",
+        ),
+        # An observation naming a raw item that does not exist.
+        "record_feed_observations": (
+            lambda run, terminal: repository.record_feed_observations(
+                [
+                    {
+                        "raw_item_id": 999999,
+                        "feed_provenance": [
+                            {
+                                "feed_source": "rss:test",
+                                "external_id": "x",
+                                "snapshot_id": 1,
+                                "entry_digest": "a" * 64,
+                            }
+                        ],
+                    }
+                ],
+                run=run,
+                terminal=terminal,
+            ),
+            "raw_item_feeds",
         ),
         # A decision naming a raw item that has no RSS provenance at all.
         "replace_relevance_classifications": (
