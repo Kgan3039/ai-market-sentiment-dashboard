@@ -1,0 +1,47 @@
+# Phase 0 ingestion schedule (issue #68).
+# Install with: crontab deploy/phase0-pipeline.cron
+#
+# TIMEZONE ASSUMPTION
+# Every expression below is written in America/New_York and means nothing
+# in any other zone: "every 30 minutes through 16:30" is a market-hours
+# statement, not a wall-clock one. CRON_TZ is what makes that true, and it
+# is honoured by Vixie cron and cronie only. On an implementation that
+# ignores it -- busybox cron, some containers, macOS launchd wrappers --
+# these lines silently run in host local time and the market window lands
+# somewhere else. Verify before trusting the schedule:
+#
+#     grep CRON_TZ /var/log/syslog          # cron logged it, or it did not
+#     date; TZ=America/New_York date        # host offset vs intended offset
+#
+# DST needs no handling here: America/New_York carries EST and EDT with it,
+# so 09:30 stays 09:30 across both changeovers. A UTC schedule would drift
+# by an hour twice a year, which is why one is not used.
+CRON_TZ=America/New_York
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Replace these three for the deployment host.
+PROJECT_DIR=/opt/ticker-narratives
+PYTHON_BIN=/opt/ticker-narratives/.venv/bin/python
+PHASE0_DATABASE_PATH=/var/lib/ticker-narratives/phase0.sqlite3
+
+# OVERLAPPING INVOCATIONS
+# A fetch can outlast its interval -- a slow provider, a retry budget, a
+# large feed -- and cron starts the next copy regardless. Two live
+# invocations then race for the same feeds and the same provider slots.
+# `flock -n` refuses the second one immediately instead of queueing it
+# behind a run that may itself be wedged; pipeline.py takes the same lock
+# internally, so a manual or systemd invocation is covered too.
+#
+# EXIT CODES: 0 success (or skipped for overlap), 1 degraded, 2 failed.
+# A degraded run persisted real evidence with some source incomplete, so
+# alerting that treats every nonzero code as an outage will be noisy;
+# alert on 2, and trend 1.
+
+# Every 30 minutes from 09:00 through 16:30 ET on weekdays.
+0,30 9-16 * * 1-5 cd $PROJECT_DIR && flock -n /var/lock/phase0-pipeline.lock $PYTHON_BIN pipeline.py >> /var/log/ticker-narratives-pipeline.log 2>&1
+
+# Hourly outside the market-hour window: weekdays before 09:00 and after
+# 16:30, plus every weekend hour.
+0 0-8,17-23 * * 1-5 cd $PROJECT_DIR && flock -n /var/lock/phase0-pipeline.lock $PYTHON_BIN pipeline.py >> /var/log/ticker-narratives-pipeline.log 2>&1
+0 * * * 0,6 cd $PROJECT_DIR && flock -n /var/lock/phase0-pipeline.lock $PYTHON_BIN pipeline.py >> /var/log/ticker-narratives-pipeline.log 2>&1
