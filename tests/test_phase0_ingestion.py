@@ -2241,3 +2241,279 @@ def test_an_unusable_xml_base_still_fails_safely():
     # No absolute base to resolve against, so the link stays unusable --
     # recorded as invalid evidence rather than thrown away or crashed on.
     assert entry["validation_errors"] == ["link must resolve to absolute HTTP(S)"]
+
+
+# ---------------------------------------------------------------------------
+# Duplicate accounting (#83 review)
+# ---------------------------------------------------------------------------
+
+
+def _entry(guid, *, title=b"NVIDIA update", link=b"https://p.example/a"):
+    return (
+        b"<item><guid>" + guid + b"</guid><title>" + title + b"</title>"
+        b"<link>" + link + b"</link></item>"
+    )
+
+
+def _channel(*entries):
+    return b"<rss><channel>" + b"".join(entries) + b"</channel></rss>"
+
+
+def _assert_counters_compose(counts, *, decisions):
+    """The two counter families, each summing to what it describes.
+
+    They are independent partitions and must not be added together: a
+    malformed entry is stored evidence, so it is both ``inserted`` and
+    ``invalid``.  Asserting one identity without the other is how a
+    duplicate went missing from ``duplicates`` while ``inserted`` stayed
+    right and nothing looked wrong.
+
+    ``decisions`` is the number of classification decisions, which is the
+    distinct persisted items *per feed*.  A story carried by two approved
+    feeds is one row but two decisions, because each feed classifies the
+    batch it fetched; see ``test_cross_feed_duplicate_accounting_is_unchanged``.
+    """
+
+    assert counts["fetched"] == counts["inserted"] + counts["duplicates"]
+    assert (
+        counts["assigned"]
+        + counts["unmatched"]
+        + counts["ambiguous"]
+        + counts["invalid"]
+        == decisions
+    )
+
+
+def test_two_identical_entries_in_one_response_count_one_duplicate(tmp_path):
+    """The lookup runs before any insert, so both arrive as first sightings.
+
+    Only the insert knows which of them created the row, and it says so on
+    the result; predicting it from the pre-insert snapshot cannot work.
+    """
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    counts, errors = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(_channel(_entry(b"g1"), _entry(b"g2"))),
+        max_retries=0,
+    ).fetch(run_id="dup")
+
+    assert not errors
+    assert counts["fetched"] == 2
+    assert counts["inserted"] == 1
+    assert counts["duplicates"] == 1
+    assert repository.count("raw_items") == 1
+    _assert_counters_compose(counts, decisions=1)
+
+
+def test_three_identical_entries_in_one_response_count_two_duplicates(tmp_path):
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    counts, errors = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(_channel(_entry(b"g1"), _entry(b"g2"), _entry(b"g3"))),
+        max_retries=0,
+    ).fetch(run_id="dup")
+
+    assert not errors
+    assert (counts["fetched"], counts["inserted"], counts["duplicates"]) == (3, 1, 2)
+    assert repository.count("raw_items") == 1
+    # Each entry is its own sighting, so each leaves its own provenance row.
+    assert repository.count("raw_item_feeds") == 3
+    _assert_counters_compose(counts, decisions=1)
+
+
+def test_a_stored_duplicate_and_a_fresh_item_are_counted_apart(tmp_path):
+    """One duplicate the lookup can see, one item it has never seen."""
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    first = _channel(_entry(b"g1"))
+    second = _channel(
+        _entry(b"g1"),
+        _entry(b"n1", title=b"NVIDIA follow-up", link=b"https://p.example/b"),
+    )
+    responses = iter((first, second))
+
+    def get(*args, **kwargs):
+        body = next(responses)
+
+        class Response:
+            status_code = 200
+            headers: dict = {}
+            content = body
+
+            def raise_for_status(self):
+                return None
+
+        return Response()
+
+    fetcher = RSSFetcher(
+        repository, feeds_path=feeds, aliases_path=aliases, get=get, max_retries=0
+    )
+    fetcher.fetch(run_id="one")
+    counts, errors = fetcher.fetch(run_id="two")
+
+    assert not errors
+    assert (counts["fetched"], counts["inserted"], counts["duplicates"]) == (2, 1, 1)
+    assert repository.count("raw_items") == 2
+    _assert_counters_compose(counts, decisions=2)
+
+
+def test_a_stored_duplicate_and_a_same_response_duplicate_both_count(tmp_path):
+    """Both kinds at once: the counter has to add them, not choose."""
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    fresh_pair = (
+        _entry(b"n1", title=b"NVIDIA follow-up", link=b"https://p.example/b"),
+        _entry(b"n2", title=b"NVIDIA follow-up", link=b"https://p.example/b"),
+    )
+    responses = iter((_channel(_entry(b"g1")), _channel(_entry(b"g1"), *fresh_pair)))
+
+    def get(*args, **kwargs):
+        body = next(responses)
+
+        class Response:
+            status_code = 200
+            headers: dict = {}
+            content = body
+
+            def raise_for_status(self):
+                return None
+
+        return Response()
+
+    fetcher = RSSFetcher(
+        repository, feeds_path=feeds, aliases_path=aliases, get=get, max_retries=0
+    )
+    fetcher.fetch(run_id="one")
+    counts, errors = fetcher.fetch(run_id="two")
+
+    assert not errors
+    # Three entries: one already stored, one new, one duplicating the new.
+    assert (counts["fetched"], counts["inserted"], counts["duplicates"]) == (3, 1, 2)
+    assert repository.count("raw_items") == 2
+    _assert_counters_compose(counts, decisions=2)
+
+
+def test_cross_feed_duplicate_accounting_is_unchanged(tmp_path):
+    """The second feed's copy is a duplicate, and the row stays single."""
+
+    repository = migrated(tmp_path)
+    feeds = tmp_path / "feeds.yaml"
+    aliases = tmp_path / "aliases.yaml"
+    _write_feeds(
+        feeds,
+        "feeds:\n"
+        "  - id: alpha\n    url: https://a.example/feed\n"
+        "  - id: beta\n    url: https://b.example/feed\n",
+    )
+    aliases.write_text(NVDA_ALIASES, encoding="utf-8")
+
+    counts, errors = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(_channel(_entry(b"g1"))),
+        max_retries=0,
+    ).fetch(run_id="cross")
+
+    assert not errors
+    assert (counts["fetched"], counts["inserted"], counts["duplicates"]) == (2, 1, 1)
+    assert repository.count("raw_items") == 1
+    assert {row["feed_source"] for row in reader(repository).raw_item_feeds()} == {
+        "rss:alpha",
+        "rss:beta",
+    }
+    # One row, but two decisions: each feed classifies the batch it fetched,
+    # and both resolve to the same story.  The decisions agree -- they are
+    # computed from the same persisted evidence -- so this is a counter
+    # nuance, not drift.
+    assert counts["assigned"] == 2
+    _assert_counters_compose(counts, decisions=2)
+
+
+def test_counting_duplicates_did_not_change_what_is_persisted(tmp_path):
+    """The durable data was already right; only the counters were not."""
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(_channel(_entry(b"g1"), _entry(b"g2"))),
+        max_retries=0,
+    ).fetch(run_id="dup")
+
+    read = reader(repository)
+    assert repository.count("raw_items") == 1
+    # One provenance row per entry: two sightings of one story, and each
+    # still points at the snapshot it was parsed from.
+    provenance = read.raw_item_feeds()
+    assert {row["external_id"] for row in provenance} == {"g1", "g2"}
+    assert {row["snapshot_id"] for row in provenance} == {1}
+    assert read.raw_items()[0]["ticker"] == "NVDA"
+    assert [row["ticker"] for row in read.raw_item_associations()] == ["NVDA"]
+
+
+def test_refetching_the_same_response_reports_every_entry_as_a_duplicate(tmp_path):
+    """A replayed fetch inserts nothing and says so."""
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    fetcher = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(_channel(_entry(b"g1"), _entry(b"g2"))),
+        max_retries=0,
+    )
+    first, _ = fetcher.fetch(run_id="one")
+    second, errors = fetcher.fetch(run_id="two")
+
+    assert not errors
+    assert (first["fetched"], first["inserted"], first["duplicates"]) == (2, 1, 1)
+    assert (second["fetched"], second["inserted"], second["duplicates"]) == (2, 0, 2)
+    assert repository.count("raw_items") == 1
+    _assert_counters_compose(second, decisions=1)
+
+
+def test_invalid_entries_and_duplicates_compose(tmp_path):
+    """A malformed entry is stored evidence, so it is inserted *and* invalid.
+
+    The two counter families answer different questions, and this is the
+    case where treating them as one would have to lose an answer.
+    """
+
+    repository = migrated(tmp_path)
+    feeds, aliases = _one_feed(tmp_path, NVDA_ALIASES)
+    body = _channel(
+        _entry(b"g1"),
+        _entry(b"g2"),
+        b"<item><guid>broken</guid></item>",
+    )
+    counts, errors = RSSFetcher(
+        repository,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=_responder(body),
+        max_retries=0,
+    ).fetch(run_id="mixed")
+
+    assert [error["type"] for error in errors] == ["invalid_entry"]
+    # Three entries: one row for the story, one duplicate of it, one row of
+    # malformed evidence kept under its own urn.
+    assert (counts["fetched"], counts["inserted"], counts["duplicates"]) == (3, 2, 1)
+    assert counts["invalid"] == 1
+    assert counts["assigned"] == 1
+    assert repository.count("raw_items") == 2
+    _assert_counters_compose(counts, decisions=2)
+    # A partial feed still withholds the conditional marker.
+    assert repository.source_state("rss:test")["status"] == "partial"

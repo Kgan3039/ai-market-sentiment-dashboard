@@ -839,6 +839,8 @@ class RSSFetcher:
                 for group in seen.values()
                 for observation in group
             ]
+            # An entry that was already stored *before* this response is a
+            # duplicate the lookup above can see.
             counts["duplicates"] += len(item_ids)
             for day in sorted(fresh):
                 with self.repository.stage_run(
@@ -850,7 +852,15 @@ class RSSFetcher:
                     results = self.repository.ingest_raw_items(
                         fresh[day], run=run, terminal=True
                     )
+                # ...and one that duplicates an entry from *this* response is
+                # a duplicate only the insert can see.  The lookup ran before
+                # any of them was written, so a feed listing the same story
+                # twice arrives here as two first sightings; ``inserted`` on
+                # the result is the authoritative answer to which of them
+                # actually created the row, so both buckets come from it
+                # rather than from a second dedup guess in this module.
                 counts["inserted"] += sum(result.inserted for result in results)
+                counts["duplicates"] += sum(not result.inserted for result in results)
                 item_ids.extend(result.item_id for result in results)
             for day in sorted(seen):
                 with self.repository.stage_run(
@@ -1154,6 +1164,20 @@ class RSSFetcher:
         only ever be ignored or fatal -- and for RSS it would be fatal,
         because the snapshot and the checkpoint carry real fetch
         timestamps that a declared day would contradict.
+
+        **The counters are two independent partitions, not one.**
+
+        * What happened to each parsed *entry*:
+          ``fetched == inserted + duplicates``.  An entry is a duplicate
+          whether the row it resolved to was stored by an earlier fetch or
+          by an earlier entry of this same response.
+        * What was decided about each distinct persisted *item*:
+          ``assigned + unmatched + ambiguous + invalid``.
+
+        The two do not sum together and are not meant to.  A malformed
+        entry is stored evidence like any other, so it counts once as
+        ``inserted`` and once as ``invalid`` -- those are answers to
+        different questions, and collapsing them would lose one of them.
         """
 
         base_run_id = self._resolved_run_id("rss", run_id)
