@@ -1600,16 +1600,25 @@ def test_a_request_is_retired_before_its_answer_reaches_the_caller():
 
 
 @contextmanager
-def thread_start_fails(error=None):
+def thread_start_fails(error=None, only=None):
     """Make ``Thread.start`` fail the way an exhausted process makes it fail.
 
     This is the one path where the worker never reaches ``_run``, so nothing
     but ``call`` itself can undo the registration and the slot ``call``
-    already took.
+    already took.  *only* narrows the failure to one worker by name, which
+    the window tests need: they hold this patch open while a second caller
+    runs, and that caller has a worker of its own to start.
     """
 
     failure = error if error is not None else RuntimeError("can't start new thread")
-    with patch.object(threading.Thread, "start", side_effect=failure):
+    real_start = threading.Thread.start
+
+    def start(self):
+        if only is None or self.name == only:
+            raise failure
+        return real_start(self)
+
+    with patch.object(threading.Thread, "start", start):
         yield failure
 
 
@@ -1854,3 +1863,422 @@ def test_a_worker_that_never_starts_settles_the_partition_as_a_failure(
 
     assert gate.outstanding == 0
     assert free_slots(gate, hanging) == gate.max_concurrent
+
+
+# ---------------------------------------------------------------------------
+# Registry and capacity must move together
+# ---------------------------------------------------------------------------
+
+
+class CountingSlots:
+    """The gate's semaphore, with its free count made observable."""
+
+    def __init__(self, semaphore, available):
+        self._semaphore = semaphore
+        self._guard = threading.Lock()
+        self.available = available
+
+    def acquire(self, blocking=True, timeout=None):
+        acquired = self._semaphore.acquire(blocking, timeout)
+        if acquired:
+            with self._guard:
+                self.available -= 1
+        return acquired
+
+    def release(self):
+        self._semaphore.release()
+        with self._guard:
+            self.available += 1
+
+
+def audited(gate):
+    """Record every moment *gate* becomes observable in a state it must not.
+
+    The gate keeps one fact — how much of it is in use — in two structures,
+    and a caller can only ever look between unlocks.  So the check is that
+    the two still add up every time the gate gives the lock back: an
+    invariant that holds at every unlock is one no caller can catch broken.
+    This needs no second thread and no timing at all, which is what makes it
+    the load-bearing test rather than the racing ones below.
+    """
+
+    slots = CountingSlots(gate._slots, gate.max_concurrent)
+    gate._slots = slots
+    real_lock = gate._lock
+    violations = []
+
+    class AuditedLock:
+        def acquire(self, *args, **kwargs):
+            return real_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            outstanding = len(gate._inflight)
+            if outstanding + slots.available != gate.max_concurrent:
+                violations.append(
+                    {"outstanding": outstanding, "available": slots.available}
+                )
+            real_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc_info):
+            self.release()
+
+    gate._lock = AuditedLock()
+    return violations
+
+
+class ParkedCleanup:
+    """Hold the gate inside a retirement so another caller can walk into it.
+
+    The defect is a window rather than a state, so catching it means
+    stopping the gate in the middle of one.  Parking on the slot release
+    puts that pause exactly between the registry cleanup and the capacity
+    restore — the two steps whose ordering is the entire question.
+    """
+
+    def __init__(self, semaphore):
+        self._semaphore = semaphore
+        self.window_open = threading.Event()
+        self.may_finish = threading.Event()
+        self.probe_reached_capacity = threading.Event()
+        self._parked = False
+
+    def acquire(self, blocking=True, timeout=None):
+        if self.window_open.is_set():
+            # Only a caller that got past the registry can ask for capacity,
+            # so reaching here during the window *is* the defect.
+            self.probe_reached_capacity.set()
+        return self._semaphore.acquire(blocking, timeout)
+
+    def release(self):
+        if not self._parked:
+            self._parked = True
+            self.window_open.set()
+            assert self.may_finish.wait(10), "the parked cleanup was never let go"
+        self._semaphore.release()
+
+
+class WatchedLock:
+    """The gate's lock, with contention and ownership made observable."""
+
+    def __init__(self, lock):
+        self._lock = lock
+        self._guard = threading.Lock()
+        self.waiting = 0
+        self.held = False
+
+    def acquire(self, *args, **kwargs):
+        with self._guard:
+            self.waiting += 1
+        try:
+            acquired = self._lock.acquire(*args, **kwargs)
+        finally:
+            with self._guard:
+                self.waiting -= 1
+        if acquired:
+            self.held = True
+        return acquired
+
+    def release(self):
+        self.held = False
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+
+
+def parked(gate):
+    """Instrument *gate* so its first retirement can be paused mid-way."""
+
+    park = ParkedCleanup(gate._slots)
+    gate._slots = park
+    gate._lock = WatchedLock(gate._lock)
+    return park
+
+
+def probe_the_window(gate, park, probe):
+    """Run *probe* against a gate parked inside a retirement.
+
+    Returns ``{"value": ...}`` or ``{"error": ...}``.  The wait below is on
+    a condition and never on a duration, and it decides for either gate:
+
+    * A gate that unlocks mid-cleanup lets the probe run straight through to
+      the capacity check, which is what ``probe_reached_capacity`` reports.
+    * A gate that keeps the cleanup atomic makes the probe block on the lock
+      the cleanup still holds — ``waiting`` with ``held``, which the first
+      kind of gate cannot show, because it has already given the lock back.
+    """
+
+    outcome = {}
+    finished = threading.Event()
+
+    def run():
+        try:
+            outcome["value"] = probe()
+        except BaseException as exc:  # the refusal under test is one of these
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    prober = threading.Thread(target=run, name="window-probe", daemon=True)
+    prober.start()
+    assert wait_for(
+        lambda: finished.is_set()
+        or park.probe_reached_capacity.is_set()
+        or (gate._lock.waiting > 0 and gate._lock.held)
+    ), "the probe never reached the cleanup window"
+    park.may_finish.set()
+    prober.join(timeout=5)
+    assert not prober.is_alive(), "the probe never returned"
+    return outcome
+
+
+def failed_start_parked_in_cleanup(gate, key="NVDA"):
+    """Start a doomed request for *key* and leave it parked mid-cleanup."""
+
+    park = parked(gate)
+    raised = {}
+
+    def start_and_fail():
+        with thread_start_fails(only=f"yahoo-provider-{key}"):
+            try:
+                gate.call(key, lambda: "never asked for")
+            except BaseException as exc:
+                raised["error"] = exc
+
+    starter = threading.Thread(target=start_and_fail, name="failed-start", daemon=True)
+    starter.start()
+    assert park.window_open.wait(5), "the failed start never reached its cleanup"
+    return park, starter, raised
+
+
+@pytest.mark.parametrize(
+    "probe_ticker", ["NVDA", "TSLA"], ids=["same-ticker", "other-ticker"]
+)
+def test_a_caller_meeting_a_failed_start_mid_cleanup_is_never_refused(probe_ticker):
+    """The race itself, with the losing caller forced into the window.
+
+    On the last slot, a cleanup that drops the registry entry before it
+    gives the capacity back publishes a moment where the ticker is not
+    outstanding *and* there is no room to start it.  A caller arriving then
+    is told the provider is busy over a request that no longer exists — and
+    its ticker is settled as provider-busy without a provider worker ever
+    having existed.
+    """
+
+    gate = YahooProviderGate(1)
+    park, starter, raised = failed_start_parked_in_cleanup(gate)
+
+    outcome = probe_the_window(
+        gate, park, lambda: gate.call(probe_ticker, lambda: "answer")
+    )
+
+    starter.join(timeout=5)
+    assert isinstance(raised["error"], RuntimeError)
+    assert "error" not in outcome, (
+        f"refused mid-cleanup with {outcome.get('error')!r}: the gate was "
+        f"observable with no request outstanding and no capacity free"
+    )
+    assert outcome["value"].result(timeout=5) == "answer"
+    assert wait_for(lambda: gate.outstanding == 0)
+    assert gate.live_workers == 0
+
+
+def test_a_failed_start_never_unlocks_the_gate_half_cleaned_up():
+    """The same defect without a second thread: no timing, no window to hit.
+
+    Whether a caller is *observed* losing the race depends on scheduling;
+    whether the gate ever becomes observable in a state that would lose it
+    does not.  This asserts the latter, so it cannot go quiet.
+    """
+
+    gate = YahooProviderGate(1)
+    violations = audited(gate)
+
+    with thread_start_fails():
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "never asked for")
+
+    assert violations == [], (
+        "the gate gave the lock back with the request already gone and its "
+        "slot not yet returned; a caller looking then is refused as "
+        "provider-busy over a request that does not exist"
+    )
+    assert gate.call("NVDA", lambda: "answer").result(timeout=5) == "answer"
+    assert violations == []
+
+
+def test_a_failed_start_leaves_nothing_for_the_same_ticker_to_join():
+    """The stale registration the atomic cleanup must still not leave behind.
+
+    Freeing the slot under the lock must not be bought by leaving the
+    registry entry in place: the next caller for that ticker would join a
+    future no worker will ever complete and wait out its whole budget.
+    """
+
+    gate = YahooProviderGate(1)
+    violations = audited(gate)
+
+    with thread_start_fails():
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "never asked for")
+
+    assert gate.outstanding_keys == ()
+    assert gate.joined == 0
+
+    answered = gate.call("NVDA", lambda: "answer")
+
+    assert answered.result(timeout=5) == "answer"
+    assert gate.joined == 0, "the next caller joined a request that never ran"
+    assert violations == []
+
+
+def test_a_failed_start_leaves_a_wider_gate_exactly_its_other_slots(hanging):
+    """Cleanup restores one slot: not the gate, and not one too few."""
+
+    gate = YahooProviderGate(3)
+    violations = audited(gate)
+    factory = hanging()
+
+    gate.call("TSLA", lambda: factory("TSLA"))
+    factory.wait_until_entered(1)
+
+    with thread_start_fails():
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "never asked for")
+
+    assert gate.outstanding == 1
+    assert gate.outstanding_keys == ("TSLA",)
+    assert violations == []
+    assert free_slots(gate, hanging) == 2
+    assert violations == []
+
+
+def test_repeated_failed_starts_never_saturate_the_gate_even_briefly():
+    """False saturation must be neither permanent nor transient.
+
+    A leaked slot shows up as a gate that refuses everything.  A slot
+    returned a moment too late shows up as a gate that refuses *someone* —
+    rarely, unreproducibly, and only under load.  Auditing every unlock
+    across many failures is what covers the second kind.
+    """
+
+    gate = YahooProviderGate(1)
+    violations = audited(gate)
+
+    for _ in range(25):
+        with thread_start_fails():
+            with pytest.raises(RuntimeError):
+                gate.call("NVDA", lambda: "never asked for")
+        # Not merely "no slot was lost": on a one-slot gate this is also
+        # the whole capacity, so a request that starts proves the gate is
+        # neither saturated nor half-cleaned-up.
+        assert gate.call("NVDA", lambda: "answer").result(timeout=5) == "answer"
+
+    assert violations == []
+    assert gate.outstanding == 0
+    assert gate.live_workers == 0
+
+
+def test_a_start_that_raises_after_the_worker_ran_frees_exactly_one_slot():
+    """Atomicity must not be bought with a second release.
+
+    If both the failed ``call`` and a worker that did run reach for the same
+    request's slot, freeing it twice either raises out of the
+    ``BoundedSemaphore`` or quietly lifts the process-wide ceiling — which
+    the audit sees as capacity that no longer adds up.
+    """
+
+    gate = YahooProviderGate(2)
+    violations = audited(gate)
+    real_start = threading.Thread.start
+
+    def start_then_fail(self):
+        real_start(self)
+        raise RuntimeError("can't start new thread")
+
+    with patch.object(threading.Thread, "start", start_then_fail):
+        with pytest.raises(RuntimeError):
+            gate.call("NVDA", lambda: "answer")
+
+    assert wait_for(lambda: gate.outstanding == 0)
+    assert gate.live_workers == 0
+    assert violations == []
+    # Capacity is exactly two: not one lost, and not three invented.
+    assert gate._slots.available == 2
+
+
+def test_a_running_worker_still_holds_its_slot_until_the_provider_answers(hanging):
+    """The half of the contract the atomic cleanup must not overshoot.
+
+    A slot is freed by the request, not by the caller.  Retiring under the
+    lock must not start freeing slots any earlier than the provider really
+    returning.
+    """
+
+    gate = YahooProviderGate(1)
+    violations = audited(gate)
+    factory = hanging()
+
+    request = gate.call("NVDA", lambda: factory("NVDA"))
+    factory.wait_until_entered(1)
+
+    assert gate.outstanding == 1
+    assert gate._slots.available == 0
+    with pytest.raises(YahooProviderBusyError):
+        gate.call("TSLA", lambda: "too soon")
+
+    factory.released.set()
+    assert request.result(timeout=5).news
+
+    assert wait_for(lambda: gate.outstanding == 0)
+    assert wait_for(lambda: gate._slots.available == 1)
+    assert violations == []
+
+
+def test_a_failed_start_cannot_settle_another_ticker_as_provider_busy(
+    tmp_path, hanging
+):
+    """The caller-visible cost of the race, at the level it is reported.
+
+    A fetch that loses this race does not just retry: ``provider_busy`` is
+    settled like any other exhausted request, so the ticker is recorded as
+    failed on a checkpoint blaming a provider that was never asked.
+    """
+
+    repository = migrated(tmp_path)
+    gate = YahooProviderGate(1)
+    park, starter, raised = failed_start_parked_in_cleanup(gate)
+    factory = provider()
+
+    outcome = probe_the_window(
+        gate,
+        park,
+        lambda: fetcher(
+            repository, factory, provider_gate=gate, request_timeout_seconds=5
+        ).fetch(["TSLA"]),
+    )
+
+    starter.join(timeout=5)
+    assert isinstance(raised["error"], RuntimeError)
+    assert "error" not in outcome, f"the fetch itself failed: {outcome.get('error')!r}"
+
+    counts, errors = outcome["value"]
+    assert counts["provider_busy"] == 0, "settled as busy over a request that was gone"
+    assert counts["tickers_failed"] == 0
+    assert counts["tickers_succeeded"] == 1
+    assert not errors
+    assert factory.calls == ["TSLA"]
+    assert repository.source_state("yahoo:TSLA")["status"] == "success"
+    assert partitions(repository)[("TSLA", today())]["status"] == "success"
+    assert repository.source_state("yahoo:NVDA") is None
+
+    assert wait_for(lambda: gate.outstanding == 0)
+    assert free_slots(gate, hanging) == 1

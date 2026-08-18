@@ -1285,6 +1285,13 @@ limit for as long as the hang lasted.
   registration and frees the slot before the failure propagates. Which of
   the two retires a request is settled by identity under the gate's lock,
   so the slot is freed exactly once either way.
+- **Retiring is atomic.** Dropping the registry entry and giving the slot
+  back both happen under the gate's lock, so the two are never observable
+  apart. Freeing the slot after unlocking would publish a moment where a
+  ticker is not outstanding and yet no capacity exists, and a caller
+  arriving in that moment is refused as provider-busy over a request that
+  is already gone — on a one-slot gate, every caller. This holds for both
+  retirement paths: a worker finishing and a worker that never started.
 
 The gate is deliberately not a `ThreadPoolExecutor`: its workers are
 non-daemon and joined at interpreter shutdown, so one hung provider call
