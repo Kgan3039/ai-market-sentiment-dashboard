@@ -1304,3 +1304,117 @@ cannot escape the ceiling by bringing its own slots. Pass a private gate to
 opt out. A refusal settles like any other exhausted request: a `failed`
 checkpoint and a `degraded` run, with `counts["provider_busy"]` separating
 it from a timeout.
+
+## How #83 (RSS, issue #62) was ported onto this contract
+
+`rss.py` is the second consumer rebased onto the final surface, and the
+harder one. Yahoo asks for one symbol at a time; a single RSS response
+routinely carries several tickers, several days, articles that are also on
+another approved feed, and entries that do not parse at all.
+
+**Migration 015 is the one schema addition.** The final I1 schema had no
+home for three things, and none of them could be folded into an existing
+column without corrupting its meaning:
+
+| Evidence | Why nothing existing fits |
+|---|---|
+| the exact bytes of a feed response | `raw_items.raw_json` is per-entry publisher evidence, not the response body; `source_state.metadata` goes through `serialize_operational_metadata` and is *always* redacted, so a body stored there would be rewritten |
+| which feed an item arrived on | `raw_items` is unique by `(source, canonical_url)`, and RSS keys `source` by the *publisher* host so a syndicated story keeps one identity — the feed it came from has to live beside it, not in it |
+| why a ticker matched or was excluded | `raw_item_candidates` holds one free-text `reason` per (item, ticker); a decision carries an evidence *array*, and an exclusion is not a candidate |
+
+The ticker domain in 015 is a literal, not a lookup against
+`supported_tickers`, for the reason migration 009 gives: a lookup is a
+domain that any ordinary write can widen.
+
+**Four stages per feed, because the guarantees differ.** A run identity
+names one partition, and the properties #62 needs do not all belong to the
+same transaction:
+
+| Stage | Partition | Terminal operation | What it guarantees |
+|---|---|---|---|
+| `fetch_rss` | feed, fetch day, no ticker | `record_feed_snapshot` | the response bytes are durable before anything derived from them exists |
+| `ingest_rss` | one item day, no ticker | `ingest_raw_items` | normalized entries and their provenance are durable *unclassified* |
+| `observe_rss` | the stored item's day, no ticker | `record_feed_observations` | a story already stored, seen again: provenance only |
+| `classify_rss` | one ticker, one day | `replace_relevance_classifications` | derived relevance for exactly one ticker |
+| `checkpoint_rss` | feed, fetch day, no ticker | `record_source_state` | the conditional-request marker moves only over evidence that landed |
+
+Claiming one transaction for all four would mean either losing the
+evidence when classification fails, or letting a single run write across
+every partition a feed happens to mention. Both are worse than four runs.
+
+**Raw evidence outlives classification.** The classifier is a pure
+function, but persisting what it decided is not: `ingest_rss` commits
+first, so a classifier that throws costs the classification and not the
+article, the provenance, or the bytes. The feed is then checkpointed
+`failed` **without** an `etag` or `last_modified` — advancing a
+conditional marker there would tell the next fetch to skip a response
+nobody kept.
+
+**An article about two tickers is written by two runs.** `raw_items` keeps
+one row; `raw_item_tickers`, `raw_item_candidates`, and
+`raw_item_match_evidence` each gain a row per ticker, written inside that
+ticker's own partition run. Two consequences follow, and both are load
+bearing:
+
+- the item's `ticker` column is guarded by the writing run's own ticker
+  (`WHERE ticker IS NULL OR ticker = :run_ticker`), so AMD's *exclusion*
+  cannot quietly undo the assignment NVDA just made;
+- replacement is scoped per (item, ticker) rather than per item, so one
+  ticker's run cannot clear another's rows.
+
+**Offline reclassification replays from disk.** `reclassify_persisted`
+reads `rss_raw_items()` and nothing else — no session, no feed, no clock
+that matters — and replaces derived state one partition at a time. Raw
+evidence, provenance, snapshots, and the parser's `invalid` verdict all
+survive it unchanged, which is what makes replay idempotent. A ticker that
+has *stopped* matching is withdrawn explicitly, in that ticker's own run:
+only NVDA's run may clear NVDA's rows, so an omission would leave them
+behind for good. The first replay after an alias change therefore does more
+work than the second; from there it is a fixed point.
+
+**`fetch()` takes no `trading_day`**, for the reason `yahoo.py` gives: a
+run's day is a partition identity the evidence decides, not a label a
+caller may attach. For RSS an override is not merely ignored — the
+snapshot and the checkpoint carry real fetch timestamps, and I1 refuses a
+run whose day contradicts them.
+
+### Two things the first cut of this port got wrong
+
+**A repeated undated entry is an observation, not new evidence.** An item
+with no publication date takes its day from `fetched_at`, so a feed
+repeating it tomorrow made the batch look like evidence that had *moved* to
+tomorrow, and I1 refused to let one day's run mutate another day's row. The
+refusal was right; re-ingesting was the mistake — and because most feeds
+repeat their entries, the feed then failed every run from the second day
+onward, permanently. A sighting of a story that is already stored now goes
+through `record_feed_observations`, which adds provenance under the day the
+item has always belonged to and changes nothing else. Cross-day protection
+is untouched, no second row appears, and the checkpoint keeps advancing.
+
+Provenance is immutable, like the evidence it describes: a repeat from a
+feed that already has a row keeps its original `snapshot_id`, which is the
+snapshot whose bytes produced the stored text. That is also what makes
+re-running a fetch a no-op rather than a rewrite.
+
+**Classification reads the row, never the parser.** `ingest_raw_items`
+returns the stored row for a duplicate and does not overwrite its text, so a
+second feed's variant wording for a story the first feed already stored is
+*not* what the row holds. Classifying the parsed entry therefore wrote a
+ticker justified by words no reader could find in the record — and the next
+offline replay, reading the row, silently reversed it. Which of the two
+feeds "won" depended on nothing but polling order.
+
+Both paths now call one routine over rows read back from the database:
+`rss_raw_items(item_ids)` after a fetch, `rss_raw_items()` for a replay.
+Live and replay agreeing is structural rather than a coincidence worth
+re-deriving. If per-feed variant text ever becomes part of the product, it
+has to be persisted as its own evidence unit first; classifying an ephemeral
+parser object and attaching the result to a different record is exactly what
+this replaced.
+
+**XML Base is relative until something makes it absolute.** A root
+`xml:base="articles/"` was treated as if it were already absolute, yielding
+a relative link that then failed validation as "not absolute HTTP(S)". The
+base in effect at the root is the feed's own URL, and each nested
+`xml:base` resolves against the base already in effect — including one on
+the `<link>` element itself.

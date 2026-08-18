@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import hashlib
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -337,8 +338,11 @@ COUNTABLE_TABLES = frozenset(
     {
         "embeddings",
         "eval_labels",
+        "feed_snapshots",
         "pipeline_stage_keys",
         "raw_item_candidates",
+        "raw_item_feeds",
+        "raw_item_match_evidence",
         "raw_item_tickers",
         "raw_items",
         "run_log",
@@ -554,6 +558,66 @@ def normalize_candidate_tickers(value: Any) -> list[dict[str, str]]:
         # normalize_ticker raises rather than returning None here.
         seen.setdefault(str(ticker), reason)
     return [{"ticker": ticker, "reason": seen[ticker]} for ticker in sorted(seen)]
+
+
+def normalize_feed_provenance(value: Any) -> list[dict[str, Any]]:
+    """Normalize RSS ``feed_provenance`` once, for validation *and* storage.
+
+    Each entry names the feed an item arrived on, the identifier that feed
+    gave it, the snapshot whose bytes it was parsed from, and the digest of
+    the entry within that snapshot.  All four are required: provenance that
+    cannot be traced back to stored bytes is a claim, not evidence.
+
+    One parser, for the same reason :func:`normalize_candidate_tickers` is
+    one parser -- a second one downstream is how a payload comes to be
+    stored in a shape the validator never saw.
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, Sequence):
+        raise Phase0ValidationError("feed_provenance must be a sequence of mappings")
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    for position, entry in enumerate(value):
+        if not isinstance(entry, Mapping):
+            raise Phase0ValidationError(
+                f"feed provenance {position} must be a mapping, "
+                f"not {type(entry).__name__}"
+            )
+        feed_source = _require_text(
+            entry.get("feed_source"), f"feed provenance {position} feed_source"
+        )
+        if not feed_source.startswith("rss:"):
+            raise Phase0ValidationError(
+                f"feed provenance {position} feed_source must name an RSS feed"
+            )
+        external_id = _require_text(
+            entry.get("external_id"), f"feed provenance {position} external_id"
+        )
+        entry_digest = _require_text(
+            entry.get("entry_digest"), f"feed provenance {position} entry_digest"
+        )
+        if len(entry_digest) != 64:
+            raise Phase0ValidationError(
+                f"feed provenance {position} entry_digest must be a sha256 digest"
+            )
+        snapshot_id = _require_int(
+            entry.get("snapshot_id"),
+            f"feed provenance {position} snapshot_id",
+            minimum=1,
+        )
+        # First mention wins, so a feed repeating an identifier within one
+        # response cannot silently rewrite the provenance of the first.
+        seen.setdefault(
+            (feed_source, external_id),
+            {
+                "feed_source": feed_source,
+                "external_id": external_id,
+                "snapshot_id": snapshot_id,
+                "entry_digest": entry_digest,
+            },
+        )
+    return [seen[key] for key in sorted(seen)]
 
 
 def _optional_blob(value: Any, field: str) -> bytes | None:
@@ -910,9 +974,11 @@ class Phase0Admin:
     **Normal ingestion and orchestration must never use it.**  Issue #68's
     runner, and issues #82 and #83, use the logged entrypoints on
     :class:`Phase0Repository` — ``ingest_raw_items``, ``reconcile_stories``,
-    ``reconcile_themes``, ``persist_embeddings``, ``record_source_state`` —
-    each of which requires the :class:`StageRunContext` from ``stage_run``
-    and writes its run-log row in the same transaction as the data.
+    ``reconcile_themes``, ``persist_embeddings``, ``record_source_state``,
+    ``record_feed_snapshot``, ``record_feed_observations``,
+    ``replace_relevance_classifications`` — each of which requires the
+    :class:`StageRunContext` from ``stage_run`` and writes its run-log row
+    in the same transaction as the data.
 
     Keeping these behind ``repository.admin`` is the whole point: an
     unlogged write cannot happen without the call site saying so, and a
@@ -1110,6 +1176,16 @@ class Phase0Reader:
             (_require_int(item_id, "item_id", minimum=1),),
         )
 
+    def raw_items(self) -> list[dict[str, Any]]:
+        """Every raw item, in insertion order.
+
+        The symmetric listing to :meth:`raw_item_candidates` and
+        :meth:`raw_item_associations`; a consumer inspecting evidence should
+        not have to guess row ids to walk it.
+        """
+
+        return self._query("SELECT * FROM raw_items ORDER BY id")
+
     def raw_item_candidates(self, item_id: int | None = None) -> list[dict[str, Any]]:
         if item_id is None:
             return self._query(
@@ -1127,6 +1203,50 @@ class Phase0Reader:
             )
         return self._query(
             "SELECT * FROM raw_item_tickers WHERE raw_item_id = ? ORDER BY ticker",
+            (_require_int(item_id, "item_id", minimum=1),),
+        )
+
+    # -- RSS evidence and provenance (#62) -------------------------------
+
+    def feed_snapshots(self, feed_source: str | None = None) -> list[dict[str, Any]]:
+        """Stored feed responses, newest last, with their bytes.
+
+        The ``body`` is returned exactly as it was received: a reader
+        comparing a stored snapshot against the upstream feed must find it
+        byte-identical, which is the whole reason it is kept.
+        """
+
+        if feed_source is None:
+            return self._query("SELECT * FROM feed_snapshots ORDER BY id")
+        return self._query(
+            "SELECT * FROM feed_snapshots WHERE feed_source = ? ORDER BY id",
+            (_require_text(feed_source, "feed_source"),),
+        )
+
+    def raw_item_feeds(self, item_id: int | None = None) -> list[dict[str, Any]]:
+        """Which feeds an item arrived on -- one row per feed, not per item."""
+
+        if item_id is None:
+            return self._query(
+                "SELECT * FROM raw_item_feeds ORDER BY raw_item_id, feed_source"
+            )
+        return self._query(
+            "SELECT * FROM raw_item_feeds WHERE raw_item_id = ? ORDER BY feed_source",
+            (_require_int(item_id, "item_id", minimum=1),),
+        )
+
+    def raw_item_match_evidence(
+        self, item_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Why each ticker was matched or excluded, as stored."""
+
+        if item_id is None:
+            return self._query(
+                "SELECT * FROM raw_item_match_evidence " "ORDER BY raw_item_id, ticker"
+            )
+        return self._query(
+            "SELECT * FROM raw_item_match_evidence WHERE raw_item_id = ? "
+            "ORDER BY ticker",
             (_require_int(item_id, "item_id", minimum=1),),
         )
 
@@ -1796,6 +1916,7 @@ class Phase0Repository:
             "candidate_tickers": normalize_candidate_tickers(
                 item.get("candidate_tickers")
             ),
+            "feed_provenance": normalize_feed_provenance(item.get("feed_provenance")),
         }
 
     @staticmethod
@@ -1853,6 +1974,28 @@ class Phase0Repository:
                 DO UPDATE SET reason = excluded.reason
                 """,
                 (item_id, candidate["ticker"], candidate["reason"]),
+            )
+        # Provenance rides in the same transaction as the evidence it
+        # describes: #62 keeps one identity for a story syndicated by two
+        # approved feeds, so the row is named once and gains a provenance
+        # row per feed it arrived on.
+        for provenance in values.get("feed_provenance") or []:
+            connection.execute(
+                """
+                INSERT INTO raw_item_feeds (
+                    raw_item_id, feed_source, external_id, snapshot_id,
+                    entry_digest
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(raw_item_id, feed_source, external_id)
+                DO NOTHING
+                """,
+                (
+                    item_id,
+                    provenance["feed_source"],
+                    provenance["external_id"],
+                    provenance["snapshot_id"],
+                    provenance["entry_digest"],
+                ),
             )
         return InsertResult(item_id, inserted)
 
@@ -5619,6 +5762,523 @@ class Phase0Repository:
                     f"{stored['day']}, but the run covers {run.trading_day}; "
                     f"a run may not mutate another day's evidence"
                 )
+
+    def record_feed_snapshot(
+        self,
+        *,
+        feed_source: str,
+        response_url: str,
+        body: bytes,
+        run: Any,
+        fetched_at: str | None = None,
+        content_type: str | None = None,
+        content_encoding: str | None = None,
+        terminal: bool = False,
+    ) -> int:
+        """Persist the exact bytes of one feed response, with its run log.
+
+        This is the first durable step of an RSS fetch and deliberately the
+        only thing in its transaction.  Nothing derived from the body --
+        no parsed entry, no ticker, no relevance decision -- is written
+        here, so a parser or classifier that fails afterwards still leaves
+        the response that caused it on disk to replay from.
+
+        The body is stored verbatim.  It is publisher evidence, so it goes
+        through neither redaction nor re-encoding; transport credentials
+        are the fetcher's problem and must never reach this argument.  See
+        :func:`serialize_raw_evidence` for the same boundary in JSON.
+
+        Snapshots are addressed by ``(feed_source, sha256)``: re-fetching an
+        unchanged feed names the stored snapshot instead of storing a second
+        copy, which is what makes a retried fetch idempotent.
+        """
+
+        with self._logged_mutation(
+            run, operation="record_feed_snapshot", terminal=terminal
+        ) as (connection, context):
+            # Every rejection below happens inside the run, not above it: a
+            # caller that catches one outside would otherwise be free to
+            # carry on and report success for a fetch nothing recorded.
+            source = _require_text(feed_source, "feed_source")
+            if not source.startswith("rss:"):
+                raise Phase0ValidationError("feed snapshot requires an RSS feed source")
+            url = _require_text(response_url, "response_url")
+            if not isinstance(body, bytes):
+                raise Phase0ValidationError("feed snapshot body must be bytes")
+            stamp = _normalize_datetime(fetched_at or utc_now(), "fetched_at")
+            digest = hashlib.sha256(body).hexdigest()
+            if str(stamp)[:10] != context.trading_day:
+                raise Phase0RunContextError(
+                    f"record_feed_snapshot fetched on {str(stamp)[:10]} but the "
+                    f"run covers {context.trading_day}"
+                )
+            cursor = connection.execute(
+                """
+                INSERT INTO feed_snapshots (
+                    feed_source, fetched_at, response_url, content_type,
+                    content_encoding, body, sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(feed_source, sha256) DO NOTHING
+                """,
+                (
+                    source,
+                    stamp,
+                    url,
+                    _optional_text(content_type),
+                    _optional_text(content_encoding),
+                    body,
+                    digest,
+                ),
+            )
+            if cursor.rowcount:
+                snapshot_id = int(cursor.lastrowid)
+                stored = 1
+            else:
+                row = connection.execute(
+                    "SELECT id FROM feed_snapshots "
+                    "WHERE feed_source = ? AND sha256 = ?",
+                    (source, digest),
+                ).fetchone()
+                snapshot_id = int(row["id"])
+                stored = 0
+            context._record_outcome(success=1)
+            context._merge_counts(
+                {
+                    "feed_snapshots_seen": 1,
+                    "feed_snapshots_stored": stored,
+                    "feed_response_bytes": len(body),
+                }
+            )
+            return snapshot_id
+
+    def stored_raw_items(
+        self, keys: Sequence[tuple[str, str]]
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Which of these ``(source, canonical_url)`` pairs already exist.
+
+        A read, used to tell a first sighting from a later one *before* any
+        run opens.  The day returned is the stored row's own -- derived
+        here exactly as ``raw_items_for_day`` derives it -- because that is
+        the partition the evidence belongs to, whatever day a feed happens
+        to repeat it on.
+        """
+
+        found: dict[tuple[str, str], dict[str, Any]] = {}
+        if not keys:
+            return found
+        with self._connect() as connection:
+            for source, canonical_url in keys:
+                row = connection.execute(
+                    "SELECT id, substr("
+                    "  COALESCE(published_at, fetched_at), 1, 10"
+                    ") AS trading_day "
+                    "FROM raw_items WHERE source = ? AND canonical_url = ?",
+                    (str(source), str(canonical_url)),
+                ).fetchone()
+                if row is not None:
+                    found[(str(source), str(canonical_url))] = {
+                        "id": int(row["id"]),
+                        "trading_day": str(row["trading_day"]),
+                    }
+        return found
+
+    def record_feed_observations(
+        self,
+        observations: Sequence[Mapping[str, Any]],
+        *,
+        run: Any,
+        terminal: bool = False,
+    ) -> int:
+        """Record that stored items were seen again, without moving them.
+
+        A feed repeating an entry it already published is the ordinary
+        case, and for an entry with no publication date it is the case that
+        used to wedge a feed permanently: the item's day is derived from
+        ``fetched_at``, so re-seeing it tomorrow made the batch look like
+        evidence that had moved to tomorrow, and I1 rightly refused to let
+        one day's run mutate another day's row.  The refusal was correct.
+        Re-ingesting was the mistake.
+
+        So a later sighting adds *provenance*, never evidence.  Nothing
+        about the raw item changes -- not its day, not its text, not its
+        identity -- and the run doing the writing covers the day the item
+        has always belonged to, so I1's cross-day protection is left
+        exactly as strong as it was.
+
+        Provenance is immutable, like the evidence it describes: a repeat
+        from a feed that already has a row keeps the original snapshot
+        link, which is the one whose bytes produced the stored text.  That
+        also makes replaying a fetch a no-op rather than a rewrite.
+        """
+
+        with self._logged_mutation(
+            run, operation="record_feed_observations", terminal=terminal
+        ) as (connection, context):
+            prepared = [self._prepare_feed_observation(entry) for entry in observations]
+            self._assert_observation_partition(connection, prepared, context)
+            written = 0
+            for values in prepared:
+                for provenance in values["feed_provenance"]:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO raw_item_feeds (
+                            raw_item_id, feed_source, external_id, snapshot_id,
+                            entry_digest
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(raw_item_id, feed_source, external_id)
+                        DO NOTHING
+                        """,
+                        (
+                            values["raw_item_id"],
+                            provenance["feed_source"],
+                            provenance["external_id"],
+                            provenance["snapshot_id"],
+                            provenance["entry_digest"],
+                        ),
+                    )
+                    written += cursor.rowcount or 0
+            context._record_outcome(success=len(prepared))
+            context._merge_counts(
+                {
+                    "feed_observations": len(prepared),
+                    "feed_provenance_added": written,
+                }
+            )
+            return written
+
+    @staticmethod
+    def _prepare_feed_observation(entry: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "raw_item_id": _require_int(
+                entry.get("raw_item_id"), "raw_item_id", minimum=1
+            ),
+            "feed_provenance": normalize_feed_provenance(entry.get("feed_provenance")),
+        }
+
+    @staticmethod
+    def _assert_observation_partition(
+        connection: sqlite3.Connection,
+        prepared: Sequence[Mapping[str, Any]],
+        run: StageRunContext,
+    ) -> None:
+        """An observation belongs to the day its item already belongs to."""
+
+        for position, values in enumerate(prepared):
+            stored = connection.execute(
+                "SELECT substr(COALESCE(published_at, fetched_at), 1, 10) AS day "
+                "FROM raw_items WHERE id = ?",
+                (values["raw_item_id"],),
+            ).fetchone()
+            if stored is None:
+                raise Phase0RunContextError(
+                    f"record_feed_observations observation {position} names raw "
+                    f"item {values['raw_item_id']}, which does not exist"
+                )
+            if str(stored["day"]) != run.trading_day:
+                raise Phase0RunContextError(
+                    f"record_feed_observations observation {position} names raw "
+                    f"item {values['raw_item_id']} on {stored['day']}, but the "
+                    f"run covers {run.trading_day}; a run may not mutate "
+                    f"another day's evidence"
+                )
+            for provenance in values["feed_provenance"]:
+                # Checked here rather than left to the foreign key:
+                # provenance that cannot be traced to stored bytes is a
+                # claim, and a bare IntegrityError out of the driver says
+                # far less about which observation was wrong.
+                snapshot = connection.execute(
+                    "SELECT 1 FROM feed_snapshots WHERE id = ?",
+                    (provenance["snapshot_id"],),
+                ).fetchone()
+                if snapshot is None:
+                    raise Phase0RunContextError(
+                        f"record_feed_observations observation {position} cites "
+                        f"snapshot {provenance['snapshot_id']}, which is not "
+                        f"stored"
+                    )
+
+    def replace_relevance_classifications(
+        self,
+        decisions: Sequence[Mapping[str, Any]],
+        *,
+        run: Any,
+        terminal: bool = False,
+    ) -> int:
+        """Replace one partition's derived relevance state, with its run log.
+
+        Derived state only.  The raw item, its stored bytes, and its feed
+        provenance are never touched here -- which is what lets a
+        reclassification run repeatedly over evidence it must not alter,
+        and what keeps a failed classifier from taking the evidence with it.
+
+        **Partition.** Every decision belongs to the run's ticker and the
+        run's trading day, and both are checked against the *stored* row
+        rather than the payload: the day of the evidence is the day it was
+        published or fetched, not the day a caller claims. A run for NVDA
+        may not write AMD's decisions, and a run for D may not reach back
+        into D-1.
+
+        **Replacement is per (item, ticker), not per item.** An item
+        matching two tickers has a decision from each ticker's run, so
+        clearing every decision for the item would make each run destroy
+        the other's work. What is replaced is exactly this ticker's
+        association, candidate row, and evidence for these items.
+
+        A ``ticker`` of ``None`` on a decision means "this item resolves to
+        no ticker" -- the item's own ``ticker`` column is cleared -- while
+        the evidence explaining why is still recorded under the run's
+        ticker.
+        """
+
+        with self._logged_mutation(
+            run, operation="replace_relevance_classifications", terminal=terminal
+        ) as (connection, context):
+            # Inside the run, for the same reason ``ingest_raw_items``
+            # prepares inside it: a rejection has to belong to a run.
+            prepared = [self._prepare_relevance_decision(item) for item in decisions]
+            if context.ticker is None:
+                raise Phase0RunContextError(
+                    "replace_relevance_classifications needs a ticker-scoped run: "
+                    "a relevance decision is always about one ticker"
+                )
+            self._assert_relevance_partition(connection, prepared, context)
+            for values in prepared:
+                self._apply_relevance_decision(connection, values, context)
+            assigned = sum(1 for values in prepared if values["ticker"] is not None)
+            context._record_outcome(success=len(prepared))
+            context._merge_counts(
+                {
+                    "relevance_decisions": len(prepared),
+                    "relevance_assigned": assigned,
+                }
+            )
+            return len(prepared)
+
+    @staticmethod
+    def _prepare_relevance_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+        item_id = _require_int(decision.get("raw_item_id"), "raw_item_id", minimum=1)
+        status = str(decision.get("ingest_status") or "valid")
+        if status not in INGEST_STATUSES:
+            raise Phase0ValidationError("invalid relevance ingest_status")
+        evidence = decision.get("evidence")
+        if evidence is None:
+            evidence_json = "[]"
+            decision_kind = None
+        else:
+            if not isinstance(evidence, Mapping):
+                raise Phase0ValidationError("relevance evidence must be a mapping")
+            decision_kind = str(evidence.get("decision") or "")
+            if decision_kind not in {"matched", "excluded"}:
+                raise Phase0ValidationError(
+                    "relevance evidence decision must be matched or excluded"
+                )
+            # Derived diagnostics, not publisher evidence: redacted.
+            evidence_json = serialize_operational_metadata(
+                list(evidence.get("evidence") or []), "relevance evidence", list
+            )
+        return {
+            "raw_item_id": item_id,
+            "ticker": normalize_ticker(decision.get("ticker"), optional=True),
+            "ingest_status": status,
+            "decision": decision_kind,
+            "evidence": evidence_json,
+            "candidate_reason": _optional_text(decision.get("candidate_reason")),
+        }
+
+    @staticmethod
+    def _assert_relevance_partition(
+        connection: sqlite3.Connection,
+        prepared: Sequence[Mapping[str, Any]],
+        run: StageRunContext,
+    ) -> None:
+        """Reject foreign-partition decisions before any of them is written."""
+
+        for position, values in enumerate(prepared):
+            if values["ticker"] is not None and values["ticker"] != run.ticker:
+                raise Phase0RunContextError(
+                    f"replace_relevance_classifications decision {position} "
+                    f"assigns {values['ticker']} but the run covers {run.ticker}"
+                )
+            stored = connection.execute(
+                "SELECT substr(COALESCE(published_at, fetched_at), 1, 10) AS day "
+                "FROM raw_items WHERE id = ?",
+                (values["raw_item_id"],),
+            ).fetchone()
+            if stored is None:
+                raise Phase0RunContextError(
+                    f"replace_relevance_classifications decision {position} names "
+                    f"raw item {values['raw_item_id']}, which does not exist"
+                )
+            if str(stored["day"]) != run.trading_day:
+                raise Phase0RunContextError(
+                    f"replace_relevance_classifications decision {position} names "
+                    f"raw item {values['raw_item_id']} on {stored['day']}, but the "
+                    f"run covers {run.trading_day}; a run may not mutate another "
+                    f"day's evidence"
+                )
+            provenance = connection.execute(
+                "SELECT 1 FROM raw_item_feeds WHERE raw_item_id = ? LIMIT 1",
+                (values["raw_item_id"],),
+            ).fetchone()
+            if provenance is None:
+                raise Phase0RunContextError(
+                    f"replace_relevance_classifications decision {position} names "
+                    f"raw item {values['raw_item_id']}, which has no RSS provenance"
+                )
+
+    @staticmethod
+    def _apply_relevance_decision(
+        connection: sqlite3.Connection,
+        values: Mapping[str, Any],
+        run: StageRunContext,
+    ) -> None:
+        item_id = values["raw_item_id"]
+        ticker = values["ticker"]
+        # Scoped to this run's ticker: an item matched by two tickers has a
+        # row from each, and clearing all of them would make the second run
+        # erase the first.
+        connection.execute(
+            "DELETE FROM raw_item_tickers WHERE raw_item_id = ? AND ticker = ? "
+            "AND association_type = 'relevance'",
+            (item_id, run.ticker),
+        )
+        connection.execute(
+            "DELETE FROM raw_item_candidates WHERE raw_item_id = ? AND ticker = ?",
+            (item_id, run.ticker),
+        )
+        connection.execute(
+            "DELETE FROM raw_item_match_evidence WHERE raw_item_id = ? "
+            "AND ticker = ?",
+            (item_id, run.ticker),
+        )
+        # A malformed entry stays invalid: relevance never rehabilitates
+        # evidence the parser rejected.
+        #
+        # The ticker column is guarded by the run's own ticker, which is
+        # what keeps two partitions off each other's work.  An item matched
+        # by NVDA also carries AMD's *exclusion*, and AMD's run reaches this
+        # same row: unguarded, its ``ticker = NULL`` would quietly undo the
+        # assignment NVDA just made.  A run may therefore only claim a row
+        # that is unclaimed, or release one it already holds.
+        connection.execute(
+            """
+            UPDATE raw_items
+            SET ticker = ?,
+                ingest_status = CASE
+                    WHEN ingest_status = 'invalid' THEN 'invalid'
+                    ELSE ?
+                END
+            WHERE id = ?
+              AND (ticker IS NULL OR ticker = ?)
+            """,
+            (ticker, values["ingest_status"], item_id, run.ticker),
+        )
+        # The status is a property of the item, not of the partition -- every
+        # run computes it from the same matcher over the same evidence -- so
+        # a run that could not claim the ticker still records it.
+        connection.execute(
+            """
+            UPDATE raw_items
+            SET ingest_status = CASE
+                    WHEN ingest_status = 'invalid' THEN 'invalid'
+                    ELSE ?
+                END
+            WHERE id = ?
+            """,
+            (values["ingest_status"], item_id),
+        )
+        if ticker is not None:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO raw_item_tickers
+                    (raw_item_id, ticker, association_type)
+                VALUES (?, ?, 'relevance')
+                """,
+                (item_id, ticker),
+            )
+        if values["candidate_reason"] is not None:
+            connection.execute(
+                """
+                INSERT INTO raw_item_candidates (raw_item_id, ticker, reason)
+                VALUES (?, ?, ?)
+                ON CONFLICT(raw_item_id, ticker)
+                DO UPDATE SET reason = excluded.reason
+                """,
+                (item_id, run.ticker, values["candidate_reason"]),
+            )
+        if values["decision"] is not None:
+            connection.execute(
+                """
+                INSERT INTO raw_item_match_evidence
+                    (raw_item_id, ticker, decision, evidence)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(raw_item_id, ticker)
+                DO UPDATE SET
+                    decision = excluded.decision,
+                    evidence = excluded.evidence
+                """,
+                (item_id, run.ticker, values["decision"], values["evidence"]),
+            )
+
+    def rss_raw_items(
+        self, item_ids: Sequence[int] | None = None
+    ) -> list[dict[str, Any]]:
+        """Raw items with RSS provenance, as persisted.
+
+        A read, and only a read.  This is the authoritative view of an
+        item's evidence, and both classification paths go through it: the
+        live fetch reads back the rows it just persisted (``item_ids``) and
+        a replay reads them all.  Classifying anything else -- a parser
+        object, a second feed's variant of the same story -- writes
+        decisions about text that is not what the row actually holds.
+
+        Ordered by id so a replay is deterministic.
+
+        ``derived_tickers`` carries the tickers that currently hold derived
+        state for the row.  A replay needs them to know what to *withdraw*:
+        when a ticker stops matching it produces no new decision, and the
+        rows it left behind can only be cleared by that ticker's own run.
+        """
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT raw_items.id, raw_items.title, raw_items.description,
+                       raw_items.ingest_status, raw_items.published_at,
+                       raw_items.fetched_at,
+                       substr(
+                           COALESCE(raw_items.published_at, raw_items.fetched_at),
+                           1, 10
+                       ) AS trading_day,
+                       -- Every ticker that currently holds derived state for
+                       -- this item.  A replay has to know these to *remove*
+                       -- them: a ticker that no longer matches gets no new
+                       -- decision, and only its own run may clear its rows.
+                       (
+                           SELECT json_group_array(ticker) FROM (
+                               SELECT ticker FROM raw_item_tickers
+                               WHERE raw_item_id = raw_items.id
+                                 AND association_type = 'relevance'
+                               UNION
+                               SELECT ticker FROM raw_item_candidates
+                               WHERE raw_item_id = raw_items.id
+                               UNION
+                               SELECT ticker FROM raw_item_match_evidence
+                               WHERE raw_item_id = raw_items.id
+                           )
+                       ) AS derived_tickers
+                FROM raw_items
+                WHERE EXISTS (
+                    SELECT 1 FROM raw_item_feeds
+                    WHERE raw_item_feeds.raw_item_id = raw_items.id
+                )
+                ORDER BY raw_items.id
+                """
+            ).fetchall()
+        if item_ids is None:
+            return [dict(row) for row in rows]
+        wanted = {_require_int(item_id, "item_id", minimum=1) for item_id in item_ids}
+        return [dict(row) for row in rows if int(row["id"]) in wanted]
 
     def persist_embeddings(
         self,
