@@ -5321,6 +5321,11 @@ LOGGED_ENTRYPOINTS = [
     "reconcile_themes",
     "persist_embeddings",
     "record_source_state",
+    # RSS evidence and relevance (#62): both go through _logged_mutation,
+    # so a key moves only in the transaction that commits the data and the
+    # run log with it.
+    "record_feed_snapshot",
+    "replace_relevance_classifications",
 ]
 
 
@@ -5381,8 +5386,13 @@ ESCAPE_HATCHES = [
 #: surface cannot grow untested.
 READER_PROBES = {
     "raw_item": ((1,), {}),
+    "raw_items": ((), {}),
     "raw_item_candidates": ((), {}),
     "raw_item_associations": ((), {}),
+    # RSS evidence and provenance (#62).
+    "feed_snapshots": ((), {}),
+    "raw_item_feeds": ((), {}),
+    "raw_item_match_evidence": ((), {}),
     "story": ((1,), {}),
     "theme": ((1,), {}),
     "source_state_rows": ((), {}),
@@ -9290,15 +9300,27 @@ def test_the_other_two_buckets_are_closed_by_their_primary_keys(
             connection.execute(statement, (set_id, story_id, *extra))
 
 
+#: The migration that introduced the one-theme-per-story overlap rule.  The
+#: fixtures below mean "one short of *this*", not "one short of latest": when
+#: 015 was added, ``LATEST_VERSION - 1`` quietly re-aimed them at a database
+#: that already had the rule, and the hostile cases stopped testing it.
+OVERLAP_RULE_VERSION = next(
+    migration.version
+    for migration in ALL_MIGRATIONS
+    if migration.name.endswith("one_theme_per_story.sql")
+)
+PRE_OVERLAP_VERSION = OVERLAP_RULE_VERSION - 1
+
+
 def v13_repository(tmp_path, name="v13.sqlite3"):
     """A database stopped one migration short of the overlap rule."""
 
     database = tmp_path / name
     Phase0Repository(
-        database, migrations_path=partial_migrations(tmp_path, LATEST_VERSION - 1)
+        database, migrations_path=partial_migrations(tmp_path, PRE_OVERLAP_VERSION)
     ).migrate()
     repository = Phase0Repository(database)
-    assert repository.schema_version() == LATEST_VERSION - 1
+    assert repository.schema_version() == PRE_OVERLAP_VERSION
     return repository, database
 
 
@@ -9373,8 +9395,8 @@ def test_a_v13_database_already_carrying_a_duplicate_refuses_to_upgrade(tmp_path
     # Whole: still at 13, ledger unchanged, the duplicate still there for
     # the operator to look at.
     assert database_state(database) == before
-    assert before["user_version"] == LATEST_VERSION - 1
-    assert Phase0Repository(database).schema_version() == LATEST_VERSION - 1
+    assert before["user_version"] == PRE_OVERLAP_VERSION
+    assert Phase0Repository(database).schema_version() == PRE_OVERLAP_VERSION
 
     # And once resolved, the upgrade goes through.
     with Phase0Repository(database).admin.connect_writable() as connection:
@@ -11083,6 +11105,27 @@ def caught_validation_cases(repository: Phase0Repository) -> dict:
                 [sample_embedding("999999")], run=run, terminal=terminal
             ),
             "embeddings",
+        ),
+        # A snapshot stamped on a day this run does not cover.
+        "record_feed_snapshot": (
+            lambda run, terminal: repository.record_feed_snapshot(
+                feed_source="rss:test",
+                response_url="https://example.com/feed",
+                body=b"<rss/>",
+                fetched_at="2026-07-24T12:00:00+00:00",
+                run=run,
+                terminal=terminal,
+            ),
+            "feed_snapshots",
+        ),
+        # A decision naming a raw item that has no RSS provenance at all.
+        "replace_relevance_classifications": (
+            lambda run, terminal: repository.replace_relevance_classifications(
+                [{"raw_item_id": item_ids[0], "ticker": "NVDA"}],
+                run=run,
+                terminal=terminal,
+            ),
+            "raw_item_match_evidence",
         ),
     }
 

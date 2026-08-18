@@ -5,3 +5,5 @@ yfinance>=0.2.54
 pandas==2.2.1
 requests==2.31.0
 python-dotenv==1.0.1
+# RSS feed/alias configuration (phase0/rss.py, issue #62)
+PyYAML==6.0.2
