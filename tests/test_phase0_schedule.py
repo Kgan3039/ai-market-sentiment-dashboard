@@ -178,18 +178,64 @@ def test_no_instant_is_scheduled_twice(cron):
 # ---------------------------------------------------------------------------
 
 
-def test_every_scheduled_invocation_is_guarded_against_overlap(cron):
-    """A cron file alone is not overlap prevention.
+def cron_env(cron: str) -> dict[str, str]:
+    """The environment assignments a crontab sets for its commands."""
 
-    Each entry takes the same non-blocking lock, so a run that outlasts its
-    interval refuses its successor immediately rather than letting two live
-    fetchers race for the same feeds and provider slots.
+    env = {}
+    for line in cron.splitlines():
+        match = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line.strip())
+        if match:
+            env[match.group(1)] = match.group(2)
+    return env
+
+
+def expanded(line: str, env: dict[str, str]) -> str:
+    """A command line with its crontab variables substituted.
+
+    cron hands the command to a shell, so ``$PHASE0_LOCK_FILE`` is a real
+    path at run time. Asserting on the unexpanded text would let the
+    variable point anywhere.
     """
 
-    lines = schedule_lines(cron)
-    assert all("flock -n" in line for line in lines)
-    locks = {re.search(r"flock -n (\S+)", line).group(1) for line in lines}
-    assert len(locks) == 1, f"schedules take different locks: {locks}"
+    for name, value in sorted(env.items(), key=lambda item: -len(item[0])):
+        line = line.replace(f"${name}", value)
+    return line
+
+
+def test_every_scheduled_invocation_passes_the_production_lock_file(cron):
+    """One lock, named explicitly, identical on every entry.
+
+    The default is ``<database>.lock``, which is right for local
+    development and wrong for a deployment: a manual run that fell back to
+    it would not contend with the schedule at all.
+    """
+
+    env = cron_env(cron)
+    commands = [expanded(line, env) for line in schedule_lines(cron)]
+    locks = {re.search(r"--lock-file (\S+)", command).group(1) for command in commands}
+    assert locks == {"/var/lock/phase0-pipeline.lock"}
+
+
+def test_the_schedule_takes_no_lock_of_its_own(cron):
+    """No outer ``flock``: two nested locks are two *different* locks.
+
+    A shell-level lock plus pipeline.py's own default is exactly the
+    failure it looks like protection against -- a cron run and a manual run
+    would hold different files and both believe they were alone.
+    """
+
+    for line in schedule_lines(cron):
+        assert "flock" not in line
+
+
+def test_the_documented_manual_command_uses_the_same_lock(cron):
+    """Cron is not the only entrypoint, so it cannot be the only one told."""
+
+    env = cron_env(cron)
+    lock = env["PHASE0_LOCK_FILE"]
+    assert lock == "/var/lock/phase0-pipeline.lock"
+    manual = cron.split("EVERY PRODUCTION ENTRYPOINT")[1]
+    assert f"--lock-file {lock}" in manual
 
 
 def test_schedule_documents_exit_codes_rather_than_implying_green_or_red(cron):
@@ -228,6 +274,34 @@ def test_a_second_invocation_is_refused_while_the_first_holds_the_lock(tmp_path)
     # The lock is released with the holder, not leaked past it.
     with single_instance(lock) as third:
         assert third is True
+
+
+def test_entrypoints_spelling_the_path_differently_share_one_inode(tmp_path):
+    """Contention is on the file, not on the string naming it.
+
+    A cron entry, a systemd unit, and an operator's shell will each write
+    the path their own way -- through a symlinked ``/var/lock``, with a
+    ``..`` in it, or absolutely. All three must land on one inode, or
+    "everyone passes --lock-file" stops being a guarantee.
+    """
+
+    real = tmp_path / "locks"
+    real.mkdir()
+    linked = tmp_path / "var-lock"
+    linked.symlink_to(real)
+    spellings = [
+        real / "phase0-pipeline.lock",
+        linked / "phase0-pipeline.lock",
+        tmp_path / "locks" / ".." / "locks" / "phase0-pipeline.lock",
+    ]
+
+    with single_instance(spellings[0]) as first:
+        assert first is True
+        held_inode = spellings[0].stat().st_ino
+        for other in spellings[1:]:
+            assert other.stat().st_ino == held_inode, f"{other} is a different file"
+            with single_instance(other) as second:
+                assert second is False, f"{other} did not contend with the holder"
 
 
 def test_the_lock_is_released_when_an_invocation_raises(tmp_path):

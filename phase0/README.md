@@ -1471,10 +1471,25 @@ stale version called its `clear_derived_for_day` step "replay" — it deleted
 derived rows it had no stage capable of rebuilding.
 
 **Overlap prevention is a mechanism, not a cron comment.** A cron file
-proves only that something was scheduled. Every entry now takes the same
-non-blocking `flock` and `pipeline.py` takes the same lock internally, so
-the guarantee holds for manual and systemd invocations too; a second
-invocation is refused immediately rather than queued behind a run that may
-be wedged. `CRON_TZ` is a Vixie/cronie extension and is documented as one —
-an implementation that ignores it runs the market window in host local time
+proves only that something was scheduled. `pipeline.py` owns lock
+acquisition and every production entrypoint passes it the same
+`--lock-file`; there is no outer `flock` in the crontab. The first cut had
+one, and it was worse than none: the shell's `/var/lock/...` and
+`pipeline.py`'s own `<database>.lock` default were two different files, so
+a cron run and a manual run each held a lock, each concluded it was alone,
+and both fetched. One authoritative lock is the whole guarantee — the
+`<database>.lock` default survives only as the local-development case,
+where two checkouts on one laptop genuinely should not block each other.
+`CRON_TZ` is a Vixie/cronie extension and is documented as one — an
+implementation that ignores it runs the market window in host local time
 while looking perfectly installed.
+
+**A component's constructor is part of its stage.** `RSSFetcher.__init__`
+reads and validates `feeds.yaml` and `aliases.yaml`, and
+`YahooFinanceFetcher.__init__` validates its own arguments. Building them
+while assembling the stage list put that work outside the isolation
+boundary, so a YAML typo did not fail one component — it raised before
+Yahoo had run at all, cost the invocation a day of Yahoo evidence it could
+have had, and left the process with a traceback instead of one of the
+three documented exit codes. Each stage now constructs its own component
+when it runs.

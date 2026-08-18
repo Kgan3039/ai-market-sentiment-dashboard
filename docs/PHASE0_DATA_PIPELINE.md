@@ -98,6 +98,12 @@ partition commits:
 * One feed is unreachable → the other feeds still run.
 * A component raises an unexpected exception → it is recorded `failed`,
   and the next component still runs.
+* A component's **construction** fails — a missing or malformed
+  `feeds.yaml`/`aliases.yaml`, a blank `pipeline_version` — → same
+  treatment. Components are built inside their own stage, not while the
+  stage list is assembled, so a YAML typo costs one component rather than
+  the invocation, and the CLI answers with an exit code rather than a
+  traceback.
 
 ## Replay
 
@@ -141,11 +147,30 @@ deployment host. DST needs no handling: the zone carries EST and EDT with
 it, which a UTC schedule would not.
 
 **Overlap.** A fetch can outlast its interval, and cron starts the next
-copy regardless. Every entry takes the same non-blocking `flock`, and
-`pipeline.py` takes the same lock internally so manual and systemd
-invocations are covered too. A second invocation is refused immediately
-and exits 0 after logging `invocation_skipped` — it does not queue behind
-a run that may itself be wedged.
+copy regardless.
+
+`pipeline.py` acquires the lock itself and is the only thing that does.
+There is no outer `flock` in the crontab, deliberately: two nested locks
+are two *different* locks, and a cron run holding the shell's while a
+manual run held `pipeline.py`'s own default would leave both believing
+they were alone.
+
+**Every production entrypoint must pass the same `--lock-file`.** Cron
+does; so must anything else pointed at the same deployment:
+
+```bash
+.venv/bin/python pipeline.py --lock-file /var/lock/phase0-pipeline.lock
+```
+
+Omitting it falls back to `<database>.lock`. That default is right for
+local development — two checkouts on one laptop should not block each
+other — and wrong for a deployment, where cron, systemd, and an operator
+may each spell the database path differently while targeting one pipeline.
+
+The loser is refused immediately rather than queued behind a run that may
+itself be wedged: it logs `invocation_skipped`, does no component work at
+all, and exits 0. The lock is released however the invocation ends —
+success, degraded, or failed.
 
 **This is a template, not a proven unattended deployment.** It has not
 been run against a real host, there is no alerting, no log rotation, no
