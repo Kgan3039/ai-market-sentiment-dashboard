@@ -5327,6 +5327,10 @@ LOGGED_ENTRYPOINTS = [
     "record_feed_snapshot",
     "record_feed_observations",
     "replace_relevance_classifications",
+    # A3's LLM cost/latency/cache accounting (#73): writes no domain rows,
+    # only run_log.counts, but still only inside a _logged_mutation so a key
+    # cannot move to success without the accounting that justified it.
+    "record_summarization_usage",
 ]
 
 
@@ -11148,6 +11152,22 @@ def caught_validation_cases(repository: Phase0Repository) -> dict:
                 terminal=terminal,
             ),
             "raw_item_match_evidence",
+        ),
+        # A negative cache_misses is the rejection. This entrypoint writes
+        # no domain rows on success or failure alike (only run_log.counts,
+        # which the run always gets regardless) - "themes" stands in
+        # because in real use this call always accompanies
+        # reconcile_themes in the same run, and a rejected usage-logging
+        # call must not somehow leave themes behind either.
+        "record_summarization_usage": (
+            lambda run, terminal: repository.record_summarization_usage(
+                run=run,
+                calls=[{"input_tokens": 10, "output_tokens": 5, "latency_ms": 12.0}],
+                cache_hits=0,
+                cache_misses=-1,
+                terminal=terminal,
+            ),
+            "themes",
         ),
     }
 

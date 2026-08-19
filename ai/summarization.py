@@ -24,8 +24,9 @@ response_schema so parsing failures are rare by construction.
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -107,6 +108,30 @@ class SummarizationError(RuntimeError):
     """Raised when the provider fails to produce a schema-valid summary after retrying."""
 
 
+@dataclass(frozen=True)
+class GenerationUsage:
+    """Token counts for one provider call, when the provider reports them."""
+
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+
+
+@dataclass(frozen=True)
+class GenerationAttempt:
+    """One `summarize()` attempt, for callers that log cost/latency (issue #73 / A3).
+
+    Purely observational: `summarize()`'s own retry/error behavior does not
+    depend on this in any way, so a caller that ignores `on_attempt`
+    entirely sees no behavior change.
+    """
+
+    attempt: int
+    success: bool
+    latency_ms: float
+    usage: Optional[GenerationUsage]
+    error: Optional[str]
+
+
 def build_user_prompt(theme: ThemeInput) -> str:
     """Serialize a theme's member stories for the model prompt."""
     lines = [f"Ticker: {theme.ticker}"]
@@ -150,6 +175,13 @@ class GeminiClient:
         self.model = model or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
         self._api_key = api_key or os.environ.get("GEMINI_API_KEY")
         self._client = None
+        self._usage: Optional[GenerationUsage] = None
+
+    @property
+    def usage(self) -> Optional[GenerationUsage]:
+        """Token usage from the most recent `generate()` call, if reported."""
+
+        return self._usage
 
     def _get_client(self):
         if self._client is None:
@@ -172,13 +204,24 @@ class GeminiClient:
             contents=user_prompt,
             config=config,
         )
+        usage_metadata = getattr(response, "usage_metadata", None)
+        if usage_metadata is not None:
+            self._usage = GenerationUsage(
+                input_tokens=getattr(usage_metadata, "prompt_token_count", None),
+                output_tokens=getattr(usage_metadata, "candidates_token_count", None),
+            )
         parsed = getattr(response, "parsed", None)
         if parsed is not None:
             return parsed
         return response_schema.model_validate_json(response.text)
 
 
-def summarize(theme: ThemeInput, *, client: Optional[GeminiClient] = None) -> ThemeSummary:
+def summarize(
+    theme: ThemeInput,
+    *,
+    client: Optional[GeminiClient] = None,
+    on_attempt: Optional[Callable[[GenerationAttempt], None]] = None,
+) -> ThemeSummary:
     """Generate a cited ThemeSummary for `theme`.
 
     Retries once on a structurally malformed provider response - including a
@@ -187,6 +230,11 @@ def summarize(theme: ThemeInput, *, client: Optional[GeminiClient] = None) -> Th
     raises SummarizationError. Does not retry or degrade on banned-language
     guardrail failures; that loop belongs to A2's guardrail chain, which
     wraps this function.
+
+    `on_attempt`, if given, is called once per attempt with a
+    `GenerationAttempt` (latency + token usage, when the client reports
+    it) - for a caller like A3's caching layer to log cost/latency without
+    this function's retry/error behavior depending on it in any way.
     """
     if not theme.member_stories:
         raise SummarizationError("theme has no member stories to summarize")
@@ -195,7 +243,8 @@ def summarize(theme: ThemeInput, *, client: Optional[GeminiClient] = None) -> Th
     user_prompt = build_user_prompt(theme)
 
     last_error: Optional[Exception] = None
-    for _ in range(MAX_RETRIES + 1):
+    for attempt_number in range(1, MAX_RETRIES + 2):
+        started = time.monotonic()
         try:
             result = active_client.generate(SYSTEM_PROMPT, user_prompt, ThemeSummary)
             if not isinstance(result, ThemeSummary):
@@ -205,10 +254,32 @@ def summarize(theme: ThemeInput, *, client: Optional[GeminiClient] = None) -> Th
                 raise SummarizationError(
                     f"summary cited unknown story id(s): {sorted(unresolved)}"
                 )
-            return result
         except Exception as exc:
             # Provider/parse/citation failure - retried once, then raised below.
             last_error = exc
+            if on_attempt is not None:
+                on_attempt(
+                    GenerationAttempt(
+                        attempt=attempt_number,
+                        success=False,
+                        latency_ms=(time.monotonic() - started) * 1000,
+                        usage=getattr(active_client, "usage", None),
+                        error=str(exc),
+                    )
+                )
+            continue
+
+        if on_attempt is not None:
+            on_attempt(
+                GenerationAttempt(
+                    attempt=attempt_number,
+                    success=True,
+                    latency_ms=(time.monotonic() - started) * 1000,
+                    usage=getattr(active_client, "usage", None),
+                    error=None,
+                )
+            )
+        return result
 
     raise SummarizationError(
         f"failed to produce a valid theme summary after {MAX_RETRIES + 1} attempt(s): {last_error}"

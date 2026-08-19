@@ -976,9 +976,10 @@ class Phase0Admin:
     :class:`Phase0Repository` — ``ingest_raw_items``, ``reconcile_stories``,
     ``reconcile_themes``, ``persist_embeddings``, ``record_source_state``,
     ``record_feed_snapshot``, ``record_feed_observations``,
-    ``replace_relevance_classifications`` — each of which requires the
-    :class:`StageRunContext` from ``stage_run`` and writes its run-log row
-    in the same transaction as the data.
+    ``replace_relevance_classifications``, ``record_summarization_usage``
+    — each of which requires the :class:`StageRunContext` from
+    ``stage_run`` and writes its run-log row in the same transaction as
+    the data.
 
     Keeping these behind ``repository.admin`` is the whole point: an
     unlogged write cannot happen without the call site saying so, and a
@@ -4316,6 +4317,80 @@ class Phase0Repository:
             ]
             return result
 
+    def story_ids_for_fingerprints(
+        self,
+        *,
+        ticker: str,
+        trading_day: str | date,
+        pipeline_version: str,
+        fingerprints: Sequence[str],
+    ) -> dict[str, int]:
+        """Resolve M5's story_key identities to this database's story ids.
+
+        A theme's membership is expressed upstream by
+        ``cluster_fingerprint`` (M3's ``story_key``, unique within a
+        ticker/day/pipeline_version); the database identifies a story by
+        integer id. Every fingerprint must already have a story in this
+        exact partition - a caller naming one from another ticker-day or
+        pipeline version is a bug, not a lookup miss to paper over.
+        """
+
+        normalized_ticker = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        wanted = [_require_text(value, "fingerprint") for value in fingerprints]
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" for _ in wanted)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, cluster_fingerprint FROM stories
+                WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+                  AND cluster_fingerprint IN ({placeholders})
+                """,
+                (normalized_ticker, day, version, *wanted),
+            ).fetchall()
+        resolved = {str(row["cluster_fingerprint"]): int(row["id"]) for row in rows}
+        missing = sorted(set(wanted) - set(resolved))
+        if missing:
+            raise Phase0ValidationError(
+                f"no story in {normalized_ticker}/{day}/{version} matches "
+                f"fingerprint(s) {missing}"
+            )
+        return resolved
+
+    def raw_item_ids_for_stories(
+        self, *, story_ids: Sequence[int]
+    ) -> dict[int, tuple[int, ...]]:
+        """Every raw item id retained as a member of each given story.
+
+        The bridge from a summarizer's story-level citation to the
+        database's raw-item-level ``theme_citations`` table: a citation
+        naming story X may cite any raw item ``story_members`` retains
+        under X, which is exactly the set
+        :meth:`_assert_story_membership` checks a theme's
+        ``citation_item_ids`` against.
+        """
+
+        wanted = [_require_int(value, "story_id", minimum=1) for value in story_ids]
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" for _ in wanted)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT story_id, raw_item_id FROM story_members
+                WHERE story_id IN ({placeholders})
+                ORDER BY story_id, raw_item_id
+                """,
+                wanted,
+            ).fetchall()
+        resolved: dict[int, list[int]] = {story_id: [] for story_id in wanted}
+        for row in rows:
+            resolved[int(row["story_id"])].append(int(row["raw_item_id"]))
+        return {story_id: tuple(ids) for story_id, ids in resolved.items()}
+
     # ------------------------------------------------------------------
     # Evaluation labels
     # ------------------------------------------------------------------
@@ -6310,6 +6385,53 @@ class Phase0Repository:
             context._record_outcome(success=len(prepared))
             context._merge_counts({"embeddings_written": len(prepared)})
             return len(prepared)
+
+    def record_summarization_usage(
+        self,
+        *,
+        run: Any,
+        calls: Sequence[Mapping[str, Any]],
+        cache_hits: int,
+        cache_misses: int,
+        terminal: bool = False,
+    ) -> None:
+        """Log one summarization stage's LLM calls and cache accounting.
+
+        ``calls`` is the complete list of provider attempts made during
+        this run (issue #73 / A3): each entry becomes one row in
+        ``run_log.counts.llm_call_log``, and per-attempt token/latency
+        values are summed into ``counts`` alongside it. Call this **once**
+        per ``stage_run``, with every call the run made - ``run_log.counts``
+        is merged by :meth:`StageRunContext._merge_counts`, which sums
+        int-valued keys across merges but *overwrites* list-valued ones, so
+        a second call in the same run would silently discard the first
+        call's ``llm_call_log`` detail rather than append to it.
+        """
+
+        with self._logged_mutation(
+            run, operation="record_summarization_usage", terminal=terminal
+        ) as (_connection, context):
+            prepared = [dict(call) for call in calls]
+            hits = _require_int(cache_hits, "cache_hits", minimum=0)
+            misses = _require_int(cache_misses, "cache_misses", minimum=0)
+            context._record_outcome(success=misses, partial=hits)
+            context._merge_counts(
+                {
+                    "llm_calls": len(prepared),
+                    "cache_hits": hits,
+                    "cache_misses": misses,
+                    "input_tokens": sum(
+                        int(call.get("input_tokens") or 0) for call in prepared
+                    ),
+                    "output_tokens": sum(
+                        int(call.get("output_tokens") or 0) for call in prepared
+                    ),
+                    "latency_ms": sum(
+                        float(call.get("latency_ms") or 0.0) for call in prepared
+                    ),
+                    "llm_call_log": prepared,
+                }
+            )
 
     @classmethod
     def _resolve_embedding_source(
