@@ -6399,13 +6399,20 @@ class Phase0Repository:
 
         ``calls`` is the complete list of provider attempts made during
         this run (issue #73 / A3): each entry becomes one row in
-        ``run_log.counts.llm_call_log``, and per-attempt token/latency
+        ``run_log.counts.llm_call_log``, and per-attempt usage/latency
         values are summed into ``counts`` alongside it. Call this **once**
         per ``stage_run``, with every call the run made - ``run_log.counts``
         is merged by :meth:`StageRunContext._merge_counts`, which sums
         int-valued keys across merges but *overwrites* list-valued ones, so
         a second call in the same run would silently discard the first
         call's ``llm_call_log`` detail rather than append to it.
+
+        Counted as ``input_size``/``output_size``, not ``*_tokens``: every
+        key here lands in ``run_log.counts`` verbatim, and
+        :data:`phase0.redaction.SECRET_KEY_PATTERN` redacts any key
+        *containing* ``token`` (an API/auth token check) regardless of what
+        the value actually is - naming these ``*_tokens`` silently replaced
+        real counts with ``"[REDACTED]"``.
         """
 
         with self._logged_mutation(
@@ -6420,11 +6427,11 @@ class Phase0Repository:
                     "llm_calls": len(prepared),
                     "cache_hits": hits,
                     "cache_misses": misses,
-                    "input_tokens": sum(
-                        int(call.get("input_tokens") or 0) for call in prepared
+                    "input_size": sum(
+                        int(call.get("input_size") or 0) for call in prepared
                     ),
-                    "output_tokens": sum(
-                        int(call.get("output_tokens") or 0) for call in prepared
+                    "output_size": sum(
+                        int(call.get("output_size") or 0) for call in prepared
                     ),
                     "latency_ms": sum(
                         float(call.get("latency_ms") or 0.0) for call in prepared

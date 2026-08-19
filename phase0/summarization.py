@@ -114,6 +114,68 @@ def _cited_story_keys(sentences: list[dict]) -> set[str]:
     }
 
 
+def _cache_hit_sentences(stored_row: dict, content_hash: str) -> Optional[tuple[str, list[dict]]]:
+    """The stored (label, sentences) if this row is a valid cache hit, else None."""
+
+    if stored_row.get("content_hash") != content_hash or not stored_row.get("summary"):
+        return None
+    return str(stored_row["label"]), _sentences_from_json(stored_row.get("summary"))
+
+
+def _summarize_and_log(
+    theme_input: ThemeInput,
+    theme_fingerprint: str,
+    *,
+    client: Optional[GeminiClient],
+    attempts: list[GenerationAttempt],
+    calls_for_log: list[dict[str, Any]],
+) -> tuple[str, list[dict]]:
+    """Call the real summarizer for one theme, recording every attempt."""
+
+    recorded_before = len(attempts)
+    theme_summary = summarize(theme_input, client=client, on_attempt=attempts.append)
+    for attempt in attempts[recorded_before:]:
+        calls_for_log.append(
+            {
+                "theme_fingerprint": theme_fingerprint,
+                "attempt": attempt.attempt,
+                "success": attempt.success,
+                "latency_ms": attempt.latency_ms,
+                # Named input_size/output_size, not *_tokens: see
+                # Phase0Repository.record_summarization_usage's docstring -
+                # a key containing "token" gets its value silently redacted
+                # before it reaches run_log.
+                "input_size": attempt.usage.input_tokens if attempt.usage else None,
+                "output_size": attempt.usage.output_tokens if attempt.usage else None,
+                "error": attempt.error,
+            }
+        )
+    sentences = [sentence.model_dump() for sentence in theme_summary.sentences]
+    return theme_summary.label, sentences
+
+
+def _citation_item_ids(
+    sentences: list[dict],
+    *,
+    story_id_by_fingerprint: dict[str, int],
+    raw_items_by_story: dict[int, tuple[int, ...]],
+) -> tuple[int, ...]:
+    """Every raw item id a sentence's story-level citation resolves to."""
+
+    cited_story_ids = {
+        story_id_by_fingerprint[key] for key in _cited_story_keys(sentences)
+    }
+    return tuple(
+        sorted(
+            {
+                item_id
+                for story_id in cited_story_ids
+                for item_id in raw_items_by_story.get(story_id, ())
+            }
+        )
+    )
+
+
 def summarize_theme_set(
     theme_set: ThemeSet,
     *,
@@ -170,45 +232,26 @@ def summarize_theme_set(
         content_hash = compute_content_hash(theme_input)
         stored_row = stored_by_fingerprint.get(theme.fingerprint)
 
-        if (
-            stored_row is not None
-            and stored_row.get("content_hash") == content_hash
-            and stored_row.get("summary")
-        ):
+        cache_hit = _cache_hit_sentences(stored_row, content_hash) if stored_row else None
+        if cache_hit is not None:
             cache_hits += 1
-            label = str(stored_row["label"])
-            sentences = _sentences_from_json(stored_row.get("summary"))
+            label, sentences = cache_hit
         else:
             cache_misses += 1
-            recorded_before = len(attempts)
-            theme_summary = summarize(theme_input, client=client, on_attempt=attempts.append)
-            for attempt in attempts[recorded_before:]:
-                calls_for_log.append(
-                    {
-                        "theme_fingerprint": theme.fingerprint,
-                        "attempt": attempt.attempt,
-                        "success": attempt.success,
-                        "latency_ms": attempt.latency_ms,
-                        "input_tokens": attempt.usage.input_tokens if attempt.usage else None,
-                        "output_tokens": attempt.usage.output_tokens if attempt.usage else None,
-                        "error": attempt.error,
-                    }
-                )
-            label = theme_summary.label
-            sentences = [sentence.model_dump() for sentence in theme_summary.sentences]
+            label, sentences = _summarize_and_log(
+                theme_input,
+                theme.fingerprint,
+                client=client,
+                attempts=attempts,
+                calls_for_log=calls_for_log,
+            )
 
-        cited_story_keys = _cited_story_keys(sentences)
         member_fingerprints = [entry.story_key for entry in theme.evidence]
         story_ids = tuple(story_id_by_fingerprint[key] for key in member_fingerprints)
-        cited_story_ids = {story_id_by_fingerprint[key] for key in cited_story_keys}
-        citation_item_ids = tuple(
-            sorted(
-                {
-                    item_id
-                    for story_id in cited_story_ids
-                    for item_id in raw_items_by_story.get(story_id, ())
-                }
-            )
+        citation_item_ids = _citation_item_ids(
+            sentences,
+            story_id_by_fingerprint=story_id_by_fingerprint,
+            raw_items_by_story=raw_items_by_story,
         )
 
         theme_records.append(
