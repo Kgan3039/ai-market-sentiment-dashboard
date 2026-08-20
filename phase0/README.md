@@ -1418,3 +1418,78 @@ a relative link that then failed validation as "not absolute HTTP(S)". The
 base in effect at the root is the feed's own URL, and each nested
 `xml:base` resolves against the base already in effect — including one on
 the `<link>` element itself.
+
+## How #68 (orchestration, issue #68) was ported onto this contract
+
+The other two ports had to change how they *write*. This one had to stop
+writing altogether.
+
+The stale I4 branch orchestrated by minting one `uuid4` and one
+`America/New_York` date per process, handing both to every fetcher as
+`run_id=` and `trading_day=`, and recording each stage itself with
+`repository.log_stage(...)`. Every one of those calls is gone from
+`Phase0Repository`, so the branch could not run at all — but the assumption
+underneath them is the part worth naming, because it would have survived a
+mechanical port. It read *a process is a partition*. It is not. A single
+invocation legitimately spans five tickers, two feeds, and — across a
+midnight boundary or a backdated article — more than one trading day.
+
+| The stale orchestrator | What replaced it |
+|---|---|
+| `repository.log_stage(...)` per stage | nothing — components log inside their own runs |
+| one `uuid4` as *the* `run_id` | an `invocation_id` used only as a **base**, from which each component derives `partition_run_id(...)` |
+| one `trading_day` passed to both fetchers | no `trading_day` anywhere; each item's day comes from its own timestamps |
+| `clear_derived_for_day` + "replay prepared" | `reclassify_persisted`, which replaces per partition and deletes nothing |
+| `repository.connect()` in tests | `run_log_entries`, `source_state`, `Phase0Reader` |
+
+**The invocation id never becomes a run id.** `f"{invocation_id}:{stage}"`
+is a prefix a component appends its partition to; nothing opens a run under
+the bare base. Correlation and partition identity are different needs, and
+the moment one string serves both, `UNIQUE(run_id, stage)` starts meaning
+"one process" — at which point the second partition of a two-day fetch does
+not merely muddle the audit, it fails to persist.
+
+**There is no invocation-level row, because there is no invocation-level
+table.** The aggregate lives in memory and in the structured log. Writing
+it into `run_log` would require a `run_id` naming no partition, which is
+the one thing the identity rule exists to prevent, so the aggregate stays
+where it can be honest about what it is: a process summary, not an audit.
+
+**Status is three-valued on purpose.** A component that settled some
+partitions and failed others is `degraded`, and the invocation is `failed`
+only when every mandatory component settled *nothing*. Four tickers of five
+is a usable day with a hole in it; rounding it up hides an outage and
+rounding it down discards evidence that is really there. The CLI carries
+the same three states out as three exit codes rather than one bit.
+
+**Replay says what it cannot do.** `--replay` rebuilds RSS relevance and
+nothing else: Yahoo is not refetched, M1–M5 are not registered, and
+`reclassify_persisted` takes no scope argument, so replay covers all
+persisted RSS evidence rather than one ticker-day. All four facts are
+reported by the CLI itself rather than documented and left to drift. The
+stale version called its `clear_derived_for_day` step "replay" — it deleted
+derived rows it had no stage capable of rebuilding.
+
+**Overlap prevention is a mechanism, not a cron comment.** A cron file
+proves only that something was scheduled. `pipeline.py` owns lock
+acquisition and every production entrypoint passes it the same
+`--lock-file`; there is no outer `flock` in the crontab. The first cut had
+one, and it was worse than none: the shell's `/var/lock/...` and
+`pipeline.py`'s own `<database>.lock` default were two different files, so
+a cron run and a manual run each held a lock, each concluded it was alone,
+and both fetched. One authoritative lock is the whole guarantee — the
+`<database>.lock` default survives only as the local-development case,
+where two checkouts on one laptop genuinely should not block each other.
+`CRON_TZ` is a Vixie/cronie extension and is documented as one — an
+implementation that ignores it runs the market window in host local time
+while looking perfectly installed.
+
+**A component's constructor is part of its stage.** `RSSFetcher.__init__`
+reads and validates `feeds.yaml` and `aliases.yaml`, and
+`YahooFinanceFetcher.__init__` validates its own arguments. Building them
+while assembling the stage list put that work outside the isolation
+boundary, so a YAML typo did not fail one component — it raised before
+Yahoo had run at all, cost the invocation a day of Yahoo evidence it could
+have had, and left the process with a traceback instead of one of the
+three documented exit codes. Each stage now constructs its own component
+when it runs.
