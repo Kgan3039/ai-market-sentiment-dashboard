@@ -100,7 +100,15 @@ class PersistedEmbedding:
 
 @runtime_checkable
 class EmbeddingRepository(Protocol):
-    """Public persistence boundary required from issue #57's repository."""
+    """Public persistence boundary, implemented by issue #57's repository.
+
+    :class:`phase0.repository.Phase0Repository` satisfies this protocol.
+    Note that it accepts only a *durable row id* as ``source_id``; see
+    :func:`phase0.embeddings.require_durable_source_id`.  Under the I5
+    decision record (decision A) the Phase 0 pipeline does not use this
+    cache for story or theme vectors, because a story has no durable id
+    until after the stage that needs its vector has run.
+    """
 
     def get_embedding(
         self, source_kind: SourceKind, source_id: str

@@ -252,10 +252,13 @@ class ThemeConfig:
     #: the grab-bag holds 0.35 - and those are the same days it is then
     #: evaluated on, which makes every cohesion number the fixtures produce
     #: partly a restatement of the threshold.  It cannot be calibrated
-    #: honestly until real ingested days exist (#57/#68) and a human review
-    #: (#60/K3) says which groups a reader would accept.  Until then treat
-    #: it as a development default, and read any theme sitting within a few
-    #: hundredths of it as unadjudicated.
+    #: honestly until real ingested ticker-days have been *collected* and a
+    #: human review (#60/K3) says which groups a reader would accept.  The
+    #: ingestion and persistence stack that makes such days possible landed
+    #: with I1-I4; what is still missing is a collected corpus and the
+    #: two-reviewer review itself.  Until then treat this as a development
+    #: default, and read any theme sitting within a few hundredths of it as
+    #: unadjudicated.
     min_theme_cohesion: float = 0.40
     #: The *weakest pair* a theme may contain.  Separate from the mean
     #: because a mean hides its worst link: the six-story TSLA theme held a
@@ -269,7 +272,8 @@ class ThemeConfig:
     #: belongs below that range; 0.30 sits under the loosest genuine
     #: same-event pair while still excluding pairs that share almost no
     #: semantic content. That is a cross-reference, not a calibration: it
-    #: still needs real days (#57/#68) and the #60/K3 review.
+    #: still needs a collected corpus of real ingested days and the #60/K3
+    #: review, neither of which exists yet.
     min_theme_pairwise_cohesion: float = 0.30
     #: Fewest stories a group must hold to be shown as a theme.  A lone
     #: story is coverage, not a theme; it goes under "Other coverage" where

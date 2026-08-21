@@ -24,11 +24,13 @@ and fingerprints:
   reason, so "M5 allows this" is a decision on the record rather than an
   omission.
 
-**Integration requirement.**  M3 does not currently expose per-story
-compatibility evidence on its public result, so M5 derives polarity from
-text.  When #57/#68 land and M3 publishes a public evidence projection, this
-module should consume it instead of re-deriving from the headline; the
-contract below is the shape that projection needs to satisfy.
+**Integration requirement.**  M3 does not expose per-story compatibility
+evidence on its public result, so M5 derives polarity from text.  The
+blocker is M3's own public surface, not the persistence or orchestration
+layers — those landed with I1 and I4.  If M3 later publishes a public
+evidence projection, this module should consume it instead of re-deriving
+from the headline; the contract below is the shape that projection needs to
+satisfy.
 
 **The check is cluster-wide.**  :func:`incompatible_members` is handed a
 whole prospective theme and compares every member against the theme's
