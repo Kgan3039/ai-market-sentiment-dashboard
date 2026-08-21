@@ -5,3 +5,10 @@ yfinance>=0.2.54
 pandas==2.2.1
 requests==2.31.0
 python-dotenv==1.0.1
+# RSS feed/alias configuration (phase0/rss.py, issue #62)
+PyYAML==6.0.2
+
+# Explicit IANA zone data for the pipeline's America/New_York invocation
+# day (pipeline.py, issue #68). It arrives transitively via pandas today;
+# a market-hours schedule should not depend on that staying true.
+tzdata==2026.3

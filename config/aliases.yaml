@@ -64,7 +64,8 @@ tickers:
       - B200
     context_required_aliases: []
     context_terms: []
-    exclusion_terms: []
+    exclusion_terms:
+      - no relationship with NVIDIA
     notes: "NVIDIA and its branded compute products are company references; do not map generic GPU coverage without one of these terms."
 
   - ticker: AMD
@@ -100,6 +101,7 @@ tickers:
       - age-related macular degeneration
       - advanced manufacturing district
       - automated market data
+      - without semiconductor context
     notes: "The bare acronym AMD needs same-item semiconductor or company context; it is never sufficient by itself."
 
   - ticker: AAPL
