@@ -1,4 +1,13 @@
-"""Read-model boundary for fixture data now and SQLite data after I1 lands."""
+"""Read-model boundary for the Phase 0 narrative API.
+
+Still fixture-backed. I1's SQLite persistence layer
+(:mod:`phase0.repository`) is on ``main``, but nothing yet writes the
+``stories`` and ``themes`` it would read: the downstream stages are
+implemented in :mod:`nlp` and not registered in ``pipeline.py``. The
+adapter from that repository to this read model is deliberately
+deferred until the stored output is stable -- see
+``docs/decisions/I5-decisions.md``.
+"""
 
 from __future__ import annotations
 
@@ -177,5 +186,10 @@ def _load_fixture() -> dict:
 
 @lru_cache(maxsize=1)
 def get_narrative_repository() -> NarrativeReadRepository:
-    """Return the read source until I1 provides the SQLite adapter."""
+    """Return the read source.
+
+    Fixture-backed until a SQLite adapter is built on top of
+    :class:`phase0.repository.Phase0Repository`; that waits on the
+    downstream stages actually producing stored output.
+    """
     return FixtureNarrativeRepository.from_default_fixture()

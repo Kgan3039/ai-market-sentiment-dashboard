@@ -7,8 +7,12 @@ calls.  Everything about a run comes from its arguments.
 
 What it deliberately does *not* do: assign durable story identifiers,
 persist anything, read configuration from disk, project database rows, or
-report partial success.  Those belong to the Phase 0 repository (issue #57)
-and the pipeline runner (issue #68), neither of which exists yet.
+report partial success.  Those belong to the Phase 0 repository
+(:mod:`phase0.repository`, issue #57) and the pipeline runner
+(``pipeline.py``, issue #68), both of which are on ``main``.  This core is
+still not wired to them: the projection that turns persisted evidence into
+:class:`~nlp.dedup.models.RawItem` and clusters into
+:class:`~phase0.models.StoryRecord` is I5's, not M2's.
 """
 
 from __future__ import annotations

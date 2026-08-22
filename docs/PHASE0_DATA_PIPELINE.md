@@ -125,7 +125,7 @@ the claim is deliberately narrow:
 |---|---|
 | RSS relevance | replayable |
 | Yahoo refetch | not replayed — replay never fetches |
-| Dedup, clustering, summarization (M1–M5) | not implemented, not registered |
+| Dedup, clustering, summarization (M1–M5) | implemented in `nlp/`, not registered |
 | Scoped replay (one ticker/day/version) | unavailable — `reclassify_persisted` takes no scope |
 
 Replay currently covers **all** persisted RSS evidence, because that is
