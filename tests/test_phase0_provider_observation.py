@@ -13,6 +13,8 @@ so a future edit that tries to persist from here fails loudly rather than
 quietly writing a row.
 """
 
+from datetime import datetime, timedelta
+import itertools
 import json
 
 import pytest
@@ -70,6 +72,29 @@ def observed(ticker, items, *, attempt=1, when=WHEN):
     return observe.observe_yahoo_response(
         ticker, items, attempt=attempt, observed_at=when
     )
+
+
+def later(seconds, *, start=WHEN):
+    """A timestamp a stated distance from the window's start."""
+
+    return (datetime.fromisoformat(start) + timedelta(seconds=seconds)).isoformat()
+
+
+def advancing_clock(step_seconds=3600, start=WHEN):
+    """A deterministic clock that moves on every read.
+
+    ``collect`` reads the clock once per attempt and once per provider, so
+    a frozen clock would put every observation of an article at the same
+    instant -- which is exactly the condition under which no stability
+    claim can be made, and not what most of these tests are about.
+    """
+
+    counter = itertools.count()
+
+    def clock():
+        return later(step_seconds * next(counter), start=start)
+
+    return clock
 
 
 def rss_xml(*entries, channel_title="Feed"):
@@ -305,22 +330,146 @@ def test_one_publisher_reusing_an_id_across_articles_is_named_publisher_scoped()
     assert findings.semantics == "publisher_scoped"
 
 
-def test_one_title_under_two_urls_is_url_churn_and_not_blamed_on_the_id():
-    """A shared id with one title says the URL moved, not that the id is wrong."""
+#: The semantics that mean "this identifier is shared by two articles".
+#: Which of the two is reached is a statement about *how* it is shared; both
+#: are collisions and both are disqualifying.
+COLLISION_SEMANTICS = {"colliding", "publisher_scoped"}
+
+
+def test_one_article_seen_twice_at_one_url_with_one_title_does_not_collide():
+    """The ordinary case: an article observed again is not two articles."""
+
+    observations = observed(
+        "AAPL", [current_item("same", title="One", url="https://www.fool.com/one")]
+    ) + observed(
+        "AAPL",
+        [current_item("same", title="One", url="https://www.fool.com/one")],
+        attempt=2,
+        when=later(3 * 3600),
+    )
+
+    findings = observe.summarize_candidate(observations, "id")
+
+    assert findings.colliding_ids == ()
+    assert findings.semantics == "article_scoped"
+
+
+def test_one_article_whose_headline_was_rewritten_does_not_collide():
+    """One canonical URL is one article, whatever the desk did to the headline."""
+
+    observations = observed(
+        "AAPL", [current_item("same", title="One", url="https://www.fool.com/one")]
+    ) + observed(
+        "AAPL",
+        [current_item("same", title="One, revised", url="https://www.fool.com/one")],
+        attempt=2,
+        when=later(3 * 3600),
+    )
+
+    findings = observe.summarize_candidate(observations, "id")
+
+    assert findings.colliding_ids == ()
+    assert findings.articles_observed == 1
+    assert findings.semantics == "article_scoped"
+
+
+def test_one_id_on_two_urls_collides_even_when_the_headlines_match():
+    """The bug this replaces: an identical headline excused the collision.
+
+    Two canonical URLs are two articles here -- that is the study's article
+    identity -- and a recurring or templated headline is exactly what a
+    real collision looks like, not a reason to look away from one.
+    """
 
     observations = observed(
         "AAPL",
         [
-            current_item("same", title="One", url="https://www.fool.com/one"),
-            current_item("same", title="One", url="https://www.fool.com/one-v2"),
+            current_item(
+                "same", title="Market wrap", url="https://www.fool.com/wrap-monday"
+            ),
+            current_item(
+                "same", title="Market wrap", url="https://www.fool.com/wrap-tuesday"
+            ),
         ],
     )
 
     findings = observe.summarize_candidate(observations, "id")
 
+    assert findings.colliding_ids[0]["id"] == "same"
     assert findings.colliding_ids[0]["distinct_titles"] is False
-    assert findings.semantics != "colliding"
-    assert any("URLs differ" in line for line in findings.evidence)
+    assert findings.colliding_ids[0]["article_urls"] == [
+        "https://www.fool.com/wrap-monday",
+        "https://www.fool.com/wrap-tuesday",
+    ]
+    assert findings.semantics in COLLISION_SEMANTICS
+
+
+def test_one_id_on_two_urls_collides_when_the_headlines_differ_too():
+    observations = observed(
+        "AAPL",
+        [
+            current_item("same", title="One", url="https://www.fool.com/one"),
+            current_item(
+                "same",
+                title="Two",
+                url="https://www.barrons.com/two",
+                publisher="Barrons.com",
+                source_id="Barrons.com",
+            ),
+        ],
+    )
+
+    findings = observe.summarize_candidate(observations, "id")
+
+    assert findings.colliding_ids[0]["distinct_titles"] is True
+    assert findings.semantics in COLLISION_SEMANTICS
+
+
+def test_two_ids_sharing_a_headline_across_urls_is_not_an_id_collision():
+    """Collision is a claim about identifiers, not about headlines."""
+
+    observations = observed(
+        "AAPL",
+        [
+            current_item("first", title="Market wrap", url="https://www.fool.com/one"),
+            current_item("second", title="Market wrap", url="https://www.fool.com/two"),
+        ],
+    )
+
+    findings = observe.summarize_candidate(observations, "id")
+
+    assert findings.colliding_ids == ()
+    assert findings.distinct_ids == 2
+    assert findings.articles_observed == 2
+    assert findings.semantics not in COLLISION_SEMANTICS
+
+
+def test_a_collision_disqualifies_the_field_however_long_it_was_watched():
+    """No amount of stable observation makes a shared identifier a key."""
+
+    url = "https://www.fool.com/wrap-{}"
+    observations = []
+    for attempt, when in enumerate([WHEN, later(20 * 3600)], start=1):
+        observations += observed(
+            "AAPL",
+            [
+                current_item("same", title="Market wrap", url=url.format("monday")),
+                current_item("same", title="Market wrap", url=url.format("tuesday")),
+            ],
+            attempt=attempt,
+            when=when,
+        )
+    findings = {
+        field: observe.summarize_candidate(observations, field)
+        for field in observe.CANDIDATE_FIELDS
+    }
+
+    verdict = observe._external_id_verdict(findings, span_seconds=20 * 3600)
+
+    assert findings["id"].stability_span_met is True
+    assert verdict["verdict"] == "UNSAFE"
+    assert verdict["verdict"] != "SAFE TO IMPLEMENT"
+    assert verdict["semantics"] in COLLISION_SEMANTICS
 
 
 # -- Yahoo source strings ------------------------------------------------
@@ -668,7 +817,7 @@ def test_one_provider_failing_does_not_lose_the_other_provider_s_evidence(
     assert "[REDACTED]" in records[0].yahoo["AAPL"]["error"]
 
 
-def artifact_from(fetcher, feed, *, attempts=2, items=None):
+def artifact_from(fetcher, feed, *, attempts=2, items=None, step_seconds=3600):
     body = rss_xml(entry("A", "https://www.marketwatch.com/story/a", guid="a"))
     payloads = [current_item("a")] if items is None else items
     records, yahoo, rss = observe.collect(
@@ -679,7 +828,7 @@ def artifact_from(fetcher, feed, *, attempts=2, items=None):
         interval_seconds=0,
         news_for=lambda ticker: payloads,
         feed_get=lambda url, timeout: FakeResponse(body, url=url),
-        clock=lambda: WHEN,
+        clock=advancing_clock(step_seconds),
         sleep=lambda seconds: None,
     )
     return observe.build_artifact(
@@ -717,6 +866,51 @@ def test_the_artifact_records_what_produced_it(fetcher, feed):
     assert artifact["tickers"] == ["AAPL"]
     assert artifact["feeds"]["enabled_feed_ids"] == ["marketwatch-top-stories"]
     assert len(artifact["feeds"]["config_sha256"]) == 64
+
+
+def test_the_artifact_keeps_the_records_its_conclusions_were_computed_from(
+    fetcher, feed
+):
+    """A verdict nobody can recompute is a verdict nobody can correct."""
+
+    artifact = artifact_from(fetcher, feed)
+    records = artifact["yahoo"]["observations"]
+
+    assert len(records) == artifact["yahoo"]["item_observation_count"]
+    assert {row["observed_at"] for row in records} == {later(3600), later(14_400)}
+    assert all(row["canonical_url"] for row in records)
+
+    recomputed = observe.summarize_candidate(
+        [
+            observe.YahooItemObservation(
+                attempt=row["attempt"],
+                observed_at=row["observed_at"],
+                ticker=row["ticker"],
+                position=row["position"],
+                candidate_ids=row["candidate_ids"],
+                valid=row["valid"],
+                validation_error=None,
+                stored_source=row["stored_source"],
+                raw_publisher=None,
+                publisher_field=None,
+                provider_display_name=None,
+                provider_source_id=None,
+                provider_url=None,
+                canonical_url=row["canonical_url"],
+                title=row["title"],
+            )
+            for row in records
+        ],
+        "id",
+    )
+
+    assert (
+        dict(recomputed.repeat_span_summary)
+        == artifact["yahoo"]["provider_id_candidates"]["id"]["repeat_span_summary"]
+    )
+    assert recomputed.semantics == (
+        artifact["yahoo"]["provider_id_candidates"]["id"]["semantics"]
+    )
 
 
 def test_a_stable_fully_present_identifier_is_safe_to_implement(fetcher, feed):
@@ -760,7 +954,7 @@ def test_the_verdict_names_the_field_it_rests_on():
     findings = {
         field: observe.summarize_candidate(
             observed("AAPL", [legacy_item("u1")], attempt=1)
-            + observed("AAPL", [legacy_item("u1")], attempt=2),
+            + observed("AAPL", [legacy_item("u1")], attempt=2, when=later(3 * 3600)),
             field,
         )
         for field in observe.CANDIDATE_FIELDS
@@ -847,52 +1041,179 @@ def test_a_single_attempt_spans_nothing():
     )
 
 
+def repeated_at(article, *moments, ids=None, title="Headline"):
+    """One article, observed at each stated moment, carrying one id."""
+
+    observations = []
+    identifiers = ids or [article] * len(moments)
+    for attempt, (moment, identifier) in enumerate(zip(moments, identifiers), start=1):
+        observations += observed(
+            "AAPL",
+            [
+                current_item(
+                    identifier,
+                    title=title,
+                    url=f"https://www.fool.com/{article}",
+                )
+            ],
+            attempt=attempt,
+            when=moment,
+        )
+    return observations
+
+
+def verdict_for(observations, *, span_seconds=0.0):
+    findings = {
+        field: observe.summarize_candidate(observations, field)
+        for field in observe.CANDIDATE_FIELDS
+    }
+    return observe._external_id_verdict(findings, span_seconds=span_seconds)
+
+
 def test_a_short_window_marks_the_verdict_provisional(fetcher, feed):
-    artifact = artifact_from(fetcher, feed)
+    """Attempts minutes apart test a claim about minutes, however many there are."""
+
+    artifact = artifact_from(fetcher, feed, step_seconds=60)
     stability = artifact["yahoo"]["external_id_verdict"]["stability_window"]
 
-    assert stability["observed_span_seconds"] == 0.0
+    assert stability["longest_repeat_span_seconds"] == 180.0
     assert stability["meets_decision_g"] is False
+    assert artifact["yahoo"]["external_id_verdict"]["verdict"] == "UNKNOWN"
     assert "provisional" in observe.render_markdown(artifact)
 
 
 def test_a_window_of_hours_earns_the_verdict_outright():
-    findings = {
-        field: observe.summarize_candidate(
-            observed("AAPL", [current_item("a")], attempt=1)
-            + observed(
-                "AAPL", [current_item("a")], attempt=2, when="2026-08-22T15:00:00+00:00"
-            ),
-            field,
-        )
-        for field in observe.CANDIDATE_FIELDS
-    }
-
-    verdict = observe._external_id_verdict(findings, span_seconds=10_800)
+    verdict = verdict_for(repeated_at("a", WHEN, later(3 * 3600)), span_seconds=10_800)
 
     assert verdict["verdict"] == "SAFE TO IMPLEMENT"
     assert verdict["stability_window"]["meets_decision_g"] is True
+    assert verdict["stability_window"]["longest_repeat_span_seconds"] == 10_800.0
 
 
-def test_the_span_is_reported_beside_the_verdict_and_never_folded_into_it():
-    """A short window must not turn a clean field into a dirty one, or back."""
+def test_a_long_run_of_repeats_minutes_apart_does_not_meet_the_bar():
+    """The defect this replaces: the run's own length stood in for evidence.
 
-    findings = {
-        field: observe.summarize_candidate(
-            observed("AAPL", [current_item("a")], attempt=1)
-            + observed("AAPL", [current_item("a")], attempt=2),
-            field,
+    Twenty hours of observation in which no article was ever seen twice
+    more than ten minutes apart tests a ten-minute claim. It is reported,
+    and it earns nothing.
+    """
+
+    observations = repeated_at("a", WHEN, later(600)) + repeated_at(
+        "b", later(20 * 3600), later(20 * 3600 + 600)
+    )
+
+    verdict = verdict_for(observations, span_seconds=20 * 3600)
+    stability = verdict["stability_window"]
+
+    assert stability["observation_window_span_seconds"] == 72_000
+    assert stability["longest_repeat_span_seconds"] == 600.0
+    assert stability["repeated_article_count"] == 2
+    assert stability["articles_meeting_required_span"] == 0
+    assert stability["meets_decision_g"] is False
+    assert verdict["verdict"] == "UNKNOWN"
+
+
+def test_a_short_run_with_one_article_repeated_over_the_bar_meets_it():
+    """Three hours of run, one article watched for two and a quarter of them."""
+
+    verdict = verdict_for(
+        repeated_at("a", WHEN, later(2 * 3600 + 900)), span_seconds=3 * 3600
+    )
+    stability = verdict["stability_window"]
+
+    assert stability["longest_repeat_span_seconds"] == 8_100.0
+    assert stability["articles_meeting_required_span"] == 1
+    assert stability["meets_decision_g"] is True
+    assert verdict["verdict"] == "SAFE TO IMPLEMENT"
+
+
+def test_several_repeated_articles_all_under_the_bar_do_not_add_up_to_it():
+    """Four articles watched for an hour each is not one article watched four."""
+
+    observations = []
+    for index, article in enumerate("abcd"):
+        start = index * 4 * 3600
+        observations += repeated_at(
+            article, later(start), later(start + 3600), title=f"Headline {article}"
         )
-        for field in observe.CANDIDATE_FIELDS
-    }
 
-    short = observe._external_id_verdict(findings, span_seconds=60)
-    long = observe._external_id_verdict(findings, span_seconds=86_400)
+    verdict = verdict_for(observations, span_seconds=16 * 3600)
+    stability = verdict["stability_window"]
+
+    assert stability["repeated_article_count"] == 4
+    assert stability["articles_meeting_required_span"] == 0
+    assert stability["longest_repeat_span_seconds"] == 3_600.0
+    assert stability["median_repeat_span_seconds"] == 3_600.0
+    assert stability["meets_decision_g"] is False
+    assert verdict["verdict"] == "UNKNOWN"
+
+
+def test_one_repeated_article_over_the_bar_among_short_ones_meets_it():
+    observations = (
+        repeated_at("a", WHEN, later(600), title="Headline a")
+        + repeated_at("b", WHEN, later(1800), title="Headline b")
+        + repeated_at("c", WHEN, later(4 * 3600), title="Headline c")
+    )
+
+    verdict = verdict_for(observations, span_seconds=4 * 3600)
+    stability = verdict["stability_window"]
+
+    assert stability["repeated_article_count"] == 3
+    assert stability["articles_meeting_required_span"] == 1
+    assert stability["longest_repeat_span_seconds"] == 14_400.0
+    assert stability["shortest_repeat_span_seconds"] == 600.0
+    assert stability["median_repeat_span_seconds"] == 1_800.0
+    assert stability["meets_decision_g"] is True
+    assert verdict["verdict"] == "SAFE TO IMPLEMENT"
+
+
+def test_two_articles_are_never_added_up_into_one_stability_span():
+    """A span belongs to the article it was measured on, and to no other."""
+
+    observations = repeated_at("a", WHEN, later(300), title="Headline a") + repeated_at(
+        "b", later(8 * 3600), later(8 * 3600 + 300), title="Headline b"
+    )
+
+    findings = observe.summarize_candidate(observations, "id")
+    spans = {row["article_url"]: row["span_seconds"] for row in findings.repeat_spans}
+
+    assert spans == {
+        "https://www.fool.com/a": 300.0,
+        "https://www.fool.com/b": 300.0,
+    }
+    assert findings.repeat_span_summary["longest_seconds"] == 300.0
+    assert findings.stability_span_met is False
+
+
+def test_an_article_that_changed_id_over_the_span_does_not_meet_the_bar():
+    """Watched for three hours, and what it showed was the opposite of stability."""
+
+    observations = repeated_at("a", WHEN, later(3 * 3600), ids=["first", "second"])
+
+    findings = observe.summarize_candidate(observations, "id")
+
+    assert findings.repeat_spans[0]["span_seconds"] == 10_800.0
+    assert findings.repeat_spans[0]["one_identifier"] is False
+    assert findings.repeat_span_summary["repeated_article_count"] == 1
+    assert findings.repeat_span_summary["meeting_required_span"] == 0
+    assert findings.stability_span_met is False
+    assert findings.semantics == "unstable"
+
+
+def test_the_run_span_is_reported_beside_the_verdict_and_never_folded_into_it():
+    """The run's length may be published; it may not decide anything."""
+
+    observations = repeated_at("a", WHEN, later(3 * 3600))
+
+    short = verdict_for(observations, span_seconds=60)
+    long = verdict_for(observations, span_seconds=86_400)
 
     assert short["verdict"] == long["verdict"] == "SAFE TO IMPLEMENT"
     assert short["field"] == long["field"]
-    assert short["stability_window"]["meets_decision_g"] is False
+    assert short["stability_window"]["meets_decision_g"] is True
     assert long["stability_window"]["meets_decision_g"] is True
+    assert short["stability_window"]["observation_window_span_seconds"] == 60
+    assert long["stability_window"]["observation_window_span_seconds"] == 86_400
 
 
 # -- Candidate agreement -------------------------------------------------

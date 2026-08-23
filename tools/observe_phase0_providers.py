@@ -42,6 +42,7 @@ import hashlib
 import json
 from pathlib import Path
 import platform
+import statistics
 import subprocess
 import sys
 import time
@@ -58,7 +59,7 @@ from phase0.yahoo import normalize_yahoo_item
 
 #: Bumped when the artifact's shape changes, so a committed observation can
 #: always be read by the code that claims to understand it.
-ARTIFACT_SCHEMA = "i5-provider-observation/1"
+ARTIFACT_SCHEMA = "i5-provider-observation/2"
 
 #: The candidate provider-identifier fields, in the order the artifact
 #: reports them.  ``uuid`` is the legacy shape ``phase0/yahoo.py`` still
@@ -72,6 +73,16 @@ CANDIDATE_FIELDS = ("id", "uuid", "content.id")
 RSS_USER_AGENT = "TickerNarrativesPhase0/1.0"
 
 DEFAULT_TICKERS = ("AAPL", "AMD", "META", "NVDA", "TSLA")
+
+#: Decision G asks that the same article be seen to carry the same
+#: identifier "across fetches hours apart".  Two hours is the smallest span
+#: that honestly reads as "hours"; the number is here rather than inline so
+#: a reviewer can see what the artifact's claim was measured against.
+#:
+#: It is measured *per article*.  How long a run lasted says nothing about
+#: an identifier: a twenty-hour run whose articles were each seen twice ten
+#: minutes apart tested a ten-minute claim twenty hours late.
+DECISION_G_STABILITY_SECONDS = 2 * 60 * 60
 
 
 # -- Observation records -------------------------------------------------
@@ -332,6 +343,9 @@ class CandidateFindings:
     articles_repeated: int
     articles_at_multiple_positions: int
     cross_ticker_articles: int
+    repeat_spans: tuple[Mapping[str, Any], ...]
+    repeat_span_summary: Mapping[str, Any]
+    stability_span_met: bool
     unstable_articles: tuple[Mapping[str, Any], ...]
     position_varying_articles: tuple[Mapping[str, Any], ...]
     cross_ticker_divergent_articles: tuple[Mapping[str, Any], ...]
@@ -352,9 +366,17 @@ def _article_key(observation: YahooItemObservation) -> str | None:
 
 
 def summarize_candidate(
-    observations: Sequence[YahooItemObservation], field: str
+    observations: Sequence[YahooItemObservation],
+    field: str,
+    *,
+    required_span_seconds: float = DECISION_G_STABILITY_SECONDS,
 ) -> CandidateFindings:
-    """Establish presence, stability, scope, and collisions for one field."""
+    """Establish presence, stability, scope, and collisions for one field.
+
+    Stability is measured per article, not per run.  ``required_span_seconds``
+    is the bar each *repeated article* has to clear on its own, and the
+    spans behind that count are reported rather than reduced to a flag.
+    """
 
     valid = [entry for entry in observations if entry.valid and _article_key(entry)]
     present = [entry for entry in valid if entry.candidate_ids.get(field)]
@@ -369,6 +391,7 @@ def summarize_candidate(
     unstable: list[Mapping[str, Any]] = []
     position_varying: list[Mapping[str, Any]] = []
     cross_ticker_divergent: list[Mapping[str, Any]] = []
+    repeat_spans: list[Mapping[str, Any]] = []
     repeated = 0
     multi_position = 0
     cross_ticker = 0
@@ -389,6 +412,32 @@ def summarize_candidate(
             multi_position += 1
         if len(tickers) > 1:
             cross_ticker += 1
+        # How long *this article* was watched.  Only observations that
+        # carried the field count: an observation with no identifier is no
+        # evidence that the identifier held, and folding it in would stretch
+        # the span with time nobody was measuring.  Timestamps never leave
+        # the article they belong to, so two different articles can never be
+        # added up into one stability claim.
+        carrying = [entry for entry in entries if entry.candidate_ids.get(field)]
+        if len(carrying) > 1:
+            moments = sorted(
+                datetime.fromisoformat(entry.observed_at) for entry in carrying
+            )
+            span = round((moments[-1] - moments[0]).total_seconds(), 3)
+            repeat_spans.append(
+                {
+                    "article_url": url,
+                    "first_observed_at": moments[0].isoformat(),
+                    "last_observed_at": moments[-1].isoformat(),
+                    "span_seconds": span,
+                    "observation_count": len(carrying),
+                    "attempts": attempts,
+                    "ids": ids,
+                    "one_identifier": len(ids) == 1,
+                    "meets_required_span": span >= required_span_seconds
+                    and len(ids) == 1,
+                }
+            )
         if len(ids) <= 1:
             continue
         detail = {
@@ -464,8 +513,13 @@ def summarize_candidate(
             }
         )
 
+    repeat_spans.sort(key=lambda row: (-row["span_seconds"], row["article_url"]))
+    span_summary = _repeat_span_summary(repeat_spans, required_span_seconds)
+    stability_span_met = span_summary["meeting_required_span"] > 0
+
     semantics, evidence = _classify_semantics(
         field=field,
+        span_summary=span_summary,
         present_count=len(present),
         valid_count=len(valid),
         articles=len(by_article),
@@ -487,6 +541,9 @@ def summarize_candidate(
         articles_repeated=repeated,
         articles_at_multiple_positions=multi_position,
         cross_ticker_articles=cross_ticker,
+        repeat_spans=tuple(repeat_spans),
+        repeat_span_summary=span_summary,
+        stability_span_met=stability_span_met,
         unstable_articles=tuple(unstable),
         position_varying_articles=tuple(position_varying),
         cross_ticker_divergent_articles=tuple(cross_ticker_divergent),
@@ -496,9 +553,40 @@ def summarize_candidate(
     )
 
 
+def _repeat_span_summary(
+    repeat_spans: Sequence[Mapping[str, Any]],
+    required_span_seconds: float,
+) -> dict[str, Any]:
+    """Describe the repeated articles' spans, rather than just counting them.
+
+    The longest span is what the strongest single piece of evidence is
+    worth; the median says whether that piece was typical or lucky.  Both
+    are ``None`` when nothing repeated, because zero would read as a
+    measured span of no time rather than as an absence of measurement.
+
+    The distribution covers every repeated article.  ``meeting_required_span``
+    counts only those that held *one* identifier across the span: an article
+    that carried two identifiers three hours apart was watched for three
+    hours and demonstrated the opposite of stability.
+    """
+
+    spans = sorted(float(row["span_seconds"]) for row in repeat_spans)
+    return {
+        "required_span_seconds": required_span_seconds,
+        "repeated_article_count": len(spans),
+        "meeting_required_span": sum(
+            1 for row in repeat_spans if row["meets_required_span"]
+        ),
+        "longest_seconds": spans[-1] if spans else None,
+        "shortest_seconds": spans[0] if spans else None,
+        "median_seconds": round(statistics.median(spans), 3) if spans else None,
+    }
+
+
 def _classify_semantics(
     *,
     field: str,
+    span_summary: Mapping[str, Any],
     present_count: int,
     valid_count: int,
     articles: int,
@@ -518,12 +606,24 @@ def _classify_semantics(
     merely unstable.  "Unconfirmed" is a real verdict and not a polite way
     of saying "fine": it is what an identifier gets when nothing repeated
     and so nothing was tested.
+
+    A collision is never explained away here.  Article identity in this
+    study is the canonical URL, so one identifier on two canonical URLs is
+    two articles sharing an identifier, and the headlines have no vote:
+    recurring and templated headlines are exactly how a real collision
+    looks.  Deciding that two URLs are one article would take a URL-alias
+    rule defined and defended on its own evidence, and there is no such
+    rule here.
     """
 
     evidence = [
         f"{present_count}/{valid_count} valid items carried {field}",
         f"{articles} distinct articles observed",
         f"{repeated} articles observed in more than one attempt",
+        f"{span_summary['repeated_article_count']} articles observed more than "
+        f"once carrying {field}, "
+        f"{span_summary['meeting_required_span']} of them at least "
+        f"{span_summary['required_span_seconds']:g}s apart",
         f"{multi_position} articles observed at more than one response position",
         f"{cross_ticker} articles observed under more than one ticker",
     ]
@@ -540,18 +640,22 @@ def _classify_semantics(
         shared_publisher = all(len(entry["publishers"]) == 1 for entry in colliding)
         differing_titles = any(entry["distinct_titles"] for entry in colliding)
         evidence.append(
-            f"{len(colliding)} identifiers were shared by more than one article"
+            f"{len(colliding)} identifiers were shared by more than one "
+            "canonical URL, which is this study's article identity"
         )
+        # "Publisher-scoped" is the narrower claim, and it needs headlines
+        # that differ to establish that the articles differ.  Without them
+        # the finding is still a collision -- it is simply a collision this
+        # observation cannot attribute to a publisher's numbering.
         if differing_titles and shared_publisher:
             return "publisher_scoped", evidence
-        if differing_titles:
-            return "colliding", evidence
-        # Same title under two URLs is URL churn, not an identifier defect,
-        # and calling it a collision would blame the wrong field.
-        evidence.append(
-            "shared identifiers carried one title, so the URLs differ rather "
-            "than the articles"
-        )
+        if not differing_titles:
+            evidence.append(
+                "the shared identifiers carried one headline across those "
+                "URLs, which recurring and templated coverage does too; it "
+                "is not evidence that the URLs are one article"
+            )
+        return "colliding", evidence
     if repeated == 0 and cross_ticker == 0 and multi_position == 0:
         return "article_scoped_unconfirmed", evidence
     return "article_scoped", evidence
@@ -1160,19 +1264,18 @@ def candidate_agreement(
     return rows
 
 
-#: Decision G asks that the same article be seen to carry the same
-#: identifier "across fetches hours apart".  Two hours is the smallest span
-#: that honestly reads as "hours"; the number is here rather than inline so
-#: a reviewer can see what the artifact's claim was measured against.
-DECISION_G_STABILITY_SECONDS = 2 * 60 * 60
-
-
 def observation_span_seconds(records: Sequence[AttemptRecord]) -> float:
     """How far apart the first and last rounds of observation really were.
 
     Not the configured interval: an attempt that failed, was slow, or was
-    interrupted moves the real span, and the real span is what a stability
-    claim rests on.
+    interrupted moves the real span.
+
+    This is context, not evidence.  It says how long the *run* lasted, and
+    a run's length says nothing about an identifier -- a twenty-hour run
+    can consist entirely of articles seen twice ten minutes apart.  The
+    stability bar is decided per article, in
+    :func:`summarize_candidate`, and this number is reported beside the
+    verdict as ``observation_window_span_seconds`` without entering it.
     """
 
     started = sorted(record.started_at for record in records)
@@ -1187,7 +1290,6 @@ def _external_id_verdict(
     findings: Mapping[str, CandidateFindings],
     *,
     span_seconds: float = 0.0,
-    required_span_seconds: float = DECISION_G_STABILITY_SECONDS,
 ) -> dict[str, Any]:
     """Turn the per-field findings into the one decision I5 is waiting on.
 
@@ -1195,6 +1297,11 @@ def _external_id_verdict(
     candidate that decides it -- and the reasoning names which field that
     was, because "safe to implement" with no field named is not a decision
     anyone can act on.
+
+    Decision G's stability bar is a gate on this verdict, and it is cleared
+    only by a *repeated article* whose own observations were far enough
+    apart.  ``span_seconds`` -- how long the run lasted -- is reported and
+    never gated on.
     """
 
     order = {
@@ -1244,6 +1351,25 @@ def _external_id_verdict(
             f"{best.field!r} looks article-scoped, but no article repeated, "
             "so stability was never tested"
         )
+    elif not best.stability_span_met:
+        # Repeated, but not over enough time to have tested what decision G
+        # asks.  UNKNOWN rather than PARTIALLY SAFE: the gap is missing
+        # evidence, not a known limit.
+        verdict = "UNKNOWN"
+        longest = best.repeat_span_summary["longest_seconds"]
+        if longest is None:
+            measured = f"no article carried {best.field!r} more than once"
+        else:
+            measured = (
+                f"the longest any one article was watched carrying it was "
+                f"{longest:g}s"
+            )
+        reason = (
+            f"{best.field!r} is article-scoped where it was seen, but "
+            f"{measured}, short of the "
+            f"{best.repeat_span_summary['required_span_seconds']:g}s apart "
+            "decision G asks for, so stability over hours was never tested"
+        )
     elif best.presence_fraction < 1.0:
         verdict = "PARTIALLY SAFE"
         reason = (
@@ -1254,7 +1380,11 @@ def _external_id_verdict(
         verdict = "SAFE TO IMPLEMENT"
         reason = (
             f"{best.field!r} was present on every valid item, unchanged "
-            "across attempts, positions, and tickers, and never shared"
+            "across attempts, positions, and tickers, never shared by two "
+            "canonical URLs, and held by "
+            f"{best.repeat_span_summary['meeting_required_span']} articles "
+            "across observations at least "
+            f"{best.repeat_span_summary['required_span_seconds']:g}s apart"
         )
     return {
         "verdict": verdict,
@@ -1262,28 +1392,45 @@ def _external_id_verdict(
         "reason": reason,
         "semantics": best.semantics,
         "presence_fraction": best.presence_fraction,
-        # Reported beside the verdict rather than folded into it.  The
-        # verdict is about the *field*; this is about how long anyone
-        # watched it, and a reader deserves both rather than one number
-        # that quietly averages them.
+        # What decision G's bar was actually measured against: the
+        # repeated articles, one at a time.  ``observation_window_span``
+        # sits alongside as context and is deliberately not what
+        # ``meets_decision_g`` reads.
         "stability_window": {
-            "observed_span_seconds": span_seconds,
-            "required_span_seconds": required_span_seconds,
-            "meets_decision_g": span_seconds >= required_span_seconds,
+            # Read off the finding, so the bar reported is the bar the
+            # articles were actually measured against.
+            "required_span_seconds": best.repeat_span_summary["required_span_seconds"],
+            "repeated_article_count": best.repeat_span_summary[
+                "repeated_article_count"
+            ],
+            "articles_meeting_required_span": best.repeat_span_summary[
+                "meeting_required_span"
+            ],
+            "longest_repeat_span_seconds": best.repeat_span_summary["longest_seconds"],
+            "median_repeat_span_seconds": best.repeat_span_summary["median_seconds"],
+            "shortest_repeat_span_seconds": best.repeat_span_summary[
+                "shortest_seconds"
+            ],
+            "meets_decision_g": best.stability_span_met,
+            "observation_window_span_seconds": span_seconds,
         },
     }
 
 
 DEFAULT_LIMITATIONS = (
-    "Stability is only as strong as the span it was watched over. The "
-    "artifact reports that span next to the verdict; a verdict marked "
-    "provisional was not watched long enough to meet decision G.",
+    "Stability is only as strong as the span each repeated article was "
+    "watched over, which is what the verdict is gated on. How long the run "
+    "lasted is reported beside it as context and decides nothing: a long "
+    "run of closely spaced repeats tests a short claim.",
     "Observation issues an unconditional GET, because reading a feed's "
     "stored ETag would mean reading source_state; a scheduled fetch sends "
     "conditional headers and can receive 304, which never appears here.",
     "Article identity is proxied by the canonical URL phase0 stores. Two "
     "URLs for one article would read as two articles, and one URL reused "
-    "for two articles would read as one.",
+    "for two articles would read as one. One identifier on two canonical "
+    "URLs is therefore counted as a collision, headlines included: "
+    "suppressing it would need a URL-alias rule defined on its own "
+    "evidence, and none is defined here.",
     "Only the five approved tickers and the enabled feeds were observed. "
     "A publisher that never appeared in this window is not evidence of "
     "absence.",
@@ -1353,6 +1500,7 @@ def build_artifact(
             for record in records
         ],
         "yahoo": {
+            "observations": [_observation_json(entry) for entry in yahoo_observations],
             "item_observation_count": len(yahoo_observations),
             "valid_item_count": sum(1 for e in yahoo_observations if e.valid),
             "invalid_item_count": sum(1 for e in yahoo_observations if not e.valid),
@@ -1378,6 +1526,29 @@ def build_artifact(
     }
 
 
+def _observation_json(entry: YahooItemObservation) -> dict[str, Any]:
+    """The minimal record a reader needs to recompute the conclusions.
+
+    Committed because a verdict nobody can recompute is a verdict nobody
+    can correct: every number under ``provider_id_candidates`` follows from
+    these rows and the article identity (the canonical URL), and a
+    methodology error found later can be re-run against them instead of
+    re-run against the providers, which will have moved on.
+    """
+
+    return {
+        "attempt": entry.attempt,
+        "observed_at": entry.observed_at,
+        "ticker": entry.ticker,
+        "position": entry.position,
+        "valid": entry.valid,
+        "candidate_ids": dict(entry.candidate_ids),
+        "canonical_url": entry.canonical_url,
+        "stored_source": entry.stored_source,
+        "title": entry.title,
+    }
+
+
 def _findings_json(entry: CandidateFindings) -> dict[str, Any]:
     return {
         "field": entry.field,
@@ -1389,6 +1560,9 @@ def _findings_json(entry: CandidateFindings) -> dict[str, Any]:
         "articles_repeated": entry.articles_repeated,
         "articles_at_multiple_positions": entry.articles_at_multiple_positions,
         "cross_ticker_articles": entry.cross_ticker_articles,
+        "repeat_span_summary": dict(entry.repeat_span_summary),
+        "stability_span_met": entry.stability_span_met,
+        "repeat_spans": [dict(row) for row in entry.repeat_spans],
         "unstable_articles": [dict(row) for row in entry.unstable_articles],
         "position_varying_articles": [
             dict(row) for row in entry.position_varying_articles
@@ -1403,6 +1577,61 @@ def _findings_json(entry: CandidateFindings) -> dict[str, Any]:
 
 
 # -- Rendering -----------------------------------------------------------
+
+
+def _hours(seconds: float | None) -> str:
+    return "n/a" if seconds is None else f"{seconds / 3600:.2f}h"
+
+
+def _stability_lines(stability: Mapping[str, Any]) -> list[str]:
+    """Say what the stability claim was measured on, article by article.
+
+    A reader who is told only "watched over 20h" cannot tell whether any
+    article was watched for twenty hours or whether every article was
+    watched for ten minutes, twenty hours apart. So the repeated articles
+    are reported, and the run's own span is reported separately and named
+    as context.
+    """
+
+    required_hours = stability["required_span_seconds"] / 3600
+    repeated = stability["repeated_article_count"]
+    meeting = stability["articles_meeting_required_span"]
+    lines = []
+    if stability["meets_decision_g"]:
+        lines.append(
+            f"Decision G's bar is met by article, not by run: {meeting} of "
+            f"{repeated} repeated articles carried the identifier across "
+            f"observations at least {required_hours:.0f}h apart. The longest "
+            f"was {_hours(stability['longest_repeat_span_seconds'])}, the "
+            f"median repeated article "
+            f"{_hours(stability['median_repeat_span_seconds'])}, the shortest "
+            f"{_hours(stability['shortest_repeat_span_seconds'])}."
+        )
+    elif repeated == 0:
+        lines.append(
+            "**This verdict is provisional.** No article was observed twice "
+            "carrying the identifier, so nothing was measured against "
+            f"decision G's {required_hours:.0f}h bar."
+        )
+    else:
+        lines.append(
+            f"**This verdict is provisional.** {repeated} articles repeated, "
+            "and none of them was watched for long enough: the longest was "
+            f"{_hours(stability['longest_repeat_span_seconds'])} and the "
+            f"median {_hours(stability['median_repeat_span_seconds'])}, "
+            f"against decision G's {required_hours:.0f}h. Nothing here "
+            "contradicts the verdict; no repeated article was watched long "
+            "enough to have earned it."
+        )
+    lines.append("")
+    lines.append(
+        "The observation window itself spanned "
+        f"{_hours(stability['observation_window_span_seconds'])}. That is "
+        "context, not evidence: a run's length says nothing about an "
+        "identifier, and it does not enter the verdict."
+    )
+    lines.append("")
+    return lines
 
 
 def render_markdown(artifact: Mapping[str, Any]) -> str:
@@ -1452,36 +1681,26 @@ def render_markdown(artifact: Mapping[str, Any]) -> str:
     lines.append("")
     lines.append(f"{verdict['reason']}.")
     lines.append("")
-    stability = verdict["stability_window"]
-    observed_hours = stability["observed_span_seconds"] / 3600
-    required_hours = stability["required_span_seconds"] / 3600
-    if stability["meets_decision_g"]:
-        lines.append(
-            f"Stability was watched over {observed_hours:.2f}h, meeting "
-            f"decision G's bar of {required_hours:.0f}h apart."
-        )
-    else:
-        lines.append(
-            f"**This verdict is provisional.** Stability was watched over "
-            f"{observed_hours:.2f}h, short of the {required_hours:.0f}h "
-            "apart decision G asks for. Nothing here contradicts the "
-            "verdict; the window is simply not yet long enough to have "
-            "earned it."
-        )
-    lines.append("")
+    lines.extend(_stability_lines(verdict["stability_window"]))
     lines.append("### Candidate fields")
     lines.append("")
     lines.append(
         "| field | present | coverage | distinct ids | articles | repeated | "
-        "cross-ticker | unstable | collisions | semantics |"
+        "repeats over the bar | longest repeat | cross-ticker | unstable | "
+        "collisions | semantics |"
     )
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    )
     for field in CANDIDATE_FIELDS:
         row = artifact["yahoo"]["provider_id_candidates"][field]
+        spans = row["repeat_span_summary"]
         lines.append(
             f"| `{field}` | {row['present_count']}/{row['valid_item_count']} | "
             f"{row['presence_fraction']:.0%} | {row['distinct_ids']} | "
             f"{row['articles_observed']} | {row['articles_repeated']} | "
+            f"{spans['meeting_required_span']}/{spans['repeated_article_count']} | "
+            f"{_hours(spans['longest_seconds'])} | "
             f"{row['cross_ticker_articles']} | {len(row['unstable_articles'])} | "
             f"{len(row['colliding_ids'])} | `{row['semantics']}` |"
         )
