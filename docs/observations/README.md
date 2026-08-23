@@ -14,8 +14,8 @@ Each observation is a pair:
 
 - `i5-provider-observation-<date>.json` — the machine-readable record:
   window, code commit, library versions, feed-config hash, per-attempt
-  counts, per-candidate identifier findings, the exact source strings, and
-  the equivalence table.
+  counts, the minimal per-item observations, per-candidate identifier
+  findings, the exact source strings, and the equivalence table.
 - `i5-provider-observation-<date>.md` — the same artifact rendered for a
   reviewer. It is generated from the JSON and holds no independent claims,
   so the two cannot drift apart.
@@ -23,12 +23,28 @@ Each observation is a pair:
 ## Re-running
 
 ```
-python -m tools.observe_phase0_providers --attempts 4 --interval-seconds 300
+python -m tools.observe_phase0_providers --attempts 4 --interval-seconds 2800
 ```
+
+Space the attempts deliberately. Decision G's stability bar is measured per
+article — the longest gap between two observations *of one canonical URL* —
+so a long run of closely spaced attempts tests a short claim and earns
+nothing. The artifact reports the run's own span separately, as context, and
+never as evidence about an identifier.
 
 The tool is diagnostic. It never opens a `Phase0Repository`, never writes a
 row, never reads or mutates `source_state`, and nothing in `pipeline.py`
 reaches it. It does issue live provider requests, so run it deliberately.
+
+## Recomputing a verdict
+
+`yahoo.observations` holds the minimal record each conclusion was computed
+from: attempt, timestamp, ticker, response position, the candidate
+identifiers, the canonical URL, the stored source, and the title. Every
+number under `provider_id_candidates` follows from those rows plus the
+article identity — the canonical URL — so a methodology error found later
+can be re-run against the committed evidence instead of against providers
+that have since moved on.
 
 ## What is deliberately not here
 

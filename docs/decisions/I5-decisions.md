@@ -156,19 +156,22 @@ an attribution segment — which is exactly today's behaviour.
 ### Stop condition
 
 The observed sources are recorded in
-`docs/observations/i5-provider-observation-2026-08-23.md`: 18 distinct
+`docs/observations/i5-provider-observation-2026-08-23.md`: 15 distinct
 `yahoo:<publisher>` strings, each one display name per publisher, and 2
 `rss:<host>` strings. One spelling per publisher, so B's premise holds so far.
 Three things in that record bear directly on the mapping:
 
 - `content.provider.sourceId` is **not** a usable key. Its vocabulary is
   mixed — `motleyfool.com` and `wsj.com` beside `benzinga_79`,
-  `24_7_wall_st__718`, and `us.finance.gurufocus` — and where it does look
+  `24_7_wall_st__718`, and `simply_wall_st__316` — and where it does look
   like a host it can still disagree with the article's: `ibd.com` against
   articles on `www.investors.com`.
-- Most Yahoo articles canonicalize to `finance.yahoo.com` rather than to the
-  publisher's own host, so a shared article URL is a weak bridge between the
-  two schemes in practice.
+- A large share of Yahoo articles canonicalize to `finance.yahoo.com` rather
+  than to the publisher's own host — 15 of the 56 distinct articles in this
+  window, including every Benzinga, Fortune, Insider Monkey, Investing.com,
+  Reuters, and Simply Wall St. article — so a shared article URL is a weak
+  bridge between the two schemes in practice, and which publishers it fails
+  for is not predictable from the name.
 - `yahoo:Yahoo Finance` is real, observed under META and NVDA. The reserved-
   namespace rule above is what that row needs, not a hypothesis about it.
 
@@ -341,17 +344,29 @@ failed semantics **is** a blocker.
 
 **Evidence (I5 PR 2).** `docs/observations/i5-provider-observation-2026-08-23.json`,
 collected by `tools/observe_phase0_providers.py` over four attempts spanning
-20.65 hours against the five approved tickers. All four required findings are
+2.33 hours against the five approved tickers. All four required findings are
 met by the top-level `id` field:
 
 - **Presence** — 200 of 200 valid items carried it. `content.id` carried the
   identical value on all 200; the legacy `uuid` did not appear at all.
-- **Stability** — 86 distinct articles, 51 of them observed in more than one
-  attempt across that span, and not one carried two values.
-- **Semantics** — article-scoped. 10 articles appeared under more than one
-  ticker and each kept one identifier; 43 appeared at more than one response
+- **Stability** — 56 distinct articles, 48 of them observed more than once,
+  and 37 of those carried one unchanged identifier across observations at
+  least two hours apart: longest 2.33h, median 2.33h, shortest repeat 0.78h.
+  Not one article carried two values.
+- **Semantics** — article-scoped. 4 articles appeared under more than one
+  ticker and each kept one identifier; 19 appeared at more than one response
   position and each kept one identifier.
-- **Collisions** — 86 identifiers for 86 articles. None was shared.
+- **Collisions** — 56 identifiers for 56 distinct canonical URLs. None was
+  shared.
+
+Stability here is a claim about articles, not about the run. How long the
+observation lasted is reported beside the verdict and decides nothing: a long
+run whose articles were each seen twice ten minutes apart would test a
+ten-minute claim. What clears G's bar is the 37 articles that were each
+watched for two hours or more. Likewise a collision: one identifier on two
+canonical URLs is a collision whatever the two headlines say, because
+identical headlines across distinct URLs are what recurring and templated
+coverage looks like.
 
 This clears the bar G sets. It does not by itself authorize the change: the
 I2 correction that writes `external_id` on the valid path is still separately
