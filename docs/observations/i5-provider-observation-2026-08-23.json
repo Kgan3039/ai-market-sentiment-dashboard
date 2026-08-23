@@ -1,0 +1,1005 @@
+{
+  "attempts": [
+    {
+      "attempt": 1,
+      "rss": {
+        "marketwatch-top-stories": {
+          "body_bytes": 8468,
+          "entry_count": 10,
+          "observed_at": "2026-08-22T23:14:52.271364+00:00",
+          "status_code": 200
+        },
+        "techcrunch-latest": {
+          "body_bytes": 17996,
+          "entry_count": 20,
+          "observed_at": "2026-08-22T23:14:52.422564+00:00",
+          "status_code": 200
+        }
+      },
+      "started_at": "2026-08-22T23:14:51.090361+00:00",
+      "yahoo": {
+        "AAPL": {
+          "item_count": 10,
+          "observed_at": "2026-08-22T23:14:51.090550+00:00",
+          "valid_count": 10
+        },
+        "AMD": {
+          "item_count": 10,
+          "observed_at": "2026-08-22T23:14:51.743954+00:00",
+          "valid_count": 10
+        },
+        "META": {
+          "item_count": 10,
+          "observed_at": "2026-08-22T23:14:51.912924+00:00",
+          "valid_count": 10
+        },
+        "NVDA": {
+          "item_count": 10,
+          "observed_at": "2026-08-22T23:14:52.029145+00:00",
+          "valid_count": 10
+        },
+        "TSLA": {
+          "item_count": 10,
+          "observed_at": "2026-08-22T23:14:52.150992+00:00",
+          "valid_count": 10
+        }
+      }
+    },
+    {
+      "attempt": 2,
+      "rss": {
+        "marketwatch-top-stories": {
+          "body_bytes": 8468,
+          "entry_count": 10,
+          "observed_at": "2026-08-23T05:44:32.788079+00:00",
+          "status_code": 200
+        },
+        "techcrunch-latest": {
+          "body_bytes": 17566,
+          "entry_count": 20,
+          "observed_at": "2026-08-23T05:44:32.895134+00:00",
+          "status_code": 200
+        }
+      },
+      "started_at": "2026-08-23T05:44:31.992464+00:00",
+      "yahoo": {
+        "AAPL": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T05:44:31.992682+00:00",
+          "valid_count": 10
+        },
+        "AMD": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T05:44:32.219132+00:00",
+          "valid_count": 10
+        },
+        "META": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T05:44:32.412184+00:00",
+          "valid_count": 10
+        },
+        "NVDA": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T05:44:32.545151+00:00",
+          "valid_count": 10
+        },
+        "TSLA": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T05:44:32.670622+00:00",
+          "valid_count": 10
+        }
+      }
+    },
+    {
+      "attempt": 3,
+      "rss": {
+        "marketwatch-top-stories": {
+          "body_bytes": 8581,
+          "entry_count": 10,
+          "observed_at": "2026-08-23T17:00:03.583076+00:00",
+          "status_code": 200
+        },
+        "techcrunch-latest": {
+          "body_bytes": 17539,
+          "entry_count": 20,
+          "observed_at": "2026-08-23T17:00:03.703496+00:00",
+          "status_code": 200
+        }
+      },
+      "started_at": "2026-08-23T17:00:02.715127+00:00",
+      "yahoo": {
+        "AAPL": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T17:00:02.715249+00:00",
+          "valid_count": 10
+        },
+        "AMD": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T17:00:02.943709+00:00",
+          "valid_count": 10
+        },
+        "META": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T17:00:03.122982+00:00",
+          "valid_count": 10
+        },
+        "NVDA": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T17:00:03.322383+00:00",
+          "valid_count": 10
+        },
+        "TSLA": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T17:00:03.441457+00:00",
+          "valid_count": 10
+        }
+      }
+    },
+    {
+      "attempt": 4,
+      "rss": {
+        "marketwatch-top-stories": {
+          "body_bytes": 8534,
+          "entry_count": 10,
+          "observed_at": "2026-08-23T19:53:56.557657+00:00",
+          "status_code": 200
+        },
+        "techcrunch-latest": {
+          "body_bytes": 17655,
+          "entry_count": 20,
+          "observed_at": "2026-08-23T19:53:56.719259+00:00",
+          "status_code": 200
+        }
+      },
+      "started_at": "2026-08-23T19:53:55.809094+00:00",
+      "yahoo": {
+        "AAPL": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T19:53:55.809162+00:00",
+          "valid_count": 10
+        },
+        "AMD": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T19:53:56.034353+00:00",
+          "valid_count": 10
+        },
+        "META": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T19:53:56.172413+00:00",
+          "valid_count": 10
+        },
+        "NVDA": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T19:53:56.307791+00:00",
+          "valid_count": 10
+        },
+        "TSLA": {
+          "item_count": 10,
+          "observed_at": "2026-08-23T19:53:56.440865+00:00",
+          "valid_count": 10
+        }
+      }
+    }
+  ],
+  "code": {
+    "commit": "654ec87c4aa81a8b64966089e193627af9b2041d",
+    "dirty": true
+  },
+  "environment": {
+    "python_version": "3.11.15",
+    "yfinance_version": "0.2.65"
+  },
+  "equivalence": {
+    "findings": [],
+    "unknown_pair_count": 36,
+    "verdict_meanings": {
+      "CONFIRMED": "the same article, or the same publisher host, was observed under both source strings",
+      "LIKELY_BUT_NOT_PROVEN": "the names reduce to the same comparable token, but no article and no provider-declared host connects them",
+      "NOT_EQUIVALENT": "the names look related, but the provider itself declares a different host",
+      "UNKNOWN": "no observed signal relates the two strings"
+    }
+  },
+  "feeds": {
+    "config_path": "config/feeds.yaml",
+    "config_sha256": "3c12ec954a7a4372da50856a0c98a84a29f6d6395bcaf320c574582c8d798b62",
+    "enabled_feed_ids": [
+      "marketwatch-top-stories",
+      "techcrunch-latest"
+    ]
+  },
+  "generated_at": "2026-08-23T19:53:56.875545+00:00",
+  "limitations": [
+    "Stability is only as strong as the span it was watched over. The artifact reports that span next to the verdict; a verdict marked provisional was not watched long enough to meet decision G.",
+    "Observation issues an unconditional GET, because reading a feed's stored ETag would mean reading source_state; a scheduled fetch sends conditional headers and can receive 304, which never appears here.",
+    "Article identity is proxied by the canonical URL phase0 stores. Two URLs for one article would read as two articles, and one URL reused for two articles would read as one.",
+    "Only the five approved tickers and the enabled feeds were observed. A publisher that never appeared in this window is not evidence of absence.",
+    "Every number here describes one observation window. Provider payload shapes have changed before -- the legacy uuid shape is why the code reads two -- so a verdict is a statement about now, not forever."
+  ],
+  "rss": {
+    "entry_observation_count": 120,
+    "sources": [
+      {
+        "distinct_article_count": 26,
+        "example": {
+          "canonical_url": "https://techcrunch.com/2026/08/21/anthropics-opus-4-6-is-a-smut-machine",
+          "entry_link": "https://techcrunch.com/2026/08/21/anthropics-opus-4-6-is-a-smut-machine/",
+          "external_id": "https://techcrunch.com/?p=3155131",
+          "feed_id": "techcrunch-latest",
+          "title": "Anthropic\u2019s Opus 4.6 is a smut-machine"
+        },
+        "feed_ids": [
+          "techcrunch-latest"
+        ],
+        "ingest_statuses": [
+          "valid"
+        ],
+        "is_feed_scoped_fallback": false,
+        "observation_count": 80,
+        "resolved_host": "techcrunch.com",
+        "stored_source": "rss:techcrunch.com"
+      },
+      {
+        "distinct_article_count": 16,
+        "example": {
+          "canonical_url": "https://www.marketwatch.com/story/canada-announces-retaliatory-tariffs-on-u-s-goods-after-trade-talks-break-down-45081c2f?mod=mw_rss_topstories",
+          "entry_link": "https://www.marketwatch.com/story/canada-announces-retaliatory-tariffs-on-u-s-goods-after-trade-talks-break-down-45081c2f?mod=mw_rss_topstories",
+          "external_id": "WP-MKTW-0005194199",
+          "feed_id": "marketwatch-top-stories",
+          "title": "Canada announces retaliatory tariffs on U.S. goods after trade talks break down"
+        },
+        "feed_ids": [
+          "marketwatch-top-stories"
+        ],
+        "ingest_statuses": [
+          "valid"
+        ],
+        "is_feed_scoped_fallback": false,
+        "observation_count": 40,
+        "resolved_host": "www.marketwatch.com",
+        "stored_source": "rss:www.marketwatch.com"
+      }
+    ]
+  },
+  "schema": "i5-provider-observation/1",
+  "semantics_meanings": {
+    "absent": "no valid item carried the field",
+    "article_scoped": "one identifier per article, unchanged across attempts, positions, and tickers, and never shared by two articles",
+    "article_scoped_unconfirmed": "consistent with an article-scoped identifier, but no article was observed twice, so stability was never actually tested",
+    "colliding": "demonstrably different articles shared an identifier",
+    "publisher_scoped": "different articles from one publisher shared an identifier",
+    "response_position_scoped": "the same article carried a different identifier at a different position in the response",
+    "ticker_scoped": "the same article carried different identifiers under different tickers",
+    "unstable": "the same article carried different identifiers for no observed reason"
+  },
+  "tickers": [
+    "AAPL",
+    "AMD",
+    "META",
+    "NVDA",
+    "TSLA"
+  ],
+  "window": {
+    "attempts": 4,
+    "ended_at": "2026-08-23T19:53:55.809094+00:00",
+    "interval_seconds": 2500.0,
+    "observed_span_seconds": 74344.719,
+    "started_at": "2026-08-22T23:14:51.090361+00:00"
+  },
+  "yahoo": {
+    "candidate_agreement": [
+      {
+        "agreed_count": 0,
+        "both_present_count": 0,
+        "disagreements": [],
+        "fields": [
+          "id",
+          "uuid"
+        ]
+      },
+      {
+        "agreed_count": 200,
+        "both_present_count": 200,
+        "disagreements": [],
+        "fields": [
+          "id",
+          "content.id"
+        ]
+      },
+      {
+        "agreed_count": 0,
+        "both_present_count": 0,
+        "disagreements": [],
+        "fields": [
+          "uuid",
+          "content.id"
+        ]
+      }
+    ],
+    "external_id_verdict": {
+      "field": "id",
+      "presence_fraction": 1.0,
+      "reason": "'id' was present on every valid item, unchanged across attempts, positions, and tickers, and never shared",
+      "semantics": "article_scoped",
+      "stability_window": {
+        "meets_decision_g": true,
+        "observed_span_seconds": 74344.719,
+        "required_span_seconds": 7200
+      },
+      "verdict": "SAFE TO IMPLEMENT"
+    },
+    "invalid_item_count": 0,
+    "invalid_sources": [],
+    "item_observation_count": 200,
+    "provider_id_candidates": {
+      "content.id": {
+        "articles_at_multiple_positions": 43,
+        "articles_observed": 86,
+        "articles_repeated": 51,
+        "colliding_ids": [],
+        "cross_ticker_articles": 10,
+        "cross_ticker_divergent_articles": [],
+        "distinct_ids": 86,
+        "evidence": [
+          "200/200 valid items carried content.id",
+          "86 distinct articles observed",
+          "51 articles observed in more than one attempt",
+          "43 articles observed at more than one response position",
+          "10 articles observed under more than one ticker"
+        ],
+        "field": "content.id",
+        "position_varying_articles": [],
+        "presence_fraction": 1.0,
+        "present_count": 200,
+        "semantics": "article_scoped",
+        "unstable_articles": [],
+        "valid_item_count": 200
+      },
+      "id": {
+        "articles_at_multiple_positions": 43,
+        "articles_observed": 86,
+        "articles_repeated": 51,
+        "colliding_ids": [],
+        "cross_ticker_articles": 10,
+        "cross_ticker_divergent_articles": [],
+        "distinct_ids": 86,
+        "evidence": [
+          "200/200 valid items carried id",
+          "86 distinct articles observed",
+          "51 articles observed in more than one attempt",
+          "43 articles observed at more than one response position",
+          "10 articles observed under more than one ticker"
+        ],
+        "field": "id",
+        "position_varying_articles": [],
+        "presence_fraction": 1.0,
+        "present_count": 200,
+        "semantics": "article_scoped",
+        "unstable_articles": [],
+        "valid_item_count": 200
+      },
+      "uuid": {
+        "articles_at_multiple_positions": 43,
+        "articles_observed": 86,
+        "articles_repeated": 51,
+        "colliding_ids": [],
+        "cross_ticker_articles": 10,
+        "cross_ticker_divergent_articles": [],
+        "distinct_ids": 0,
+        "evidence": [
+          "0/200 valid items carried uuid",
+          "86 distinct articles observed",
+          "51 articles observed in more than one attempt",
+          "43 articles observed at more than one response position",
+          "10 articles observed under more than one ticker"
+        ],
+        "field": "uuid",
+        "position_varying_articles": [],
+        "presence_fraction": 0.0,
+        "present_count": 0,
+        "semantics": "absent",
+        "unstable_articles": [],
+        "valid_item_count": 200
+      }
+    },
+    "sources": [
+      {
+        "article_hosts": [
+          "247wallst.com"
+        ],
+        "distinct_article_count": 9,
+        "example": {
+          "candidate_ids": {
+            "content.id": "f5368eb5-9fd5-3533-a00f-89e36e70426f",
+            "id": "f5368eb5-9fd5-3533-a00f-89e36e70426f",
+            "uuid": null
+          },
+          "canonical_url": "https://247wallst.com/investing/2026/08/22/nvidia-stock-doesnt-look-as-expensive-as-you-think",
+          "ticker": "AMD",
+          "title": "Nvidia Stock Doesn\u2019t Look as Expensive as You Think"
+        },
+        "observation_count": 24,
+        "provider_display_names": [
+          "24/7 Wall St."
+        ],
+        "provider_source_ids": [
+          "24_7_wall_st__718"
+        ],
+        "provider_urls": [
+          "https://247wallst.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "24/7 Wall St.",
+        "stored_source": "yahoo:24/7 Wall St.",
+        "tickers": [
+          "AAPL",
+          "AMD",
+          "META",
+          "NVDA",
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 1,
+        "example": {
+          "candidate_ids": {
+            "content.id": "de277283-aa4d-3089-9c6c-1059377882f7",
+            "id": "de277283-aa4d-3089-9c6c-1059377882f7",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/technology/ai/articles/anthropic-market-debut-could-break-124722679.html",
+          "ticker": "AAPL",
+          "title": "Anthropic market debut could break SpaceX IPO record: media"
+        },
+        "observation_count": 2,
+        "provider_display_names": [
+          "AFP"
+        ],
+        "provider_source_ids": [
+          "afp.com"
+        ],
+        "provider_urls": [
+          "http://www.afp.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "AFP",
+        "stored_source": "yahoo:AFP",
+        "tickers": [
+          "AAPL"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.barchart.com"
+        ],
+        "distinct_article_count": 2,
+        "example": {
+          "candidate_ids": {
+            "content.id": "13ac3444-7ae0-3040-b770-42150c33d503",
+            "id": "13ac3444-7ae0-3040-b770-42150c33d503",
+            "uuid": null
+          },
+          "canonical_url": "https://www.barchart.com/story/news/3976519/whale-rock-just-dumped-most-of-its-nvidia-stake",
+          "ticker": "AMD",
+          "title": "Whale Rock Just Dumped Most of Its Nvidia Stake"
+        },
+        "observation_count": 3,
+        "provider_display_names": [
+          "Barchart"
+        ],
+        "provider_source_ids": [
+          "barchart_com_477"
+        ],
+        "provider_urls": [
+          "https://www.barchart.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Barchart",
+        "stored_source": "yahoo:Barchart",
+        "tickers": [
+          "AMD",
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.barrons.com"
+        ],
+        "distinct_article_count": 2,
+        "example": {
+          "candidate_ids": {
+            "content.id": "be7b758b-d8a2-3b74-a555-4685f09e9af4",
+            "id": "be7b758b-d8a2-3b74-a555-4685f09e9af4",
+            "uuid": null
+          },
+          "canonical_url": "https://www.barrons.com/articles/the-lakers-as-a-12-5-billion-tax-shelter-e68d9178?siteid=yhoof2&yptr=yahoo",
+          "ticker": "AAPL",
+          "title": "The Lakers as a $12.5 Billion Tax Shelter"
+        },
+        "observation_count": 4,
+        "provider_display_names": [
+          "Barrons.com"
+        ],
+        "provider_source_ids": [
+          "Barrons.com"
+        ],
+        "provider_urls": [
+          "http://www.barrons.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Barrons.com",
+        "stored_source": "yahoo:Barrons.com",
+        "tickers": [
+          "AAPL",
+          "META"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 4,
+        "example": {
+          "candidate_ids": {
+            "content.id": "87ac4ad5-1e59-307e-8cd6-12fcd3e3dd17",
+            "id": "87ac4ad5-1e59-307e-8cd6-12fcd3e3dd17",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/technology/ai/articles/jpmorgan-says-tesla-confident-scaling-213147223.html",
+          "ticker": "TSLA",
+          "title": "JPMorgan Says Tesla Is Confident of Scaling Cybercab Operations, Touts Future Models Based on Platform\u2014FSD V15 a \u2018Step-Change\u2019 From Previous Versions"
+        },
+        "observation_count": 13,
+        "provider_display_names": [
+          "Benzinga"
+        ],
+        "provider_source_ids": [
+          "benzinga_79"
+        ],
+        "provider_urls": [
+          "https://www.benzinga.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Benzinga",
+        "stored_source": "yahoo:Benzinga",
+        "tickers": [
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 2,
+        "example": {
+          "candidate_ids": {
+            "content.id": "56fbf84b-c7f8-3122-8fac-b4e3649397c0",
+            "id": "56fbf84b-c7f8-3122-8fac-b4e3649397c0",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/technology/ai/articles/veteran-fortune-500-ceo-turned-080000432.html",
+          "ticker": "META",
+          "title": "The veteran Fortune 500 CEO who turned an 80-year-old AC company into an AI darling"
+        },
+        "observation_count": 4,
+        "provider_display_names": [
+          "Fortune"
+        ],
+        "provider_source_ids": [
+          "fortune_175"
+        ],
+        "provider_urls": [
+          "http://fortune.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Fortune",
+        "stored_source": "yahoo:Fortune",
+        "tickers": [
+          "META"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 2,
+        "example": {
+          "candidate_ids": {
+            "content.id": "f3fce6c2-3fef-3a3f-8412-d6c825cb2818",
+            "id": "f3fce6c2-3fef-3a3f-8412-d6c825cb2818",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/markets/stocks/articles/goldman-sachs-sees-nvidia-setup-201703480.html",
+          "ticker": "AMD",
+          "title": "Goldman Sachs Sees Nvidia Setup Few Expect"
+        },
+        "observation_count": 5,
+        "provider_display_names": [
+          "GuruFocus.com"
+        ],
+        "provider_source_ids": [
+          "us.finance.gurufocus"
+        ],
+        "provider_urls": [
+          "http://www.gurufocus.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "GuruFocus.com",
+        "stored_source": "yahoo:GuruFocus.com",
+        "tickers": [
+          "AMD",
+          "META"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 4,
+        "example": {
+          "candidate_ids": {
+            "content.id": "4cc83f77-75e5-38fe-9113-44312fa5e491",
+            "id": "4cc83f77-75e5-38fe-9113-44312fa5e491",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/technology/ai/articles/nvidia-corporation-nvda-advanced-micro-204025825.html",
+          "ticker": "AMD",
+          "title": "NVIDIA Corporation (NVDA) & Advanced Micro Devices (AMD): Nvidia Might Ship AI Chips With Less Memory. AMD Says It\u2019s Not Worried"
+        },
+        "observation_count": 13,
+        "provider_display_names": [
+          "Insider Monkey"
+        ],
+        "provider_source_ids": [
+          "insidermonkey.com"
+        ],
+        "provider_urls": [
+          "http://www.insidermonkey.com"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Insider Monkey",
+        "stored_source": "yahoo:Insider Monkey",
+        "tickers": [
+          "AAPL",
+          "AMD",
+          "META"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 3,
+        "example": {
+          "candidate_ids": {
+            "content.id": "c84a6820-dc63-3a68-8bec-2f7ca5a46fd2",
+            "id": "c84a6820-dc63-3a68-8bec-2f7ca5a46fd2",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/markets/stocks/articles/apple-risk-appetite-change-under-173456162.html",
+          "ticker": "AAPL",
+          "title": "Will Apple\u2019s risk appetite change under John Ternus?"
+        },
+        "observation_count": 9,
+        "provider_display_names": [
+          "Investing.com"
+        ],
+        "provider_source_ids": [
+          "investing_com_631"
+        ],
+        "provider_urls": [
+          "https://www.investing.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Investing.com",
+        "stored_source": "yahoo:Investing.com",
+        "tickers": [
+          "AAPL",
+          "AMD",
+          "NVDA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.investors.com"
+        ],
+        "distinct_article_count": 1,
+        "example": {
+          "candidate_ids": {
+            "content.id": "0e4d198b-0fbe-345f-9a59-99f6074c2273",
+            "id": "0e4d198b-0fbe-345f-9a59-99f6074c2273",
+            "uuid": null
+          },
+          "canonical_url": "https://www.investors.com/market-trend/stock-market-today/dow-jones-futures-market-rally-nvidia-crowdstrike-warsh?src=A00220&yptr=yahoo",
+          "ticker": "NVDA",
+          "title": "Dow Jones Futures: Market Rally Repairs Some Damage As Nvidia Looms; New Trump Tariffs On Canada"
+        },
+        "observation_count": 3,
+        "provider_display_names": [
+          "Investor's Business Daily"
+        ],
+        "provider_source_ids": [
+          "ibd.com"
+        ],
+        "provider_urls": [
+          "http://www.investors.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Investor's Business Daily",
+        "stored_source": "yahoo:Investor's Business Daily",
+        "tickers": [
+          "NVDA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.marketbeat.com"
+        ],
+        "distinct_article_count": 1,
+        "example": {
+          "candidate_ids": {
+            "content.id": "36242b7d-bcfe-3ecc-a418-f82be6195b3e",
+            "id": "36242b7d-bcfe-3ecc-a418-f82be6195b3e",
+            "uuid": null
+          },
+          "canonical_url": "https://www.marketbeat.com/articles/marketbeat-week-in-review-08-17-08-21",
+          "ticker": "TSLA",
+          "title": "MarketBeat Week in Review \u2013 08/17 - 08/21"
+        },
+        "observation_count": 2,
+        "provider_display_names": [
+          "MarketBeat"
+        ],
+        "provider_source_ids": [
+          "marketbeat_955"
+        ],
+        "provider_urls": [
+          "https://www.marketbeat.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "MarketBeat",
+        "stored_source": "yahoo:MarketBeat",
+        "tickers": [
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.fool.com"
+        ],
+        "distinct_article_count": 45,
+        "example": {
+          "candidate_ids": {
+            "content.id": "199a7bbe-6870-3c31-b182-82013fb73622",
+            "id": "199a7bbe-6870-3c31-b182-82013fb73622",
+            "uuid": null
+          },
+          "canonical_url": "https://www.fool.com/investing/2026/08/22/apple-announced-its-largest-ever-stock-buyback-und",
+          "ticker": "AAPL",
+          "title": "Apple Announced Its Largest-Ever Stock Buyback Under Tim Cook's Leadership. Here's Why the Size of the Repurchase Program Matters for Shareholders."
+        },
+        "observation_count": 86,
+        "provider_display_names": [
+          "Motley Fool"
+        ],
+        "provider_source_ids": [
+          "motleyfool.com"
+        ],
+        "provider_urls": [
+          "http://www.fool.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Motley Fool",
+        "stored_source": "yahoo:Motley Fool",
+        "tickers": [
+          "AAPL",
+          "AMD",
+          "META",
+          "NVDA",
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 3,
+        "example": {
+          "candidate_ids": {
+            "content.id": "d4492d42-5167-304f-8685-b9bfbbef1bb9",
+            "id": "d4492d42-5167-304f-8685-b9bfbbef1bb9",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/markets/stocks/articles/advanced-micro-devices-amd-adds-061002113.html",
+          "ticker": "AMD",
+          "title": "Advanced Micro Devices (AMD) Adds Tim Ryan To Board After Director Retirement"
+        },
+        "observation_count": 9,
+        "provider_display_names": [
+          "Simply Wall St."
+        ],
+        "provider_source_ids": [
+          "simply_wall_st__316"
+        ],
+        "provider_urls": [
+          "https://simplywall.st/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Simply Wall St.",
+        "stored_source": "yahoo:Simply Wall St.",
+        "tickers": [
+          "AMD",
+          "META",
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "stocktwits.com"
+        ],
+        "distinct_article_count": 2,
+        "example": {
+          "candidate_ids": {
+            "content.id": "1b2a615a-86ab-38b5-8ba8-4fb47ccaaccd",
+            "id": "1b2a615a-86ab-38b5-8ba8-4fb47ccaaccd",
+            "uuid": null
+          },
+          "canonical_url": "https://stocktwits.com/news-articles/markets/equity/apple-reportedly-shifts-focus-to-ai-and-smart-glasses/cZY9ORKRJVW",
+          "ticker": "AAPL",
+          "title": "Apple Reportedly Shifts Focus To AI And Smart Glasses With Job Cuts In Siri And Vision Pro Teams"
+        },
+        "observation_count": 4,
+        "provider_display_names": [
+          "Stocktwits"
+        ],
+        "provider_source_ids": [
+          "stocktwits_383"
+        ],
+        "provider_urls": [
+          "Stocktwits"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Stocktwits",
+        "stored_source": "yahoo:Stocktwits",
+        "tickers": [
+          "AAPL",
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.wsj.com"
+        ],
+        "distinct_article_count": 1,
+        "example": {
+          "candidate_ids": {
+            "content.id": "f24f6c8f-039f-3eee-9886-b9a44fa5d693",
+            "id": "f24f6c8f-039f-3eee-9886-b9a44fa5d693",
+            "uuid": null
+          },
+          "canonical_url": "https://www.wsj.com/lifestyle/cars/tesla-model-y-review-13d303c1?siteid=yhoof2&yptr=yahoo",
+          "ticker": "TSLA",
+          "title": "Full Self-Driving Is the Best Thing About the New Tesla Model Y"
+        },
+        "observation_count": 4,
+        "provider_display_names": [
+          "The Wall Street Journal"
+        ],
+        "provider_source_ids": [
+          "wsj.com"
+        ],
+        "provider_urls": [
+          "http://www.wsj.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "The Wall Street Journal",
+        "stored_source": "yahoo:The Wall Street Journal",
+        "tickers": [
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.thestreet.com"
+        ],
+        "distinct_article_count": 1,
+        "example": {
+          "candidate_ids": {
+            "content.id": "4bbbca5e-6c1c-32ff-a245-7fd42e99ed0f",
+            "id": "4bbbca5e-6c1c-32ff-a245-7fd42e99ed0f",
+            "uuid": null
+          },
+          "canonical_url": "https://www.thestreet.com/investing/stocks/morgan-stanley-reiterates-nvidia-stock-forecast-ahead-of-q2-fy27-earnings",
+          "ticker": "AAPL",
+          "title": "Morgan Stanley resets Nvidia stock forecast ahead of earnings"
+        },
+        "observation_count": 5,
+        "provider_display_names": [
+          "TheStreet"
+        ],
+        "provider_source_ids": [
+          "thestreet_881"
+        ],
+        "provider_urls": [
+          "https://www.thestreet.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "TheStreet",
+        "stored_source": "yahoo:TheStreet",
+        "tickers": [
+          "AAPL",
+          "META",
+          "TSLA"
+        ]
+      },
+      {
+        "article_hosts": [
+          "www.trefis.com"
+        ],
+        "distinct_article_count": 1,
+        "example": {
+          "candidate_ids": {
+            "content.id": "1459906f-2de9-3e64-bdff-6a8b44b0cd00",
+            "id": "1459906f-2de9-3e64-bdff-6a8b44b0cd00",
+            "uuid": null
+          },
+          "canonical_url": "https://www.trefis.com/articles/612357/the-116-billion-that-nvda-quietly-paid-its-owners/2026-08-21",
+          "ticker": "AMD",
+          "title": "The $116 Billion That NVDA Quietly Paid Its Owners"
+        },
+        "observation_count": 4,
+        "provider_display_names": [
+          "Trefis"
+        ],
+        "provider_source_ids": [
+          "trefis_142"
+        ],
+        "provider_urls": [
+          "https://www.trefis.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Trefis",
+        "stored_source": "yahoo:Trefis",
+        "tickers": [
+          "AMD"
+        ]
+      },
+      {
+        "article_hosts": [
+          "finance.yahoo.com"
+        ],
+        "distinct_article_count": 2,
+        "example": {
+          "candidate_ids": {
+            "content.id": "ff0aae86-6289-4d4a-a7b9-68a659130b1d",
+            "id": "ff0aae86-6289-4d4a-a7b9-68a659130b1d",
+            "uuid": null
+          },
+          "canonical_url": "https://finance.yahoo.com/news/nvidias-q2-earnings-to-test-resurgent-ai-trade-112502189.html",
+          "ticker": "META",
+          "title": "Nvidia's Q2 earnings to test resurgent AI trade"
+        },
+        "observation_count": 6,
+        "provider_display_names": [
+          "Yahoo Finance"
+        ],
+        "provider_source_ids": [
+          "yahoofinance.com"
+        ],
+        "provider_urls": [
+          "http://finance.yahoo.com/"
+        ],
+        "publisher_field": "content.provider.displayName",
+        "raw_publisher": "Yahoo Finance",
+        "stored_source": "yahoo:Yahoo Finance",
+        "tickers": [
+          "META",
+          "NVDA"
+        ]
+      }
+    ],
+    "valid_item_count": 200
+  }
+}
