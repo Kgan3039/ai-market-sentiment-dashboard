@@ -1269,3 +1269,291 @@ def test_the_agreement_is_rendered_for_a_reviewer(fetcher, feed):
 
     assert "Do the candidates agree?" in markdown
     assert "carried the same value" in markdown
+
+
+# -- Candidate selection -------------------------------------------------
+
+
+def split_item(article_id, *, top_level=True, content=True, url=None, title=None):
+    """A payload that carries only some of the candidate identifiers.
+
+    Yahoo has sent ``id`` and ``content.id`` identical in every window
+    observed so far, so no real artifact separates them. That is exactly
+    why both are observed, and why the ranking has to be right on the day
+    a payload stops sending both.
+    """
+
+    item = current_item(
+        article_id,
+        url=url or f"https://www.fool.com/{article_id}",
+        **({"title": title} if title else {}),
+    )
+    if not content:
+        item["content"].pop("id")
+    if not top_level:
+        item.pop("id")
+    return item
+
+
+def article_seen(article, moments, *, top_level=True, content=True, ids=None):
+    """One article, observed at each moment, carrying the named candidates."""
+
+    identifiers = ids or [article] * len(moments)
+    observations = []
+    for attempt, (moment, identifier) in enumerate(zip(moments, identifiers), start=1):
+        observations += observed(
+            "AAPL",
+            [
+                split_item(
+                    identifier,
+                    top_level=top_level,
+                    content=content,
+                    url=f"https://www.fool.com/{article}",
+                )
+            ],
+            attempt=attempt,
+            when=moment,
+        )
+    return observations
+
+
+def finding(
+    field,
+    *,
+    semantics="article_scoped",
+    presence=1.0,
+    meets_bar=True,
+    repeated=1,
+    longest=10_800.0,
+    collisions=0,
+    unstable=0,
+):
+    """A hand-built summary, for candidate shapes observation cannot produce.
+
+    Full coverage means a field was carried by every observation of every
+    article, so it inherits the longest span any candidate has: a
+    full-coverage candidate cannot miss decision G's bar while a narrower
+    one clears it — ``test_a_candidate_on_every_item_cannot_miss_a_bar_a_
+    narrower_one_clears`` holds that. The shape is specified anyway,
+    because ranking is a claim about evidence rather than about Yahoo's
+    current payload, and it has to hold when the two diverge.
+    """
+
+    spans = {
+        "required_span_seconds": observe.DECISION_G_STABILITY_SECONDS,
+        "repeated_article_count": repeated,
+        "meeting_required_span": 1 if meets_bar else 0,
+        "longest_seconds": longest,
+        "shortest_seconds": longest,
+        "median_seconds": longest,
+    }
+    return observe.CandidateFindings(
+        field=field,
+        valid_item_count=10,
+        present_count=round(presence * 10),
+        presence_fraction=presence,
+        distinct_ids=repeated,
+        articles_observed=repeated,
+        articles_repeated=repeated,
+        articles_at_multiple_positions=0,
+        cross_ticker_articles=0,
+        repeat_spans=(),
+        repeat_span_summary=spans,
+        stability_span_met=meets_bar,
+        unstable_articles=({"article_url": "u"},) * unstable,
+        position_varying_articles=(),
+        cross_ticker_divergent_articles=(),
+        colliding_ids=({"id": "x"},) * collisions,
+        semantics=semantics,
+        evidence=(),
+    )
+
+
+ABSENT = finding("uuid", semantics="absent", presence=0.0, meets_bar=False, repeated=0)
+
+
+def test_full_coverage_without_the_stability_evidence_loses_to_partial_with_it():
+    """Coverage is not evidence of stability, and cannot stand in for it."""
+
+    verdict = observe._external_id_verdict(
+        {
+            "id": finding("id", presence=1.0, meets_bar=False),
+            "content.id": finding("content.id", presence=0.6, meets_bar=True),
+            "uuid": ABSENT,
+        }
+    )
+
+    assert verdict["field"] == "content.id"
+    assert verdict["verdict"] == "PARTIALLY SAFE"
+
+
+def test_full_coverage_on_both_prefers_the_candidate_that_cleared_the_bar():
+    verdict = observe._external_id_verdict(
+        {
+            "id": finding("id", presence=1.0, meets_bar=False),
+            "content.id": finding("content.id", presence=1.0, meets_bar=True),
+            "uuid": ABSENT,
+        }
+    )
+
+    assert verdict["field"] == "content.id"
+    assert verdict["verdict"] == "SAFE TO IMPLEMENT"
+
+
+def test_a_candidate_on_every_item_cannot_miss_a_bar_a_narrower_one_clears():
+    """Why the two tests above are hand-built rather than observed."""
+
+    observations = article_seen("long", [WHEN, later(3 * 3600)]) + article_seen(
+        "short", [WHEN, later(600)], content=False
+    )
+
+    everywhere = observe.summarize_candidate(observations, "id")
+    narrower = observe.summarize_candidate(observations, "content.id")
+
+    assert everywhere.presence_fraction == 1.0
+    assert narrower.presence_fraction == 0.5
+    assert narrower.stability_span_met
+    assert everywhere.stability_span_met
+
+
+def test_a_wider_candidate_that_proved_nothing_loses_to_a_narrower_one_that_did():
+    """The failure shape, observed: the wider field is watched for minutes."""
+
+    observations = article_seen(
+        "short", [WHEN, later(200), later(400), later(600)], content=False
+    ) + article_seen("long", [WHEN, later(3 * 3600)], top_level=False)
+
+    verdict = verdict_for(observations)
+
+    assert verdict["selection"]["considered"][0]["field"] == "content.id"
+    assert verdict["field"] == "content.id"
+    assert verdict["verdict"] == "PARTIALLY SAFE"
+
+
+def test_between_two_qualified_candidates_the_wider_one_wins():
+    observations = article_seen("long", [WHEN, later(3 * 3600)]) + article_seen(
+        "short", [WHEN, later(600)], content=False
+    )
+
+    verdict = verdict_for(observations)
+
+    assert verdict["field"] == "id"
+    assert verdict["verdict"] == "SAFE TO IMPLEMENT"
+
+
+def test_two_qualified_candidates_with_equal_coverage_break_toward_id():
+    """Deterministic, and toward the field phase0 already reads."""
+
+    verdict = verdict_for(article_seen("a", [WHEN, later(3 * 3600)]))
+
+    assert verdict["field"] == "id"
+    assert "tie-break" in verdict["selection"]["reason"]
+
+
+def test_a_colliding_candidate_never_outranks_a_qualified_one():
+    """100% coverage does not buy a shared identifier a recommendation."""
+
+    shared = observed(
+        "AAPL",
+        [
+            split_item("x", content=False, url="https://www.fool.com/a"),
+            split_item("x", content=False, url="https://www.fool.com/b"),
+        ],
+        attempt=1,
+    )
+    observations = shared + article_seen("c", [WHEN, later(3 * 3600)])
+
+    findings = {
+        field: observe.summarize_candidate(observations, field)
+        for field in observe.CANDIDATE_FIELDS
+    }
+    verdict = observe._external_id_verdict(findings)
+
+    assert findings["id"].presence_fraction == 1.0
+    assert findings["id"].semantics in COLLISION_SEMANTICS
+    assert verdict["field"] == "content.id"
+    assert verdict["verdict"] == "PARTIALLY SAFE"
+
+
+def test_an_unqualified_candidate_with_no_qualified_alternative_stays_unknown():
+    verdict = verdict_for(article_seen("a", [WHEN, later(600)]))
+
+    assert verdict["field"] == "id"
+    assert verdict["verdict"] == "UNKNOWN"
+    assert all(
+        row["meets_decision_g"] is False for row in verdict["selection"]["considered"]
+    )
+
+
+def test_when_no_candidate_is_article_scoped_the_verdict_is_never_safe():
+    verdict = verdict_for(article_seen("a", [WHEN, later(3 * 3600)], ids=["1", "2"]))
+
+    assert verdict["verdict"] == "UNSAFE"
+    assert verdict["semantics"] == "unstable"
+
+
+def test_the_verdict_reports_every_candidate_it_ranked_and_why_one_won():
+    """A verdict that names only its winner cannot be audited."""
+
+    observations = article_seen(
+        "short", [WHEN, later(600)], content=False
+    ) + article_seen("long", [WHEN, later(3 * 3600)], top_level=False)
+
+    selection = verdict_for(observations)["selection"]
+    rows = {row["field"]: row for row in selection["considered"]}
+
+    assert [row["field"] for row in selection["considered"]] == [
+        "content.id",
+        "id",
+        "uuid",
+    ]
+    assert rows["content.id"]["meets_decision_g"] is True
+    assert rows["id"]["meets_decision_g"] is False
+    assert rows["id"]["longest_repeat_span_seconds"] == 600.0
+    assert rows["uuid"]["semantics"] == "absent"
+    assert "decision G asks for" in selection["reason"]
+
+
+def test_the_ranking_is_rendered_for_a_reviewer(fetcher, feed):
+    artifact = artifact_from(fetcher, feed)
+    verdict = artifact["yahoo"]["external_id_verdict"]
+
+    markdown = observe.render_markdown(artifact)
+
+    assert "Which candidate the verdict rests on" in markdown
+    assert verdict["selection"]["reason"] in markdown
+    for row in verdict["selection"]["considered"]:
+        assert f"{row['rank'] + 1}. `{row['field']}`" in markdown
+
+
+# -- Recomputing a committed artifact ------------------------------------
+
+
+def test_a_recompute_reaches_the_findings_the_run_reached(fetcher, feed):
+    """The retained records are enough to re-derive what they were used for."""
+
+    artifact = artifact_from(fetcher, feed)
+
+    again = observe.recompute_artifact(artifact, at="2026-08-24T00:00:00+00:00")
+
+    assert again["yahoo"]["provider_id_candidates"] == (
+        artifact["yahoo"]["provider_id_candidates"]
+    )
+    assert again["yahoo"]["external_id_verdict"] == (
+        artifact["yahoo"]["external_id_verdict"]
+    )
+    assert again["yahoo"]["sources"] == artifact["yahoo"]["sources"]
+    assert again["rss"] == artifact["rss"]
+    assert again["attempts"] == artifact["attempts"]
+    assert again["recomputed"]["from_records"] == "yahoo.observations"
+    assert again["recomputed"]["at"] == "2026-08-24T00:00:00+00:00"
+
+
+def test_a_recompute_refuses_a_record_set_that_lost_rows(fetcher, feed):
+    """Numbers from a truncated record set would describe neither window."""
+
+    artifact = artifact_from(fetcher, feed)
+    artifact["yahoo"]["observations"].pop()
+
+    with pytest.raises(ValueError, match="insufficient"):
+        observe.recompute_artifact(artifact, at=WHEN)

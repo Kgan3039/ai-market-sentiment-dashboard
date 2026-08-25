@@ -35,6 +35,7 @@ limitation, recorded as one.
 from __future__ import annotations
 
 import argparse
+import copy
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -59,7 +60,7 @@ from phase0.yahoo import normalize_yahoo_item
 
 #: Bumped when the artifact's shape changes, so a committed observation can
 #: always be read by the code that claims to understand it.
-ARTIFACT_SCHEMA = "i5-provider-observation/2"
+ARTIFACT_SCHEMA = "i5-provider-observation/3"
 
 #: The candidate provider-identifier fields, in the order the artifact
 #: reports them.  ``uuid`` is the legacy shape ``phase0/yahoo.py`` still
@@ -1286,6 +1287,112 @@ def observation_span_seconds(records: Sequence[AttemptRecord]) -> float:
     return round((last - first).total_seconds(), 3)
 
 
+# How safe each classification is for keying a raw item.  This is the
+# first thing ranking looks at, so a colliding or unstable field can never
+# be preferred over an article-scoped one however often it appears.
+SEMANTICS_RANK = {
+    "article_scoped": 0,
+    "article_scoped_unconfirmed": 1,
+    "publisher_scoped": 2,
+    "response_position_scoped": 3,
+    "ticker_scoped": 3,
+    "unstable": 3,
+    "colliding": 3,
+    "absent": 4,
+}
+
+
+def _candidate_rank(entry: CandidateFindings) -> tuple[int, int, float, int]:
+    """Order candidates by the same evidence the verdict is made of.
+
+    Semantic safety first, then whether the candidate actually cleared
+    decision G's per-article stability bar, then coverage, and only then a
+    deterministic field preference.
+
+    Stability sits *above* coverage deliberately.  A field carried by every
+    item but never watched long enough has not shown what decision G asks;
+    preferring it over a field that has would report UNKNOWN with the
+    qualifying evidence sitting one row further down the same table.
+    Coverage still matters -- it is what separates SAFE TO IMPLEMENT from
+    PARTIALLY SAFE -- but it decides between candidates only once they are
+    equally scoped and equally stable.
+
+    The last tie-break is toward the field the codebase already reads.
+    ``id`` and ``content.id`` can carry the same value on every payload,
+    and recommending the one that merely sorts first would be an arbitrary
+    choice dressed up as a finding -- ``_invalid_evidence`` already reaches
+    for ``id``, so that is the one a reader will expect.
+    """
+
+    return (
+        SEMANTICS_RANK[entry.semantics],
+        0 if entry.stability_span_met else 1,
+        -entry.presence_fraction,
+        CANDIDATE_FIELDS.index(entry.field),
+    )
+
+
+def _selection_row(entry: CandidateFindings, rank: int) -> dict[str, Any]:
+    """One candidate as ranking saw it, so the choice can be re-derived."""
+
+    spans = entry.repeat_span_summary
+    return {
+        "rank": rank,
+        "field": entry.field,
+        "semantics": entry.semantics,
+        "semantics_safe": entry.semantics == "article_scoped",
+        "meets_decision_g": entry.stability_span_met,
+        "presence_fraction": entry.presence_fraction,
+        "repeated_article_count": spans["repeated_article_count"],
+        "articles_meeting_required_span": spans["meeting_required_span"],
+        "longest_repeat_span_seconds": spans["longest_seconds"],
+        "collision_count": len(entry.colliding_ids),
+        "unstable_article_count": len(entry.unstable_articles),
+    }
+
+
+def _selection_reason(
+    best: CandidateFindings,
+    rival: CandidateFindings | None,
+) -> str:
+    """Name the dimension that actually decided it.
+
+    Ranking compares four things in order, so exactly one of them is the
+    first difference between the winner and the runner-up.  Reporting that
+    one -- rather than restating the winner's evidence, which says nothing
+    about why the other candidate lost -- is what lets a reviewer check the
+    choice instead of taking it.
+    """
+
+    if rival is None:
+        return f"{best.field!r} was the only candidate considered"
+    if SEMANTICS_RANK[best.semantics] < SEMANTICS_RANK[rival.semantics]:
+        return (
+            f"{best.field!r} is {best.semantics} where the next candidate "
+            f"{rival.field!r} is {rival.semantics}"
+        )
+    if best.stability_span_met and not rival.stability_span_met:
+        bar = best.repeat_span_summary["required_span_seconds"]
+        return (
+            f"{best.field!r} and {rival.field!r} are both {best.semantics}, "
+            f"but only {best.field!r} was held by an article across "
+            f"observations at least {bar:g}s apart, which is the evidence "
+            "decision G asks for"
+        )
+    if best.presence_fraction > rival.presence_fraction:
+        return (
+            f"{best.field!r} and {rival.field!r} are equally scoped and "
+            f"equally stable, and {best.field!r} was carried by "
+            f"{best.presence_fraction:.1%} of valid items against "
+            f"{rival.presence_fraction:.1%}"
+        )
+    return (
+        f"{best.field!r} and {rival.field!r} are indistinguishable on this "
+        f"evidence, and {best.field!r} takes the documented tie-break as the "
+        "field phase0 already reads"
+    )
+
+
 def _external_id_verdict(
     findings: Mapping[str, CandidateFindings],
     *,
@@ -1298,36 +1405,21 @@ def _external_id_verdict(
     was, because "safe to implement" with no field named is not a decision
     anyone can act on.
 
+    "Best" is ``_candidate_rank``: the candidate is chosen on the same
+    evidence the verdict is then read off, so the tool cannot pick a field
+    on coverage and then report UNKNOWN about it while a qualified
+    candidate went unexamined.  Every candidate it compared is reported
+    under ``selection``, with the reason the winner won.
+
     Decision G's stability bar is a gate on this verdict, and it is cleared
     only by a *repeated article* whose own observations were far enough
     apart.  ``span_seconds`` -- how long the run lasted -- is reported and
     never gated on.
     """
 
-    order = {
-        "article_scoped": 0,
-        "article_scoped_unconfirmed": 1,
-        "publisher_scoped": 2,
-        "response_position_scoped": 3,
-        "ticker_scoped": 3,
-        "unstable": 3,
-        "colliding": 3,
-        "absent": 4,
-    }
-    # Ties break toward the field the codebase already reads.  ``id`` and
-    # ``content.id`` can carry the same value on every payload, and
-    # recommending the one that merely sorts first would be an arbitrary
-    # choice dressed up as a finding -- ``_invalid_evidence`` already
-    # reaches for ``id``, so that is the one a reader will expect.
-    ranked = sorted(
-        findings.values(),
-        key=lambda entry: (
-            order[entry.semantics],
-            -entry.presence_fraction,
-            CANDIDATE_FIELDS.index(entry.field),
-        ),
-    )
+    ranked = sorted(findings.values(), key=_candidate_rank)
     best = ranked[0]
+    rival = ranked[1] if len(ranked) > 1 else None
     if best.semantics == "absent":
         verdict = "UNKNOWN"
         reason = "no candidate field was present on any valid item"
@@ -1414,6 +1506,16 @@ def _external_id_verdict(
             "meets_decision_g": best.stability_span_met,
             "observation_window_span_seconds": span_seconds,
         },
+        # Which candidates were compared, in the order ranking put them,
+        # and what decided between the first two.  A verdict that names
+        # only its winner cannot be audited for the candidate it passed
+        # over.
+        "selection": {
+            "reason": _selection_reason(best, rival),
+            "considered": [
+                _selection_row(entry, rank) for rank, entry in enumerate(ranked)
+            ],
+        },
     }
 
 
@@ -1422,6 +1524,10 @@ DEFAULT_LIMITATIONS = (
     "watched over, which is what the verdict is gated on. How long the run "
     "lasted is reported beside it as context and decides nothing: a long "
     "run of closely spaced repeats tests a short claim.",
+    "The verdict rests on one candidate, ranked on scope, then decision G's "
+    "per-article bar, then coverage. A candidate below it is not thereby "
+    "unsafe -- it may simply be less well evidenced in this window -- so the "
+    "whole ranking is reported and not only its winner.",
     "Observation issues an unconditional GET, because reading a feed's "
     "stored ETag would mean reading source_state; a scheduled fetch sends "
     "conditional headers and can receive 304, which never appears here.",
@@ -1549,6 +1655,107 @@ def _observation_json(entry: YahooItemObservation) -> dict[str, Any]:
     }
 
 
+def _observation_from_json(row: Mapping[str, Any]) -> YahooItemObservation:
+    """Rebuild one retained record: the inverse of ``_observation_json``.
+
+    The publisher and validation fields are ``None`` because they were
+    never retained -- they answer the source-string questions, not the
+    identifier ones.  Every field the candidate analysis reads (validity,
+    the canonical URL, the candidate ids, attempt, position, ticker, title,
+    and the stored source a collision is attributed with) is in the record,
+    which is why that analysis and only that analysis can be re-derived.
+    """
+
+    return YahooItemObservation(
+        attempt=row["attempt"],
+        observed_at=row["observed_at"],
+        ticker=row["ticker"],
+        position=row["position"],
+        candidate_ids=dict(row["candidate_ids"]),
+        valid=row["valid"],
+        validation_error=None,
+        stored_source=row["stored_source"],
+        raw_publisher=None,
+        publisher_field=None,
+        provider_display_name=None,
+        provider_source_id=None,
+        provider_url=None,
+        canonical_url=row["canonical_url"],
+        title=row["title"],
+    )
+
+
+def recompute_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    at: str,
+    commit: str | None = None,
+    dirty: bool | None = None,
+) -> dict[str, Any]:
+    """Re-derive the identifier conclusions from the records the artifact kept.
+
+    Nothing is re-fetched.  The providers have moved on, and the point of
+    committing the minimal records was that a methodology error found later
+    could be re-run against the window that was actually observed rather
+    than against a different one.  Everything those records cannot
+    regenerate -- the attempt log, the RSS side, the source strings, the
+    equivalence pairs -- is carried through untouched, and the recompute is
+    stamped so a reader can tell measurement from re-derivation.
+
+    Raises ``ValueError`` if the retained rows do not account for every item
+    the artifact says was observed: recomputing a verdict from a truncated
+    record set would produce numbers that describe neither window.
+    """
+
+    observations = [
+        _observation_from_json(row) for row in artifact["yahoo"]["observations"]
+    ]
+    stored = artifact["yahoo"]
+    counted = {
+        "item_observation_count": len(observations),
+        "valid_item_count": sum(1 for entry in observations if entry.valid),
+        "invalid_item_count": sum(1 for entry in observations if not entry.valid),
+    }
+    missing = {
+        key: (stored[key], value)
+        for key, value in counted.items()
+        if stored[key] != value
+    }
+    if missing:
+        raise ValueError(
+            "retained observations are insufficient to recompute: "
+            + ", ".join(
+                f"{key} recorded {was} but the records hold {now}"
+                for key, (was, now) in sorted(missing.items())
+            )
+        )
+
+    findings = {
+        field: summarize_candidate(observations, field) for field in CANDIDATE_FIELDS
+    }
+    updated = copy.deepcopy(dict(artifact))
+    updated["schema"] = ARTIFACT_SCHEMA
+    updated["yahoo"]["provider_id_candidates"] = {
+        field: _findings_json(entry) for field, entry in findings.items()
+    }
+    updated["yahoo"]["candidate_agreement"] = candidate_agreement(observations)
+    updated["yahoo"]["external_id_verdict"] = _external_id_verdict(
+        findings, span_seconds=artifact["window"]["observed_span_seconds"]
+    )
+    # These are code, not measurement: a recompute that left the old
+    # wording beside re-derived numbers would misdescribe them.
+    updated["semantics_meanings"] = dict(SEMANTICS)
+    updated["limitations"] = list(DEFAULT_LIMITATIONS)
+    updated["recomputed"] = {
+        "at": at,
+        "from_schema": artifact["schema"],
+        "from_records": "yahoo.observations",
+        "commit": commit,
+        "dirty": dirty,
+    }
+    return updated
+
+
 def _findings_json(entry: CandidateFindings) -> dict[str, Any]:
     return {
         "field": entry.field,
@@ -1634,6 +1841,40 @@ def _stability_lines(stability: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def _selection_lines(verdict: Mapping[str, Any]) -> list[str]:
+    """Show the ranking, not just its winner.
+
+    The verdict rests on one field, and which field that is was itself a
+    decision made on evidence.  A reviewer who can see only the winner
+    cannot tell whether a better-qualified candidate was passed over, so
+    the order and the three things it was ordered on are printed too.
+    """
+
+    selection = verdict["selection"]
+    lines = ["### Which candidate the verdict rests on", ""]
+    lines.append(
+        "Ranked on the evidence the verdict is read off: scope first, then "
+        "whether the candidate cleared decision G's per-article bar, then "
+        "coverage, then the field phase0 already reads."
+    )
+    lines.append("")
+    for row in selection["considered"]:
+        qualified = "meets decision G" if row["meets_decision_g"] else "unqualified"
+        lines.append(
+            f"{row['rank'] + 1}. `{row['field']}` — `{row['semantics']}`, "
+            f"{qualified} ({row['articles_meeting_required_span']} of "
+            f"{row['repeated_article_count']} repeated articles over the bar, "
+            f"longest {_hours(row['longest_repeat_span_seconds'])}), "
+            f"{row['presence_fraction']:.0%} coverage, "
+            f"{row['collision_count']} collisions, "
+            f"{row['unstable_article_count']} unstable articles"
+        )
+    lines.append("")
+    lines.append(f"Selected `{verdict['field']}`: {selection['reason']}.")
+    lines.append("")
+    return lines
+
+
 def render_markdown(artifact: Mapping[str, Any]) -> str:
     """Render the artifact for a reviewer, from the artifact and nothing else.
 
@@ -1705,6 +1946,7 @@ def render_markdown(artifact: Mapping[str, Any]) -> str:
             f"{len(row['colliding_ids'])} | `{row['semantics']}` |"
         )
     lines.append("")
+    lines.extend(_selection_lines(verdict))
     lines.append("### Do the candidates agree?")
     lines.append("")
     for row in artifact["yahoo"]["candidate_agreement"]:
@@ -1864,6 +2106,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help="artifact date stamp; defaults to the UTC date of the run",
     )
+    parser.add_argument(
+        "--recompute",
+        default=None,
+        metavar="ARTIFACT_JSON",
+        help=(
+            "re-derive an existing artifact's identifier findings from the "
+            "observations it retained, and rewrite it in place; no network"
+        ),
+    )
     parser.add_argument("--skip-yahoo", action="store_true")
     parser.add_argument("--skip-rss", action="store_true")
     parser.add_argument(
@@ -1874,8 +2125,40 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _write_artifact(json_path: Path, artifact: Mapping[str, Any]) -> Path:
+    """Write the JSON and its rendered twin. Returns the markdown path."""
+
+    md_path = json_path.with_suffix(".md")
+    json_path.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    md_path.write_text(render_markdown(artifact), encoding="utf-8")
+    return md_path
+
+
+def _recompute(path: Path) -> int:
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        updated = recompute_artifact(
+            artifact,
+            at=utc_now(),
+            commit=_git("rev-parse", "HEAD"),
+            dirty=bool(_git("status", "--porcelain")),
+        )
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    md_path = _write_artifact(path, updated)
+    print(f"recomputed {path}")
+    print(f"wrote {md_path}")
+    print(updated["yahoo"]["external_id_verdict"]["verdict"])
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.recompute:
+        return _recompute(Path(args.recompute))
     if args.attempts < 1:
         print("--attempts must be at least 1", file=sys.stderr)
         return 2
@@ -1918,11 +2201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / f"i5-provider-observation-{stamp}.json"
-    md_path = out_dir / f"i5-provider-observation-{stamp}.md"
-    json_path.write_text(
-        json.dumps(artifact, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    md_path.write_text(markdown, encoding="utf-8")
+    md_path = _write_artifact(json_path, artifact)
     print(f"wrote {json_path}")
     print(f"wrote {md_path}")
     print(artifact["yahoo"]["external_id_verdict"]["verdict"])

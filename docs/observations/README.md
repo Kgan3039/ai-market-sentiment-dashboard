@@ -15,7 +15,8 @@ Each observation is a pair:
 - `i5-provider-observation-<date>.json` — the machine-readable record:
   window, code commit, library versions, feed-config hash, per-attempt
   counts, the minimal per-item observations, per-candidate identifier
-  findings, the exact source strings, and the equivalence table.
+  findings, the ranking that chose the field the verdict rests on, the exact
+  source strings, and the equivalence table.
 - `i5-provider-observation-<date>.md` — the same artifact rendered for a
   reviewer. It is generated from the JSON and holds no independent claims,
   so the two cannot drift apart.
@@ -44,7 +45,21 @@ identifiers, the canonical URL, the stored source, and the title. Every
 number under `provider_id_candidates` follows from those rows plus the
 article identity — the canonical URL — so a methodology error found later
 can be re-run against the committed evidence instead of against providers
-that have since moved on.
+that have since moved on:
+
+```bash
+PYTHONPATH=. python tools/observe_phase0_providers.py \
+  --recompute docs/observations/i5-provider-observation-2026-08-23.json
+```
+
+That touches no network. It re-derives the candidate findings, the
+agreement table, and the `external_id` verdict from the retained rows,
+rewrites the JSON and its markdown in place, and stamps the artifact with
+a `recomputed` block naming when and at which commit. Anything the rows
+cannot regenerate — the attempt log, the RSS side, the source strings, the
+equivalence pairs — is carried through untouched, and a record set that no
+longer accounts for every item the artifact says it observed is refused
+rather than quietly recomputed against a smaller window.
 
 ## What is deliberately not here
 
