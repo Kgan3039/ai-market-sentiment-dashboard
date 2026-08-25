@@ -359,6 +359,14 @@ met by the top-level `id` field:
 - **Collisions** — 56 identifiers for 56 distinct canonical URLs. None was
   shared.
 
+`id` and `content.id` are indistinguishable on this window: same scope, same
+coverage, the same 37 articles over the bar. `id` is recommended on the
+documented tie-break — it is the field `phase0/yahoo.py` already reads — and
+the artifact records every candidate it ranked. Had the two diverged, the
+candidate carrying decision G's stability evidence would have won regardless
+of which appeared on more items; coverage separates a full recommendation
+from a partial one, and never stands in for stability.
+
 Stability here is a claim about articles, not about the run. How long the
 observation lasted is reported beside the verdict and decides nothing: a long
 run whose articles were each seen twice ten minutes apart would test a

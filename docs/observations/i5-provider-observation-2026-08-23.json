@@ -210,11 +210,19 @@
   "generated_at": "2026-08-23T23:06:44.140822+00:00",
   "limitations": [
     "Stability is only as strong as the span each repeated article was watched over, which is what the verdict is gated on. How long the run lasted is reported beside it as context and decides nothing: a long run of closely spaced repeats tests a short claim.",
+    "The verdict rests on one candidate, ranked on scope, then decision G's per-article bar, then coverage. A candidate below it is not thereby unsafe -- it may simply be less well evidenced in this window -- so the whole ranking is reported and not only its winner.",
     "Observation issues an unconditional GET, because reading a feed's stored ETag would mean reading source_state; a scheduled fetch sends conditional headers and can receive 304, which never appears here.",
     "Article identity is proxied by the canonical URL phase0 stores. Two URLs for one article would read as two articles, and one URL reused for two articles would read as one. One identifier on two canonical URLs is therefore counted as a collision, headlines included: suppressing it would need a URL-alias rule defined on its own evidence, and none is defined here.",
     "Only the five approved tickers and the enabled feeds were observed. A publisher that never appeared in this window is not evidence of absence.",
     "Every number here describes one observation window. Provider payload shapes have changed before -- the legacy uuid shape is why the code reads two -- so a verdict is a statement about now, not forever."
   ],
+  "recomputed": {
+    "at": "2026-08-24T23:59:20.478841+00:00",
+    "commit": "2f8f5767881b7e9246594351b23f051388be063e",
+    "dirty": true,
+    "from_records": "yahoo.observations",
+    "from_schema": "i5-provider-observation/3"
+  },
   "rss": {
     "entry_observation_count": 120,
     "sources": [
@@ -260,7 +268,7 @@
       }
     ]
   },
-  "schema": "i5-provider-observation/2",
+  "schema": "i5-provider-observation/3",
   "semantics_meanings": {
     "absent": "no valid item carried the field",
     "article_scoped": "one identifier per article, unchanged across attempts, positions, and tickers, and never shared by two articles",
@@ -319,6 +327,50 @@
       "field": "id",
       "presence_fraction": 1.0,
       "reason": "'id' was present on every valid item, unchanged across attempts, positions, and tickers, never shared by two canonical URLs, and held by 37 articles across observations at least 7200s apart",
+      "selection": {
+        "considered": [
+          {
+            "articles_meeting_required_span": 37,
+            "collision_count": 0,
+            "field": "id",
+            "longest_repeat_span_seconds": 8404.355,
+            "meets_decision_g": true,
+            "presence_fraction": 1.0,
+            "rank": 0,
+            "repeated_article_count": 48,
+            "semantics": "article_scoped",
+            "semantics_safe": true,
+            "unstable_article_count": 0
+          },
+          {
+            "articles_meeting_required_span": 37,
+            "collision_count": 0,
+            "field": "content.id",
+            "longest_repeat_span_seconds": 8404.355,
+            "meets_decision_g": true,
+            "presence_fraction": 1.0,
+            "rank": 1,
+            "repeated_article_count": 48,
+            "semantics": "article_scoped",
+            "semantics_safe": true,
+            "unstable_article_count": 0
+          },
+          {
+            "articles_meeting_required_span": 0,
+            "collision_count": 0,
+            "field": "uuid",
+            "longest_repeat_span_seconds": null,
+            "meets_decision_g": false,
+            "presence_fraction": 0.0,
+            "rank": 2,
+            "repeated_article_count": 0,
+            "semantics": "absent",
+            "semantics_safe": false,
+            "unstable_article_count": 0
+          }
+        ],
+        "reason": "'id' and 'content.id' are indistinguishable on this evidence, and 'id' takes the documented tie-break as the field phase0 already reads"
+      },
       "semantics": "article_scoped",
       "stability_window": {
         "articles_meeting_required_span": 37,

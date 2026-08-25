@@ -30,6 +30,16 @@ The observation window itself spanned 2.33h. That is context, not evidence: a ru
 | `uuid` | 0/200 | 0% | 0 | 56 | 48 | 0/0 | n/a | 4 | 0 | 0 | `absent` |
 | `content.id` | 200/200 | 100% | 56 | 56 | 48 | 37/48 | 2.33h | 4 | 0 | 0 | `article_scoped` |
 
+### Which candidate the verdict rests on
+
+Ranked on the evidence the verdict is read off: scope first, then whether the candidate cleared decision G's per-article bar, then coverage, then the field phase0 already reads.
+
+1. `id` — `article_scoped`, meets decision G (37 of 48 repeated articles over the bar, longest 2.33h), 100% coverage, 0 collisions, 0 unstable articles
+2. `content.id` — `article_scoped`, meets decision G (37 of 48 repeated articles over the bar, longest 2.33h), 100% coverage, 0 collisions, 0 unstable articles
+3. `uuid` — `absent`, unqualified (0 of 0 repeated articles over the bar, longest n/a), 0% coverage, 0 collisions, 0 unstable articles
+
+Selected `id`: 'id' and 'content.id' are indistinguishable on this evidence, and 'id' takes the documented tie-break as the field phase0 already reads.
+
 ### Do the candidates agree?
 
 - `id` and `uuid` were never both present.
@@ -116,6 +126,7 @@ Example entries, showing that a feed's host is not the article's:
 ## Limitations
 
 - Stability is only as strong as the span each repeated article was watched over, which is what the verdict is gated on. How long the run lasted is reported beside it as context and decides nothing: a long run of closely spaced repeats tests a short claim.
+- The verdict rests on one candidate, ranked on scope, then decision G's per-article bar, then coverage. A candidate below it is not thereby unsafe -- it may simply be less well evidenced in this window -- so the whole ranking is reported and not only its winner.
 - Observation issues an unconditional GET, because reading a feed's stored ETag would mean reading source_state; a scheduled fetch sends conditional headers and can receive 304, which never appears here.
 - Article identity is proxied by the canonical URL phase0 stores. Two URLs for one article would read as two articles, and one URL reused for two articles would read as one. One identifier on two canonical URLs is therefore counted as a collision, headlines included: suppressing it would need a URL-alias rule defined on its own evidence, and none is defined here.
 - Only the five approved tickers and the enabled feeds were observed. A publisher that never appeared in this window is not evidence of absence.
