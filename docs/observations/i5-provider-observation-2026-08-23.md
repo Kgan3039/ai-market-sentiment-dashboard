@@ -38,7 +38,7 @@ Ranked on the evidence the verdict is read off: scope first, then whether the ca
 2. `content.id` — `article_scoped`, meets decision G (37 of 48 repeated articles over the bar, longest 2.33h), 100% coverage, 0 collisions, 0 unstable articles
 3. `uuid` — `absent`, unqualified (0 of 0 repeated articles over the bar, longest n/a), 0% coverage, 0 collisions, 0 unstable articles
 
-Selected `id`: 'id' and 'content.id' are indistinguishable on this evidence, and 'id' takes the documented tie-break as the field phase0 already reads.
+Selected `id`, decided on field order: 'id' and 'content.id' are indistinguishable on this evidence, and 'id' takes the deterministic field-order tie-break as the field phase0 already reads.
 
 ### Do the candidates agree?
 

@@ -60,7 +60,7 @@ from phase0.yahoo import normalize_yahoo_item
 
 #: Bumped when the artifact's shape changes, so a committed observation can
 #: always be read by the code that claims to understand it.
-ARTIFACT_SCHEMA = "i5-provider-observation/3"
+ARTIFACT_SCHEMA = "i5-provider-observation/4"
 
 #: The candidate provider-identifier fields, in the order the artifact
 #: reports them.  ``uuid`` is the legacy shape ``phase0/yahoo.py`` still
@@ -1340,6 +1340,11 @@ def _selection_row(entry: CandidateFindings, rank: int) -> dict[str, Any]:
         "rank": rank,
         "field": entry.field,
         "semantics": entry.semantics,
+        # Both, because they answer different questions: the rank says how
+        # far ranking could separate this candidate from another, and
+        # several distinct classifications share one.  Only the label says
+        # what the field was actually found to be.
+        "semantics_rank": SEMANTICS_RANK[entry.semantics],
         "semantics_safe": entry.semantics == "article_scoped",
         "meets_decision_g": entry.stability_span_met,
         "presence_fraction": entry.presence_fraction,
@@ -1351,45 +1356,101 @@ def _selection_row(entry: CandidateFindings, rank: int) -> dict[str, Any]:
     }
 
 
-def _selection_reason(
+def _semantics_clause(
+    best: CandidateFindings,
+    rival: CandidateFindings,
+) -> str:
+    """How the two classifications actually compare, not how they ranked.
+
+    ``SEMANTICS_RANK`` deliberately maps several distinct classifications
+    onto one rank -- a ticker-scoped field and a position-scoped one are
+    equally unusable as a key, and ranking has no reason to prefer either.
+    Equal rank is therefore not equal semantics, and reading "both are
+    ticker-scoped" off the fact that ranking could not separate them would
+    report a finding the observations do not contain.
+    """
+
+    if best.semantics == rival.semantics:
+        return f"{best.field!r} and {rival.field!r} are both {best.semantics}"
+    return (
+        f"{best.field!r} is {best.semantics} and {rival.field!r} is "
+        f"{rival.semantics}, which rank equally safe"
+    )
+
+
+def _qualification_clause(
+    best: CandidateFindings,
+    rival: CandidateFindings,
+) -> str:
+    """Whether decision G's bar was cleared, read off both candidates."""
+
+    bar = best.repeat_span_summary["required_span_seconds"]
+    if best.stability_span_met and rival.stability_span_met:
+        return f"both cleared decision G's {bar:g}s bar"
+    if not (best.stability_span_met or rival.stability_span_met):
+        return f"neither cleared decision G's {bar:g}s bar"
+    holder = best if best.stability_span_met else rival
+    return f"only {holder.field!r} cleared decision G's {bar:g}s bar"
+
+
+def _selection_decision(
     best: CandidateFindings,
     rival: CandidateFindings | None,
-) -> str:
-    """Name the dimension that actually decided it.
+) -> tuple[str, str]:
+    """Name the dimension that actually decided it, and say what it found.
 
     Ranking compares four things in order, so exactly one of them is the
     first difference between the winner and the runner-up.  Reporting that
     one -- rather than restating the winner's evidence, which says nothing
     about why the other candidate lost -- is what lets a reviewer check the
     choice instead of taking it.
+
+    Every clause is built from the candidates' own values.  Position in the
+    ranking says only that no earlier dimension put the runner-up first; it
+    does not say the two agreed on anything, so nothing here is inferred
+    from where a candidate landed.
     """
 
     if rival is None:
-        return f"{best.field!r} was the only candidate considered"
+        return "only_candidate", f"{best.field!r} was the only candidate considered"
     if SEMANTICS_RANK[best.semantics] < SEMANTICS_RANK[rival.semantics]:
-        return (
-            f"{best.field!r} is {best.semantics} where the next candidate "
-            f"{rival.field!r} is {rival.semantics}"
+        return "semantics", (
+            f"{best.field!r} is {best.semantics}, which ranks safer than the "
+            f"{rival.semantics} of the next candidate {rival.field!r}"
         )
     if best.stability_span_met and not rival.stability_span_met:
         bar = best.repeat_span_summary["required_span_seconds"]
-        return (
-            f"{best.field!r} and {rival.field!r} are both {best.semantics}, "
-            f"but only {best.field!r} was held by an article across "
-            f"observations at least {bar:g}s apart, which is the evidence "
-            "decision G asks for"
+        return "stability", (
+            f"{_semantics_clause(best, rival)}, but only {best.field!r} was "
+            f"held by an article across observations at least {bar:g}s apart, "
+            "which is the evidence decision G asks for"
         )
-    if best.presence_fraction > rival.presence_fraction:
-        return (
-            f"{best.field!r} and {rival.field!r} are equally scoped and "
-            f"equally stable, and {best.field!r} was carried by "
-            f"{best.presence_fraction:.1%} of valid items against "
+    if (
+        best.stability_span_met == rival.stability_span_met
+        and best.presence_fraction > rival.presence_fraction
+    ):
+        return "coverage", (
+            f"{_semantics_clause(best, rival)} and "
+            f"{_qualification_clause(best, rival)}, and {best.field!r} was "
+            f"carried by {best.presence_fraction:.1%} of valid items against "
             f"{rival.presence_fraction:.1%}"
         )
-    return (
-        f"{best.field!r} and {rival.field!r} are indistinguishable on this "
-        f"evidence, and {best.field!r} takes the documented tie-break as the "
-        "field phase0 already reads"
+    if (
+        best.semantics == rival.semantics
+        and best.stability_span_met == rival.stability_span_met
+        and best.presence_fraction == rival.presence_fraction
+    ):
+        return "field_order", (
+            f"{best.field!r} and {rival.field!r} are indistinguishable on this "
+            f"evidence, and {best.field!r} takes the deterministic field-order "
+            "tie-break as the field phase0 already reads"
+        )
+    return "field_order", (
+        f"{_semantics_clause(best, rival)}, {_qualification_clause(best, rival)}, "
+        f"and {best.field!r} was carried by {best.presence_fraction:.1%} of "
+        f"valid items against {rival.presence_fraction:.1%}, so no dimension "
+        f"before it separated them and {best.field!r} takes the deterministic "
+        "field-order tie-break as the field phase0 already reads"
     )
 
 
@@ -1420,6 +1481,7 @@ def _external_id_verdict(
     ranked = sorted(findings.values(), key=_candidate_rank)
     best = ranked[0]
     rival = ranked[1] if len(ranked) > 1 else None
+    decided_by, reason_selected = _selection_decision(best, rival)
     if best.semantics == "absent":
         verdict = "UNKNOWN"
         reason = "no candidate field was present on any valid item"
@@ -1511,7 +1573,8 @@ def _external_id_verdict(
         # only its winner cannot be audited for the candidate it passed
         # over.
         "selection": {
-            "reason": _selection_reason(best, rival),
+            "decided_by": decided_by,
+            "reason": reason_selected,
             "considered": [
                 _selection_row(entry, rank) for rank, entry in enumerate(ranked)
             ],
@@ -1870,7 +1933,11 @@ def _selection_lines(verdict: Mapping[str, Any]) -> list[str]:
             f"{row['unstable_article_count']} unstable articles"
         )
     lines.append("")
-    lines.append(f"Selected `{verdict['field']}`: {selection['reason']}.")
+    decided_by = selection["decided_by"].replace("_", " ")
+    lines.append(
+        f"Selected `{verdict['field']}`, decided on {decided_by}: "
+        f"{selection['reason']}."
+    )
     lines.append("")
     return lines
 

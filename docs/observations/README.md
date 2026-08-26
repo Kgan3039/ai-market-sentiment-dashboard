@@ -21,6 +21,15 @@ Each observation is a pair:
   reviewer. It is generated from the JSON and holds no independent claims,
   so the two cannot drift apart.
 
+Under `external_id_verdict.selection`, every candidate is listed in rank
+order with both its `semantics` and its `semantics_rank`, and `decided_by`
+names the first dimension that actually separated the top two — scope,
+decision G's per-article bar, coverage, or the deterministic field-order
+tie-break. The two are reported separately on purpose: several distinct
+classifications share a rank, because neither of them can key a raw item,
+so candidates that ranked alike were not thereby found to be the same
+thing.
+
 ## Re-running
 
 ```

@@ -361,7 +361,8 @@ met by the top-level `id` field:
 
 `id` and `content.id` are indistinguishable on this window: same scope, same
 coverage, the same 37 articles over the bar. `id` is recommended on the
-documented tie-break — it is the field `phase0/yahoo.py` already reads — and
+deterministic field-order tie-break — it is the field `phase0/yahoo.py`
+already reads — and
 the artifact records every candidate it ranked. Had the two diverged, the
 candidate carrying decision G's stability evidence would have won regardless
 of which appeared on more items; coverage separates a full recommendation
