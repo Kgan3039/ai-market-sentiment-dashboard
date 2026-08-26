@@ -1526,6 +1526,160 @@ def test_the_ranking_is_rendered_for_a_reviewer(fetcher, feed):
         assert f"{row['rank'] + 1}. `{row['field']}`" in markdown
 
 
+# -- What the selection reason is allowed to claim -----------------------
+
+
+# Phrases that assert the two candidates were found to be the same thing.
+# Ranking cannot establish any of them: it can only establish that no
+# dimension it looked at put the runner-up first.
+EQUALITY_CLAIMS = ("are both", "equally scoped", "indistinguishable")
+
+
+def reason_for(**semantics_and_findings):
+    """The selection decision for a hand-built pair, plus the absent third."""
+
+    verdict = observe._external_id_verdict({**semantics_and_findings, "uuid": ABSENT})
+    return verdict["selection"], verdict
+
+
+def test_two_classifications_that_rank_alike_are_not_reported_as_one():
+    """``response_position_scoped`` and ``ticker_scoped`` share a rank.
+
+    They share it because neither can key a raw item, so ranking has no
+    reason to prefer either — not because they are the same finding. A
+    reason that read "both are response_position_scoped" off the tie would
+    tell a reviewer something the observations never said.
+    """
+
+    selection, _ = reason_for(
+        **{
+            "id": finding("id", semantics="response_position_scoped", meets_bar=True),
+            "content.id": finding(
+                "content.id", semantics="ticker_scoped", meets_bar=False
+            ),
+        }
+    )
+    rows = {row["field"]: row for row in selection["considered"]}
+
+    assert rows["id"]["semantics_rank"] == rows["content.id"]["semantics_rank"]
+    assert rows["id"]["semantics"] != rows["content.id"]["semantics"]
+    assert "response_position_scoped" in selection["reason"]
+    assert "ticker_scoped" in selection["reason"]
+    assert not any(claim in selection["reason"] for claim in EQUALITY_CLAIMS)
+    assert selection["decided_by"] == "stability"
+
+
+def test_a_shared_rank_still_reports_the_dimension_that_decided_it():
+    """Naming both classifications does not excuse leaving the reason vague."""
+
+    selection, _ = reason_for(
+        **{
+            "id": finding("id", semantics="response_position_scoped", presence=1.0),
+            "content.id": finding(
+                "content.id", semantics="ticker_scoped", presence=0.5
+            ),
+        }
+    )
+
+    assert selection["decided_by"] == "coverage"
+    assert "100.0%" in selection["reason"] and "50.0%" in selection["reason"]
+    assert not any(claim in selection["reason"] for claim in EQUALITY_CLAIMS)
+
+
+def test_candidates_alike_in_every_dimension_but_classification_are_not_tied():
+    """Same rank, same bar, same coverage — and still two different findings."""
+
+    selection, _ = reason_for(
+        **{
+            "id": finding("id", semantics="response_position_scoped"),
+            "content.id": finding("content.id", semantics="ticker_scoped"),
+        }
+    )
+
+    assert selection["decided_by"] == "field_order"
+    assert "field-order tie-break" in selection["reason"]
+    assert "response_position_scoped" in selection["reason"]
+    assert "ticker_scoped" in selection["reason"]
+    assert "indistinguishable" not in selection["reason"]
+
+
+def test_the_same_classification_twice_is_reported_as_the_same():
+    """The reverse guard: equal labels may be, and are, stated as equal."""
+
+    selection, _ = reason_for(
+        **{
+            "id": finding("id", meets_bar=True),
+            "content.id": finding("content.id", meets_bar=False),
+        }
+    )
+
+    assert selection["decided_by"] == "stability"
+    assert "'id' and 'content.id' are both article_scoped" in selection["reason"]
+    assert "decision G asks for" in selection["reason"]
+
+
+def test_coverage_is_named_when_scope_and_the_bar_leave_nothing_to_choose():
+    selection, _ = reason_for(
+        **{
+            "id": finding("id", presence=1.0),
+            "content.id": finding("content.id", presence=0.4),
+        }
+    )
+
+    assert selection["decided_by"] == "coverage"
+    assert "both cleared decision G's 7200s bar" in selection["reason"]
+    assert "100.0% of valid items against 40.0%" in selection["reason"]
+
+
+def test_the_field_order_tie_break_is_named_when_it_is_what_decided():
+    """The one branch where the reason is about the tool, not the provider."""
+
+    selection, _ = reason_for(
+        **{"id": finding("id"), "content.id": finding("content.id")}
+    )
+
+    assert selection["decided_by"] == "field_order"
+    assert "indistinguishable on this evidence" in selection["reason"]
+    assert "deterministic field-order tie-break" in selection["reason"]
+
+
+def test_a_safer_classification_is_reported_with_both_classifications():
+    selection, _ = reason_for(
+        **{
+            "id": finding("id", semantics="article_scoped"),
+            "content.id": finding("content.id", semantics="publisher_scoped"),
+        }
+    )
+    rows = {row["field"]: row for row in selection["considered"]}
+
+    assert rows["id"]["semantics_rank"] < rows["content.id"]["semantics_rank"]
+    assert selection["decided_by"] == "semantics"
+    assert "article_scoped" in selection["reason"]
+    assert "publisher_scoped" in selection["reason"]
+    assert not any(claim in selection["reason"] for claim in EQUALITY_CLAIMS)
+
+
+def test_the_only_candidate_is_reported_as_the_only_candidate():
+    verdict = observe._external_id_verdict({"id": finding("id")})
+
+    assert verdict["selection"]["decided_by"] == "only_candidate"
+    assert "only candidate" in verdict["selection"]["reason"]
+
+
+def test_the_rendered_reason_is_the_reason_the_artifact_recorded(fetcher, feed):
+    """Markdown carries the decision through unedited, dimension and all."""
+
+    artifact = artifact_from(fetcher, feed)
+    selection = artifact["yahoo"]["external_id_verdict"]["selection"]
+
+    markdown = observe.render_markdown(artifact)
+
+    assert selection["reason"] in markdown
+    assert f"decided on {selection['decided_by'].replace('_', ' ')}" in markdown
+    for row in selection["considered"]:
+        assert f"`{row['semantics']}`" in markdown
+
+
 # -- Recomputing a committed artifact ------------------------------------
 
 

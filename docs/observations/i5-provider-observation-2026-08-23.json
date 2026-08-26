@@ -217,8 +217,8 @@
     "Every number here describes one observation window. Provider payload shapes have changed before -- the legacy uuid shape is why the code reads two -- so a verdict is a statement about now, not forever."
   ],
   "recomputed": {
-    "at": "2026-08-24T23:59:20.478841+00:00",
-    "commit": "2f8f5767881b7e9246594351b23f051388be063e",
+    "at": "2026-08-26T08:00:40.572235+00:00",
+    "commit": "a1ad7fe3bbb88864057c7843078655054532a16e",
     "dirty": true,
     "from_records": "yahoo.observations",
     "from_schema": "i5-provider-observation/3"
@@ -268,7 +268,7 @@
       }
     ]
   },
-  "schema": "i5-provider-observation/3",
+  "schema": "i5-provider-observation/4",
   "semantics_meanings": {
     "absent": "no valid item carried the field",
     "article_scoped": "one identifier per article, unchanged across attempts, positions, and tickers, and never shared by two articles",
@@ -339,6 +339,7 @@
             "rank": 0,
             "repeated_article_count": 48,
             "semantics": "article_scoped",
+            "semantics_rank": 0,
             "semantics_safe": true,
             "unstable_article_count": 0
           },
@@ -352,6 +353,7 @@
             "rank": 1,
             "repeated_article_count": 48,
             "semantics": "article_scoped",
+            "semantics_rank": 0,
             "semantics_safe": true,
             "unstable_article_count": 0
           },
@@ -365,11 +367,13 @@
             "rank": 2,
             "repeated_article_count": 0,
             "semantics": "absent",
+            "semantics_rank": 4,
             "semantics_safe": false,
             "unstable_article_count": 0
           }
         ],
-        "reason": "'id' and 'content.id' are indistinguishable on this evidence, and 'id' takes the documented tie-break as the field phase0 already reads"
+        "decided_by": "field_order",
+        "reason": "'id' and 'content.id' are indistinguishable on this evidence, and 'id' takes the deterministic field-order tie-break as the field phase0 already reads"
       },
       "semantics": "article_scoped",
       "stability_window": {
