@@ -48,10 +48,12 @@ result.provider_conflicts   # quarantined provider identities
 ```
 
 **This does not close issue #64.** The DoD requires the stage to run inside
-`pipeline.py`, which is issue #68 (open, blocked by #61/#62); #64 also
-declares itself blocked by #57 (open). AC-3's precision/recall half needs
-M4's labelled set and M3. What is here is the deduplication logic those
-will call.
+`pipeline.py`. That runner is now on `main` (issue #68), as are I1
+persistence (#57), I2 Yahoo ingestion (#61) and I3 RSS ingestion (#62) — but
+`DOWNSTREAM_STAGES` is still empty, so no dedup stage is registered and
+nothing calls this core. AC-3's precision/recall half needs a real sample and
+a human review, neither of which exists. What is here is the deduplication
+logic the pipeline will call once I5 wires it.
 
 ### Precision-first, with one gate
 
@@ -304,10 +306,12 @@ Every loaded pair, item, and case is stamped `synthetic=True` from the
 manifest.
 
 Issue #67 asks for ~150 pairs **sampled from real ingested data**,
-co-labelled with Kartik under the K3 (#60) guidelines. None of that is
-possible on `main`: I2 (#61) and I3 (#62) are open, so there is no ingestion
-and no populated `raw_items`; K3 is open, so the co-labelling protocol is
-not written. Every headline, URL, outlet and timestamp is authored. Real
+co-labelled with Kartik under the K3 (#60) guidelines. Neither was possible
+when this set was written: I2 (#61) and I3 (#62) were open, so there was no
+ingestion path and no populated `raw_items`. Both have since landed, so a
+real sample is now *collectable* — but none has been collected, and K3 is
+still open, so the co-labelling protocol is still unwritten. The committed
+set remains authored: every headline, URL, outlet and timestamp. Real
 outlet names are used so the syndication and attribution cases exercise the
 real publisher policy; invented names (`Wolfsberg Motors`, `Pacific Advanced
 Packaging`, `Harbourline Media`, `Northfield Securities`, `Calder Bank
@@ -516,10 +520,11 @@ the rows live under `points`, each carrying its own scope and completeness.
 
 ### This does not close issue #67
 
-The DoD's "sampled from real ingested data" and "co-label with Kartik per
-K3" halves remain blocked on #61, #62 and #60. The numbers here are
-development regression signals. G4 needs the real sample, a second reviewer,
-and adjudication.
+The DoD's "sampled from real ingested data" half is no longer blocked by
+missing ingestion — #61 and #62 landed — but no real sample has been drawn.
+The "co-label with Kartik per K3" half remains blocked on #60. The numbers
+here are development regression signals. G4 needs the real sample, a second
+reviewer, and adjudication.
 
 Lint and test with:
 
@@ -551,9 +556,10 @@ result = merge_semantic_duplicates(
 ```
 
 **This does not close issue #70.** The DoD requires the stage to be
-"integrated in pipeline"; `pipeline.py` is issue #68 (open, blocked by
-#61/#62). The AC-3 half of the DoD is met *on the committed labelled set* —
-which is synthetic, so it is a design measurement, not the G4 gate result.
+"integrated in pipeline". `pipeline.py` (#68) is on `main`, but
+`DOWNSTREAM_STAGES` is empty and this stage is not registered in it. The
+AC-3 half of the DoD is met *on the committed labelled set* — which is
+synthetic, so it is a design measurement, not the G4 gate result.
 
 ### The finding that shaped the design
 
@@ -906,8 +912,9 @@ with no model call.
 - **The dataset and the guards share an author.** The reported precision is
   optimistic for that reason alone: the guard families were written from the
   same failure taxonomy the negatives were written from. Real-sample
-  numbers (blocked on #61/#62) should be expected to be worse, and the
-  guards will need cases they have not seen.
+  numbers should be expected to be worse, and the guards will need cases
+  they have not seen. Ingestion now exists to draw such a sample from; no
+  sample has been drawn.
 - **The guard lexicons are English and finite.** An opposing claim phrased
   outside them ("greenlights"/"nixes") is invisible to `contrast_polarity`,
   and the threshold is the only thing left.
@@ -1181,8 +1188,9 @@ and every move is reported in `method_reason`.
 
 *Integration requirement:* M3 does not expose per-story compatibility
 evidence on its public result, so M5 derives polarity from the canonical
-title and standfirst. When #57/#68 land and M3 publishes a public evidence
-projection, this module should consume it instead.
+title and standfirst. The gap is in M3's public surface, not in persistence
+or orchestration — those landed with I1 and I4. If M3 later publishes a
+public evidence projection, this module should consume it instead.
 
 ### Salience and stability
 

@@ -220,8 +220,11 @@ def first_available_descriptions(
 
     *Missing public contract:* M3 would need to publish the raw item id
     behind ``canonical_story_key`` for a caller to recover the canonical
-    standfirst. Until it does (#57/#68), a caller that needs true canonical
-    provenance should pass its own mapping rather than use this helper.
+    standfirst. It still does not, and the gap is in M3's public result
+    rather than in persistence or orchestration, both of which landed with
+    I1 and I4. A caller that needs true canonical provenance should pass its
+    own mapping rather than use this helper; I5's projection resolves the
+    canonical member through M2's cluster index for exactly this reason.
     """
 
     chosen: dict[str, str | None] = {}
