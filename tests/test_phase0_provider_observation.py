@@ -996,6 +996,25 @@ def test_the_markdown_is_rendered_from_the_artifact_and_nothing_else(fetcher, fe
         assert limitation in markdown
 
 
+def test_no_rendered_line_ends_in_whitespace(fetcher, feed):
+    """The artifact is committed, so the repo's whitespace checks apply to it.
+
+    Markdown's hard break is two trailing spaces, which renders as a line
+    break and reads as an error to ``git diff --check``. Every structure
+    the renderer needs — nested bullets, blank lines, tables — is reachable
+    without them, so the check is over the whole document rather than the
+    lines that happened to break it.
+    """
+
+    markdown = observe.render_markdown(artifact_from(fetcher, feed))
+
+    assert [line for line in markdown.splitlines() if line != line.rstrip()] == []
+    # The example entries are where the hard breaks were, so a document
+    # rendered without that section would pass the check above vacuously.
+    assert "Example entries" in markdown
+    assert "  - stored canonical URL:" in markdown
+
+
 def test_every_semantics_verdict_the_summary_can_reach_has_a_stated_meaning():
     """A table cell nobody can read is not a finding."""
 

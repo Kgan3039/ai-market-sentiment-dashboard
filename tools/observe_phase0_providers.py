@@ -2096,12 +2096,13 @@ def render_markdown(artifact: Mapping[str, Any]) -> str:
     lines.append("")
     for row in artifact["rss"]["sources"]:
         example = row["example"]
-        lines.append(
-            f"- feed `{example['feed_id']}` → `{row['stored_source']}`  \n"
-            f"  link: `{example['entry_link']}`  \n"
-            f"  stored canonical URL: `{example['canonical_url']}`  \n"
-            f"  external_id: `{example['external_id']}`"
-        )
+        # A nested list rather than one bullet broken by hard breaks: two
+        # trailing spaces are invisible in the rendered page and visible to
+        # every whitespace check the repo runs.
+        lines.append(f"- feed `{example['feed_id']}` → `{row['stored_source']}`")
+        lines.append(f"  - link: `{example['entry_link']}`")
+        lines.append(f"  - stored canonical URL: `{example['canonical_url']}`")
+        lines.append(f"  - external_id: `{example['external_id']}`")
     lines.append("")
 
     lines.append("## Cross-source publisher equivalence")
