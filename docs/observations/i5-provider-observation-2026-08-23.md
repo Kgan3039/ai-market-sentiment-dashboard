@@ -104,14 +104,14 @@ No Yahoo record failed normalization in this window.
 
 Example entries, showing that a feed's host is not the article's:
 
-- feed `techcrunch-latest` → `rss:techcrunch.com`  
-  link: `https://techcrunch.com/2026/08/21/anthropics-opus-4-6-is-a-smut-machine/`  
-  stored canonical URL: `https://techcrunch.com/2026/08/21/anthropics-opus-4-6-is-a-smut-machine`  
-  external_id: `https://techcrunch.com/?p=3155131`
-- feed `marketwatch-top-stories` → `rss:www.marketwatch.com`  
-  link: `https://www.marketwatch.com/story/canada-announces-retaliatory-tariffs-on-u-s-goods-after-trade-talks-break-down-45081c2f?mod=mw_rss_topstories`  
-  stored canonical URL: `https://www.marketwatch.com/story/canada-announces-retaliatory-tariffs-on-u-s-goods-after-trade-talks-break-down-45081c2f?mod=mw_rss_topstories`  
-  external_id: `WP-MKTW-0005194199`
+- feed `techcrunch-latest` → `rss:techcrunch.com`
+  - link: `https://techcrunch.com/2026/08/21/anthropics-opus-4-6-is-a-smut-machine/`
+  - stored canonical URL: `https://techcrunch.com/2026/08/21/anthropics-opus-4-6-is-a-smut-machine`
+  - external_id: `https://techcrunch.com/?p=3155131`
+- feed `marketwatch-top-stories` → `rss:www.marketwatch.com`
+  - link: `https://www.marketwatch.com/story/canada-announces-retaliatory-tariffs-on-u-s-goods-after-trade-talks-break-down-45081c2f?mod=mw_rss_topstories`
+  - stored canonical URL: `https://www.marketwatch.com/story/canada-announces-retaliatory-tariffs-on-u-s-goods-after-trade-talks-break-down-45081c2f?mod=mw_rss_topstories`
+  - external_id: `WP-MKTW-0005194199`
 
 ## Cross-source publisher equivalence
 
