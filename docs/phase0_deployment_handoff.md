@@ -6,20 +6,22 @@ deployment.
 
 ## Current Blockers
 
-1. I1–I4 are available only on their feature branches and are not merged into
-   `main`.
-2. The current B1 API deliberately reads committed fixtures. It needs a tested
-   `SQLiteNarrativeRepository` before it can read the pipeline database.
-3. The current I4 pipeline runs Yahoo and RSS fetch stages. Downstream
-   deduplication, clustering, and summarization must be registered and writing
-   themes before the ticker page can show live narrative data.
-4. A deployment host, private URL, backup destination, and responsible
+1. The current B1 API deliberately reads committed fixtures. Its live-data
+   adapter must resolve cited sentences to persisted evidence, map run and
+   persistence health into the API degradation state, and exclude incomplete
+   or failed outputs.
+2. The merged pipeline must be demonstrated to persist API-eligible, completed
+   narrative/theme output before the ticker page switches to live data. Raw
+   items and intermediate story records, including degraded intermediate story
+   output, do not satisfy this gate.
+3. A deployment host, private URL, backup destination, and responsible
    operator have not been provided to this repository.
 
 ## Preconditions Before Host Work
 
-1. Merge I1–I4 into `main` and complete the B1 live-data readiness gate in
-   `docs/phase0_api_contract.md`.
+1. Complete the B1 live-data readiness gate in
+   `docs/phase0_api_contract.md` against the merged I1–I4 persistence and
+   pipeline stack.
 2. Verify the B2 page against persisted SQLite data, not fixtures.
 3. Record B3 screenshots and Kartik’s copy sign-off.
 4. Select the VM hostname, private access mechanism, backup destination, and
@@ -39,8 +41,8 @@ deployment.
    frontend uses same-origin `/api/v1` requests by default; set
    `VITE_API_BASE_URL` only when the API is intentionally hosted elsewhere.
    nginx basic auth is acceptable at the private boundary.
-5. Install the reviewed I4 cron template only after it lands on `main`. Verify
-   that a scheduled run updates SQLite `run_log` and that `/api/v1/meta/status`
+5. Install the merged, reviewed I4 scheduler configuration. Verify that a
+   scheduled run updates SQLite `run_log` and that `/api/v1/meta/status`
    reports the corresponding run metadata.
 6. Run a nightly SQLite backup using SQLite’s backup mechanism to a separate
    persistent location. Restore it into a temporary database and verify API
