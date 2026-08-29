@@ -155,6 +155,30 @@ an attribution segment — which is exactly today's behaviour.
 
 ### Stop condition
 
+The observed sources are recorded in
+`docs/observations/i5-provider-observation-2026-08-23.md`: 15 distinct
+`yahoo:<publisher>` strings, each one display name per publisher, and 2
+`rss:<host>` strings. One spelling per publisher, so B's premise holds so far.
+Three things in that record bear directly on the mapping:
+
+- `content.provider.sourceId` is **not** a usable key. Its vocabulary is
+  mixed — `motleyfool.com` and `wsj.com` beside `benzinga_79`,
+  `24_7_wall_st__718`, and `simply_wall_st__316` — and where it does look
+  like a host it can still disagree with the article's: `ibd.com` against
+  articles on `www.investors.com`.
+- A large share of Yahoo articles canonicalize to `finance.yahoo.com` rather
+  than to the publisher's own host — 15 of the 56 distinct articles in this
+  window, including every Benzinga, Fortune, Insider Monkey, Investing.com,
+  Reuters, and Simply Wall St. article — so a shared article URL is a weak
+  bridge between the two schemes in practice, and which publishers it fails
+  for is not predictable from the name.
+- `yahoo:Yahoo Finance` is real, observed under META and NVDA. The reserved-
+  namespace rule above is what that row needs, not a hypothesis about it.
+
+No Yahoo↔RSS equivalence was observed at all in that window — neither
+MarketWatch nor TechCrunch appeared as a Yahoo publisher — so the reviewed
+mapping starts empty, which the fallback already makes safe.
+
 If the sources observed in PR 2 cannot be represented by a small explicit
 reviewed mapping — many spellings per publisher, or names that vary per
 article — then decision B's premise does not hold for real data. **Revisit
@@ -317,6 +341,45 @@ the same value), and absence of collisions.
 Partial presence is not a blocker — `external_id` is nullable and a missing
 provider id already means "no authoritative signal". Failed stability or
 failed semantics **is** a blocker.
+
+**Evidence (I5 PR 2).** `docs/observations/i5-provider-observation-2026-08-23.json`,
+collected by `tools/observe_phase0_providers.py` over four attempts spanning
+2.33 hours against the five approved tickers. All four required findings are
+met by the top-level `id` field:
+
+- **Presence** — 200 of 200 valid items carried it. `content.id` carried the
+  identical value on all 200; the legacy `uuid` did not appear at all.
+- **Stability** — 56 distinct articles, 48 of them observed more than once,
+  and 37 of those carried one unchanged identifier across observations at
+  least two hours apart: longest 2.33h, median 2.33h, shortest repeat 0.78h.
+  Not one article carried two values.
+- **Semantics** — article-scoped. 4 articles appeared under more than one
+  ticker and each kept one identifier; 19 appeared at more than one response
+  position and each kept one identifier.
+- **Collisions** — 56 identifiers for 56 distinct canonical URLs. None was
+  shared.
+
+`id` and `content.id` are indistinguishable on this window: same scope, same
+coverage, the same 37 articles over the bar. `id` is recommended on the
+deterministic field-order tie-break — it is the field `phase0/yahoo.py`
+already reads — and
+the artifact records every candidate it ranked. Had the two diverged, the
+candidate carrying decision G's stability evidence would have won regardless
+of which appeared on more items; coverage separates a full recommendation
+from a partial one, and never stands in for stability.
+
+Stability here is a claim about articles, not about the run. How long the
+observation lasted is reported beside the verdict and decides nothing: a long
+run whose articles were each seen twice ten minutes apart would test a
+ten-minute claim. What clears G's bar is the 37 articles that were each
+watched for two hours or more. Likewise a collision: one identifier on two
+canonical URLs is a collision whatever the two headlines say, because
+identical headlines across distinct URLs are what recurring and templated
+coverage looks like.
+
+This clears the bar G sets. It does not by itself authorize the change: the
+I2 correction that writes `external_id` on the valid path is still separately
+reviewed, and the observation is one window, not a guarantee.
 
 ---
 
@@ -587,3 +650,6 @@ stage-agnostic.
 - `docs/PHASE0_DATA_PIPELINE.md` — the operational contract for
   `pipeline.py`, including run identity and replay scope.
 - `nlp/README.md` — M1–M5 design notes and their honest limitations.
+- `docs/observations/` — what the providers actually sent, on a stated day.
+  Decisions B, G, and A2 rest on those observations; the artifacts are
+  evidence rather than tests, and are expected to age.
