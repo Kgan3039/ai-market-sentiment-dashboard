@@ -1,9 +1,9 @@
 # Phase 0 Read API Contract
 
-Owner: Mihir. This contract is fixture-backed until Isaac's Phase 0 SQLite
-pipeline is merged, then the same response shapes must be served from the
-repository. The frontend must not depend on legacy sentiment, prediction,
-market, or dashboard routes.
+Owner: Mihir. This contract is currently fixture-backed. The same response
+shapes must be served when the API switches to the merged pipeline's persisted
+output. The frontend must not depend on legacy sentiment, prediction, market,
+or dashboard routes.
 
 ## Endpoints
 
@@ -43,22 +43,39 @@ The committed source is
 normal summaries, a degraded summary, Other coverage, and an empty coverage
 day so UI work and API tests can proceed independently of live ingestion.
 
-## SQLite Handoff
+## Live Persistence Handoff
 
 The API depends only on `NarrativeReadRepository` in
-`backend/app/phase0/repository.py`. When Isaac's `phase0.repository.Phase0Repository`
-lands on `main`, add a `SQLiteNarrativeRepository` implementation behind that
-interface.
+`backend/app/phase0/repository.py`. The live-data adapter must preserve that
+interface while reading the pipeline's persisted output.
 
-- Read `themes` by `(ticker, trading_day)` ordered by `salience_rank`.
+- Read only API-eligible, completed narrative/theme output by
+  `(ticker, trading_day)`, ordered by `salience_rank`.
 - Decode the stored `summary` into the `sentences` shape produced by
   `ai.summarization.ThemeSummary`.
-- Resolve `citations` and canonical story members through `stories.member_ids`
-  and `raw_items`; never emit a generated sentence with an unresolved ID.
+- Resolve every cited sentence to its persisted evidence and returned member
+  stories; never emit a generated sentence with an unresolved citation ID.
 - Return unclustered/noise stories through `other_coverage` once Matthew's
   clustering stage records that assignment.
-- Map the newest `run_log` entry for each stage to `/meta/status` and compute
-  the stale flag using the approved market-hours rule.
+- Map run and persistence health into `/meta/status` and the API degradation
+  state, and compute freshness using the approved market-hours rule.
+- Exclude incomplete or failed outputs instead of presenting intermediate
+  records as a completed theme set.
+
+### Live-data readiness gate
+
+Do not switch the default API source from fixtures merely because the SQLite
+repository is present. The switch requires all of the following:
+
+- The pipeline completes the required downstream processing and persists
+  API-eligible narrative/theme output. Raw items and intermediate story
+  records, including degraded intermediate story output, do not satisfy this
+  contract.
+- The live-data adapter resolves every cited sentence to persisted evidence,
+  maps run and persistence health into the API degradation state, and excludes
+  incomplete or failed outputs.
+- Temporary-SQLite contract tests cover `/tickers`, `/themes`, and
+  `/meta/status` with real persisted rows before the source selection changes.
 
 Do not change these response names during the handoff. Add live-data adapter
 tests using a temporary SQLite database before switching the default source

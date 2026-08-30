@@ -1,8 +1,9 @@
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import App from "./App";
+import { resolveApiBaseUrl } from "./api";
 
 const dataAsOf = "2026-07-15T15:30:00Z";
 
@@ -56,7 +57,12 @@ function jsonResponse(payload, ok = true) {
   });
 }
 
-function mockApi({ themePayload = makeThemePayload(), status = {}, fail = false } = {}) {
+function mockApi({
+  themePayload = makeThemePayload(),
+  themePayloads = {},
+  status = {},
+  fail = false,
+} = {}) {
   vi.stubGlobal(
     "fetch",
     vi.fn((url) => {
@@ -65,8 +71,12 @@ function mockApi({ themePayload = makeThemePayload(), status = {}, fail = false 
       if (url.endsWith("/api/v1/meta/status")) {
         return jsonResponse({ data_as_of: dataAsOf, is_stale: false, last_runs: [], ...status });
       }
-      if (url.includes("/api/v1/tickers/") && url.endsWith("/themes")) {
-        return jsonResponse(themePayload);
+      const themeMatch = url.match(/\/api\/v1\/tickers\/([^/]+)\/themes$/);
+      if (themeMatch) {
+        const ticker = themeMatch[1];
+        return jsonResponse(
+          themePayloads[ticker] || { ...themePayload, ticker },
+        );
       }
       throw new Error(`Unexpected request: ${url}`);
     }),
@@ -80,6 +90,14 @@ afterEach(() => {
 });
 
 describe("Ticker Narratives states", () => {
+  it("uses same-origin API requests in production and keeps the local development default", () => {
+    expect(resolveApiBaseUrl({ DEV: false })).toBe("");
+    expect(resolveApiBaseUrl({ DEV: true })).toBe("http://localhost:8000");
+    expect(
+      resolveApiBaseUrl({ DEV: false, VITE_API_BASE_URL: "https://api.example.test" }),
+    ).toBe("https://api.example.test");
+  });
+
   it("renders the approved loading state while requests are pending", () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
 
@@ -95,7 +113,16 @@ describe("Ticker Narratives states", () => {
 
     expect(await screen.findByRole("heading", { name: "Delivery updates" })).toBeInTheDocument();
     expect(screen.getAllByRole("button")).toHaveLength(5);
-    expect(screen.getByRole("button", { name: /TSLA/ })).toBeInTheDocument();
+    for (const label of [
+      "TSLA — Tesla",
+      "NVDA — NVIDIA",
+      "AMD — Advanced Micro Devices",
+      "AAPL — Apple",
+      "META — Meta Platforms",
+    ]) {
+      expect(screen.getByRole("button", { name: new RegExp(label) })).toBeInTheDocument();
+    }
+    expect(screen.getByRole("navigation", { name: "Ticker Narratives" })).toBeInTheDocument();
     for (const citationLink of screen.getAllByTitle("Open source: Tesla delivery coverage remains in focus")) {
       expect(citationLink).toHaveAttribute("href", story.url);
       expect(citationLink).toHaveAttribute("target", "_blank");
@@ -103,6 +130,34 @@ describe("Ticker Narratives states", () => {
     expect(
       screen.getByText("AI-generated from cited sources. Informational only — not investment advice."),
     ).toBeInTheDocument();
+  });
+
+  it("loads the selected ticker's theme endpoint", async () => {
+    const nvdaPayload = makeThemePayload({
+      ticker: "NVDA",
+      themes: [
+        {
+          ...makeThemePayload().themes[0],
+          id: "nvda-infrastructure",
+          label: "AI infrastructure",
+        },
+      ],
+    });
+    mockApi({ themePayloads: { NVDA: nvdaPayload } });
+
+    render(<App />);
+
+    const nvdaTab = await screen.findByRole("button", { name: /NVDA — NVIDIA/ });
+    fireEvent.click(nvdaTab);
+
+    expect(
+      await screen.findByRole("heading", { name: "AI infrastructure" }),
+    ).toBeInTheDocument();
+    expect(nvdaTab).toHaveClass("active");
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/api/v1/tickers/NVDA/themes"),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("renders the approved error state when an API request fails", async () => {
