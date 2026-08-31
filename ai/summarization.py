@@ -23,6 +23,8 @@ response_schema so parsing failures are rare by construction.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -102,6 +104,30 @@ class ThemeSummary(BaseModel):
         if word_count == 0 or word_count > MAX_LABEL_WORDS:
             raise ValueError(f"label must be 1-{MAX_LABEL_WORDS} words, got {word_count}")
         return value
+
+
+def policy_fingerprint(model: str) -> str:
+    """Hash everything that changes what `summarize()` can be expected to produce.
+
+    Two calls to `summarize()` under the same model, prompt, generation
+    config, and output schema are the same policy; a caller (issue #73 /
+    A3's cache, or anyone else deciding whether to trust a stored summary)
+    can treat their outputs as comparable. Change any of the four - edit
+    the prompt, swap the model, change the temperature, or change
+    `ThemeSummary`'s shape (which is also the citation contract) - and this
+    fingerprint changes too, so a cache keyed on it invalidates
+    automatically rather than needing someone to remember to bump a
+    version string by hand.
+    """
+
+    payload = {
+        "system_prompt": SYSTEM_PROMPT,
+        "model": model,
+        "temperature": DEFAULT_TEMPERATURE,
+        "schema": ThemeSummary.model_json_schema(),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class SummarizationError(RuntimeError):

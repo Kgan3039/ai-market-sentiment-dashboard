@@ -4317,80 +4317,6 @@ class Phase0Repository:
             ]
             return result
 
-    def story_ids_for_fingerprints(
-        self,
-        *,
-        ticker: str,
-        trading_day: str | date,
-        pipeline_version: str,
-        fingerprints: Sequence[str],
-    ) -> dict[str, int]:
-        """Resolve M5's story_key identities to this database's story ids.
-
-        A theme's membership is expressed upstream by
-        ``cluster_fingerprint`` (M3's ``story_key``, unique within a
-        ticker/day/pipeline_version); the database identifies a story by
-        integer id. Every fingerprint must already have a story in this
-        exact partition - a caller naming one from another ticker-day or
-        pipeline version is a bug, not a lookup miss to paper over.
-        """
-
-        normalized_ticker = normalize_ticker(ticker)
-        day = _normalize_day(trading_day)
-        version = _require_text(pipeline_version, "pipeline_version")
-        wanted = [_require_text(value, "fingerprint") for value in fingerprints]
-        if not wanted:
-            return {}
-        placeholders = ",".join("?" for _ in wanted)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT id, cluster_fingerprint FROM stories
-                WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
-                  AND cluster_fingerprint IN ({placeholders})
-                """,
-                (normalized_ticker, day, version, *wanted),
-            ).fetchall()
-        resolved = {str(row["cluster_fingerprint"]): int(row["id"]) for row in rows}
-        missing = sorted(set(wanted) - set(resolved))
-        if missing:
-            raise Phase0ValidationError(
-                f"no story in {normalized_ticker}/{day}/{version} matches "
-                f"fingerprint(s) {missing}"
-            )
-        return resolved
-
-    def raw_item_ids_for_stories(
-        self, *, story_ids: Sequence[int]
-    ) -> dict[int, tuple[int, ...]]:
-        """Every raw item id retained as a member of each given story.
-
-        The bridge from a summarizer's story-level citation to the
-        database's raw-item-level ``theme_citations`` table: a citation
-        naming story X may cite any raw item ``story_members`` retains
-        under X, which is exactly the set
-        :meth:`_assert_story_membership` checks a theme's
-        ``citation_item_ids`` against.
-        """
-
-        wanted = [_require_int(value, "story_id", minimum=1) for value in story_ids]
-        if not wanted:
-            return {}
-        placeholders = ",".join("?" for _ in wanted)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT story_id, raw_item_id FROM story_members
-                WHERE story_id IN ({placeholders})
-                ORDER BY story_id, raw_item_id
-                """,
-                wanted,
-            ).fetchall()
-        resolved: dict[int, list[int]] = {story_id: [] for story_id in wanted}
-        for row in rows:
-            resolved[int(row["story_id"])].append(int(row["raw_item_id"]))
-        return {story_id: tuple(ids) for story_id, ids in resolved.items()}
-
     # ------------------------------------------------------------------
     # Evaluation labels
     # ------------------------------------------------------------------
@@ -6407,12 +6333,25 @@ class Phase0Repository:
         a second call in the same run would silently discard the first
         call's ``llm_call_log`` detail rather than append to it.
 
-        Counted as ``input_size``/``output_size``, not ``*_tokens``: every
-        key here lands in ``run_log.counts`` verbatim, and
-        :data:`phase0.redaction.SECRET_KEY_PATTERN` redacts any key
-        *containing* ``token`` (an API/auth token check) regardless of what
-        the value actually is - naming these ``*_tokens`` silently replaced
-        real counts with ``"[REDACTED]"``.
+        **Not the data-owning call.** This only ever writes accounting into
+        ``run_log.counts`` - never a ``themes``/``theme_sets`` row - so it
+        should be called **non-terminally**, before whatever call in the
+        same ``stage_run`` actually persists the summaries (e.g.
+        ``reconcile_themes``), which should be the run's terminal
+        operation. Matches the worked example in ``phase0/README.md``: the
+        stage's *last* operation carries ``terminal=True``, so the data
+        write and the run's outcome can never disagree.
+
+        Cache hits count as ``success``, the same as cache misses: a
+        cache hit is successful reuse, not a degraded or partial outcome,
+        and a 100%-cache-hit run should resolve to ``"success"`` like any
+        other run that did exactly what it was supposed to.
+
+        Fields are named ``input_tokens``/``output_tokens`` (not
+        ``*_size``): :data:`phase0.redaction.SAFE_TELEMETRY_KEYS`
+        exempts these exact names from :data:`phase0.redaction.
+        SECRET_KEY_PATTERN`'s broad ``token`` clause, so real LLM usage
+        counts survive redaction without needing an evasive name.
         """
 
         with self._logged_mutation(
@@ -6421,17 +6360,17 @@ class Phase0Repository:
             prepared = [dict(call) for call in calls]
             hits = _require_int(cache_hits, "cache_hits", minimum=0)
             misses = _require_int(cache_misses, "cache_misses", minimum=0)
-            context._record_outcome(success=misses, partial=hits)
+            context._record_outcome(success=hits + misses)
             context._merge_counts(
                 {
                     "llm_calls": len(prepared),
                     "cache_hits": hits,
                     "cache_misses": misses,
-                    "input_size": sum(
-                        int(call.get("input_size") or 0) for call in prepared
+                    "input_tokens": sum(
+                        int(call.get("input_tokens") or 0) for call in prepared
                     ),
-                    "output_size": sum(
-                        int(call.get("output_size") or 0) for call in prepared
+                    "output_tokens": sum(
+                        int(call.get("output_tokens") or 0) for call in prepared
                     ),
                     "latency_ms": sum(
                         float(call.get("latency_ms") or 0.0) for call in prepared

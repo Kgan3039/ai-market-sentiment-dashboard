@@ -11172,6 +11172,33 @@ def caught_validation_cases(repository: Phase0Repository) -> dict:
     }
 
 
+def test_summarization_usage_all_cache_hits_resolves_success_not_degraded(tmp_path):
+    """A 100%-cache-hit run did exactly what it was supposed to - reusing
+    every summary rather than calling the provider - and must not be
+    reported degraded just because nothing needed regenerating."""
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="run-cache-hits",
+        stage="themes",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.record_summarization_usage(
+            run=run,
+            calls=[],
+            cache_hits=3,
+            cache_misses=0,
+            terminal=True,
+        )
+
+    entry = repository.run_log_entries(run_id="run-cache-hits")[0]
+    assert entry["status"] == "success"
+    assert entry["counts"]["cache_hits"] == 3
+    assert entry["counts"]["cache_misses"] == 0
+
+
 @pytest.mark.parametrize("entrypoint", LOGGED_ENTRYPOINTS)
 @pytest.mark.parametrize("terminal", [False, True])
 def test_a_caught_validation_failure_still_ends_the_run_as_failed(

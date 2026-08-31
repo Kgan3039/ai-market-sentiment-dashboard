@@ -24,6 +24,7 @@ from ai.summarization import (
     ThemeInput,
     ThemeSummary,
     build_generation_config_kwargs,
+    policy_fingerprint,
     resolve_citations,
     summarize,
 )
@@ -330,6 +331,43 @@ class OnAttemptCallbackTests(unittest.TestCase):
         # caller (A1's own tests, A4's tools) already uses.
         result = summarize(self.theme, client=FakeGeminiClient())
         self.assertIsInstance(result, ThemeSummary)
+
+
+class PolicyFingerprintTests(unittest.TestCase):
+    """Issue #73 (A3)'s cache key must invalidate when the summarizer's own
+    policy changes, not just when story content changes."""
+
+    def test_stable_for_identical_inputs(self) -> None:
+        first = policy_fingerprint("gemini-2.5-flash")
+        second = policy_fingerprint("gemini-2.5-flash")
+        self.assertEqual(first, second)
+
+    def test_changes_with_model(self) -> None:
+        self.assertNotEqual(policy_fingerprint("gemini-2.5-flash"), policy_fingerprint("gemini-2.5-pro"))
+
+    def test_changes_with_system_prompt(self) -> None:
+        import ai.summarization as module
+
+        original = module.SYSTEM_PROMPT
+        try:
+            before = policy_fingerprint("gemini-2.5-flash")
+            module.SYSTEM_PROMPT = original + " Extra rule."
+            after = policy_fingerprint("gemini-2.5-flash")
+        finally:
+            module.SYSTEM_PROMPT = original
+        self.assertNotEqual(before, after)
+
+    def test_changes_with_temperature(self) -> None:
+        import ai.summarization as module
+
+        original = module.DEFAULT_TEMPERATURE
+        try:
+            before = policy_fingerprint("gemini-2.5-flash")
+            module.DEFAULT_TEMPERATURE = original + 0.1
+            after = policy_fingerprint("gemini-2.5-flash")
+        finally:
+            module.DEFAULT_TEMPERATURE = original
+        self.assertNotEqual(before, after)
 
 
 class GuardrailPromptAndConfigTests(unittest.TestCase):
