@@ -976,9 +976,10 @@ class Phase0Admin:
     :class:`Phase0Repository` — ``ingest_raw_items``, ``reconcile_stories``,
     ``reconcile_themes``, ``persist_embeddings``, ``record_source_state``,
     ``record_feed_snapshot``, ``record_feed_observations``,
-    ``replace_relevance_classifications`` — each of which requires the
-    :class:`StageRunContext` from ``stage_run`` and writes its run-log row
-    in the same transaction as the data.
+    ``replace_relevance_classifications``, ``record_summarization_usage``
+    — each of which requires the :class:`StageRunContext` from
+    ``stage_run`` and writes its run-log row in the same transaction as
+    the data.
 
     Keeping these behind ``repository.admin`` is the whole point: an
     unlogged write cannot happen without the call site saying so, and a
@@ -6310,6 +6311,73 @@ class Phase0Repository:
             context._record_outcome(success=len(prepared))
             context._merge_counts({"embeddings_written": len(prepared)})
             return len(prepared)
+
+    def record_summarization_usage(
+        self,
+        *,
+        run: Any,
+        calls: Sequence[Mapping[str, Any]],
+        cache_hits: int,
+        cache_misses: int,
+        terminal: bool = False,
+    ) -> None:
+        """Log one summarization stage's LLM calls and cache accounting.
+
+        ``calls`` is the complete list of provider attempts made during
+        this run (issue #73 / A3): each entry becomes one row in
+        ``run_log.counts.llm_call_log``, and per-attempt usage/latency
+        values are summed into ``counts`` alongside it. Call this **once**
+        per ``stage_run``, with every call the run made - ``run_log.counts``
+        is merged by :meth:`StageRunContext._merge_counts`, which sums
+        int-valued keys across merges but *overwrites* list-valued ones, so
+        a second call in the same run would silently discard the first
+        call's ``llm_call_log`` detail rather than append to it.
+
+        **Not the data-owning call.** This only ever writes accounting into
+        ``run_log.counts`` - never a ``themes``/``theme_sets`` row - so it
+        should be called **non-terminally**, before whatever call in the
+        same ``stage_run`` actually persists the summaries (e.g.
+        ``reconcile_themes``), which should be the run's terminal
+        operation. Matches the worked example in ``phase0/README.md``: the
+        stage's *last* operation carries ``terminal=True``, so the data
+        write and the run's outcome can never disagree.
+
+        Cache hits count as ``success``, the same as cache misses: a
+        cache hit is successful reuse, not a degraded or partial outcome,
+        and a 100%-cache-hit run should resolve to ``"success"`` like any
+        other run that did exactly what it was supposed to.
+
+        Fields are named ``input_tokens``/``output_tokens`` (not
+        ``*_size``): :data:`phase0.redaction.SAFE_TELEMETRY_KEYS`
+        exempts these exact names from :data:`phase0.redaction.
+        SECRET_KEY_PATTERN`'s broad ``token`` clause, so real LLM usage
+        counts survive redaction without needing an evasive name.
+        """
+
+        with self._logged_mutation(
+            run, operation="record_summarization_usage", terminal=terminal
+        ) as (_connection, context):
+            prepared = [dict(call) for call in calls]
+            hits = _require_int(cache_hits, "cache_hits", minimum=0)
+            misses = _require_int(cache_misses, "cache_misses", minimum=0)
+            context._record_outcome(success=hits + misses)
+            context._merge_counts(
+                {
+                    "llm_calls": len(prepared),
+                    "cache_hits": hits,
+                    "cache_misses": misses,
+                    "input_tokens": sum(
+                        int(call.get("input_tokens") or 0) for call in prepared
+                    ),
+                    "output_tokens": sum(
+                        int(call.get("output_tokens") or 0) for call in prepared
+                    ),
+                    "latency_ms": sum(
+                        float(call.get("latency_ms") or 0.0) for call in prepared
+                    ),
+                    "llm_call_log": prepared,
+                }
+            )
 
     @classmethod
     def _resolve_embedding_source(
