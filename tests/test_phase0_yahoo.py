@@ -331,6 +331,189 @@ def test_two_spellings_of_one_article_ingest_as_one_row(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The provider's own article id (decision G)
+# ---------------------------------------------------------------------------
+
+
+def stored_item(tmp_path, item):
+    """Ingest one Yahoo record and hand back the row it settled as."""
+
+    repository = migrated(tmp_path)
+    counts, _ = fetcher(repository, provider(news=[item])).fetch(["NVDA"])
+    return counts, repository.raw_items_for_day(today(), "NVDA")[0]
+
+
+def test_the_provider_id_reaches_the_stored_row(tmp_path):
+    counts, stored = stored_item(tmp_path, legacy_item("NVDA", id="prov-9001"))
+
+    assert counts["inserted"] == 1
+    assert stored["ingest_status"] == "valid"
+    assert stored["external_id"] == "prov-9001"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [{}, {"id": None}, {"id": ""}, {"id": "   "}, {"id": "\t\n"}],
+    ids=["absent", "null", "empty", "spaces", "whitespace"],
+)
+def test_an_absent_or_blank_provider_id_is_stored_as_null(tmp_path, updates):
+    """Blank is not an identifier, and the repository's contract says so."""
+
+    counts, stored = stored_item(tmp_path, legacy_item("NVDA", **updates))
+
+    assert counts["inserted"] == 1
+    assert counts["invalid"] == 0
+    assert stored["ingest_status"] == "valid"
+    assert stored["external_id"] is None
+
+
+def test_a_missing_provider_id_does_not_cost_an_otherwise_valid_item(tmp_path):
+    """A missing id means no authoritative signal, not a rejected article."""
+
+    counts, stored = stored_item(tmp_path, legacy_item("NVDA"))
+
+    assert (counts["fetched"], counts["inserted"], counts["invalid"]) == (1, 1, 0)
+    assert stored["title"] == "NVDA headline"
+    assert stored["external_id"] is None
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"content": {"id": "content-1"}},
+        {"uuid": "uuid-1"},
+        {"content": {"provider": {"sourceId": "source-1"}}},
+        {"content": {"id": "content-1"}, "uuid": "uuid-1"},
+    ],
+    ids=["content.id", "uuid", "content.provider.sourceId", "both"],
+)
+def test_no_other_identifier_stands_in_for_the_provider_id(item):
+    """Decision G: only the field the observation qualified, or nothing.
+
+    ``content.id`` and ``uuid`` were observed alongside ``id`` and were not
+    the field the verdict rests on; ``sourceId`` identifies the publisher,
+    not the article. Reading any of them would put an unqualified value
+    where M2 treats it as authoritative.
+    """
+
+    payload = legacy_item("NVDA")
+    for key, value in item.items():
+        if isinstance(value, dict):
+            payload.setdefault(key, {}).update(value)
+        else:
+            payload[key] = value
+
+    assert normalize_yahoo_item("NVDA", payload)["external_id"] is None
+
+
+def test_the_top_level_id_wins_over_every_other_identifier():
+    """Yahoo sends ``id`` and ``content.id`` alike, so they are pulled apart.
+
+    Which field was read is not observable while the provider agrees with
+    itself, and the day it stops agreeing is the day it matters.
+    """
+
+    item = legacy_item("NVDA", id="prov-9001", uuid="uuid-1")
+    item["content"] = {"id": "content-1", "provider": {"sourceId": "source-1"}}
+
+    assert normalize_yahoo_item("NVDA", item)["external_id"] == "prov-9001"
+
+
+def test_the_provider_id_is_stored_as_the_provider_sent_it():
+    """Provider-native, not ``yahoo:``-qualified.
+
+    The scheme lives on ``source``, which is what ``provider_namespace``
+    reads downstream to keep a Yahoo id and an RSS id apart. Qualifying the
+    stored value too would namespace it twice.
+    """
+
+    normalized = normalize_yahoo_item("NVDA", legacy_item("NVDA", id="prov-9001"))
+
+    assert normalized["external_id"] == "prov-9001"
+    assert normalized["source"].startswith("yahoo:")
+
+
+def test_the_provider_id_changes_nothing_else_about_normalization():
+    """Everything but the new field, and the payload, comes out as before."""
+
+    at = "2026-07-23T12:00:00+00:00"
+    with_id = normalize_yahoo_item(
+        "NVDA", legacy_item("NVDA", id="prov-9001"), fetched_at=at
+    )
+    without = normalize_yahoo_item("NVDA", legacy_item("NVDA"), fetched_at=at)
+    carried = {"external_id", "raw_json"}
+
+    assert {k: v for k, v in with_id.items() if k not in carried} == {
+        k: v for k, v in without.items() if k not in carried
+    }
+    assert with_id["raw_json"]["id"] == "prov-9001"
+    assert "id" not in without["raw_json"]
+
+
+def test_one_provider_id_on_two_articles_still_ingests_as_two_rows(tmp_path):
+    """Dedup is unchanged: the row identity is still source and canonical URL."""
+
+    repository = migrated(tmp_path)
+    factory = provider(
+        news=[
+            legacy_item("NVDA", id="prov-9001", link="https://publisher.example/a"),
+            legacy_item("NVDA", id="prov-9001", link="https://publisher.example/b"),
+        ]
+    )
+
+    counts, _ = fetcher(repository, factory).fetch(["NVDA"])
+
+    assert (counts["inserted"], counts["duplicates"]) == (2, 0)
+    assert repository.count("raw_items") == 2
+
+
+def observe_twice(tmp_path, first, second):
+    """Fetch one article, then fetch it again as the provider then described it."""
+
+    repository = migrated(tmp_path)
+    fetcher(repository, provider(news=[first])).fetch(["NVDA"])
+    counts, _ = fetcher(repository, provider(news=[second])).fetch(["NVDA"])
+    return counts, repository.raw_items_for_day(today(), "NVDA")
+
+
+def test_a_later_provider_id_does_not_fill_in_a_row_that_had_none(tmp_path):
+    """Raw evidence is what was observed first, not what was observed since.
+
+    ``ON CONFLICT(source, canonical_url) DO NOTHING`` means the second
+    observation is counted and discarded. Letting it write the id it now
+    carries would make the raw row a running summary of the article rather
+    than a record of one response, and M2 would inherit a provider_key that
+    no stored payload supports.
+    """
+
+    counts, stored = observe_twice(
+        tmp_path,
+        legacy_item("NVDA", link="https://publisher.example/story"),
+        legacy_item("NVDA", link="https://publisher.example/story", id="prov-9001"),
+    )
+
+    assert (counts["fetched"], counts["inserted"], counts["duplicates"]) == (1, 0, 1)
+    assert len(stored) == 1
+    assert stored[0]["external_id"] is None
+    assert "prov-9001" not in stored[0]["raw_json"]
+
+
+def test_a_changed_provider_id_does_not_overwrite_the_one_first_observed(tmp_path):
+    """The first id stands, so the stored id and the stored payload agree."""
+
+    counts, stored = observe_twice(
+        tmp_path,
+        legacy_item("NVDA", link="https://publisher.example/story", id="prov-9001"),
+        legacy_item("NVDA", link="https://publisher.example/story", id="prov-9999"),
+    )
+
+    assert (counts["fetched"], counts["inserted"], counts["duplicates"]) == (1, 0, 1)
+    assert len(stored) == 1
+    assert stored[0]["external_id"] == "prov-9001"
+    assert "prov-9999" not in stored[0]["raw_json"]
+
+
+# ---------------------------------------------------------------------------
 # Timestamp normalization
 # ---------------------------------------------------------------------------
 
@@ -578,6 +761,73 @@ def test_invalid_evidence_keeps_the_original_payload_and_the_reason(tmp_path):
     assert stored["canonical_url"].startswith("urn:yahoo:nvda:")
     assert "missing title" in stored["validation_errors"]
     assert "publisher.example" in stored["raw_json"]
+
+
+def test_invalid_evidence_keeps_the_provider_id_when_the_payload_carries_one(
+    tmp_path,
+):
+    """The rule that governs a settled row governs a quarantined one too."""
+
+    counts, stored = stored_item(
+        tmp_path, {"id": " prov-9001 ", "link": "https://publisher.example/x"}
+    )
+
+    assert counts["invalid"] == 1
+    assert stored["ingest_status"] == "invalid"
+    assert stored["external_id"] == "prov-9001"
+    assert stored["canonical_url"].startswith("urn:yahoo:nvda:")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"uuid": "not-the-id", "link": "https://publisher.example/x"},
+        {"id": "  ", "uuid": "not-the-id", "link": "https://publisher.example/x"},
+        {
+            "content": {"id": "nested"},
+            "uuid": "not-the-id",
+            "link": "https://publisher.example/x",
+        },
+    ],
+    ids=["uuid-only", "blank-id-beside-uuid", "nested-id-beside-uuid"],
+)
+def test_invalid_evidence_never_falls_back_to_another_identifier(tmp_path, payload):
+    """A uuid is not the article id, and quarantine does not make it one."""
+
+    _, stored = stored_item(tmp_path, payload)
+
+    assert stored["ingest_status"] == "invalid"
+    assert stored["external_id"] is None
+    assert "not-the-id" in stored["raw_json"]
+
+
+def test_invalid_evidence_without_a_provider_id_keeps_its_digest_identity(tmp_path):
+    """No identifier means none stored -- and the row still names itself."""
+
+    _, stored = stored_item(tmp_path, {"link": "https://publisher.example/x"})
+
+    assert stored["external_id"] is None
+    digest = stored["canonical_url"].removeprefix("urn:yahoo:nvda:")
+    assert len(digest) == 64 and int(digest, 16) >= 0
+    assert "publisher.example" in stored["raw_json"]
+
+
+def test_two_unidentified_broken_payloads_stay_two_replayable_rows(tmp_path):
+    """The digest still separates them, and a replay still lands on itself."""
+
+    repository = migrated(tmp_path)
+    broken = [
+        {"link": "https://publisher.example/one"},
+        {"link": "https://publisher.example/two"},
+    ]
+
+    fetcher(repository, provider(news=broken)).fetch(["NVDA"])
+    counts, _ = fetcher(repository, provider(news=broken)).fetch(["NVDA"])
+
+    stored = repository.raw_items_for_day(today(), "NVDA")
+    assert counts["invalid"] == 2
+    assert [row["external_id"] for row in stored] == [None, None]
+    assert len({row["canonical_url"] for row in stored}) == 2
 
 
 def test_invalid_evidence_settles_on_the_fetch_day_even_beside_older_valid_items(
