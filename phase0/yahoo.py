@@ -343,6 +343,27 @@ def _nested_url(value: Any) -> str | None:
     return str(value).strip() if value else None
 
 
+def _provider_item_id(payload: Mapping[str, Any]) -> str | None:
+    """The provider's own top-level ``id``, or no identifier at all.
+
+    Decision G: this field and nothing else.  There is no fallback -- not
+    ``content.id``, not ``uuid``, not a digest of the payload -- because
+    ``provider_key`` is M2's one authoritative, non-time-bounded merge
+    signal, and a value the provider never issued would arrive there
+    looking exactly like one it did.  A blank id is no identifier, so the
+    same ``or None`` the repository applies is applied here, and both the
+    settled and the quarantined path read this one expression: evidence
+    that could not be parsed says the same thing about its identity as
+    evidence that could.
+
+    The value stays provider-native.  ``source`` carries the ``yahoo:``
+    scheme and is what ``provider_namespace`` reads downstream, so
+    qualifying it here would namespace it twice.
+    """
+
+    return str(payload.get("id") or "").strip() or None
+
+
 def normalize_yahoo_item(
     ticker: str,
     item: Mapping[str, Any],
@@ -391,6 +412,7 @@ def normalize_yahoo_item(
     )
     return {
         "source": f"yahoo:{source}",
+        "external_id": _provider_item_id(item),
         "ticker": symbol,
         "tickers": [symbol],
         "title": title,
@@ -413,7 +435,10 @@ def _invalid_evidence(
     """Keep an unusable provider record as evidence rather than dropping it.
 
     It carries no ``published_at`` — the timestamp is exactly what could
-    not be trusted — so it settles on the fetch day.
+    not be trusted — so it settles on the fetch day.  The payload digest
+    names the row through ``canonical_url``; it is deliberately not offered
+    as an ``external_id``, which follows the same rule here as it does for
+    an item that parsed.
     """
 
     raw_payload = (
@@ -423,13 +448,12 @@ def _invalid_evidence(
         raw_payload, sort_keys=True, separators=(",", ":"), default=str
     ).encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
-    external_id = str(raw_payload.get("id") or raw_payload.get("uuid") or digest)
     return {
         "source": f"yahoo:{ticker}",
         "ticker": ticker,
         "tickers": [ticker],
         "canonical_url": f"urn:yahoo:{ticker.lower()}:{digest}",
-        "external_id": external_id,
+        "external_id": _provider_item_id(raw_payload),
         "ingest_status": "invalid",
         "validation_errors": [redact_secrets(str(error))],
         "fetched_at": fetched_at or utc_now(),
