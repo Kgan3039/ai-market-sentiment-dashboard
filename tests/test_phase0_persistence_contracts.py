@@ -5407,7 +5407,31 @@ READER_PROBES = {
     "integrity_check": ((), {}),
     "schema_version": ((), {}),
     "count": (("raw_items",), {}),
+    # The I5 evidence read boundary.  These answer with frozen records
+    # rather than row dictionaries; the probe below checks the records
+    # carry nothing but plain values either.
+    "evidence_partitions": ((), {}),
+    "evidence_days": ((), {}),
+    "unassociated_items": (("2026-08-20",), {}),
+    "withheld_matches": (("2026-08-20",), {}),
+    "partition_evidence": (("NVDA", "2026-08-20"), {}),
 }
+
+
+def _plain_values(value):
+    """Every scalar reachable from one returned value, records unpacked."""
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        assert value.__dataclass_params__.frozen, value
+        for field in dataclasses.fields(value):
+            yield from _plain_values(getattr(value, field.name))
+    elif isinstance(value, dict):
+        yield from value.values()
+    elif isinstance(value, (list, tuple)):
+        for element in value:
+            yield from _plain_values(element)
+    else:
+        yield value
 
 
 def _public_names(obj) -> set:
@@ -5471,11 +5495,13 @@ def test_every_reader_method_returns_plain_data(tmp_path):
         values = result if isinstance(result, list) else [result]
         for value in values:
             assert not isinstance(value, (sqlite3.Connection, sqlite3.Cursor))
-            assert isinstance(value, (dict, str, int, type(None))), (name, value)
-            if isinstance(value, dict):
-                assert all(
-                    not isinstance(item, (sqlite3.Connection, sqlite3.Cursor))
-                    for item in value.values()
+            assert isinstance(value, (dict, str, int, type(None))) or (
+                dataclasses.is_dataclass(value) and value.__dataclass_params__.frozen
+            ), (name, value)
+            for item in _plain_values(value):
+                assert not isinstance(item, (sqlite3.Connection, sqlite3.Cursor)), (
+                    name,
+                    item,
                 )
 
 
