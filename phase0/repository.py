@@ -49,6 +49,18 @@ from .embeddings import (
     require_durable_source_id,
     validate_embedding,
 )
+from .evidence import (
+    CandidateEvidence,
+    EXCLUDED_INVALID,
+    EXCLUDED_UNPROJECTABLE,
+    EvidenceDay,
+    EvidencePartition,
+    MatchEvidence,
+    PartitionEvidence,
+    UnassociatedItem,
+    WithheldMatch,
+    classify_evidence,
+)
 from .errors import (
     Phase0Error,
     Phase0IntegrityError,
@@ -83,6 +95,11 @@ from .schema import (
 )
 from .tickers import SUPPORTED_TICKERS, TICKER_UNIVERSE, normalize_ticker
 
+
+#: How a raw item's day is derived, in SQL, in one place.  Every evidence
+#: read and every partition assertion uses this expression, so decision C's
+#: UTC-derived day has one definition rather than several that can drift.
+_EVIDENCE_DAY = "substr(COALESCE(raw_items.published_at, raw_items.fetched_at), 1, 10)"
 
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parents[1] / "data" / "phase0.sqlite3"
 MIGRATIONS_PATH = Path(__file__).with_name("migrations")
@@ -1248,6 +1265,380 @@ class Phase0Reader:
             "SELECT * FROM raw_item_match_evidence WHERE raw_item_id = ? "
             "ORDER BY ticker",
             (_require_int(item_id, "item_id", minimum=1),),
+        )
+
+    # -- The evidence read boundary (I5) ---------------------------------
+    #
+    # Every read below derives the day exactly as `raw_items_for_day` and
+    # the partition assertions do -- `substr(COALESCE(published_at,
+    # fetched_at), 1, 10)`, decision C, unchanged and UTC -- so "which day
+    # is this evidence on" keeps one definition.
+    #
+    # Ownership comes from `raw_item_tickers` and from nothing else
+    # (decision F).  `raw_items.ticker` is the first claimant, not an
+    # authority, so it is deliberately not consulted here even though
+    # `raw_items_for_day` still accepts it.
+    #
+    # The counters are folded in Python through `classify_evidence`, the
+    # same call that produces the projected evidence itself.  Writing them
+    # as SQL aggregates would mean a second definition of "eligible" that
+    # nothing keeps in step with the first.
+
+    def evidence_partitions(
+        self, *, trading_day: str | date | None = None, ticker: str | None = None
+    ) -> list[EvidencePartition]:
+        """Per-``(ticker, day)`` accounting over authoritatively owned rows.
+
+        One article associated with two tickers is counted once in each of
+        their partitions (decision E), so these counts are **not** a
+        partition of the day's evidence and must never be summed against
+        :attr:`~phase0.evidence.EvidenceDay.associated_any_ticker`.
+        """
+
+        day_filter = None if trading_day is None else _normalize_day(trading_day)
+        symbol = None if ticker is None else normalize_ticker(ticker)
+
+        # DISTINCT without `association_type` is what makes one item
+        # carrying both a 'source' and a 'relevance' row for one ticker
+        # count once: the primary key allows both, and a naive count would
+        # report the partition twice as large as it is.
+        #
+        # The optional filters are bound rather than concatenated, so the
+        # SQL stays one literal this module wrote.
+        tallies: dict[tuple[str, str], dict[str, Any]] = {}
+        rows = self._query(
+            f"""
+            SELECT DISTINCT
+                raw_item_tickers.ticker AS partition_ticker,
+                {_EVIDENCE_DAY} AS trading_day,
+                raw_items.*
+            FROM raw_items
+            JOIN raw_item_tickers ON raw_item_tickers.raw_item_id = raw_items.id
+            WHERE (? IS NULL OR {_EVIDENCE_DAY} = ?)
+              AND (? IS NULL OR raw_item_tickers.ticker = ?)
+            ORDER BY partition_ticker, trading_day, raw_items.id
+            """,
+            (day_filter, day_filter, symbol, symbol),
+        )
+        for row in rows:
+            key = (str(row["partition_ticker"]), str(row["trading_day"]))
+            tally = tallies.setdefault(
+                key,
+                {
+                    "associated": 0,
+                    "eligible": 0,
+                    "invalid": 0,
+                    "unprojectable": 0,
+                    "ambiguous": 0,
+                    "latest_fetched_at": None,
+                },
+            )
+            outcome, _, _ = classify_evidence(row, key[0], key[1])
+            tally["associated"] += 1
+            if outcome == EXCLUDED_INVALID:
+                tally["invalid"] += 1
+                if str(row["ingest_status"]) == "ambiguous":
+                    tally["ambiguous"] += 1
+            elif outcome == EXCLUDED_UNPROJECTABLE:
+                tally["unprojectable"] += 1
+            else:
+                tally["eligible"] += 1
+            fetched_at = str(row["fetched_at"])
+            if (
+                tally["latest_fetched_at"] is None
+                or fetched_at > tally["latest_fetched_at"]
+            ):
+                tally["latest_fetched_at"] = fetched_at
+
+        return [
+            EvidencePartition(
+                ticker=partition_ticker,
+                trading_day=day,
+                associated_item_count=tally["associated"],
+                eligible_item_count=tally["eligible"],
+                excluded_invalid=tally["invalid"],
+                excluded_unprojectable=tally["unprojectable"],
+                excluded_ambiguous=tally["ambiguous"],
+                latest_fetched_at=tally["latest_fetched_at"],
+            )
+            for (partition_ticker, day), tally in sorted(tallies.items())
+        ]
+
+    def evidence_days(
+        self, *, trading_day: str | date | None = None
+    ) -> list[EvidenceDay]:
+        """Day-level accounting over every persisted row, owned or not.
+
+        The unassociated signals overlap on purpose -- an item can be
+        ambiguous *and* carry candidates *and* carry match evidence -- so
+        they are independent counts rather than a cause breakdown that
+        invites subtraction.
+        """
+
+        day_filter = None if trading_day is None else _normalize_day(trading_day)
+        tallies: dict[str, dict[str, Any]] = {}
+        rows = self._query(
+            f"""
+            SELECT
+                {_EVIDENCE_DAY} AS trading_day,
+                raw_items.ingest_status AS ingest_status,
+                raw_items.fetched_at AS fetched_at,
+                EXISTS (
+                    SELECT 1 FROM raw_item_tickers
+                    WHERE raw_item_tickers.raw_item_id = raw_items.id
+                ) AS associated,
+                EXISTS (
+                    SELECT 1 FROM raw_item_candidates
+                    WHERE raw_item_candidates.raw_item_id = raw_items.id
+                ) AS has_candidates,
+                EXISTS (
+                    SELECT 1 FROM raw_item_match_evidence
+                    WHERE raw_item_match_evidence.raw_item_id = raw_items.id
+                ) AS has_match_evidence
+            FROM raw_items
+            WHERE (? IS NULL OR {_EVIDENCE_DAY} = ?)
+            ORDER BY trading_day, raw_items.id
+            """,
+            (day_filter, day_filter),
+        )
+        for row in rows:
+            day = str(row["trading_day"])
+            tally = tallies.setdefault(
+                day,
+                {
+                    "total": 0,
+                    "associated": 0,
+                    "unassociated": 0,
+                    "invalid": 0,
+                    "ambiguous": 0,
+                    "candidates": 0,
+                    "match_evidence": 0,
+                    "no_evidence": 0,
+                    "latest_fetched_at": None,
+                },
+            )
+            tally["total"] += 1
+            if row["associated"]:
+                tally["associated"] += 1
+            else:
+                tally["unassociated"] += 1
+                status = str(row["ingest_status"])
+                if status == "invalid":
+                    tally["invalid"] += 1
+                elif status == "ambiguous":
+                    tally["ambiguous"] += 1
+                if row["has_candidates"]:
+                    tally["candidates"] += 1
+                if row["has_match_evidence"]:
+                    tally["match_evidence"] += 1
+                if not row["has_candidates"] and not row["has_match_evidence"]:
+                    tally["no_evidence"] += 1
+            fetched_at = str(row["fetched_at"])
+            if (
+                tally["latest_fetched_at"] is None
+                or fetched_at > tally["latest_fetched_at"]
+            ):
+                tally["latest_fetched_at"] = fetched_at
+
+        return [
+            EvidenceDay(
+                trading_day=day,
+                total_item_count=tally["total"],
+                associated_any_ticker=tally["associated"],
+                unassociated_item_count=tally["unassociated"],
+                unassociated_invalid=tally["invalid"],
+                unassociated_ambiguous=tally["ambiguous"],
+                unassociated_with_candidates=tally["candidates"],
+                unassociated_with_match_evidence=tally["match_evidence"],
+                unassociated_without_evidence=tally["no_evidence"],
+                latest_fetched_at=tally["latest_fetched_at"],
+            )
+            for day, tally in sorted(tallies.items())
+        ]
+
+    def unassociated_items(
+        self, trading_day: str | date, *, limit: int = 50
+    ) -> list[UnassociatedItem]:
+        """Rows no ticker holds, carrying the evidence that explains them.
+
+        The candidate and match rows travel with the item rather than being
+        reduced to a count, because the question this read exists for --
+        "was any of this real coverage we missed?" -- is answered by
+        reading the evidence, not by a number.  They still confer no
+        ownership.
+        """
+
+        day = _normalize_day(trading_day)
+        rows = self._query(
+            f"""
+            SELECT
+                raw_items.*,
+                {_EVIDENCE_DAY} AS trading_day,
+                raw_item_candidates.ticker AS candidate_ticker,
+                raw_item_candidates.reason AS candidate_reason,
+                raw_item_match_evidence.ticker AS match_ticker,
+                raw_item_match_evidence.decision AS match_decision,
+                raw_item_match_evidence.evidence AS match_evidence
+            FROM raw_items
+            JOIN (
+                SELECT raw_items.id AS id
+                FROM raw_items
+                WHERE {_EVIDENCE_DAY} = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM raw_item_tickers
+                      WHERE raw_item_tickers.raw_item_id = raw_items.id
+                  )
+                ORDER BY raw_items.id
+                LIMIT ?
+            ) chosen ON chosen.id = raw_items.id
+            LEFT JOIN raw_item_candidates
+                ON raw_item_candidates.raw_item_id = raw_items.id
+            LEFT JOIN raw_item_match_evidence
+                ON raw_item_match_evidence.raw_item_id = raw_items.id
+            ORDER BY raw_items.id, candidate_ticker, match_ticker
+            """,
+            (day, _require_int(limit, "limit", minimum=1)),
+        )
+
+        # One item with two candidates and two match rows arrives as four
+        # rows; the two evidence sets are collected independently so the
+        # join's cross product cannot inflate either one.
+        items: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            item_id = int(row["id"])
+            item = items.setdefault(
+                item_id, {"row": row, "candidates": {}, "match_evidence": {}}
+            )
+            if row["candidate_ticker"] is not None:
+                item["candidates"][str(row["candidate_ticker"])] = CandidateEvidence(
+                    ticker=str(row["candidate_ticker"]),
+                    reason=str(row["candidate_reason"]),
+                )
+            if row["match_ticker"] is not None:
+                item["match_evidence"][str(row["match_ticker"])] = MatchEvidence(
+                    ticker=str(row["match_ticker"]),
+                    decision=str(row["match_decision"]),
+                    evidence=tuple(json.loads(row["match_evidence"])),
+                )
+
+        return [
+            UnassociatedItem(
+                raw_item_id=item_id,
+                trading_day=str(collected["row"]["trading_day"]),
+                source=str(collected["row"]["source"]),
+                ingest_status=str(collected["row"]["ingest_status"]),
+                title=collected["row"]["title"],
+                url=collected["row"]["url"],
+                canonical_url=str(collected["row"]["canonical_url"]),
+                external_id=collected["row"]["external_id"],
+                published_at=collected["row"]["published_at"],
+                fetched_at=str(collected["row"]["fetched_at"]),
+                validation_errors=tuple(
+                    json.loads(collected["row"]["validation_errors"])
+                ),
+                candidates=tuple(
+                    collected["candidates"][key]
+                    for key in sorted(collected["candidates"])
+                ),
+                match_evidence=tuple(
+                    collected["match_evidence"][key]
+                    for key in sorted(collected["match_evidence"])
+                ),
+            )
+            for item_id, collected in sorted(items.items())
+        ]
+
+    def withheld_matches(
+        self, trading_day: str | date, *, ticker: str | None = None
+    ) -> list[WithheldMatch]:
+        """Match evidence naming a ticker that holds no association.
+
+        Keyed on ``(raw_item_id, ticker)``: an item authoritatively
+        associated with AMD can still have a withheld NVDA match, and that
+        AMD association must not hide it.  These rows are observability with
+        their own denominator -- items whose evidence names this ticker --
+        and are neither associated nor eligible for it.
+        """
+
+        symbol = None if ticker is None else normalize_ticker(ticker)
+        rows = self._query(
+            f"""
+            SELECT
+                raw_item_match_evidence.raw_item_id AS raw_item_id,
+                raw_item_match_evidence.ticker AS ticker,
+                raw_item_match_evidence.evidence AS evidence,
+                {_EVIDENCE_DAY} AS trading_day,
+                raw_items.ingest_status AS ingest_status,
+                raw_items.source AS source,
+                raw_items.title AS title
+            FROM raw_item_match_evidence
+            JOIN raw_items ON raw_items.id = raw_item_match_evidence.raw_item_id
+            WHERE raw_item_match_evidence.decision = 'matched'
+              AND {_EVIDENCE_DAY} = ?
+              AND (? IS NULL OR raw_item_match_evidence.ticker = ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM raw_item_tickers
+                  WHERE raw_item_tickers.raw_item_id
+                            = raw_item_match_evidence.raw_item_id
+                    AND raw_item_tickers.ticker = raw_item_match_evidence.ticker
+              )
+            ORDER BY raw_item_id, ticker
+            """,
+            (_normalize_day(trading_day), symbol, symbol),
+        )
+
+        return [
+            WithheldMatch(
+                raw_item_id=int(row["raw_item_id"]),
+                ticker=str(row["ticker"]),
+                trading_day=str(row["trading_day"]),
+                ingest_status=str(row["ingest_status"]),
+                source=str(row["source"]),
+                title=row["title"],
+                evidence=tuple(json.loads(row["evidence"])),
+            )
+            for row in rows
+        ]
+
+    def partition_evidence(
+        self, ticker: str, trading_day: str | date
+    ) -> PartitionEvidence:
+        """Project one partition's owned evidence for a downstream stage.
+
+        The eligible rows come back as :class:`~nlp.dedup.models.RawItem`
+        and the rest as :class:`~phase0.evidence.ExcludedEvidence`, so a
+        caller can report both without a second query.  Nothing here runs a
+        stage.
+        """
+
+        symbol = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        rows = self._query(
+            f"""
+            SELECT DISTINCT raw_items.*
+            FROM raw_items
+            JOIN raw_item_tickers ON raw_item_tickers.raw_item_id = raw_items.id
+            WHERE raw_item_tickers.ticker = ?
+              AND {_EVIDENCE_DAY} = ?
+            ORDER BY COALESCE(raw_items.published_at, raw_items.fetched_at),
+                     raw_items.id
+            """,
+            (symbol, day),
+        )
+
+        items = []
+        excluded = []
+        for row in rows:
+            _, item, exclusion = classify_evidence(row, symbol, day)
+            if item is not None:
+                items.append(item)
+            else:
+                excluded.append(exclusion)
+        return PartitionEvidence(
+            ticker=symbol,
+            trading_day=day,
+            items=tuple(items),
+            excluded=tuple(excluded),
         )
 
     # -- Derived output --------------------------------------------------
@@ -2796,12 +3187,14 @@ class Phase0Repository:
         """The one rule for pulling raw evidence into ticker-scoped output.
 
         A raw item may take part in ``ticker``'s derived processing only
-        when it is *explicitly* associated with it, which means either:
+        when an accepted association exists in ``raw_item_tickers`` — the
+        authoritative relationship table, and the only one this check reads.
 
-        * ``raw_items.ticker`` is that symbol; or
-        * an accepted association exists in ``raw_item_tickers`` — the
-          authoritative relationship table.  A ``raw_item_candidates`` row
-          is a suggestion nothing has accepted, and does not count.
+        ``raw_items.ticker`` is **not** an alternative route, whatever it
+        says.  It records the first claimant: it is ``NULL`` for all RSS
+        evidence, and for a multi-ticker Yahoo article it names whichever
+        run inserted the row.  A ``raw_item_candidates`` row is a suggestion
+        nothing has accepted, and does not count either.
 
         Ingestion may still store an item with ``ticker=None`` and no
         associations: unattributable evidence is real, and the spec says to
