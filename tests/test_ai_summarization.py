@@ -16,12 +16,15 @@ from ai.summarization import (
     MAX_SENTENCES,
     MIN_SENTENCES,
     SYSTEM_PROMPT,
+    GenerationAttempt,
+    GenerationUsage,
     MemberStory,
     Sentence,
     SummarizationError,
     ThemeInput,
     ThemeSummary,
     build_generation_config_kwargs,
+    policy_fingerprint,
     resolve_citations,
     summarize,
 )
@@ -94,6 +97,24 @@ class FlakyGeminiClient:
         if self.calls == 1:
             raise ValueError("transient provider error")
         return self._fake.generate(system_prompt, user_prompt, response_schema)
+
+
+class UsageReportingGeminiClient:
+    """A FakeGeminiClient that also reports token usage, like the real
+    GeminiClient does after a call (issue #73 / A3's usage capture)."""
+
+    def __init__(self) -> None:
+        self._fake = FakeGeminiClient()
+        self.usage: GenerationUsage | None = None
+
+    @property
+    def calls(self) -> int:
+        return self._fake.calls
+
+    def generate(self, system_prompt: str, user_prompt: str, response_schema):
+        result = self._fake.generate(system_prompt, user_prompt, response_schema)
+        self.usage = GenerationUsage(input_tokens=100, output_tokens=20)
+        return result
 
 
 class InventedCitationGeminiClient:
@@ -266,6 +287,87 @@ class ResolveCitationsTests(unittest.TestCase):
         result = summarize(self.theme, client=FakeGeminiClient())
         result.sentences[0].citation_ids.append("not-a-real-story-id")
         self.assertEqual(resolve_citations(self.theme, result), {"not-a-real-story-id"})
+
+
+class OnAttemptCallbackTests(unittest.TestCase):
+    """Issue #73 (A3) needs per-attempt latency/usage to log cost - this
+    must be fully additive: nothing here changes summarize()'s return type
+    or its existing retry/error behavior for a caller that ignores it."""
+
+    def setUp(self) -> None:
+        self.theme = load_fixture_themes()[0]
+
+    def test_on_attempt_receives_one_record_per_try(self) -> None:
+        attempts: list[GenerationAttempt] = []
+        summarize(self.theme, client=FakeGeminiClient(), on_attempt=attempts.append)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].attempt, 1)
+        self.assertTrue(attempts[0].success)
+        self.assertIsNone(attempts[0].error)
+        self.assertGreaterEqual(attempts[0].latency_ms, 0.0)
+
+    def test_on_attempt_receives_a_record_for_a_failed_attempt_too(self) -> None:
+        attempts: list[GenerationAttempt] = []
+        summarize(self.theme, client=FlakyGeminiClient(), on_attempt=attempts.append)
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(attempts[0].success)
+        self.assertIsNotNone(attempts[0].error)
+        self.assertEqual(attempts[0].attempt, 1)
+        self.assertTrue(attempts[1].success)
+        self.assertEqual(attempts[1].attempt, 2)
+
+    def test_on_attempt_carries_usage_when_the_client_reports_it(self) -> None:
+        attempts: list[GenerationAttempt] = []
+        summarize(self.theme, client=UsageReportingGeminiClient(), on_attempt=attempts.append)
+        self.assertEqual(attempts[0].usage, GenerationUsage(input_tokens=100, output_tokens=20))
+
+    def test_on_attempt_usage_is_none_for_a_client_without_usage(self) -> None:
+        attempts: list[GenerationAttempt] = []
+        summarize(self.theme, client=FakeGeminiClient(), on_attempt=attempts.append)
+        self.assertIsNone(attempts[0].usage)
+
+    def test_summarize_behavior_is_unchanged_when_on_attempt_is_omitted(self) -> None:
+        # No on_attempt passed at all - the default path every existing
+        # caller (A1's own tests, A4's tools) already uses.
+        result = summarize(self.theme, client=FakeGeminiClient())
+        self.assertIsInstance(result, ThemeSummary)
+
+
+class PolicyFingerprintTests(unittest.TestCase):
+    """Issue #73 (A3)'s cache key must invalidate when the summarizer's own
+    policy changes, not just when story content changes."""
+
+    def test_stable_for_identical_inputs(self) -> None:
+        first = policy_fingerprint("gemini-2.5-flash")
+        second = policy_fingerprint("gemini-2.5-flash")
+        self.assertEqual(first, second)
+
+    def test_changes_with_model(self) -> None:
+        self.assertNotEqual(policy_fingerprint("gemini-2.5-flash"), policy_fingerprint("gemini-2.5-pro"))
+
+    def test_changes_with_system_prompt(self) -> None:
+        import ai.summarization as module
+
+        original = module.SYSTEM_PROMPT
+        try:
+            before = policy_fingerprint("gemini-2.5-flash")
+            module.SYSTEM_PROMPT = original + " Extra rule."
+            after = policy_fingerprint("gemini-2.5-flash")
+        finally:
+            module.SYSTEM_PROMPT = original
+        self.assertNotEqual(before, after)
+
+    def test_changes_with_temperature(self) -> None:
+        import ai.summarization as module
+
+        original = module.DEFAULT_TEMPERATURE
+        try:
+            before = policy_fingerprint("gemini-2.5-flash")
+            module.DEFAULT_TEMPERATURE = original + 0.1
+            after = policy_fingerprint("gemini-2.5-flash")
+        finally:
+            module.DEFAULT_TEMPERATURE = original
+        self.assertNotEqual(before, after)
 
 
 class GuardrailPromptAndConfigTests(unittest.TestCase):
