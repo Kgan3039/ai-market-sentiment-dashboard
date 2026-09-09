@@ -116,6 +116,17 @@ SOURCE_STATE_STATUSES = {"success", "partial", "empty", "failed", "unknown"}
 #: the same set, so a source state and the run that recorded it cannot
 #: disagree about whether the fetch worked.
 SUCCEEDED_SOURCE_STATE_STATUSES = frozenset({"success", "partial", "empty"})
+
+#: The ``type`` of a run-log error that a stage recorded *deliberately*,
+#: through :meth:`StageRunContext.record_degradation`.  It is what separates
+#: "this stage shipped intermediate output on purpose" from the ordinary
+#: ``degraded`` a run reaches through ``partial_count`` — an idempotent
+#: replay in which nothing changed resolves ``degraded`` today with no
+#: errors at all, and a consumer that read the status alone would call that
+#: an outage.  A reader wanting the first meaning must look for this marker,
+#: never for the word ``degraded``.
+STAGE_DEGRADED = "stage_degraded"
+
 STORY_STAGES = {"m2.exact", "m3.semantic"}
 CLUSTERING_METHODS = {
     "hdbscan",
@@ -901,6 +912,50 @@ class StageRunContext:
     def closed(self) -> bool:
         return not self.active
 
+    # -- The one public thing a stage may say about its own outcome -----
+
+    def record_degradation(self, reason: str, *, detail: str | None = None) -> None:
+        """Declare that this run is shipping intermediate output on purpose.
+
+        The stage states the *fact*; the word is still derived.  There is
+        no ``status`` parameter here and there is none anywhere else in
+        this class, so a caller can say "M3 was unavailable and these are
+        M2's clusters" without being able to say "call this a success".
+        :meth:`_resolved_status` turns a recorded error into ``degraded``,
+        and ``_write_run_log`` refuses ``success`` beside a non-empty error
+        list outright, so the pairing cannot be written even by accident.
+
+        The record is built here rather than accepted from the caller.
+        :attr:`errors` hands out a shallow copy, so a mapping taken from a
+        caller would stay reachable — and mutable — from outside the run
+        that is about to persist it.
+
+        **Refused once the run has settled.**  A terminal operation has
+        already committed the outcome, and appending afterwards puts the
+        degradation in a list nothing will ever read while the durable row
+        goes on saying ``success``.  That is precisely the false-healthy
+        state decision H exists to prevent, arriving silently; raising is
+        the only way a caller finds out it recorded nothing.
+        """
+
+        if self.settled:
+            raise Phase0RunContextError(
+                f"this run is already {self._state} and its outcome is "
+                "written; record the degradation before the terminal "
+                "operation, not after it"
+            )
+        self._record_error(
+            {
+                "type": STAGE_DEGRADED,
+                # Identity (policy B): refused rather than rewritten, so a
+                # consumer can match on the reason it was told to match on.
+                "reason": require_safe_identifier_scalar(reason, "degradation reason"),
+                # Free-form explanation (policy A): usually an exception's
+                # own message, so it is redacted rather than refused.
+                "detail": sanitize_diagnostic_scalar(detail, "degradation detail"),
+            }
+        )
+
     # -- Repository-private accumulation --------------------------------
     #
     # Named with a leading underscore and absent from the public surface on
@@ -1641,7 +1696,84 @@ class Phase0Reader:
             excluded=tuple(excluded),
         )
 
+    def evidence_partition_tickers(self, trading_day: str | date) -> list[str]:
+        """Which tickers hold authoritative evidence on ``trading_day``.
+
+        Discovery, not projection.  :meth:`evidence_partitions` answers the
+        same question but folds every associated row through
+        ``classify_evidence`` on the way, which means publisher policy,
+        normalization, and the eligibility rules all run before the caller
+        has learned so much as a symbol.  A stage that enumerated its work
+        that way would do projection outside its own run: one unprojectable
+        partition would take the enumeration down and *no* partition would
+        be attempted, or even recorded as attempted.
+
+        So this reads association state and nothing else.  ``DISTINCT``
+        collapses the several ``association_type`` rows one item may hold
+        for one ticker, and multi-ticker evidence names each of its tickers
+        independently -- both of which follow from the grain rather than
+        from any filtering here.
+        """
+
+        day = _normalize_day(trading_day)
+        return [
+            str(row["ticker"])
+            for row in self._query(
+                f"""
+                SELECT DISTINCT raw_item_tickers.ticker AS ticker
+                FROM raw_item_tickers
+                JOIN raw_items ON raw_items.id = raw_item_tickers.raw_item_id
+                WHERE {_EVIDENCE_DAY} = ?
+                ORDER BY raw_item_tickers.ticker
+                """,
+                (day,),
+            )
+        ]
+
     # -- Derived output --------------------------------------------------
+
+    def story_partitions(
+        self,
+        trading_day: str | date,
+        *,
+        pipeline_version: str | None = None,
+    ) -> list[str]:
+        """Which tickers already hold persisted stories on ``trading_day``.
+
+        The runner needs this to answer a question evidence alone cannot:
+        *which partitions did a previous run write?*  A ticker whose
+        evidence has since gone — reclassified, disassociated — returns no
+        evidence partition at all, so a runner driven only by evidence
+        would never visit it and its previous generation would sit there
+        indefinitely, authoritative-looking and unreconciled.
+
+        Only the ticker column is read.  Loading whole stories to learn a
+        handful of symbols would pull every title, blob, and member list of
+        the day through the reader to discard all of it.
+
+        **Invalidated rows count.**  A tombstoned story is exactly the
+        stale state this sweep exists to clear, and filtering it out here
+        would hide the partition that most needs visiting.
+        """
+
+        day = _normalize_day(trading_day)
+        version = (
+            None
+            if pipeline_version is None
+            else _require_text(pipeline_version, "pipeline_version")
+        )
+        return [
+            str(row["ticker"])
+            for row in self._query(
+                """
+                SELECT DISTINCT ticker FROM stories
+                WHERE trading_day = ?
+                  AND (? IS NULL OR pipeline_version = ?)
+                ORDER BY ticker
+                """,
+                (day, version, version),
+            )
+        ]
 
     def story(self, story_id: int) -> dict[str, Any] | None:
         return self._one(
@@ -3298,10 +3430,23 @@ class Phase0Repository:
     ) -> ReconciliationReport:
         """Reconcile stories with no run attached; see :attr:`admin`.
 
-        Themes are derived from stories, so a structural change (a story
-        inserted, removed, or re-membered) invalidates the day's theme set
-        inside the same transaction rather than leaving themes citing a
-        membership that no longer exists.
+        Themes are derived from stories, so any story this call inserts,
+        removes, or *changes in any way a settlement would persist*
+        invalidates the day's theme set inside the same transaction.  The
+        test is :meth:`_story_signature` — the same comparison that
+        decides whether a story needs writing at all — so a theme set
+        never outlives the story representation it was built from, and
+        there is no separate list of "the fields M5 cares about" to fall
+        out of step with what is actually stored.
+
+        Deliberately conservative: a change to audit-only payload (a merge
+        similarity, a provider conflict's field list) invalidates too.
+        Rebuilding a theme set costs one clustering pass that the next
+        theme run makes anyway; serving themes assembled over a story that
+        has since been overwritten costs a reader the truth.
+
+        An identical replay changes nothing, takes the ``unchanged`` path,
+        and leaves the theme set exactly where it was.
         """
 
         normalized_ticker = normalize_ticker(ticker)
@@ -3328,53 +3473,89 @@ class Phase0Repository:
                     (normalized_ticker, day, version),
                 )
             }
-            existing_members = {
-                fingerprint: self._member_ids(connection, int(row["id"]))
-                for fingerprint, row in existing.items()
-            }
 
-            inserted: list[int] = []
-            updated: list[int] = []
+            # -- Classify the whole partition before writing any of it.
+            #
+            # Ordering, not tidiness.  Migration 003 refuses to remove a
+            # story member a live theme still cites, so an update that
+            # drops a cited member has to happen *after* the theme set is
+            # gone.  Deciding first, invalidating second, and mutating
+            # third is the only order in which both rules hold: the
+            # classification reads the stored rows as they were, and the
+            # trigger sees no citation left to protect.  Mutating as we
+            # classified -- the obvious loop -- aborted the transaction
+            # instead, and no reconciliation could complete.
+            #
+            # ``pending`` keeps the caller's own order so the report's id
+            # tuples read the way the input did.
+            pending: list[tuple[int | None, dict[str, Any]]] = []
             unchanged: list[int] = []
-            structural: set[int] = set()
-            removed_members = 0
-
             for fingerprint, values in incoming.items():
                 row = existing.get(fingerprint)
                 if row is None:
-                    story_id = self._insert_reconciled_story(
-                        connection, normalized_ticker, day, version, values
-                    )
-                    inserted.append(story_id)
-                    structural.add(story_id)
+                    pending.append((None, values))
                     continue
                 story_id = int(row["id"])
-                stored = self._stored_story_signature(connection, row)
-                if stored == self._story_signature(values):
+                if self._stored_story_signature(connection, row) == (
+                    self._story_signature(values)
+                ):
                     unchanged.append(story_id)
                     continue
-                member_change = set(existing_members[fingerprint]) != set(
-                    values["member_ids"]
-                )
-                if member_change:
-                    structural.add(story_id)
-                removed_members += self._update_reconciled_story(
-                    connection, story_id, values
-                )
-                updated.append(story_id)
+                # Past the equality check, so a settlement is about to
+                # write something other than what is stored: every theme
+                # over this partition was derived from a story that will
+                # not exist a statement from now.  Membership is not the
+                # only way that happens, and it was the only one this
+                # check used to notice — the stage, the canonical title,
+                # the outlet count, the quarantine state and the model
+                # identity all move while the fingerprint and the member
+                # set stand still.  Each changes what M5 would build:
+                # ``outlet_count`` is 30% of the salience weight, a
+                # ``semantic_skip_reason`` keeps a story out of clustering
+                # altogether, and the model identity decides whether a
+                # previous theme's identity may be carried over at all.
+                #
+                # So the signature above is the whole test.  Naming the
+                # subset of columns M5 happens to read would be a second
+                # list to keep in step with the first, and the cost of
+                # being wrong is asymmetric: over-invalidating costs a
+                # rebuild the next theme run performs anyway, while
+                # under-invalidating serves themes citing a story
+                # representation that has been overwritten.
+                pending.append((story_id, values))
 
             obsolete = [
                 (fingerprint, int(row["id"]))
                 for fingerprint, row in existing.items()
                 if fingerprint not in incoming
             ]
+
+            inserted: list[int] = []
+            updated: list[int] = []
             deleted: list[int] = []
             invalidated: list[int] = []
             invalidated_themes: tuple[int, ...] = ()
-            if obsolete or structural:
+            removed_members = 0
+
+            # Themes first, while the rows they cite are still intact.
+            if pending or obsolete:
                 invalidated_themes = self._invalidate_theme_set(
                     connection, normalized_ticker, day, version
                 )
+
+            for story_id, values in pending:
+                if story_id is None:
+                    inserted.append(
+                        self._insert_reconciled_story(
+                            connection, normalized_ticker, day, version, values
+                        )
+                    )
+                    continue
+                removed_members += self._update_reconciled_story(
+                    connection, story_id, values
+                )
+                updated.append(story_id)
+
             if obsolete and delete_obsolete:
                 for _, story_id in obsolete:
                     if self._story_is_referenced(connection, story_id):
@@ -6998,6 +7179,7 @@ __all__ = [
     "RUN_STATUSES",
     "SECRET_KEY_PATTERN",
     "SOURCE_STATE_STATUSES",
+    "STAGE_DEGRADED",
     "STORY_RECONCILED_COLUMNS",
     "SUPPORTED_TICKERS",
     "STAGE_KEY_STATUSES",
