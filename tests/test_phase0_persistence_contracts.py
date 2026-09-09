@@ -69,6 +69,7 @@ from phase0.repository import (
     Phase0Admin,
     Phase0Reader,
     Phase0Repository,
+    STAGE_DEGRADED,
     StageRunContext,
     normalize_candidate_tickers,
     serialize_operational_metadata,
@@ -5415,6 +5416,10 @@ READER_PROBES = {
     "unassociated_items": (("2026-08-20",), {}),
     "withheld_matches": (("2026-08-20",), {}),
     "partition_evidence": (("NVDA", "2026-08-20"), {}),
+    # The stale-partition sweep's enumeration, and the projection-free
+    # partition discovery the story stage runs before opening a run.
+    "story_partitions": (("2026-08-20",), {}),
+    "evidence_partition_tickers": (("2026-08-20",), {}),
 }
 
 
@@ -11953,3 +11958,729 @@ def test_no_helper_hides_a_commit():
         f"transaction boundaries this audit does not know about: "
         f"{sorted(committers - COMMITTERS)}"
     )
+
+
+# ----------------------------------------------------------------------
+# The story stage's degradation affordance, and the story -> theme
+# dependency it protects (I5 decision H, A4).
+# ----------------------------------------------------------------------
+
+
+def themed(
+    repository: Phase0Repository,
+    item_ids,
+    *,
+    fingerprint="cf1",
+    records=None,
+    cites=None,
+    **overrides,
+):
+    """One reconciled partition with a live theme set built over it.
+
+    The starting position for every invalidation test below: persisted
+    stories, a theme citing one of them, and a `theme_sets` row.  Returns
+    the id of the story the theme names, so a test can assert that row
+    survives an update in place.
+
+    ``records`` seeds the *whole* partition in one reconciliation.  A test
+    that needs an obsolete story present has to seed it here rather than in
+    a second call: a second call inserts, an insert is a change, and the
+    theme set would already be gone before the reconciliation under test
+    ever ran.
+    """
+
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=(
+            records
+            if records is not None
+            else [story(fingerprint, item_ids, **overrides)]
+        ),
+    )
+    story_id = [
+        row["id"]
+        for row in repository.stories_for_day(DAY, "NVDA")
+        if row["cluster_fingerprint"] == fingerprint
+    ][0]
+    reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint="T",
+                theme_key="T",
+                label="Theme",
+                story_ids=(story_id,),
+                citation_item_ids=((cites,) if cites is not None else (item_ids[0],)),
+                method="hdbscan",
+                salience_rank=1,
+            )
+        ],
+    )
+    assert repository.count("themes") == 1
+    assert repository.count("theme_sets") == 1
+    return story_id
+
+
+def theme_counts(repository: Phase0Repository) -> tuple[int, int, int]:
+    return (
+        repository.count("themes"),
+        repository.count("theme_stories"),
+        repository.count("theme_sets"),
+    )
+
+
+def test_record_degradation_settles_the_run_degraded_and_still_commits(tmp_path):
+    """R1: an intentional degradation is durable, and the work still lands."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+    with repository.stage_run(
+        run_id="run-degraded",
+        stage="stories",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        run.record_degradation(
+            "m3_semantic_unavailable",
+            detail="EmbeddingModelLoadError: no model cache",
+        )
+        repository.reconcile_stories(
+            run=run,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", item_ids, stage="m2.exact")],
+            terminal=True,
+        )
+
+    row = repository.read.run_log_rows()[0]
+    assert row["status"] == "degraded"
+    assert json.loads(row["errors"]) == [
+        {
+            "type": "stage_degraded",
+            "reason": "m3_semantic_unavailable",
+            "detail": "EmbeddingModelLoadError: no model cache",
+        }
+    ]
+    # Degradation is a label on a write that happened, not a rollback.
+    stored = repository.stories_for_day(DAY, "NVDA")
+    assert [entry["stage"] for entry in stored] == ["m2.exact"]
+
+
+def test_record_degradation_takes_no_status_and_refuses_a_settled_run(tmp_path):
+    """R2: a caller states the fact; it never gets to name the outcome."""
+
+    parameters = inspect.signature(StageRunContext.record_degradation).parameters
+    assert set(parameters) == {"self", "reason", "detail"}
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+    with repository.stage_run(
+        run_id="run-late",
+        stage="stories",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.reconcile_stories(
+            run=run,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", item_ids)],
+            terminal=True,
+        )
+        # Recorded here it would reach a list nothing reads, over a row
+        # already committed as `success`: exactly the false-healthy state
+        # the marker exists to prevent.
+        with pytest.raises(Phase0RunContextError, match="already"):
+            run.record_degradation("too_late")
+
+    assert repository.read.run_log_rows()[0]["status"] == "success"
+
+
+def test_a_degradation_record_is_this_run_s_own_and_is_redacted(tmp_path):
+    """R3: nothing caller-owned is retained, and secrets do not persist.
+
+    Aliasing is ruled out by the shape of the API rather than by copying:
+    the method takes two scalars, so there is no caller-owned container for
+    the run to hold on to.  Each call builds its own record from validated
+    values, and the free-form half is redacted on the way in -- a
+    provider's error message is a place a credential really does turn up.
+    """
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="run-redact",
+        stage="stories",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        detail = "EmbeddingModelLoadError: api_key=sk-live-secret-value"
+        run.record_degradation("m3_semantic_unavailable", detail=detail)
+        run.record_degradation("m3_semantic_unavailable", detail="second")
+
+        first, second = run.errors
+        assert first is not second
+        assert "sk-live-secret-value" not in first["detail"]
+        assert first["reason"] == "m3_semantic_unavailable"
+        # The caller's own string is untouched; only the record is redacted.
+        assert detail.endswith("sk-live-secret-value")
+
+    assert "sk-live-secret-value" not in repository.read.run_log_rows()[0]["errors"]
+
+
+def test_an_idempotent_replay_degrades_without_claiming_a_failure(tmp_path):
+    """R4: `degraded` alone never means a stage failed.
+
+    An unchanged replay counts as `partial` and so resolves `degraded`
+    today.  That is a different fact from an operational degradation, and
+    the marker -- not the status word -- is what tells them apart.
+    """
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+    for run_id in ("run-first", "run-again"):
+        with repository.stage_run(
+            run_id=run_id,
+            stage="stories",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.reconcile_stories(
+                run=run,
+                ticker="NVDA",
+                trading_day=DAY,
+                pipeline_version="v1",
+                stories=[story("cf1", item_ids)],
+                terminal=True,
+            )
+
+    rows = {row["run_id"]: row for row in repository.read.run_log_rows()}
+    assert rows["run-first"]["status"] == "success"
+    replay = rows["run-again"]
+    assert replay["status"] == "degraded"
+    assert json.loads(replay["errors"]) == []
+    assert STAGE_DEGRADED not in replay["errors"]
+
+
+def test_story_partitions_names_tickers_without_loading_stories(tmp_path):
+    """R5: the narrow enumeration the stale-partition sweep runs on."""
+
+    repository = migrated(tmp_path)
+    nvda = seed_raw_items(repository, 2, "NVDA")
+    amd = seed_raw_items(repository, 1, "AMD")
+    # Two stories for NVDA prove the result is DISTINCT, not one per row.
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", nvda[:1]), story("cf2", nvda[1:])],
+    )
+    reconcile_stories(
+        repository,
+        ticker="AMD",
+        trading_day=DAY,
+        pipeline_version="v2",
+        stories=[story("cf3", amd)],
+    )
+
+    assert repository.read.story_partitions(DAY) == ["AMD", "NVDA"]
+    assert repository.read.story_partitions(DAY, pipeline_version="v1") == ["NVDA"]
+    assert repository.read.story_partitions(DAY, pipeline_version="v2") == ["AMD"]
+    assert repository.read.story_partitions("2026-07-24") == []
+
+    # A tombstoned partition is precisely the one needing a sweep, so it
+    # still has to be named.
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "UPDATE stories SET invalidated_at = ? WHERE ticker = 'AMD'",
+            ("2026-07-23T00:00:00+00:00",),
+        )
+    assert "AMD" in repository.read.story_partitions(DAY)
+
+
+def test_an_identical_story_replay_leaves_the_theme_set_alone(tmp_path):
+    """R6: nothing changed, so nothing downstream is stale."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    themed(repository, item_ids)
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids)],
+    )
+
+    assert len(report.unchanged) == 1
+    assert report.invalidated_theme_ids == ()
+    assert theme_counts(repository) == (1, 1, 1)
+
+
+#: Every one of these keeps ``cluster_fingerprint`` and the member id set
+#: exactly as they were, and every one of them changes what M5 would build
+#: -- or, for the audit-only entries at the end, changes the persisted
+#: representation a theme set was derived from.  Before the fix all
+#: fifteen left the theme set standing.
+MATERIAL_STORY_CHANGES = {
+    "stage": {"stage": "m2.exact"},
+    "canonical_title": {"canonical_title": "A different headline"},
+    "published_at": {"published_at": f"{DAY}T23:30:00+00:00"},
+    "outlet_count": {"outlet_count": 7},
+    "quarantined": {"quarantined": True},
+    "semantic_skip_reason": {"semantic_skip_reason": "provider_quarantine"},
+    "algorithm_version": {"algorithm_version": "m3.2"},
+    "config_fingerprint": {"config_fingerprint": "cfg-2"},
+    "model_name": {"model_name": "another-encoder"},
+    "model_revision": {"model_revision": "rev-2"},
+    "embedding_dimension": {"embedding_dimension": 768},
+    "member_story_keys": {"member_story_keys": ("k1", "k2")},
+    "content_hash": {"content_hash": "hash-moved"},
+    "source": {"source": "yahoo:Somewhere Else"},
+    "outlet": {"outlet": "yahoo somewhereelse"},
+    "canonical_url": {"canonical_url": "https://example.com/moved"},
+}
+
+
+@pytest.mark.parametrize("change", sorted(MATERIAL_STORY_CHANGES))
+def test_a_changed_story_representation_invalidates_its_theme_set(tmp_path, change):
+    """R7: a theme set may not outlive the story representation it cites."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    themed(repository, item_ids)
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids, **MATERIAL_STORY_CHANGES[change])],
+    )
+
+    assert len(report.updated) == 1
+    assert len(report.invalidated_theme_ids) == 1
+    assert theme_counts(repository) == (0, 0, 0)
+
+
+#: Member payloads that keep the member id set identical.  ``position`` is
+#: stated on both sides so only the named field differs.
+MEMBER_PAYLOAD_CHANGES = {
+    "outlet": {"outlet": "wsj"},
+    "match_reason": {"match_reason": "exact_title"},
+    "url": {"url": "https://example.com/moved"},
+    "canonical_url": {"canonical_url": "https://example.com/moved"},
+    "quarantined": {"quarantined": True},
+}
+
+
+@pytest.mark.parametrize("change", sorted(MEMBER_PAYLOAD_CHANGES))
+def test_a_changed_member_payload_invalidates_its_theme_set(tmp_path, change):
+    """R7 (children): the same member ids, described differently."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    themed(repository, item_ids)
+
+    members = tuple(
+        StoryMemberRecord(
+            raw_item_id=item_id,
+            position=position,
+            outlet=f"O{item_id}",
+            **MEMBER_PAYLOAD_CHANGES[change],
+        )
+        if "outlet" not in MEMBER_PAYLOAD_CHANGES[change]
+        else StoryMemberRecord(
+            raw_item_id=item_id,
+            position=position,
+            **MEMBER_PAYLOAD_CHANGES[change],
+        )
+        for position, item_id in enumerate(item_ids)
+    )
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids, members=members)],
+    )
+
+    assert len(report.updated) == 1
+    assert len(report.invalidated_theme_ids) == 1
+    assert theme_counts(repository) == (0, 0, 0)
+
+
+def test_changed_audit_payload_invalidates_conservatively(tmp_path):
+    """R7 (audit): a provider conflict or a merge similarity counts too.
+
+    Neither reaches M5's clustering, and invalidating for them is the
+    deliberate cost of having one source of truth rather than a second
+    hand-kept list of the fields that matter.
+    """
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    conflict = ProviderConflictRecord(
+        provider_namespace="yahoo barrons",
+        provider_item_id="prov-1",
+        item_ids=("1",),
+        fields=("title",),
+    )
+    merge = SemanticMergeRecord(
+        left_story_key="a", right_story_key="b", similarity=0.91
+    )
+    themed(
+        repository,
+        item_ids,
+        provider_conflicts=(conflict,),
+        semantic_merges=(merge,),
+    )
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[
+            story(
+                "cf1",
+                item_ids,
+                provider_conflicts=(
+                    ProviderConflictRecord(
+                        provider_namespace="yahoo barrons",
+                        provider_item_id="prov-1",
+                        item_ids=("1", "2"),
+                        fields=("title", "url"),
+                    ),
+                ),
+                semantic_merges=(
+                    SemanticMergeRecord(
+                        left_story_key="a", right_story_key="b", similarity=0.77
+                    ),
+                ),
+            )
+        ],
+    )
+
+    assert len(report.updated) == 1
+    assert theme_counts(repository) == (0, 0, 0)
+
+
+def test_every_updated_story_reports_an_invalidated_theme_set(tmp_path):
+    """R8: the invariant itself, stated without naming a single field."""
+
+    for index, change in enumerate(sorted(MATERIAL_STORY_CHANGES)):
+        repository = migrated(tmp_path, f"invariant-{index}.sqlite3")
+        item_ids = seed_raw_items(repository, 2)
+        themed(repository, item_ids)
+        report = reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", item_ids, **MATERIAL_STORY_CHANGES[change])],
+        )
+        assert bool(report.updated) is bool(report.invalidated_theme_ids), change
+        assert repository.count("theme_sets") == 0, change
+
+
+def test_a_membership_change_still_invalidates(tmp_path):
+    """R9: the one case that already worked keeps working."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 3)
+    themed(repository, item_ids[:2])
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids)],
+    )
+
+    assert len(report.updated) == 1
+    assert len(report.invalidated_theme_ids) == 1
+    assert theme_counts(repository) == (0, 0, 0)
+
+
+def test_a_structural_update_keeps_the_story_id(tmp_path):
+    """R10: updated in place, not deleted and reinserted."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    story_id = themed(repository, item_ids)
+
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids, stage="m2.exact")],
+    )
+
+    stored = repository.stories_for_day(DAY, "NVDA", include_invalidated=True)
+    assert [(row["id"], row["stage"]) for row in stored] == [(story_id, "m2.exact")]
+    assert theme_counts(repository) == (0, 0, 0)
+
+
+def test_obsolete_stories_are_still_deleted_beside_a_structural_update(tmp_path):
+    """R11: hard-deleted, not tombstoned -- the theme set went first."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 3)
+    # Both stories are seeded in one reconciliation, so the theme set built
+    # over them is still live when the call under test begins.  Seeding the
+    # obsolete story separately inserted it -- and an insert had already
+    # invalidated the themes, so the deletion ordering was never tested.
+    themed(
+        repository,
+        item_ids[:2],
+        records=[story("cf1", item_ids[:2]), story("cf-gone", item_ids[2:])],
+    )
+    assert theme_counts(repository) == (1, 1, 1)
+
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids[:2], outlet_count=9)],
+    )
+
+    assert len(report.deleted) == 1
+    assert report.invalidated == ()
+    stored = repository.stories_for_day(DAY, "NVDA", include_invalidated=True)
+    assert [row["cluster_fingerprint"] for row in stored] == ["cf1"]
+
+
+def test_themes_rebuild_cleanly_after_a_story_driven_invalidation(tmp_path):
+    """R12: invalidation clears the way rather than blocking the next run."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    story_id = themed(repository, item_ids)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids, outlet_count=4)],
+    )
+    assert theme_counts(repository) == (0, 0, 0)
+
+    report = reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint="T2",
+                theme_key="T2",
+                label="Rebuilt",
+                story_ids=(story_id,),
+                citation_item_ids=(item_ids[0],),
+                method="hdbscan",
+                salience_rank=1,
+            )
+        ],
+    )
+
+    assert len(report.inserted) == 1
+    assert theme_counts(repository) == (1, 1, 1)
+
+
+def test_theme_invalidation_stays_inside_its_own_partition(tmp_path):
+    """R13: another version, and another ticker, are not this run's to clear."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    amd_ids = seed_raw_items(repository, 1, "AMD")
+    themed(repository, item_ids)
+
+    # A second pipeline version over the same ticker-day, and a second
+    # ticker: both hold their own theme set.
+    for ticker, version, fingerprint, ids in (
+        ("NVDA", "v2", "cf-v2", item_ids),
+        ("AMD", "v1", "cf-amd", amd_ids),
+    ):
+        reconcile_stories(
+            repository,
+            ticker=ticker,
+            trading_day=DAY,
+            pipeline_version=version,
+            stories=[story(fingerprint, ids)],
+        )
+        other_id = [
+            row["id"]
+            for row in repository.stories_for_day(DAY, ticker)
+            if row["pipeline_version"] == version
+        ][0]
+        reconcile_themes(
+            repository,
+            ticker=ticker,
+            trading_day=DAY,
+            pipeline_version=version,
+            theme_set=theme_set(),
+            themes=[
+                ThemeRecord(
+                    fingerprint=f"T-{version}-{ticker}",
+                    theme_key=f"T-{version}-{ticker}",
+                    label="Other",
+                    story_ids=(other_id,),
+                    citation_item_ids=(ids[0],),
+                    method="hdbscan",
+                    salience_rank=1,
+                )
+            ],
+        )
+    assert repository.count("theme_sets") == 3
+
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids, stage="m2.exact")],
+    )
+
+    # Only the NVDA/v1 set went.
+    assert repository.count("theme_sets") == 2
+    with repository.admin.connect_writable() as connection:
+        survivors = sorted(
+            (row["ticker"], row["pipeline_version"])
+            for row in connection.execute("SELECT ticker, pipeline_version FROM themes")
+        )
+    assert survivors == [("AMD", "v1"), ("NVDA", "v2")]
+
+
+def test_the_invalidated_theme_count_reaches_the_run_log(tmp_path):
+    """R14: the ledger records what the reconciliation actually did."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    themed(repository, item_ids)
+
+    with repository.stage_run(
+        run_id="run-counts",
+        stage="stories",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        report = repository.reconcile_stories(
+            run=run,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[story("cf1", item_ids, stage="m2.exact")],
+            terminal=True,
+        )
+
+    assert report.counts["invalidated_themes"] == 1
+    row = [
+        entry
+        for entry in repository.read.run_log_rows()
+        if entry["run_id"] == "run-counts"
+    ][0]
+    assert json.loads(row["counts"])["invalidated_themes"] == 1
+
+
+def test_removing_a_cited_member_invalidates_before_it_mutates(tmp_path):
+    """Themes must go before the member rows they still cite.
+
+    Migration 003 refuses to remove a story member a live theme cites.  So
+    a reconciliation that classified and mutated in one pass aborted the
+    whole transaction the moment an update dropped a cited member -- no
+    corruption, but no reconciliation either.  Classifying the partition
+    first and invalidating before mutating is what makes both rules hold.
+    """
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    story_id = themed(repository, item_ids, cites=item_ids[0])
+    assert repository.count("theme_citations") == 1
+
+    # Same fingerprint, and the cited member is the one being dropped.
+    report = reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids[1:])],
+    )
+
+    assert report.updated == (story_id,)
+    assert len(report.invalidated_theme_ids) == 1
+    assert report.removed_members == 1
+    assert theme_counts(repository) == (0, 0, 0)
+
+    stored = repository.stories_for_day(DAY, "NVDA", include_invalidated=True)
+    assert [row["id"] for row in stored] == [story_id]
+    assert json.loads(stored[0]["member_ids"]) == [item_ids[1]]
+    with repository.admin.connect_writable() as connection:
+        members = [
+            int(row["raw_item_id"])
+            for row in connection.execute(
+                "SELECT raw_item_id FROM story_members WHERE story_id = ?",
+                (story_id,),
+            )
+        ]
+    assert members == [item_ids[1]]
+
+
+def test_evidence_partitions_are_discoverable_without_projecting_them(tmp_path):
+    """The cheap enumeration the story stage opens its runs from.
+
+    Association state and the persisted day expression, nothing else: no
+    classification, no publisher policy, no projection.  A partition whose
+    evidence cannot be projected still has to be *discoverable*, or the
+    stage cannot open the run that would record why.
+    """
+
+    repository = migrated(tmp_path)
+    nvda = seed_raw_items(repository, 2, "NVDA")
+    amd = seed_raw_items(repository, 1, "AMD")
+
+    # A second association type on an item already associated, and one
+    # item associated with a second ticker: neither may duplicate a
+    # ticker, and the multi-ticker item must name both.
+    with repository.admin.connect_writable() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO raw_item_tickers "
+            "(raw_item_id, ticker, association_type) VALUES (?, 'NVDA', 'relevance')",
+            (nvda[0],),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO raw_item_tickers "
+            "(raw_item_id, ticker, association_type) VALUES (?, 'TSLA', 'relevance')",
+            (nvda[1],),
+        )
+
+    assert repository.read.evidence_partition_tickers(DAY) == ["AMD", "NVDA", "TSLA"]
+    assert repository.read.evidence_partition_tickers("2026-07-24") == []
+
+    # Unassociated evidence names no partition: association is what makes a
+    # ticker answerable for a row.
+    orphan = repository.admin.insert_raw_items([{**raw_item(900), "ticker": None}])[
+        0
+    ].item_id
+    assert orphan
+    assert repository.read.evidence_partition_tickers(DAY) == ["AMD", "NVDA", "TSLA"]
+    assert amd
