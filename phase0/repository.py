@@ -669,6 +669,339 @@ class InsertResult:
     inserted: bool
 
 
+class StoryGenerationConflict(Phase0IntegrityError):
+    """A derived write arrived after its input generation was replaced.
+
+    Raised inside the writing transaction, so the refusal and the rollback
+    are the same event.  It means another reconciliation committed a
+    different authoritative story generation while this stage was still
+    computing over the old one -- the output is about stories that are no
+    longer the partition's, and committing it would produce a theme set
+    nothing on disk supports.
+    """
+
+
+@dataclass(frozen=True)
+class ThemeIdentity:
+    """One persisted theme's continuity handle and the space it lives in.
+
+    Read *before* the story stage runs, because story reconciliation
+    deletes the theme set outright — ``themes`` has no ``invalidated_at``
+    column, so there is nothing to recover afterwards.
+
+    The provenance travels with the key on purpose.  A ``theme_key`` is
+    only reusable by a run that embeds in the same space the centroid was
+    measured in, and this record carries everything that decision needs
+    without the reader having to know what the decision *is*: the
+    compatibility policy is the runner's, and lives in
+    :mod:`phase0.themes`.
+    """
+
+    theme_key: str
+    algorithm_version: str | None
+    config_fingerprint: str | None
+    model_name: str | None
+    model_revision: str | None
+    embedding_dimension: int | None
+    #: The stored vector BLOB, undecoded.  Deserializing it needs a
+    #: dimension to check against, which is a property of the *upcoming*
+    #: run rather than of this row, so it is left to the caller.
+    centroid: bytes | None
+
+
+@dataclass(frozen=True)
+class PersistedStoryMember:
+    """One raw item retained inside a persisted story.
+
+    ``position`` is the durable record of the order M2 put the members in
+    — canonical first, then by publication time — which is the order M3's
+    bridge walked when it chose a story's description.  Reconstructing
+    that choice later is only possible because this column exists.
+    """
+
+    raw_item_id: int
+    position: int
+    outlet: str | None
+    url: str | None
+    canonical_url: str | None
+    match_reason: str | None
+    quarantined: bool
+    #: The member's own standfirst, from ``raw_items``.
+    description: str | None
+
+
+@dataclass(frozen=True)
+class PersistedStory:
+    """One authoritative story, whole, with the children M5 needs."""
+
+    story_id: int
+    cluster_fingerprint: str
+    ticker: str
+    trading_day: str
+    pipeline_version: str
+    stage: str | None
+    canonical_title: str
+    canonical_item_id: int | None
+    canonical_url: str | None
+    source: str | None
+    outlet: str | None
+    outlet_count: int
+    published_at: str | None
+    content_hash: str | None
+    algorithm_version: str | None
+    config_fingerprint: str | None
+    model_name: str | None
+    model_revision: str | None
+    embedding_dimension: int | None
+    quarantined: bool
+    semantic_skip_reason: str | None
+    member_story_keys: tuple[str, ...]
+    members: tuple[PersistedStoryMember, ...]
+    provider_conflicts: tuple[tuple[str, str], ...]
+    semantic_merges: tuple[tuple[str, str, float, str], ...]
+
+
+@dataclass(frozen=True)
+class StoryGeneration:
+    """Everything one partition's persisted stories say about themselves.
+
+    The *generation* rather than the rows: a story partition is written by
+    one reconciliation, so its stage and model identity are properties of
+    the set, and a set that disagrees with itself is a broken invariant
+    rather than a story-by-story detail.  Those aggregates are surfaced
+    here so the theme stage's guard reads them instead of re-deriving them
+    and possibly deriving them differently.
+    """
+
+    ticker: str
+    trading_day: str
+    pipeline_version: str
+    stories: tuple[PersistedStory, ...]
+    #: Every distinct ``stories.stage`` present, ``None`` included as the
+    #: empty string so an unset legacy stage is visible rather than absent.
+    stages: frozenset[str]
+    #: Every distinct ``(model_name, model_revision, embedding_dimension)``
+    #: triple present.  More than one is an invariant failure.
+    model_identities: frozenset[tuple[str | None, str | None, int | None]]
+    #: Digest of what this partition's stories were when they were read.
+    #: A derived stage carries it back to its own write, where the value is
+    #: recomputed inside the writing transaction: if another
+    #: reconciliation replaced the generation in between, the derived
+    #: output describes stories that are no longer there, and the write is
+    #: refused rather than committed over them.
+    signature: str = ""
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.stories
+
+
+def _rows(
+    connection: sqlite3.Connection, sql: str, parameters: Sequence[Any] = ()
+) -> list[Any]:
+    """Run one module-authored query on a caller's connection."""
+
+    return list(connection.execute(sql, parameters))
+
+
+def _persisted_stories(
+    connection: sqlite3.Connection,
+    symbol: str,
+    day: str,
+    version: str,
+    signature: str,
+) -> StoryGeneration:
+    """Assemble one partition's stored stories from a live connection.
+
+    Takes a connection rather than opening one so the stories and the
+    signature that describes them come from a single read: computed on two
+    connections they could describe two different moments, and the whole
+    point of the signature is that it describes *these* rows.
+    """
+
+    rows = _rows(
+        connection,
+        """
+        SELECT * FROM stories
+        WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+          AND cluster_fingerprint IS NOT NULL
+          AND invalidated_at IS NULL
+        ORDER BY id
+        """,
+        (symbol, day, version),
+    )
+    members = _rows(
+        connection,
+        """
+        SELECT story_members.story_id AS story_id,
+               story_members.raw_item_id AS raw_item_id,
+               story_members.position AS position,
+               story_members.outlet AS outlet,
+               story_members.url AS url,
+               story_members.canonical_url AS canonical_url,
+               story_members.match_reason AS match_reason,
+               story_members.quarantined AS quarantined,
+               raw_items.description AS description
+        FROM story_members
+        JOIN stories ON stories.id = story_members.story_id
+        LEFT JOIN raw_items ON raw_items.id = story_members.raw_item_id
+        WHERE stories.ticker = ? AND stories.trading_day = ?
+          AND stories.pipeline_version = ?
+        ORDER BY story_members.story_id, story_members.position,
+                 story_members.raw_item_id
+        """,
+        (symbol, day, version),
+    )
+    conflicts = _rows(
+        connection,
+        """
+        SELECT story_provider_conflicts.story_id AS story_id,
+               story_provider_conflicts.provider_namespace AS namespace,
+               story_provider_conflicts.provider_item_id AS provider_item_id
+        FROM story_provider_conflicts
+        JOIN stories ON stories.id = story_provider_conflicts.story_id
+        WHERE stories.ticker = ? AND stories.trading_day = ?
+          AND stories.pipeline_version = ?
+        ORDER BY story_provider_conflicts.story_id,
+                 story_provider_conflicts.provider_namespace,
+                 story_provider_conflicts.provider_item_id
+        """,
+        (symbol, day, version),
+    )
+    merges = _rows(
+        connection,
+        """
+        SELECT story_semantic_merges.story_id AS story_id,
+               story_semantic_merges.left_story_key AS left_story_key,
+               story_semantic_merges.right_story_key AS right_story_key,
+               story_semantic_merges.similarity AS similarity,
+               story_semantic_merges.reason AS reason
+        FROM story_semantic_merges
+        JOIN stories ON stories.id = story_semantic_merges.story_id
+        WHERE stories.ticker = ? AND stories.trading_day = ?
+          AND stories.pipeline_version = ?
+        ORDER BY story_semantic_merges.story_id,
+                 story_semantic_merges.left_story_key,
+                 story_semantic_merges.right_story_key
+        """,
+        (symbol, day, version),
+    )
+
+    members_by_story: dict[int, list[PersistedStoryMember]] = {}
+    for row in members:
+        members_by_story.setdefault(int(row["story_id"]), []).append(
+            PersistedStoryMember(
+                raw_item_id=int(row["raw_item_id"]),
+                position=int(row["position"]),
+                outlet=row["outlet"],
+                url=row["url"],
+                canonical_url=row["canonical_url"],
+                match_reason=row["match_reason"],
+                quarantined=bool(row["quarantined"]),
+                description=row["description"],
+            )
+        )
+    conflicts_by_story: dict[int, list[tuple[str, str]]] = {}
+    for row in conflicts:
+        conflicts_by_story.setdefault(int(row["story_id"]), []).append(
+            (str(row["namespace"]), str(row["provider_item_id"]))
+        )
+    merges_by_story: dict[int, list[tuple[str, str, float, str]]] = {}
+    for row in merges:
+        merges_by_story.setdefault(int(row["story_id"]), []).append(
+            (
+                str(row["left_story_key"]),
+                str(row["right_story_key"]),
+                float(row["similarity"] or 0.0),
+                str(row["reason"] or ""),
+            )
+        )
+
+    stories: list[PersistedStory] = []
+    for row in rows:
+        story_id = int(row["id"])
+        stories.append(
+            PersistedStory(
+                story_id=story_id,
+                cluster_fingerprint=str(row["cluster_fingerprint"]),
+                ticker=str(row["ticker"]),
+                trading_day=str(row["trading_day"]),
+                pipeline_version=str(row["pipeline_version"]),
+                stage=row["stage"],
+                canonical_title=str(row["canonical_title"]),
+                canonical_item_id=(
+                    None
+                    if row["canonical_item_id"] is None
+                    else int(row["canonical_item_id"])
+                ),
+                canonical_url=row["canonical_url"],
+                source=row["source"],
+                outlet=row["outlet"],
+                outlet_count=int(row["outlet_count"]),
+                published_at=row["published_at"],
+                content_hash=row["content_hash"],
+                algorithm_version=row["algorithm_version"],
+                config_fingerprint=row["config_fingerprint"],
+                model_name=row["model_name"],
+                model_revision=row["model_revision"],
+                embedding_dimension=(
+                    None
+                    if row["embedding_dimension"] is None
+                    else int(row["embedding_dimension"])
+                ),
+                quarantined=bool(row["quarantined"]),
+                semantic_skip_reason=row["semantic_skip_reason"],
+                member_story_keys=tuple(
+                    str(key) for key in json.loads(row["member_story_keys"] or "[]")
+                ),
+                members=tuple(members_by_story.get(story_id, ())),
+                provider_conflicts=tuple(conflicts_by_story.get(story_id, ())),
+                semantic_merges=tuple(merges_by_story.get(story_id, ())),
+            )
+        )
+
+    return StoryGeneration(
+        ticker=symbol,
+        trading_day=day,
+        pipeline_version=version,
+        stories=tuple(stories),
+        # An unset stage is reported as the empty string rather than
+        # dropped: "this partition holds a row whose stage nothing
+        # ever set" is exactly what the guard has to be able to see.
+        stages=frozenset(story.stage or "" for story in stories),
+        model_identities=frozenset(
+            (story.model_name, story.model_revision, story.embedding_dimension)
+            for story in stories
+        ),
+        signature=signature,
+    )
+
+
+@dataclass(frozen=True)
+class PreviousThemeGeneration:
+    """A partition's stored theme set, as provenance plus identities.
+
+    The *set* is the unit, not the themes.  A ``theme_sets`` row can hold
+    zero themes and still name the algorithm, configuration, and model
+    that produced it -- a day below the clustering floor is exactly that --
+    so a caller that read only the child rows would see an empty list and
+    conclude there was no previous generation to be incompatible with.
+
+    Provenance therefore comes off the set row, and the identities are
+    reported beneath it rather than instead of it.
+    """
+
+    ticker: str
+    trading_day: str
+    pipeline_version: str
+    algorithm_version: str | None
+    config_fingerprint: str | None
+    model_name: str | None
+    model_revision: str | None
+    embedding_dimension: int | None
+    identities: tuple[ThemeIdentity, ...] = ()
+
+
 #: Module-private construction key.  It is never exported, never stored on
 #: an instance, and never reachable from the public API, so a caller cannot
 #: build a :class:`StageRunContext` even by copying every visible field.
@@ -1055,6 +1388,9 @@ class Phase0Admin:
     Keeping these behind ``repository.admin`` is the whole point: an
     unlogged write cannot happen without the call site saying so, and a
     reviewer greps ``.admin.`` to find every one of them.
+
+    The theme stage adds one more to that list: ``clear_theme_set``, which
+    removes a partition's theme set through the same logged path.
     """
 
     def __init__(self, repository: "Phase0Repository") -> None:
@@ -1774,6 +2110,150 @@ class Phase0Reader:
                 (day, version, version),
             )
         ]
+
+    def theme_partitions(
+        self,
+        trading_day: str | date,
+        *,
+        pipeline_version: str | None = None,
+    ) -> list[str]:
+        """Which tickers already hold a persisted theme set on this day.
+
+        The theme stage's counterpart to :meth:`story_partitions`, and
+        needed for the same reason: a partition whose stories have gone
+        away still has themes, and a runner driven only by what currently
+        has stories would never visit it to say so.
+
+        Only the ticker column is read, and only ``theme_sets`` -- one row
+        per partition, so no ``DISTINCT`` is needed and none is implied.
+        """
+
+        day = _normalize_day(trading_day)
+        version = (
+            None
+            if pipeline_version is None
+            else _require_text(pipeline_version, "pipeline_version")
+        )
+        return [
+            str(row["ticker"])
+            for row in self._query(
+                """
+                SELECT ticker FROM theme_sets
+                WHERE trading_day = ?
+                  AND (? IS NULL OR pipeline_version = ?)
+                ORDER BY ticker
+                """,
+                (day, version, version),
+            )
+        ]
+
+    def theme_identities(
+        self, ticker: str, trading_day: str | date, pipeline_version: str
+    ) -> list[ThemeIdentity]:
+        """One partition's theme identities, for continuity across a rerun.
+
+        **Read this before the story stage runs.**  Story reconciliation
+        invalidates a partition's theme set whenever any story
+        representation changes, and invalidation here means deletion:
+        ``themes`` carries no ``invalidated_at``, so afterwards there is
+        nothing left to ask.  A theme identity captured too late is a
+        theme identity lost, and the next run mints a new one for a theme
+        the reader would have called the same theme.
+
+        No compatibility filtering happens here.  Deciding whether a
+        stored identity may be reused is A3 policy about the *upcoming*
+        run -- its model, its configuration, its algorithm -- and none of
+        that is knowable from a row.  This returns what is stored, in
+        ``theme_key`` order, and :mod:`phase0.themes` decides.
+        """
+
+        symbol = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        return [
+            ThemeIdentity(
+                theme_key=str(row["theme_key"]),
+                algorithm_version=row["algorithm_version"],
+                config_fingerprint=row["config_fingerprint"],
+                model_name=row["model_name"],
+                model_revision=row["model_revision"],
+                embedding_dimension=(
+                    None
+                    if row["embedding_dimension"] is None
+                    else int(row["embedding_dimension"])
+                ),
+                centroid=(None if row["centroid"] is None else bytes(row["centroid"])),
+            )
+            for row in self._query(
+                """
+                SELECT theme_key, algorithm_version, config_fingerprint,
+                       model_name, model_revision, embedding_dimension,
+                       centroid
+                FROM themes
+                WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+                  AND theme_key IS NOT NULL
+                ORDER BY theme_key
+                """,
+                (symbol, day, version),
+            )
+        ]
+
+    def previous_theme_generation(
+        self, ticker: str, trading_day: str | date, pipeline_version: str
+    ) -> PreviousThemeGeneration | None:
+        """One partition's stored theme generation, provenance and all.
+
+        **Read this before the story stage runs.**  Story reconciliation
+        invalidates a partition's theme set whenever any story
+        representation changes, and invalidation here means deletion:
+        ``themes`` carries no ``invalidated_at``.  A generation captured
+        too late is a generation lost.
+
+        The ``theme_sets`` row is what decides whether there *is* a
+        previous generation.  Reading the child rows alone answers a
+        different question and answers it wrongly: a partition below the
+        clustering floor stores a set with no themes in it, and a caller
+        seeing an empty list would conclude there was nothing there --
+        then fail to notice that what is there was built by a model it can
+        no longer reproduce.
+
+        No compatibility filtering happens here.  Whether a stored
+        generation may be reused is A3 policy about the *upcoming* run --
+        its model, its configuration, its algorithm -- and none of that is
+        knowable from a row.  This returns what is stored, identities in
+        ``theme_key`` order, and :mod:`phase0.themes` decides.
+        """
+
+        symbol = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        rows = self._query(
+            """
+            SELECT algorithm_version, config_fingerprint, model_name,
+                   model_revision, embedding_dimension
+            FROM theme_sets
+            WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+            """,
+            (symbol, day, version),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return PreviousThemeGeneration(
+            ticker=symbol,
+            trading_day=day,
+            pipeline_version=version,
+            algorithm_version=row["algorithm_version"],
+            config_fingerprint=row["config_fingerprint"],
+            model_name=row["model_name"],
+            model_revision=row["model_revision"],
+            embedding_dimension=(
+                None
+                if row["embedding_dimension"] is None
+                else int(row["embedding_dimension"])
+            ),
+            identities=tuple(self.theme_identities(symbol, day, version)),
+        )
 
     def story(self, story_id: int) -> dict[str, Any] | None:
         return self._one(
@@ -3243,6 +3723,83 @@ class Phase0Repository:
             ),
         )
 
+    @classmethod
+    def _story_generation_signature(
+        cls,
+        connection: sqlite3.Connection,
+        ticker: str,
+        day: str,
+        version: str,
+    ) -> str:
+        """Digest one partition's authoritative stories, as stored.
+
+        Built from :meth:`_stored_story_signature` -- the same comparison
+        that decides whether a story needs rewriting, and therefore the
+        same one that decides whether a theme set built over it is stale.
+        Reusing it means the two cannot drift: anything that would make
+        ``reconcile_stories`` invalidate the day's themes also moves this
+        digest, and nothing else does.
+
+        ``repr`` over the assembled tuples is the encoding.  Its members
+        are strings, ints, floats, bools, ``None`` and ``bytes``, whose
+        representations are stable, and the value is only ever compared
+        against one this same function produced.
+        """
+
+        payload = [
+            (
+                str(row["cluster_fingerprint"]),
+                cls._stored_story_signature(connection, row),
+            )
+            for row in connection.execute(
+                """
+                SELECT * FROM stories
+                WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+                  AND cluster_fingerprint IS NOT NULL
+                  AND invalidated_at IS NULL
+                ORDER BY cluster_fingerprint
+                """,
+                (ticker, day, version),
+            )
+        ]
+        return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+    def story_generation(
+        self, ticker: str, trading_day: str | date, pipeline_version: str
+    ) -> StoryGeneration:
+        """The authoritative persisted stories of one partition, whole.
+
+        M5 clusters what was *stored*, not what the story stage happened
+        to hold in memory on its way to storing it.  The two should agree,
+        and if they ever do not it is the stored generation that is
+        authoritative -- so this reads the rows, their members, their
+        provider conflicts, and their merge evidence back out, along with
+        each member's standfirst from ``raw_items``, which is the one
+        thing a story row does not carry and M5 needs to embed.
+
+        Members come back in persisted ``position`` order, which is the
+        order M2 assembled the cluster in.  That ordering is load-bearing
+        downstream (see ``phase0.themes.DESCRIPTION_POLICY``), so it is
+        preserved here rather than re-sorted into something tidier.
+
+        **One transaction, five statements.**  The signature has to
+        describe the rows returned beside it, so both are read under the
+        same lock.  Computed afterwards on a second connection it could
+        describe a generation that replaced this one mid-read, and the
+        write-time check downstream would then pass against stories the
+        caller never saw -- which is the failure the signature exists to
+        catch.
+        """
+
+        symbol = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        with self._connect(immediate=True) as connection:
+            signature = self._story_generation_signature(
+                connection, symbol, day, version
+            )
+            return _persisted_stories(connection, symbol, day, version, signature)
+
     def reconcile_stories(
         self,
         *,
@@ -4149,6 +4706,7 @@ class Phase0Repository:
         themes: Sequence[ThemeRecord] = (),
         other_coverage: Sequence[OtherCoverageRecord] = (),
         excluded: Sequence[ExcludedStoryRecord] = (),
+        expected_story_signature: str | None = None,
         terminal: bool = False,
     ) -> ReconciliationReport:
         """Replace one ticker/trading-day's theme set atomically.
@@ -4168,6 +4726,23 @@ class Phase0Repository:
         As with :meth:`reconcile_stories`, normalization and validation run
         inside the run's own transaction so that a rejection is recorded as
         this run's failure.
+
+        **``expected_story_signature`` closes the window between reading
+        the stories and writing what was derived from them.**  Clustering
+        takes long enough for another reconciliation to replace the
+        partition's stories underneath it, and PR #101's invalidation
+        cannot help: it deletes the theme set that existed *then*, while
+        this call is about to create one that describes stories that no
+        longer exist.  Checking the stage of the current stories would not
+        catch it either -- both generations are ``m3.semantic``.
+
+        So the caller carries the digest it read with, and it is
+        recompared here, on this transaction, immediately before anything
+        is written.  A mismatch raises
+        :class:`StoryGenerationConflict`, the transaction rolls back, and
+        the generation that won the race stays as it is.  Nothing retries
+        automatically; the run is recorded failed and the next one reads
+        the stories that are actually there.
         """
 
         with self._logged_mutation(
@@ -4192,6 +4767,21 @@ class Phase0Repository:
                 trading_day=day,
                 pipeline_version=version,
             )
+            if expected_story_signature is not None:
+                # On this connection, inside this transaction, before the
+                # first write.  A check on any other connection would be a
+                # statement about a moment that has already passed.
+                observed = self._story_generation_signature(
+                    connection, normalized_ticker, day, version
+                )
+                if observed != expected_story_signature:
+                    raise StoryGenerationConflict(
+                        f"{normalized_ticker}/{day} stories changed while this "
+                        f"theme set was being computed; the derived output "
+                        f"describes a generation that is no longer the "
+                        f"partition's, so it is refused rather than written "
+                        f"over the one that replaced it"
+                    )
             report = self._reconcile_themes_unlogged(
                 ticker=normalized_ticker,
                 trading_day=day,
@@ -4216,6 +4806,75 @@ class Phase0Repository:
             )
             context._merge_counts(report.counts)
             return report
+
+    def clear_theme_set(
+        self,
+        *,
+        run: Any,
+        ticker: str,
+        trading_day: str | date,
+        pipeline_version: str,
+        terminal: bool = False,
+    ) -> int:
+        """Remove one partition's theme set entirely; return themes removed.
+
+        The honest way to say *there are no themes for this partition*.
+        Reconciling an empty set would not say it: it writes a
+        ``theme_sets`` row with a method and a plausible reason, which
+        reads exactly like a quiet day and is what decision H forbids.  So
+        the row goes, and "a ``theme_sets`` row exists" keeps its meaning
+        — there is a theme generation here, and it is this one.
+
+        **Accounting.**  ``success`` counts the themes actually removed and
+        ``partial`` is never recorded.  Clearing a partition that already
+        holds nothing is a successful no-op, not a degradation: a day with
+        no evidence must not settle in the same state as a day whose
+        semantic dedup failed.  Recording ``partial`` for "nothing to do"
+        — the habit :meth:`reconcile_themes` follows for unchanged themes
+        — would resolve this run ``degraded`` and erase that distinction.
+
+        The count is *rows* removed, the ``theme_sets`` row included.  A
+        partition can legitimately hold a theme set with no themes in it --
+        a day below the clustering floor lists its stories under Other
+        Coverage and is honestly themeless -- and counting only ``themes``
+        would report clearing that partition as having done nothing.
+
+        Reuses the invalidation the story path already performs, so a
+        theme set cleared from here and one invalidated by a changed story
+        leave the database in the same state rather than two states that
+        merely look alike.
+        """
+
+        with self._logged_mutation(
+            run, operation="clear_theme_set", terminal=terminal
+        ) as (connection, context):
+            normalized_ticker = normalize_ticker(ticker)
+            day = _normalize_day(trading_day)
+            version = _require_text(pipeline_version, "pipeline_version")
+            self._assert_run_partition(
+                context,
+                operation="clear_theme_set",
+                ticker=normalized_ticker,
+                trading_day=day,
+                pipeline_version=version,
+            )
+            had_set = (
+                connection.execute(
+                    "SELECT 1 FROM theme_sets WHERE ticker = ? AND trading_day = ? "
+                    "AND pipeline_version = ?",
+                    (normalized_ticker, day, version),
+                ).fetchone()
+                is not None
+            )
+            removed_themes = self._invalidate_theme_set(
+                connection, normalized_ticker, day, version
+            )
+            removed = len(removed_themes) + (1 if had_set else 0)
+            context._record_outcome(success=removed)
+            context._merge_counts(
+                {"cleared_themes": len(removed_themes), "cleared_rows": removed}
+            )
+            return removed
 
     @staticmethod
     def _assert_stories_in_partition(
@@ -7165,6 +7824,8 @@ __all__ = [
     "Phase0MigrationError",
     "Phase0Reader",
     "Phase0Repository",
+    "PersistedStory",
+    "PersistedStoryMember",
     "Phase0RunContextError",
     "Phase0ValidationError",
     "ProviderConflictRecord",
@@ -7181,6 +7842,10 @@ __all__ = [
     "SOURCE_STATE_STATUSES",
     "STAGE_DEGRADED",
     "STORY_RECONCILED_COLUMNS",
+    "PreviousThemeGeneration",
+    "StoryGeneration",
+    "StoryGenerationConflict",
+    "ThemeIdentity",
     "SUPPORTED_TICKERS",
     "STAGE_KEY_STATUSES",
     "SemanticMergeRecord",
