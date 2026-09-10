@@ -5328,6 +5328,10 @@ LOGGED_ENTRYPOINTS = [
     "record_feed_snapshot",
     "record_feed_observations",
     "replace_relevance_classifications",
+    # The theme stage's one write (I5 M5 integration).  It removes a
+    # partition's theme set through the same _logged_mutation the others
+    # use, so the key moves with the data and the run log.
+    "clear_theme_set",
 ]
 
 
@@ -5420,6 +5424,11 @@ READER_PROBES = {
     # partition discovery the story stage runs before opening a run.
     "story_partitions": (("2026-08-20",), {}),
     "evidence_partition_tickers": (("2026-08-20",), {}),
+    # The theme stage's reads: partition sweep, continuity capture, and
+    # the authoritative story generation M5 clusters.
+    "theme_partitions": (("2026-08-20",), {}),
+    "theme_identities": (("NVDA", "2026-08-20", "v1"), {}),
+    "previous_theme_generation": (("NVDA", "2026-08-20", "v1"), {}),
 }
 
 
@@ -11132,6 +11141,18 @@ def caught_validation_cases(repository: Phase0Repository) -> dict:
             ),
             "themes",
         ),
+        # A partition this run does not cover: the clear must be refused
+        # and recorded as this run's failure, not quietly skipped.
+        "clear_theme_set": (
+            lambda run, terminal: repository.clear_theme_set(
+                run=run,
+                ticker="AMD",
+                trading_day=DAY,
+                pipeline_version="v1",
+                terminal=terminal,
+            ),
+            "themes",
+        ),
         "persist_embeddings": (
             lambda run, terminal: repository.persist_embeddings(
                 [sample_embedding("999999")], run=run, terminal=terminal
@@ -12684,3 +12705,449 @@ def test_evidence_partitions_are_discoverable_without_projecting_them(tmp_path):
     assert orphan
     assert repository.read.evidence_partition_tickers(DAY) == ["AMD", "NVDA", "TSLA"]
     assert amd
+
+
+# ----------------------------------------------------------------------
+# The theme stage's reads, and the one write it adds (I5 M5 integration).
+# ----------------------------------------------------------------------
+
+
+def test_clear_theme_set_removes_the_partition_and_counts_the_work(tmp_path):
+    """The honest way to say a partition has no themes."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    themed(repository, item_ids)
+
+    with repository.stage_run(
+        run_id="clear-1",
+        stage="themes",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        removed = repository.clear_theme_set(
+            run=run,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            terminal=True,
+        )
+
+    # One theme plus the theme_sets row: the count is rows removed, so a
+    # partition whose set holds no themes still reports the work.
+    assert removed == 2
+    assert theme_counts(repository) == (0, 0, 0)
+    row = [
+        entry
+        for entry in repository.read.run_log_rows()
+        if entry["run_id"] == "clear-1"
+    ][0]
+    assert row["status"] == "success"
+    assert row["success_count"] == 2
+    assert row["partial_count"] == 0
+    counts = json.loads(row["counts"])
+    assert counts["cleared_themes"] == 1
+    assert counts["cleared_rows"] == 2
+
+
+def test_clearing_an_empty_partition_is_a_successful_no_op(tmp_path):
+    """A quiet day must not settle in the same state as a broken one.
+
+    ``reconcile_themes`` counts unchanged themes as ``partial``, which
+    resolves a run ``degraded``.  If clearing copied that habit, a
+    partition with nothing to delete would report an outage.
+    """
+
+    repository = migrated(tmp_path)
+
+    with repository.stage_run(
+        run_id="clear-empty",
+        stage="themes",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        removed = repository.clear_theme_set(
+            run=run,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            terminal=True,
+        )
+
+    assert removed == 0
+    row = [
+        entry
+        for entry in repository.read.run_log_rows()
+        if entry["run_id"] == "clear-empty"
+    ][0]
+    assert row["status"] == "success"
+    assert row["partial_count"] == 0
+    assert json.loads(row["errors"]) == []
+
+
+def test_a_cleared_partition_leaves_its_neighbours_alone(tmp_path):
+    """Clearing is scoped to one ticker, day, and pipeline version."""
+
+    repository = migrated(tmp_path)
+    nvda = seed_raw_items(repository, 2, "NVDA")
+    amd = seed_raw_items(repository, 1, "AMD")
+    themed(repository, nvda)
+    for ticker, version, fingerprint, ids in (
+        ("NVDA", "v2", "cf-v2", nvda),
+        ("AMD", "v1", "cf-amd", amd),
+    ):
+        reconcile_stories(
+            repository,
+            ticker=ticker,
+            trading_day=DAY,
+            pipeline_version=version,
+            stories=[story(fingerprint, ids)],
+        )
+        other_id = [
+            row["id"]
+            for row in repository.stories_for_day(DAY, ticker)
+            if row["pipeline_version"] == version
+        ][0]
+        reconcile_themes(
+            repository,
+            ticker=ticker,
+            trading_day=DAY,
+            pipeline_version=version,
+            theme_set=theme_set(),
+            themes=[
+                ThemeRecord(
+                    fingerprint=f"T-{ticker}-{version}",
+                    theme_key=f"T-{ticker}-{version}",
+                    label="Other",
+                    story_ids=(other_id,),
+                    citation_item_ids=(ids[0],),
+                    method="hdbscan",
+                    salience_rank=1,
+                )
+            ],
+        )
+    assert repository.count("theme_sets") == 3
+
+    with repository.stage_run(
+        run_id="clear-scoped",
+        stage="themes",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.clear_theme_set(
+            run=run,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            terminal=True,
+        )
+
+    assert repository.count("theme_sets") == 2
+    with repository.admin.connect_writable() as connection:
+        survivors = sorted(
+            (row["ticker"], row["pipeline_version"])
+            for row in connection.execute("SELECT ticker, pipeline_version FROM themes")
+        )
+    assert survivors == [("AMD", "v1"), ("NVDA", "v2")]
+
+
+def test_theme_partitions_names_partitions_without_loading_them(tmp_path):
+    """The theme stage's sweep enumeration."""
+
+    repository = migrated(tmp_path)
+    nvda = seed_raw_items(repository, 1, "NVDA")
+    amd = seed_raw_items(repository, 1, "AMD")
+    themed(repository, nvda)
+    reconcile_stories(
+        repository,
+        ticker="AMD",
+        trading_day=DAY,
+        pipeline_version="v2",
+        stories=[story("cf-amd", amd)],
+    )
+    amd_id = repository.stories_for_day(DAY, "AMD")[0]["id"]
+    reconcile_themes(
+        repository,
+        ticker="AMD",
+        trading_day=DAY,
+        pipeline_version="v2",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint="T-AMD",
+                theme_key="T-AMD",
+                label="Other",
+                story_ids=(amd_id,),
+                citation_item_ids=(amd[0],),
+                method="hdbscan",
+                salience_rank=1,
+            )
+        ],
+    )
+
+    assert repository.read.theme_partitions(DAY) == ["AMD", "NVDA"]
+    assert repository.read.theme_partitions(DAY, pipeline_version="v1") == ["NVDA"]
+    assert repository.read.theme_partitions(DAY, pipeline_version="v2") == ["AMD"]
+    assert repository.read.theme_partitions("2026-07-24") == []
+
+
+def test_theme_identities_return_provenance_without_judging_it(tmp_path):
+    """Persistence reads rows; the runner decides what may be reused."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids)],
+    )
+    story_id = repository.stories_for_day(DAY, "NVDA")[0]["id"]
+    reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint=f"T{index}",
+                theme_key=f"key-{index}",
+                label="Theme",
+                story_ids=(story_id,),
+                citation_item_ids=(item_ids[0],),
+                method="hdbscan",
+                salience_rank=index + 1,
+                centroid=VECTOR_A,
+                algorithm_version="m5.themes.v1",
+                config_fingerprint="cfg-1",
+                model_name="fake-encoder",
+                model_revision="rev-1",
+                embedding_dimension=4,
+            )
+            for index in range(1)
+        ],
+    )
+
+    identities = repository.read.theme_identities("NVDA", DAY, "v1")
+    assert [entry.theme_key for entry in identities] == ["key-0"]
+    entry = identities[0]
+    assert entry.algorithm_version == "m5.themes.v1"
+    assert entry.config_fingerprint == "cfg-1"
+    assert entry.model_name == "fake-encoder"
+    assert entry.model_revision == "rev-1"
+    assert entry.embedding_dimension == 4
+    assert entry.centroid == VECTOR_A
+    # A different partition's identities are not this one's.
+    assert repository.read.theme_identities("AMD", DAY, "v1") == []
+    assert repository.read.theme_identities("NVDA", DAY, "v2") == []
+
+
+def test_story_generation_reads_the_partition_whole(tmp_path):
+    """Stories, members, children, each member's standfirst, and a digest."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[
+            story(
+                "cf1",
+                item_ids,
+                stage="m3.semantic",
+                model_name="fake-encoder",
+                model_revision="rev-1",
+                embedding_dimension=8,
+                member_story_keys=("m2-a", "m2-b"),
+                semantic_skip_reason="provider_quarantine",
+                quarantined=True,
+                provider_conflicts=(
+                    ProviderConflictRecord(
+                        provider_namespace="yahoo barrons",
+                        provider_item_id="prov-1",
+                        item_ids=("1",),
+                        fields=("title",),
+                    ),
+                ),
+                semantic_merges=(
+                    SemanticMergeRecord(
+                        left_story_key="m2-a", right_story_key="m2-b", similarity=0.93
+                    ),
+                ),
+            )
+        ],
+    )
+
+    generation = repository.story_generation("NVDA", DAY, "v1")
+    assert generation.stages == {"m3.semantic"}
+    assert generation.model_identities == {("fake-encoder", "rev-1", 8)}
+    assert not generation.is_empty
+    assert generation.signature
+
+    entry = generation.stories[0]
+    assert entry.cluster_fingerprint == "cf1"
+    assert entry.member_story_keys == ("m2-a", "m2-b")
+    assert entry.semantic_skip_reason == "provider_quarantine"
+    assert entry.quarantined is True
+    assert entry.provider_conflicts == (("yahoo barrons", "prov-1"),)
+    assert entry.semantic_merges == (("m2-a", "m2-b", 0.93, "semantic_similarity"),)
+    assert [member.raw_item_id for member in entry.members] == list(item_ids)
+    assert [member.position for member in entry.members] == [0, 1]
+    # The standfirst lives on the raw item, not the story.
+    assert [member.description for member in entry.members] == [
+        f"Body {index}" for index in (1, 2)
+    ]
+
+    empty = repository.story_generation("NVDA", DAY, "v2")
+    assert empty.is_empty
+    assert repository.story_generation("AMD", DAY, "v1").is_empty
+    # Two empty partitions of different tickers still digest the same
+    # nothing; the signature describes rows, not identity.
+    assert empty.signature == repository.story_generation("AMD", DAY, "v1").signature
+
+
+def test_the_story_generation_signature_is_stable_and_sensitive(tmp_path):
+    """It moves exactly when a story representation a settlement writes moves."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids)],
+    )
+    first = repository.story_generation("NVDA", DAY, "v1").signature
+    assert repository.story_generation("NVDA", DAY, "v1").signature == first
+
+    # An identical replay changes nothing, so the digest holds.
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids)],
+    )
+    assert repository.story_generation("NVDA", DAY, "v1").signature == first
+
+    # Any change a settlement would persist -- membership untouched -- moves it.
+    for change in ("stage", "outlet_count", "content_hash"):
+        reconcile_stories(
+            repository,
+            ticker="NVDA",
+            trading_day=DAY,
+            pipeline_version="v1",
+            stories=[
+                story(
+                    "cf1",
+                    item_ids,
+                    **{
+                        "stage": "m2.exact",
+                        "outlet_count": 9,
+                        "content_hash": "moved",
+                    },
+                )
+            ],
+        )
+        break
+    assert repository.story_generation("NVDA", DAY, "v1").signature != first
+    assert change
+
+
+def test_previous_theme_generation_reports_a_set_with_no_themes(tmp_path):
+    """The set is the unit; a themeless set is still a generation."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids)],
+    )
+    story_id = repository.stories_for_day(DAY, "NVDA")[0]["id"]
+
+    assert repository.read.previous_theme_generation("NVDA", DAY, "v1") is None
+
+    # A set with no themes at all -- what a day below the clustering floor
+    # stores -- still names the model that built it.
+    reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(method="small_n_fallback"),
+        themes=[],
+        other_coverage=(
+            OtherCoverageRecord(story_id=story_id, reason="clustering_noise"),
+        ),
+    )
+
+    captured = repository.read.previous_theme_generation("NVDA", DAY, "v1")
+    assert captured is not None
+    assert captured.identities == ()
+    assert captured.ticker == "NVDA"
+    assert captured.trading_day == DAY
+    assert captured.pipeline_version == "v1"
+    assert captured.algorithm_version == "m5.1"
+    assert captured.config_fingerprint == "cfg"
+    assert captured.model_name == "fake"
+    assert captured.model_revision == "r1"
+    assert captured.embedding_dimension == 4
+    # And it stays scoped to its own partition.
+    assert repository.read.previous_theme_generation("AMD", DAY, "v1") is None
+    assert repository.read.previous_theme_generation("NVDA", DAY, "v2") is None
+
+
+def test_previous_theme_generation_carries_its_identities(tmp_path):
+    """Provenance from the set, identities beneath it, ordered by key."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 2)
+    reconcile_stories(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        stories=[story("cf1", item_ids[:1]), story("cf2", item_ids[1:])],
+    )
+    stored = repository.stories_for_day(DAY, "NVDA")
+    reconcile_themes(
+        repository,
+        ticker="NVDA",
+        trading_day=DAY,
+        pipeline_version="v1",
+        theme_set=theme_set(),
+        themes=[
+            ThemeRecord(
+                fingerprint=f"T{index}",
+                theme_key=key,
+                label="Theme",
+                story_ids=(row["id"],),
+                citation_item_ids=(json.loads(row["member_ids"])[0],),
+                method="hdbscan",
+                salience_rank=index + 1,
+                centroid=VECTOR_A,
+                algorithm_version="m5.1",
+                config_fingerprint="cfg",
+                model_name="fake",
+                model_revision="r1",
+                embedding_dimension=4,
+            )
+            for index, (key, row) in enumerate(zip(("zeta", "alpha"), stored))
+        ],
+    )
+
+    captured = repository.read.previous_theme_generation("NVDA", DAY, "v1")
+    assert [entry.theme_key for entry in captured.identities] == ["alpha", "zeta"]
+    assert {entry.centroid for entry in captured.identities} == {VECTOR_A}
+    assert captured.model_name == "fake"
