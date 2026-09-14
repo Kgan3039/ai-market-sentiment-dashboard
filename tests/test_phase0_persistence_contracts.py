@@ -5429,6 +5429,10 @@ READER_PROBES = {
     "theme_partitions": (("2026-08-20",), {}),
     "theme_identities": (("NVDA", "2026-08-20", "v1"), {}),
     "previous_theme_generation": (("NVDA", "2026-08-20", "v1"), {}),
+    # A4's review population: one snapshot per partition, and the
+    # enumeration that finds theme-only partitions as well as story ones.
+    "partition_generations": (("2026-08-20",), {}),
+    "theme_population": (("NVDA", "2026-08-20", "v1"), {}),
 }
 
 

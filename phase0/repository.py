@@ -1002,6 +1002,116 @@ class PreviousThemeGeneration:
     identities: tuple[ThemeIdentity, ...] = ()
 
 
+@dataclass(frozen=True)
+class PartitionGeneration:
+    """One ``(ticker, pipeline_version)`` that holds derived output on a day.
+
+    Enumerated from *both* live stories and theme sets, so a theme set
+    whose stories have since been invalidated is still a partition -- it
+    is exactly the stale state a reviewer has to be told about rather
+    than one that quietly stops existing.
+    """
+
+    ticker: str
+    trading_day: str
+    pipeline_version: str
+    live_story_count: int
+    has_theme_set: bool
+
+
+@dataclass(frozen=True)
+class PersistedThemeSet:
+    """The ``theme_sets`` row: what produced a partition's themes."""
+
+    theme_set_id: int
+    method: str
+    method_reason: str
+    config_fingerprint: str
+    algorithm_version: str
+    model_name: str | None
+    model_revision: str | None
+    embedding_dimension: int | None
+    updated_at: str | None
+    #: The stored ``source_metadata`` block: what the stage recorded about
+    #: the story generation it clustered (stage, counts, model identity).
+    #: It is not a signature of that generation; nothing persisted is.
+    source_metadata: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ThemeMembership:
+    """One persisted theme with the story ids ``theme_stories`` links to it."""
+
+    theme_id: int
+    theme_key: str | None
+    label: str
+    label_source: str | None
+    salience_rank: int
+    story_count: int | None
+    story_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class OtherCoveragePlacement:
+    story_id: int
+    reason: str
+    position: int
+
+
+@dataclass(frozen=True)
+class ExcludedPlacement:
+    story_id: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class MemberEvidenceProvenance:
+    """What ``raw_items`` says about one story member's provenance.
+
+    Descriptive only.  None of these fields can establish that the row was
+    fetched from a provider: a row written through the admin insert path
+    carries every one of them.  They are reported so a reader can see what
+    the ledger holds, not so a consumer can infer origin from them.
+    """
+
+    raw_item_id: int
+    source: str | None
+    fetched_at: str | None
+    ingest_status: str | None
+    external_id: str | None
+    has_payload: bool
+    has_feed_snapshot: bool
+
+
+@dataclass(frozen=True)
+class ThemePopulation:
+    """One partition's persisted theme output over its authoritative stories.
+
+    Read in **one** read transaction, so the theme set, its membership, and
+    the story generation it was built over describe the same committed
+    state.  Assembled from three reads on three connections they could
+    describe three moments, and a review population built that way could
+    place a story that no longer exists into a theme that no longer holds
+    it.
+
+    ``stories`` is the *current* authoritative generation, signature
+    included -- the same digest ``reconcile_themes`` checks before it
+    writes.  A consumer decides whether the theme set is a valid view of
+    that generation (every story accounted for, every stage healthy); this
+    read reports both sides and judges neither.
+    """
+
+    ticker: str
+    trading_day: str
+    pipeline_version: str
+    theme_set: PersistedThemeSet | None
+    themes: tuple[ThemeMembership, ...]
+    other_coverage: tuple[OtherCoveragePlacement, ...]
+    excluded: tuple[ExcludedPlacement, ...]
+    stories: StoryGeneration
+    member_provenance: tuple[MemberEvidenceProvenance, ...]
+
+
 #: Module-private construction key.  It is never exported, never stored on
 #: an instance, and never reachable from the public API, so a caller cannot
 #: build a :class:`StageRunContext` even by copying every visible field.
@@ -2253,6 +2363,253 @@ class Phase0Reader:
                 else int(row["embedding_dimension"])
             ),
             identities=tuple(self.theme_identities(symbol, day, version)),
+        )
+
+    # -- Theme population, as one snapshot ---------------------------------
+
+    @contextmanager
+    def _snapshot(self) -> Iterator[sqlite3.Connection]:
+        """One read-only connection held open across several statements.
+
+        ``BEGIN`` opens a read transaction, so every statement inside sees
+        the same committed state.  The connection is configured exactly
+        like :meth:`_query`'s and is closed on the way out; it is yielded
+        only to methods of this class and never returned.
+        """
+
+        if not self._database_path.exists():
+            raise Phase0ValidationError(
+                f"no Phase 0 database at {self._database_path}; call migrate() first"
+            )
+        connection = sqlite3.connect(
+            f"file:{self._database_path}?mode=ro", uri=True, timeout=10
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA query_only = ON")
+            connection.set_authorizer(_read_only_authorizer)
+            connection.execute("BEGIN")
+            yield connection
+        finally:
+            connection.close()
+
+    def partition_generations(
+        self, trading_day: str | date
+    ) -> list[PartitionGeneration]:
+        """Every ``(ticker, pipeline_version)`` holding derived output on a day.
+
+        The union of live stories and theme sets, in one read.  A theme set
+        with no live stories left under it is listed with
+        ``live_story_count=0`` rather than dropped: it is stale output a
+        reviewer must be told about, not an absence.
+        """
+
+        day = _normalize_day(trading_day)
+        with self._snapshot() as connection:
+            rows = _rows(
+                connection,
+                """
+                SELECT ticker, pipeline_version,
+                       SUM(live) AS live_story_count,
+                       MAX(has_set) AS has_theme_set
+                FROM (
+                    SELECT ticker, pipeline_version, 1 AS live, 0 AS has_set
+                    FROM stories
+                    WHERE trading_day = ? AND invalidated_at IS NULL
+                      AND cluster_fingerprint IS NOT NULL
+                    UNION ALL
+                    SELECT ticker, pipeline_version, 0 AS live, 1 AS has_set
+                    FROM theme_sets WHERE trading_day = ?
+                )
+                GROUP BY ticker, pipeline_version
+                ORDER BY ticker, pipeline_version
+                """,
+                (day, day),
+            )
+        return [
+            PartitionGeneration(
+                ticker=str(row["ticker"]),
+                trading_day=day,
+                pipeline_version=str(row["pipeline_version"]),
+                live_story_count=int(row["live_story_count"] or 0),
+                has_theme_set=bool(row["has_theme_set"]),
+            )
+            for row in rows
+        ]
+
+    def theme_population(
+        self, ticker: str, trading_day: str | date, pipeline_version: str
+    ) -> ThemePopulation:
+        """One partition's theme output and its story generation, as one snapshot.
+
+        See :class:`ThemePopulation`.  Stories come through the same
+        assembly the theme stage reads (:func:`_persisted_stories`), and
+        the generation signature is the one ``reconcile_themes`` verifies,
+        so what a reviewer is shown is what the stage would have clustered.
+        """
+
+        symbol = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        with self._snapshot() as connection:
+            set_rows = _rows(
+                connection,
+                """
+                SELECT id, method, method_reason, config_fingerprint,
+                       algorithm_version, model_name, model_revision,
+                       embedding_dimension, updated_at, source_metadata
+                FROM theme_sets
+                WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+                """,
+                (symbol, day, version),
+            )
+            theme_set = None
+            themes: list[ThemeMembership] = []
+            other: list[OtherCoveragePlacement] = []
+            excluded: list[ExcludedPlacement] = []
+            if set_rows:
+                row = set_rows[0]
+                theme_set = PersistedThemeSet(
+                    theme_set_id=int(row["id"]),
+                    method=str(row["method"]),
+                    method_reason=str(row["method_reason"] or ""),
+                    config_fingerprint=str(row["config_fingerprint"] or ""),
+                    algorithm_version=str(row["algorithm_version"] or ""),
+                    model_name=row["model_name"],
+                    model_revision=row["model_revision"],
+                    embedding_dimension=(
+                        None
+                        if row["embedding_dimension"] is None
+                        else int(row["embedding_dimension"])
+                    ),
+                    updated_at=row["updated_at"],
+                    source_metadata=(
+                        None
+                        if row["source_metadata"] is None
+                        else json.loads(row["source_metadata"])
+                    ),
+                )
+                membership: dict[int, list[int]] = {}
+                for link in _rows(
+                    connection,
+                    """
+                    SELECT theme_stories.theme_id AS theme_id,
+                           theme_stories.story_id AS story_id
+                    FROM theme_stories
+                    JOIN themes ON themes.id = theme_stories.theme_id
+                    WHERE themes.ticker = ? AND themes.trading_day = ?
+                      AND themes.pipeline_version = ?
+                    ORDER BY theme_stories.theme_id, theme_stories.story_id
+                    """,
+                    (symbol, day, version),
+                ):
+                    membership.setdefault(int(link["theme_id"]), []).append(
+                        int(link["story_id"])
+                    )
+                themes = [
+                    ThemeMembership(
+                        theme_id=int(theme["id"]),
+                        theme_key=theme["theme_key"],
+                        label=str(theme["label"]),
+                        label_source=theme["label_source"],
+                        salience_rank=int(theme["salience_rank"]),
+                        story_count=(
+                            None
+                            if theme["story_count"] is None
+                            else int(theme["story_count"])
+                        ),
+                        story_ids=tuple(membership.get(int(theme["id"]), ())),
+                    )
+                    for theme in _rows(
+                        connection,
+                        """
+                        SELECT id, theme_key, label, label_source, salience_rank,
+                               story_count
+                        FROM themes
+                        WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+                        ORDER BY salience_rank, id
+                        """,
+                        (symbol, day, version),
+                    )
+                ]
+                other = [
+                    OtherCoveragePlacement(
+                        story_id=int(entry["story_id"]),
+                        reason=str(entry["reason"]),
+                        position=int(entry["position"]),
+                    )
+                    for entry in _rows(
+                        connection,
+                        """
+                        SELECT story_id, reason, position FROM theme_other_coverage
+                        WHERE theme_set_id = ? ORDER BY position, story_id
+                        """,
+                        (theme_set.theme_set_id,),
+                    )
+                ]
+                excluded = [
+                    ExcludedPlacement(
+                        story_id=int(entry["story_id"]), reason=str(entry["reason"])
+                    )
+                    for entry in _rows(
+                        connection,
+                        """
+                        SELECT story_id, reason FROM theme_excluded_stories
+                        WHERE theme_set_id = ? ORDER BY story_id
+                        """,
+                        (theme_set.theme_set_id,),
+                    )
+                ]
+            signature = Phase0Repository._story_generation_signature(
+                connection, symbol, day, version
+            )
+            stories = _persisted_stories(connection, symbol, day, version, signature)
+            provenance = [
+                MemberEvidenceProvenance(
+                    raw_item_id=int(item["id"]),
+                    source=item["source"],
+                    fetched_at=item["fetched_at"],
+                    ingest_status=item["ingest_status"],
+                    external_id=item["external_id"],
+                    has_payload=bool(item["has_payload"]),
+                    has_feed_snapshot=bool(item["has_feed_snapshot"]),
+                )
+                for item in _rows(
+                    connection,
+                    """
+                    SELECT DISTINCT raw_items.id AS id, raw_items.source AS source,
+                           raw_items.fetched_at AS fetched_at,
+                           raw_items.ingest_status AS ingest_status,
+                           raw_items.external_id AS external_id,
+                           (raw_items.raw_json IS NOT NULL
+                            AND length(raw_items.raw_json) > 0) AS has_payload,
+                           EXISTS (
+                               SELECT 1 FROM raw_item_feeds
+                               WHERE raw_item_feeds.raw_item_id = raw_items.id
+                                 AND raw_item_feeds.snapshot_id IS NOT NULL
+                           ) AS has_feed_snapshot
+                    FROM raw_items
+                    JOIN story_members ON story_members.raw_item_id = raw_items.id
+                    JOIN stories ON stories.id = story_members.story_id
+                    WHERE stories.ticker = ? AND stories.trading_day = ?
+                      AND stories.pipeline_version = ?
+                      AND stories.invalidated_at IS NULL
+                    ORDER BY raw_items.id
+                    """,
+                    (symbol, day, version),
+                )
+            ]
+        return ThemePopulation(
+            ticker=symbol,
+            trading_day=day,
+            pipeline_version=version,
+            theme_set=theme_set,
+            themes=tuple(themes),
+            other_coverage=tuple(other),
+            excluded=tuple(excluded),
+            stories=stories,
+            member_provenance=tuple(provenance),
         )
 
     def story(self, story_id: int) -> dict[str, Any] | None:
@@ -7843,6 +8200,13 @@ __all__ = [
     "STAGE_DEGRADED",
     "STORY_RECONCILED_COLUMNS",
     "PreviousThemeGeneration",
+    "PartitionGeneration",
+    "PersistedThemeSet",
+    "ThemeMembership",
+    "OtherCoveragePlacement",
+    "ExcludedPlacement",
+    "MemberEvidenceProvenance",
+    "ThemePopulation",
     "StoryGeneration",
     "StoryGenerationConflict",
     "ThemeIdentity",
