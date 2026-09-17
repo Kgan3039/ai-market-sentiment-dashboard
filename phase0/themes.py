@@ -930,6 +930,63 @@ class ThemeReconciler:
                 },
             )
 
+    def record_precondition_failure(
+        self,
+        ticker: str,
+        trading_day: str | date,
+        *,
+        base_run_id: str,
+        cause: BaseException,
+        phase: str,
+    ) -> ThemePartitionOutcome:
+        """Settle a partition whose theme work could not begin, durably.
+
+        Capturing the previous theme generation is this stage's
+        precondition: it has to happen before the story stage writes, and
+        when it raises nothing downstream may proceed.  What remains to do
+        is say so where a scheduler will find it.  The failure is raised
+        *inside* a ``themes`` run so it lands as that run's ``failed`` row
+        -- the same durable vocabulary every other theme failure uses --
+        and never raises out of here, because one partition's ledger entry
+        must not cost the next partition its turn.
+
+        Nothing about the stories is touched or claimed: no ``stories`` run
+        is opened, so the ledger does not say story reconciliation ran.
+        ``phase`` names what failed on the returned outcome, and the
+        diagnostic is redacted on the way in like every other.
+        """
+
+        symbol = normalize_ticker(ticker)
+        day = _normalize_day(trading_day)
+        try:
+            with self.repository.stage_run(
+                run_id=partition_run_id(base_run_id, symbol, day),
+                stage=STAGE,
+                ticker=symbol,
+                trading_day=day,
+                pipeline_version=self.pipeline_version,
+            ):
+                raise cause
+        except Exception as exc:  # noqa: BLE001 - isolation is the contract
+            return ThemePartitionOutcome(
+                ticker=symbol,
+                trading_day=day,
+                status="failed",
+                generation=None,
+                theme_count=0,
+                cleared=False,
+                error={
+                    "type": "theme_partition_error",
+                    "phase": phase,
+                    "ticker": symbol,
+                    "trading_day": day,
+                    "error": sanitize_diagnostic_scalar(
+                        f"{type(exc).__name__}: {exc}", "theme partition error"
+                    ),
+                },
+            )
+        raise AssertionError("unreachable: the run body always raises")
+
     def _settle_partition(
         self,
         ticker: str,

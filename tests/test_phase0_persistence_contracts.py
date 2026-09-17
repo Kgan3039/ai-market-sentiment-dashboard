@@ -5429,6 +5429,34 @@ READER_PROBES = {
     "theme_partitions": (("2026-08-20",), {}),
     "theme_identities": (("NVDA", "2026-08-20", "v1"), {}),
     "previous_theme_generation": (("NVDA", "2026-08-20", "v1"), {}),
+    # The live pipeline's day selection: what an invocation touched, and
+    # which partitions' newest intelligence outcome is worth another try.
+    "changed_partitions": (
+        ("inv:",),
+        {
+            "stages": ("fetch_yahoo", "ingest_rss"),
+            "counters": ("raw_items_inserted", "relevance_changed"),
+        },
+    ),
+    "recent_run_days": (
+        (("fetch_yahoo", "ingest_rss"),),
+        {"completed_since": "2026-08-01T00:00:00+00:00"},
+    ),
+    "attempted_partitions": (
+        ("themes", "2026-08-20"),
+        {"pipeline_version": "v1"},
+    ),
+    "latest_partition_outcomes": (
+        ("stories", "2026-08-20"),
+        {"pipeline_version": "v1"},
+    ),
+    "stage_outcome_episodes": (
+        (("stories", "themes"),),
+        {
+            "pipeline_version": "v1",
+            "completed_since": "2026-08-01T00:00:00+00:00",
+        },
+    ),
     # A4's review population: one snapshot per partition, and the
     # enumeration that finds theme-only partitions as well as story ones.
     "partition_generations": (("2026-08-20",), {}),
@@ -13155,3 +13183,382 @@ def test_previous_theme_generation_carries_its_identities(tmp_path):
     assert [entry.theme_key for entry in captured.identities] == ["alpha", "zeta"]
     assert {entry.centroid for entry in captured.identities} == {VECTOR_A}
     assert captured.model_name == "fake"
+
+
+# ----------------------------------------------------------------------
+# The live pipeline's scheduling reads
+# ----------------------------------------------------------------------
+
+
+def test_changed_partitions_match_an_exact_prefix_and_a_real_change(tmp_path):
+    """``fetch_yahoo`` contains an underscore; a LIKE would treat it as a
+    wildcard and a prefix match must not.  And a run only counts when one
+    of the named counters says it changed something."""
+
+    repository = migrated(tmp_path)
+
+    def run(run_id, *, stage, day, ticker="NVDA", items=()):
+        with repository.stage_run(
+            run_id=run_id,
+            stage=stage,
+            trading_day=day,
+            pipeline_version="v1",
+            ticker=ticker,
+        ) as ctx:
+            if items:
+                repository.ingest_raw_items(list(items), run=ctx, terminal=True)
+
+    def item(index, day):
+        return {**raw_item(index), "published_at": f"{day}T12:00:00+00:00"}
+
+    run(
+        "inv-1:yahoo:NVDA:2026-07-23",
+        stage="fetch_yahoo",
+        day="2026-07-23",
+        items=[item(1, "2026-07-23")],
+    )
+    run(
+        "inv-1:yahoo:NVDA:2026-07-21",
+        stage="fetch_yahoo",
+        day="2026-07-21",
+        items=[item(2, "2026-07-21")],
+    )
+    # The same item again: an evidence stage, a ticker, no change.
+    run(
+        "inv-1:again:NVDA:2026-07-21",
+        stage="fetch_yahoo",
+        day="2026-07-21",
+        items=[item(2, "2026-07-21")],
+    )
+    # A run that ingested nothing at all.
+    run(
+        "inv-1:yahoo:AMD:2026-07-23",
+        stage="fetch_yahoo",
+        day="2026-07-23",
+        ticker="AMD",
+    )
+    # Other stages under the same prefix, with and without a ticker.
+    run("inv-1:intelligence:NVDA:2026-07-23", stage="stories", day="2026-07-23")
+    run(
+        "inv-1:rss:alpha:checkpoint:2026-07-24",
+        stage="checkpoint_rss",
+        day="2026-07-24",
+        ticker=None,
+    )
+    # Other prefixes that share characters with this one.
+    run(
+        "inv-10:yahoo:NVDA:2026-07-25",
+        stage="fetch_yahoo",
+        day="2026-07-25",
+        items=[item(3, "2026-07-25")],
+    )
+    run(
+        "inv_1:yahoo:NVDA:2026-07-26",
+        stage="fetch_yahoo",
+        day="2026-07-26",
+        items=[item(4, "2026-07-26")],
+    )
+
+    evidence = ("fetch_yahoo", "ingest_rss")
+    counters = ("raw_items_inserted", "relevance_changed")
+    changed = repository.read.changed_partitions
+    assert changed("inv-1:", stages=evidence, counters=counters) == [
+        ("NVDA", "2026-07-21"),
+        ("NVDA", "2026-07-23"),
+    ]
+    # Inclusion by stage: the checkpoint and the stories run do not count.
+    assert (
+        changed("inv-1:", stages=("checkpoint_rss", "stories"), counters=counters) == []
+    )
+    assert changed("inv-1:", stages=(), counters=counters) == []
+    # Inclusion by counter: a counter nothing wrote matches nothing.
+    assert changed("inv-1:", stages=evidence, counters=("relevance_changed",)) == []
+    assert changed("inv-1:", stages=evidence, counters=()) == []
+    # "inv-10:" is not "inv-1:" and "inv_1:" is not either.
+    assert changed("inv-10:", stages=evidence, counters=counters) == [
+        ("NVDA", "2026-07-25")
+    ]
+    assert changed("inv_1:", stages=evidence, counters=counters) == [
+        ("NVDA", "2026-07-26")
+    ]
+    assert changed("nothing:", stages=evidence, counters=counters) == []
+
+
+def test_relevance_changed_counts_what_the_partition_now_projects(tmp_path):
+    """``relevance_assigned`` says what was decided; ``relevance_changed``
+    says whether the partition's input is different afterwards."""
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="snap", stage="fetch_rss", trading_day=DAY, pipeline_version="v1"
+    ) as run:
+        snapshot_id = repository.record_feed_snapshot(
+            feed_source="rss:test",
+            response_url="https://example.com/feed",
+            body=b"<rss/>",
+            fetched_at=f"{DAY}T10:00:00+00:00",
+            run=run,
+            terminal=True,
+        )
+    with repository.stage_run(
+        run_id="ingest", stage="ingest_rss", trading_day=DAY, pipeline_version="v1"
+    ) as run:
+        item_id = repository.ingest_raw_items(
+            [
+                {
+                    "source": "rss:p.example",
+                    "canonical_url": "https://p.example/a",
+                    "title": "GeForce launch",
+                    "url": "https://p.example/a",
+                    "fetched_at": f"{DAY}T10:00:00+00:00",
+                    "raw_json": {},
+                    "feed_provenance": [
+                        {
+                            "feed_source": "rss:test",
+                            "external_id": "a",
+                            "snapshot_id": snapshot_id,
+                            "entry_digest": "a" * 64,
+                        }
+                    ],
+                }
+            ],
+            run=run,
+            terminal=True,
+        )[0].item_id
+
+    def decide(run_id, *, ticker, status="valid"):
+        with repository.stage_run(
+            run_id=run_id,
+            stage="classify_rss",
+            trading_day=DAY,
+            pipeline_version="v1",
+            ticker="NVDA",
+        ) as run:
+            repository.replace_relevance_classifications(
+                [{"raw_item_id": item_id, "ticker": ticker, "ingest_status": status}],
+                run=run,
+                terminal=True,
+            )
+        return json.loads(
+            [row for row in repository.read.run_log_rows() if row["run_id"] == run_id][
+                0
+            ]["counts"]
+        )
+
+    first = decide("c1", ticker="NVDA")  # gains the association
+    assert (first["relevance_assigned"], first["relevance_changed"]) == (1, 1)
+    again = decide("c2", ticker="NVDA")  # same decision again
+    assert (again["relevance_assigned"], again["relevance_changed"]) == (1, 0)
+    flipped = decide("c3", ticker=None, status="ambiguous")  # withdrawn
+    assert (flipped["relevance_assigned"], flipped["relevance_changed"]) == (0, 1)
+    still = decide("c4", ticker=None, status="ambiguous")  # still withdrawn
+    assert (still["relevance_assigned"], still["relevance_changed"]) == (0, 0)
+
+
+def test_stage_outcome_episodes_report_the_unresolved_tail_per_version(tmp_path):
+    """The whole current episode, newest-first grouping, one version at a time."""
+
+    repository = migrated(tmp_path)
+    item_ids = seed_raw_items(repository, 1)
+
+    def settle(run_id, *, stage, version="v1", degrade=None, boom=False):
+        try:
+            with repository.stage_run(
+                run_id=run_id,
+                stage=stage,
+                trading_day=DAY,
+                pipeline_version=version,
+                ticker="NVDA",
+            ) as run:
+                if degrade:
+                    run.record_degradation(degrade)
+                if boom:
+                    raise RuntimeError("boom")
+                if stage == "stories":
+                    repository.reconcile_stories(
+                        run=run,
+                        ticker="NVDA",
+                        trading_day=DAY,
+                        pipeline_version=version,
+                        stories=[story("cf1", item_ids)],
+                        terminal=True,
+                    )
+                else:
+                    repository.clear_theme_set(
+                        run=run,
+                        ticker="NVDA",
+                        trading_day=DAY,
+                        pipeline_version=version,
+                        terminal=True,
+                    )
+        except RuntimeError:
+            pass
+
+    def episodes(version="v1", since="2000-01-01T00:00:00+00:00"):
+        return {
+            (entry.stage): entry
+            for entry in repository.read.stage_outcome_episodes(
+                ("stories", "themes"), pipeline_version=version, completed_since=since
+            )
+        }
+
+    settle("r1", stage="stories")  # success
+    settle("r2", stage="stories", degrade="m3_semantic_unavailable")  # unresolved
+    settle("r3", stage="stories", degrade="m3_semantic_unavailable")  # unresolved
+    settle("t1", stage="themes", boom=True)  # unresolved
+    settle("t2", stage="themes")  # success: resolves
+
+    found = episodes()
+    assert set(found) == {"stories"}
+    stories = found["stories"]
+    assert [attempt.run_id for attempt in stories.attempts] == ["r2", "r3"]
+    assert stories.newest.run_id == "r3"
+    assert stories.newest.markers == (("stage_degraded", "m3_semantic_unavailable"),)
+    assert stories.pipeline_version == "v1"
+    for attempt in stories.attempts:
+        assert attempt.completed_at
+        assert attempt.pipeline_version == "v1"
+
+    # An identical replay -- degraded, no marker -- resolves the episode.
+    settle("r4", stage="stories")  # identical: unchanged -> degraded, no marker
+    assert episodes() == {}
+
+    # Another version's rows are invisible in both directions.
+    settle("v2-t1", stage="themes", version="v2", boom=True)
+    assert episodes() == {}
+    assert set(episodes("v2")) == {"themes"}
+    assert [a.run_id for a in episodes("v2")["themes"].attempts] == ["v2-t1"]
+
+    # The scan bound applies to the newest attempt, not to the anchor.
+    assert episodes("v2", since="2999-01-01T00:00:00+00:00") == {}
+    assert (
+        repository.read.stage_outcome_episodes(
+            (), pipeline_version="v1", completed_since=DAY
+        )
+        == []
+    )
+
+
+def test_recent_run_days_and_attempted_partitions_read_the_ledger(tmp_path):
+    """The two reads the crash-recovery sweep is built from."""
+
+    from datetime import datetime, timedelta, timezone
+
+    moments = iter(
+        datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc) + timedelta(days=i)
+        for i in range(10)
+    )
+    current = {"now": next(moments)}
+    repository = Phase0Repository(
+        tmp_path / "clocked.sqlite3", clock=lambda: current["now"]
+    )
+    repository.migrate()
+
+    def settle(run_id, *, stage, day, ticker="NVDA", version="v1"):
+        current["now"] = next(moments)
+        with repository.stage_run(
+            run_id=run_id,
+            stage=stage,
+            trading_day=day,
+            pipeline_version=version,
+            ticker=ticker,
+        ):
+            pass
+        return current["now"]
+
+    settle("a:yahoo:NVDA:2026-09-01", stage="fetch_yahoo", day="2026-09-01")  # 09-11
+    cutoff = settle(
+        "a:rss:f:ingest:2026-09-02", stage="ingest_rss", day="2026-09-02", ticker=None
+    )  # 09-12
+    settle(
+        "a:rss:f:snap:2026-09-03", stage="fetch_rss", day="2026-09-03", ticker=None
+    )  # 09-13
+    settle("a:intelligence:NVDA:2026-09-02", stage="themes", day="2026-09-02")  # 09-14
+    settle(
+        "a:intelligence:AMD:2026-09-02",
+        stage="themes",
+        day="2026-09-02",
+        ticker="AMD",
+        version="v2",
+    )  # 09-15
+    settle("b:intelligence:NVDA:2026-09-02", stage="stories", day="2026-09-02")  # 09-16
+
+    evidence = ("fetch_yahoo", "ingest_rss")
+    assert repository.read.recent_run_days(
+        evidence, completed_since="2026-09-01T00:00:00+00:00"
+    ) == ["2026-09-01", "2026-09-02"]
+    # The bound is on completion time, inclusive.
+    assert repository.read.recent_run_days(evidence, completed_since=cutoff) == [
+        "2026-09-02"
+    ]
+    # A snapshot is not an evidence stage.
+    assert "2026-09-03" not in repository.read.recent_run_days(
+        evidence, completed_since="2026-09-01T00:00:00+00:00"
+    )
+    assert repository.read.recent_run_days((), completed_since=cutoff) == []
+
+    attempted = repository.read.attempted_partitions
+    assert attempted("themes", "2026-09-02", pipeline_version="v1") == ["NVDA"]
+    # Another version's attempt is not this version's.
+    assert attempted("themes", "2026-09-02", pipeline_version="v2") == ["AMD"]
+    # A stories row is not a themes row.
+    assert attempted("stories", "2026-09-02", pipeline_version="v1") == ["NVDA"]
+    assert attempted("themes", "2026-09-01", pipeline_version="v1") == []
+
+
+def test_latest_partition_outcomes_report_each_tickers_newest_run(tmp_path):
+    """The read that tells crash recovery where the story stage left off."""
+
+    repository = migrated(tmp_path)
+
+    def settle(run_id, *, stage="stories", ticker="NVDA", version="v1", boom=False):
+        try:
+            with repository.stage_run(
+                run_id=run_id,
+                stage=stage,
+                trading_day=DAY,
+                pipeline_version=version,
+                ticker=ticker,
+            ) as run:
+                if boom:
+                    run.record_degradation("m3_semantic_unavailable")
+                    raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+
+    latest = repository.read.latest_partition_outcomes
+
+    assert latest("stories", DAY, pipeline_version="v1") == {}
+
+    settle("s1")  # NVDA success
+    settle("s2", boom=True)  # NVDA failed, with a marker
+    settle("a1", ticker="AMD")  # AMD success
+    settle("t1", stage="themes")  # a themes row is not a stories row
+    settle("v2", version="v2", boom=True)  # another version
+
+    found = latest("stories", DAY, pipeline_version="v1")
+    assert list(found) == ["AMD", "NVDA"]
+    assert found["NVDA"].run_id == "s2"
+    assert found["NVDA"].status == "failed"
+    assert found["NVDA"].markers == (("stage_degraded", "m3_semantic_unavailable"),)
+    assert found["NVDA"].stage == "stories"
+    assert found["NVDA"].pipeline_version == "v1"
+    assert found["NVDA"].completed_at
+    assert found["AMD"].run_id == "a1"
+    assert found["AMD"].status == "success"
+    assert found["AMD"].markers == ()
+
+    # Newest by ledger order, whatever its age: a later success wins.
+    settle("s3")
+    assert latest("stories", DAY, pipeline_version="v1")["NVDA"].run_id == "s3"
+    assert latest("stories", DAY, pipeline_version="v1")["NVDA"].status in (
+        "success",
+        "degraded",
+    )
+
+    # Scoped: the other version sees only its own row, the other stage its own.
+    assert list(latest("stories", DAY, pipeline_version="v2")) == ["NVDA"]
+    assert latest("stories", DAY, pipeline_version="v2")["NVDA"].run_id == "v2"
+    assert list(latest("themes", DAY, pipeline_version="v1")) == ["NVDA"]
+    assert latest("themes", DAY, pipeline_version="v1")["NVDA"].run_id == "t1"
+    assert latest("stories", "2026-01-01", pipeline_version="v1") == {}

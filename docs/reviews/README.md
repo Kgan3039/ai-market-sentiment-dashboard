@@ -292,9 +292,10 @@ eligibility is making a decision that belongs to K4.
 
 ## What is still open
 
-- **No soak-window theme sets exist.** `pipeline.py` does not yet register
-  the `stories`/`themes` stages (`DOWNSTREAM_STAGES = ()`), so nothing
-  scheduled writes what this tool samples.
+- **No soak-window theme sets exist yet.** `pipeline.py` now registers the
+  `intelligence` component that writes `stories`/`themes` on every live
+  run, so scheduled runs will produce what this tool samples — but no soak
+  window has run under it, and nothing sampled so far came from one.
 - **Origin cannot be verified from persistence.** `verified_live` needs a
   structural fetch-run link on raw items. Until it exists, every database
   sample is `unverified` and no G1 release verdict is reachable.

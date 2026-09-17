@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from nlp.embeddings import PersistedEmbedding
 
@@ -679,6 +679,82 @@ class StoryGenerationConflict(Phase0IntegrityError):
     longer the partition's, and committing it would produce a theme set
     nothing on disk supports.
     """
+
+
+@dataclass(frozen=True)
+class StageOutcome:
+    """One settled run of one stage on one partition, as the ledger has it.
+
+    The status that was written, and the ``type``/``reason`` pairs of every
+    structured error the run recorded.  Nothing here says whether the
+    outcome should be *acted on* -- that is a scheduling policy, and it
+    lives with the scheduler.  What this makes possible is the distinction
+    that policy needs: a run that settled ``degraded`` because it recorded
+    a ``stage_degraded`` marker, and a run that settled ``degraded``
+    because an identical replay counted as partial work, look the same in
+    ``status`` and different here.
+    """
+
+    run_id: str
+    ticker: str
+    trading_day: str
+    stage: str
+    pipeline_version: str
+    status: str
+    #: ``(type, reason)`` for each structured error, in recorded order.
+    #: ``reason`` is ``None`` when the error carried none.
+    markers: tuple[tuple[str, str | None], ...]
+    completed_at: str
+
+
+@dataclass(frozen=True)
+class StageEpisode:
+    """One partition's current run of unresolved outcomes for one stage.
+
+    An *episode* is every attempt since the last one that resolved the
+    partition -- a ``success``, or a ``degraded`` run carrying no
+    ``stage_degraded`` marker, which is an identical replay and means the
+    stored generation is healthy and unchanged.  A partition whose newest
+    outcome resolved has no episode and is not reported.
+
+    ``attempts`` are the unresolved rows of the episode, oldest first, run
+    identity included, so a scheduler can tell an attempt it triggered on
+    new evidence from one it triggered as a retry.  Which of those may
+    anchor a retry window is the scheduler's rule; this record only makes
+    the rows available to it.
+    """
+
+    ticker: str
+    trading_day: str
+    stage: str
+    pipeline_version: str
+    attempts: tuple[StageOutcome, ...]
+
+    @property
+    def newest(self) -> StageOutcome:
+        return self.attempts[-1]
+
+
+def _stage_outcome(row: Mapping[str, Any], pipeline_version: str) -> StageOutcome:
+    """One ``run_log`` row as the ledger's account of a settled run."""
+
+    markers = []
+    for error in json.loads(row["errors"] or "[]"):
+        if isinstance(error, dict) and "type" in error:
+            reason = error.get("reason")
+            markers.append(
+                (str(error["type"]), None if reason is None else str(reason))
+            )
+    return StageOutcome(
+        run_id=str(row["run_id"]),
+        ticker=str(row["ticker"]),
+        trading_day=str(row["trading_day"]),
+        stage=str(row["stage"]),
+        pipeline_version=pipeline_version,
+        status=str(row["status"]),
+        markers=tuple(markers),
+        completed_at=str(row["completed_at"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -2629,6 +2705,240 @@ class Phase0Reader:
 
     # -- The operational ledger ------------------------------------------
 
+    def changed_partitions(
+        self, run_id_prefix: str, *, stages: Sequence[str], counters: Sequence[str]
+    ) -> list[tuple[str, str]]:
+        """``(ticker, trading_day)`` of every partition a run under
+        ``run_id_prefix`` durably changed.
+
+        An orchestrator hands each component a base id and the component
+        derives its partition run ids from it, so the base is a prefix of
+        every ``run_id`` that invocation wrote, and the ledger under that
+        prefix is the authoritative record of what it did -- committed by
+        the components, not remembered by the orchestrator.
+
+        ``substr`` rather than ``LIKE``: stage names contain ``_``, which
+        ``LIKE`` reads as a single-character wildcard, and a prefix match
+        must not be a pattern match.
+
+        A run counts only if it is one of ``stages``, names a ticker, and
+        recorded a value above zero for one of ``counters`` -- the keys the
+        mutations write when they actually insert or re-associate
+        evidence.  A run that opened, saw only what was already stored, and
+        wrote its row is not a change to anything downstream reads, and is
+        not returned.  Which counters mean "changed" is the caller's
+        policy; this read only applies it.
+        """
+
+        prefix = _require_text(run_id_prefix, "run_id_prefix")
+        names = tuple(_require_text(stage, "stage") for stage in stages)
+        keys = tuple(_require_text(counter, "counter") for counter in counters)
+        if not names or not keys:
+            return []
+        stage_slots = ",".join("?" for _ in names)
+        changed = " OR ".join("COALESCE(json_extract(counts, ?), 0) > 0" for _ in keys)
+        return [
+            (str(row["ticker"]), str(row["trading_day"]))
+            for row in self._query(
+                f"""
+                SELECT DISTINCT ticker, trading_day FROM run_log
+                WHERE substr(run_id, 1, ?) = ?
+                  AND stage IN ({stage_slots})
+                  AND ticker IS NOT NULL
+                  AND ({changed})
+                ORDER BY trading_day, ticker
+                """,
+                (len(prefix), prefix, *names, *(f"$.{key}" for key in keys)),
+            )
+        ]
+
+    def recent_run_days(
+        self, stages: Sequence[str], *, completed_since: str | datetime
+    ) -> list[str]:
+        """Days on which a run of one of ``stages`` completed recently.
+
+        Read from the ledger's own ``completed_at``, so a caller bounding
+        "recent" by the repository's clock is comparing like with like.
+        The stages are named by the caller -- for a scheduler, the ones
+        that write or re-attribute evidence -- and a day is named whether
+        or not the run left anything behind.
+        """
+
+        names = tuple(_require_text(stage, "stage") for stage in stages)
+        if not names:
+            return []
+        since = _normalize_datetime(completed_since, "completed_since")
+        placeholders = ",".join("?" for _ in names)
+        return [
+            str(row["trading_day"])
+            for row in self._query(
+                f"""
+                SELECT DISTINCT trading_day FROM run_log
+                WHERE stage IN ({placeholders})
+                  AND completed_at >= ?
+                ORDER BY trading_day
+                """,
+                (*names, since),
+            )
+        ]
+
+    def attempted_partitions(
+        self, stage: str, trading_day: str | date, *, pipeline_version: str
+    ) -> list[str]:
+        """Tickers with any run of ``stage`` on ``trading_day``, one version.
+
+        Any status counts: a partition that was opened and failed was
+        still attempted, and a scheduler asking "did this stage ever get
+        to this partition" wants exactly that answer.  Scoped to one
+        pipeline version, because one version's attempt says nothing
+        about another's.
+        """
+
+        name = _require_text(stage, "stage")
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        return [
+            str(row["ticker"])
+            for row in self._query(
+                """
+                SELECT DISTINCT ticker FROM run_log
+                WHERE stage = ? AND trading_day = ? AND pipeline_version = ?
+                  AND ticker IS NOT NULL
+                ORDER BY ticker
+                """,
+                (name, day, version),
+            )
+        ]
+
+    def latest_partition_outcomes(
+        self, stage: str, trading_day: str | date, *, pipeline_version: str
+    ) -> dict[str, StageOutcome]:
+        """Each ticker's newest run of ``stage`` on ``trading_day``, one version.
+
+        Whatever its age and whatever its status: this is the row a
+        scheduler reads to learn where one stage last left a partition
+        before deciding whether the *next* stage's absence means the
+        partition was never carried through or means its failure is
+        already being handled.  Scoped to one pipeline version, because one
+        version's outcome says nothing about another's.  A ticker with no
+        run of ``stage`` is simply absent.
+        """
+
+        name = _require_text(stage, "stage")
+        day = _normalize_day(trading_day)
+        version = _require_text(pipeline_version, "pipeline_version")
+        rows = self._query(
+            """
+            SELECT run_id, ticker, trading_day, stage, status, errors, completed_at
+            FROM run_log
+            WHERE id IN (
+                SELECT MAX(id) FROM run_log
+                WHERE stage = ? AND trading_day = ? AND pipeline_version = ?
+                  AND ticker IS NOT NULL
+                GROUP BY ticker
+            )
+            ORDER BY ticker
+            """,
+            (name, day, version),
+        )
+        return {str(row["ticker"]): _stage_outcome(row, version) for row in rows}
+
+    def stage_outcome_episodes(
+        self,
+        stages: Sequence[str],
+        *,
+        pipeline_version: str,
+        completed_since: str | datetime,
+    ) -> list[StageEpisode]:
+        """Every partition of ``pipeline_version`` whose newest outcome is
+        unresolved, with its whole current episode.
+
+        Scoped to one pipeline version throughout: the rows that resolve a
+        partition, the rows that form its episode, and the row that is its
+        newest are all read under the same version, so a success under
+        ``v2`` can neither hide an unresolved ``v1`` failure nor schedule
+        ``v1`` work, and the other way round.
+
+        *Resolved* is decided in SQL from the same two facts the run wrote:
+        a ``success`` status, or a ``degraded`` status whose ``errors``
+        carry no ``stage_degraded`` marker.  The marker is matched as the
+        serialized pair this module writes (sorted keys, no spaces), which
+        is why the pattern is built from :data:`STAGE_DEGRADED` rather than
+        typed out.
+
+        ``completed_since`` bounds the scan, not the policy: a partition
+        whose newest attempt is older than it is left out, and every
+        attempt of a reported episode is returned whatever its age, so the
+        caller can anchor its window on the attempt it chooses.
+        """
+
+        names = tuple(_require_text(stage, "stage") for stage in stages)
+        if not names:
+            return []
+        version = _require_text(pipeline_version, "pipeline_version")
+        since = _normalize_datetime(completed_since, "completed_since")
+        placeholders = ",".join("?" for _ in names)
+        marker = f'%"type":"{STAGE_DEGRADED}"%'
+        rows = self._query(
+            f"""
+            WITH scoped AS (
+                SELECT id, run_id, ticker, trading_day, stage, status, errors,
+                       completed_at,
+                       CASE
+                           WHEN status = 'success' THEN 1
+                           WHEN status = 'degraded' AND errors NOT LIKE ? THEN 1
+                           ELSE 0
+                       END AS resolved
+                FROM run_log
+                WHERE stage IN ({placeholders})
+                  AND pipeline_version = ?
+                  AND ticker IS NOT NULL
+            ),
+            newest AS (
+                SELECT ticker, trading_day, stage, MAX(id) AS id
+                FROM scoped GROUP BY ticker, trading_day, stage
+            ),
+            last_resolved AS (
+                SELECT ticker, trading_day, stage, MAX(id) AS id
+                FROM scoped WHERE resolved = 1
+                GROUP BY ticker, trading_day, stage
+            )
+            SELECT attempt.run_id AS run_id, attempt.ticker AS ticker,
+                   attempt.trading_day AS trading_day, attempt.stage AS stage,
+                   attempt.status AS status, attempt.errors AS errors,
+                   attempt.completed_at AS completed_at
+            FROM scoped AS attempt
+            JOIN newest ON newest.ticker = attempt.ticker
+                       AND newest.trading_day = attempt.trading_day
+                       AND newest.stage = attempt.stage
+            JOIN scoped AS latest ON latest.id = newest.id
+            LEFT JOIN last_resolved ON last_resolved.ticker = attempt.ticker
+                       AND last_resolved.trading_day = attempt.trading_day
+                       AND last_resolved.stage = attempt.stage
+            WHERE attempt.resolved = 0
+              AND attempt.id > COALESCE(last_resolved.id, 0)
+              AND latest.resolved = 0
+              AND latest.completed_at >= ?
+            ORDER BY attempt.trading_day, attempt.ticker, attempt.stage, attempt.id
+            """,
+            (marker, *names, version, since),
+        )
+
+        grouped: dict[tuple[str, str, str], list[StageOutcome]] = {}
+        for row in rows:
+            key = (str(row["trading_day"]), str(row["ticker"]), str(row["stage"]))
+            grouped.setdefault(key, []).append(_stage_outcome(row, version))
+        return [
+            StageEpisode(
+                ticker=ticker,
+                trading_day=day,
+                stage=stage,
+                pipeline_version=version,
+                attempts=tuple(attempts),
+            )
+            for (day, ticker, stage), attempts in grouped.items()
+        ]
+
     def run_log_rows(
         self,
         *,
@@ -2735,9 +3045,18 @@ class Phase0Repository:
         database_path: str | Path = DEFAULT_DATABASE_PATH,
         *,
         migrations_path: str | Path = MIGRATIONS_PATH,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.database_path = Path(database_path)
         self.migrations_path = Path(migrations_path)
+        #: The clock a run's ``started_at`` and ``completed_at`` are read
+        #: from.  Injected so that anything *comparing* against those
+        #: timestamps -- a scheduler deciding whether a failure is recent --
+        #: can be driven by the same instant in a test, instead of racing a
+        #: wall clock it cannot see.  Production leaves it unset and gets
+        #: UTC wall time; nothing else in this class reads it, so evidence
+        #: and settlement timestamps written by the fetchers are unchanged.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.admin = Phase0Admin(self)
         #: The public read surface.  Holds a path, never a connection.
         self.read = Phase0Reader(self.database_path)
@@ -2746,6 +3065,26 @@ class Phase0Repository:
         # never a copy carrying the same fields.
         self._active_runs: dict[int, StageRunContext] = {}
         self._run_lock = threading.Lock()
+
+    def now(self) -> datetime:
+        """The instant this repository's runs are stamped with.
+
+        Timezone-aware UTC.  A caller that needs to compare against a
+        run's ``completed_at`` reads its "now" from here, so the two sides
+        of the comparison come from one clock.
+        """
+
+        moment = self._clock()
+        if not isinstance(moment, datetime):
+            raise Phase0ValidationError("the repository clock must return a datetime")
+        if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+            # Refused rather than assumed: a naive instant says nothing
+            # about which wall it hangs on, and guessing UTC would move
+            # every run timestamp by the host's offset without a trace.
+            raise Phase0ValidationError(
+                "the repository clock must return a timezone-aware datetime"
+            )
+        return moment.astimezone(timezone.utc)
 
     # ------------------------------------------------------------------
     # Connections and migrations
@@ -6602,7 +6941,7 @@ class Phase0Repository:
             stage_key=key,
         )
         self._register_run(context)
-        started = datetime.now(timezone.utc)
+        started = self.now()
         object.__setattr__(context, "_started_at", started)
         failure: BaseException | None = None
         try:
@@ -6775,7 +7114,7 @@ class Phase0Repository:
         context: StageRunContext,
         status: str,
     ) -> None:
-        completed = datetime.now(timezone.utc)
+        completed = self.now()
         self._write_run_log(
             connection,
             run_id=context.run_id,
@@ -7632,17 +7971,58 @@ class Phase0Repository:
                     "a relevance decision is always about one ticker"
                 )
             self._assert_relevance_partition(connection, prepared, context)
+            # ``relevance_changed`` is the count a scheduler can trust: how
+            # many of these items now project into this partition
+            # differently from before this run -- gained the association,
+            # lost it, or changed eligibility.  ``relevance_assigned`` says
+            # what was decided, and re-deciding the same thing is a decision
+            # too, so it cannot tell a repeat sighting from news.
+            changed = 0
             for values in prepared:
+                before = self._partition_input_state(
+                    connection, values["raw_item_id"], context.ticker
+                )
                 self._apply_relevance_decision(connection, values, context)
+                after = self._partition_input_state(
+                    connection, values["raw_item_id"], context.ticker
+                )
+                changed += before != after
             assigned = sum(1 for values in prepared if values["ticker"] is not None)
             context._record_outcome(success=len(prepared))
             context._merge_counts(
                 {
                     "relevance_decisions": len(prepared),
                     "relevance_assigned": assigned,
+                    "relevance_changed": changed,
                 }
             )
             return len(prepared)
+
+    @staticmethod
+    def _partition_input_state(
+        connection: sqlite3.Connection, item_id: int, ticker: str
+    ) -> tuple[bool, str | None]:
+        """What one item contributes to one partition's evidence projection.
+
+        Exactly the two facts ``partition_evidence`` reads: whether any
+        association row joins the item to the ticker, and the item's
+        ``ingest_status``, which decides eligibility.  Content is immutable
+        once inserted and the day is derived from it, so nothing else about
+        the row can change what the story stage sees.
+        """
+
+        associated = connection.execute(
+            "SELECT 1 FROM raw_item_tickers WHERE raw_item_id = ? AND ticker = ? "
+            "LIMIT 1",
+            (item_id, ticker),
+        ).fetchone()
+        status = connection.execute(
+            "SELECT ingest_status FROM raw_items WHERE id = ?", (item_id,)
+        ).fetchone()
+        return (
+            associated is not None,
+            None if status is None else str(status["ingest_status"]),
+        )
 
     @staticmethod
     def _prepare_relevance_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
@@ -8199,6 +8579,8 @@ __all__ = [
     "SOURCE_STATE_STATUSES",
     "STAGE_DEGRADED",
     "STORY_RECONCILED_COLUMNS",
+    "StageEpisode",
+    "StageOutcome",
     "PreviousThemeGeneration",
     "PartitionGeneration",
     "PersistedThemeSet",

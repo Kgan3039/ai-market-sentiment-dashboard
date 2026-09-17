@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .repository import Phase0Repository, _normalize_day
 from .stories import PartitionOutcome, StoryReconciler
@@ -57,6 +57,33 @@ class PartitionResult:
     @property
     def themes_attempted(self) -> bool:
         return self.themes.attempted
+
+
+def _stories_not_attempted(
+    ticker: str, trading_day: str, reason: str
+) -> PartitionOutcome:
+    """A story outcome for a partition whose stories were never opened.
+
+    Not ``failed``: nothing was attempted, and a ledger reader must not be
+    told story reconciliation ran and lost.  The reason travels on the
+    outcome; the durable record is the ``themes`` run the coordinator
+    settles beside it.
+    """
+
+    return PartitionOutcome(
+        ticker=ticker,
+        trading_day=trading_day,
+        status="not_attempted",
+        story_stage=None,
+        degradation_reason=None,
+        story_count=0,
+        error={
+            "type": "stories_not_attempted",
+            "ticker": ticker,
+            "trading_day": trading_day,
+            "reason": reason,
+        },
+    )
 
 
 def _not_attempted(ticker: str, trading_day: str, reason: str) -> ThemePartitionOutcome:
@@ -98,6 +125,19 @@ class PartitionCoordinator:
         self.pipeline_version = str(pipeline_version).strip()
         if not self.pipeline_version:
             raise ValueError("pipeline_version is required")
+        if encoder is None and (stories is None or themes is None):
+            # One encoder, resolved once, handed to both stages.  Each
+            # reconciler can resolve the default for itself, and in
+            # production both would get the same singleton -- but "would"
+            # is doing the work there, and the theme stage refuses to
+            # cluster stories merged in a different embedding space.  A
+            # coordinator that lets its two halves answer that question
+            # separately is a coordinator that can disagree with itself;
+            # resolving here makes the shared space a property of the
+            # object rather than of the module the default lives in.
+            from nlp.embeddings import get_default_service
+
+            encoder = get_default_service()
         self.stories = stories or StoryReconciler(
             repository, pipeline_version=self.pipeline_version, encoder=encoder
         )
@@ -133,13 +173,29 @@ class PartitionCoordinator:
     # -- The ordering ------------------------------------------------------
 
     def run(
-        self, trading_day: str | date, *, run_id: str
+        self,
+        trading_day: str | date,
+        *,
+        run_id: str,
+        identity: Callable[[str], str] | None = None,
     ) -> tuple[dict[str, Any], list[Any]]:
-        """Settle every partition of ``trading_day``; report what happened."""
+        """Settle every partition of ``trading_day``; report what happened.
+
+        The day is the unit of execution; the partition is the unit of
+        identity.  ``identity`` maps a ticker to the base run id its
+        partition runs under, for a scheduler whose reason for running one
+        partition on the day is not its reason for running the next -- a
+        retry beside a first attempt.  Without it every partition runs
+        under ``run_id``.
+        """
 
         day = _normalize_day(trading_day)
         results = [
-            self.run_partition(ticker, day, base_run_id=run_id)
+            self.run_partition(
+                ticker,
+                day,
+                base_run_id=run_id if identity is None else identity(ticker),
+            )
             for ticker in self.partitions(day)
         ]
         return summarize(results)
@@ -169,7 +225,31 @@ class PartitionCoordinator:
         # 1. Before any story write can delete it.  The whole generation,
         #    not only its themes: a set with no themes in it still names
         #    the model and configuration that built it.
-        previous = self.themes.capture_previous(symbol, day)
+        #
+        #    A capture that raises is this partition's failure and no one
+        #    else's.  The stories are not touched -- writing them would
+        #    delete the very identities that could not be read -- and the
+        #    failure is settled as a ``themes`` run so a later invocation
+        #    can find the partition and try again.  Then the next ticker
+        #    gets its turn, with everything settled before it intact.
+        try:
+            previous = self.themes.capture_previous(symbol, day)
+        except Exception as exc:  # noqa: BLE001 - isolation is the contract
+            return PartitionResult(
+                ticker=symbol,
+                trading_day=day,
+                stories=_stories_not_attempted(
+                    symbol, day, "previous_theme_capture_failed"
+                ),
+                themes=self.themes.record_precondition_failure(
+                    symbol,
+                    day,
+                    base_run_id=base_run_id,
+                    cause=exc,
+                    phase="previous_theme_capture",
+                ),
+                previous_captured=0,
+            )
         captured = 0 if previous is None else len(previous.identities)
 
         # 2. The story stage, which may invalidate what we just captured.
@@ -201,6 +281,7 @@ _STORY_COUNTER = {
     "success": "succeeded",
     "degraded": "degraded",
     "failed": "failed",
+    "not_attempted": "not_attempted",
 }
 _THEME_COUNTER = {
     "success": "succeeded",
@@ -225,6 +306,7 @@ def summarize(
         "stories_succeeded": 0,
         "stories_degraded": 0,
         "stories_failed": 0,
+        "stories_not_attempted": 0,
         "themes_succeeded": 0,
         "themes_degraded": 0,
         "themes_failed": 0,
@@ -244,7 +326,12 @@ def summarize(
         # the aggregate has to survive it too.
         counts["theme_rows_cleared"] += result.themes.counts.get("cleared_rows", 0)
         counts["previous_themes_captured"] += result.previous_captured
-        if result.stories.error is not None:
+        if (
+            result.stories.error is not None
+            # Stories not attempted because capture failed are explained by
+            # the theme error folded in below; the counter carries the fact.
+            and result.stories.error.get("type") != "stories_not_attempted"
+        ):
             errors.append(dict(result.stories.error))
         if (
             result.themes.error is not None

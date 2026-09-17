@@ -1,7 +1,8 @@
 # Phase 0 Data Pipeline
 
-`pipeline.py` orchestrates the Phase 0 ingestion components. It calls
-Yahoo (#61) and RSS (#62); it persists nothing itself.
+`pipeline.py` orchestrates the Phase 0 components. It calls Yahoo (#61)
+and RSS (#62), then the intelligence component that turns what they
+persisted into stories and themes; it persists nothing itself.
 
 That division is the design, not an implementation detail. I1 (#57) made
 every durable write happen inside a run that names exactly one partition —
@@ -105,6 +106,156 @@ partition commits:
   the invocation, and the CLI answers with an exit code rather than a
   traceback.
 
+## Stories and themes
+
+After both ingestion components have settled, the `intelligence`
+component reconciles persisted stories and themes for the days that need
+it. It calls `PartitionCoordinator` and nothing else: the coordinator owns
+the ordering that makes the output correct — capture the previous theme
+identities, reconcile stories, reconcile themes with the captured
+identities — and isolates each ticker-day from the others: a failure in
+any of the three steps settles that partition and the next one runs. A
+capture failure is recorded as a `failed` `themes` run for the partition
+and its stories are left untouched. Each partition's work lands as its
+own `stories` and `themes` run-log rows, written by the reconcilers under
+their own stage names. **No summary is generated.** The narrative API is
+unaffected and may still serve fixtures; a live run producing themes does
+not establish release provenance for anything.
+
+**Which partitions.** Every scheduling fact is kept per ticker/day
+partition — that is the grain the ledger records it at — and the day is
+only the unit the coordinator executes. Three sources, unioned, and the
+days they name are what runs:
+
+* *Touched* — the partitions this invocation's evidence-stage runs
+  (`fetch_yahoo`, `ingest_rss`, `classify_rss`, `reclassify_rss`)
+  **durably changed**, read back from `run_log` under the invocation's
+  id prefix: a ticker-scoped run of one of those stages whose counts
+  record `raw_items_inserted > 0` or `relevance_changed > 0`. Those
+  counters are written by the mutations themselves — an insert that
+  created the row, a classification after which the item's association
+  with that ticker, or its eligibility, is different from before. A
+  late-arriving article inserts under its published day, so that
+  partition is touched and rebuilt. A provider serving an article already
+  stored, a feed re-listing an old entry, or a classifier re-deciding an
+  association that already stood opens runs that record no change and
+  touches nothing; `relevance_assigned` counts decisions, not changes,
+  and is not consulted. A duplicate observation therefore cannot reopen
+  an expired failure.
+* *Retried* — partitions whose newest `stories` or `themes` outcome is
+  *unresolved* — a `failed` run, or a `degraded` run carrying a
+  `stage_degraded` marker — and whose failure episode is still inside its
+  window. Without this, a transient failure — a model cache missing on
+  Friday's last run — would stay failed until fresh evidence happened to
+  arrive for that partition. The marker is what separates that case from
+  an identical replay, which also settles `degraded` (unchanged rows count
+  as partial work) and is deliberately *not* retried: nothing went wrong
+  and nothing would change.
+
+* *Recovered* — partitions, not touched, on days where an evidence-writing
+  run completed within the horizon, whose intelligence work under the
+  running `pipeline_version` either never began or was interrupted
+  before themes. Per ticker, read from the run ledger:
+
+  | newest `stories` run | `themes` run | decided by |
+  |---|---|---|
+  | none | none | **recovery** — never attempted |
+  | `success`, or `degraded` with no marker | none | **recovery** — interrupted between stories and themes |
+  | `failed`, or `degraded` with a `stage_degraded` marker | none | **the retry window** — this is an episode |
+  | any | any | the outcome itself, and the retry window if it is unresolved |
+
+  "No `themes` row" alone is *not* the criterion. The coordinator does not
+  open themes over a story failure, so a partition whose stories failed
+  also has no `themes` row — and it already has an episode with an anchor
+  and a deadline. Recovering it under the evidence-triggered identity
+  would give it a new anchor on every invocation and the deadline would
+  never arrive; so the newest `stories` outcome is read, and an
+  unresolved one keeps the partition out of recovery whether its window
+  is open or expired. A settled `stories` outcome the coordinator would
+  have carried on from, with no `themes` row, is the interrupted case and
+  is recovered. The `themes` row is the witness that a partition was
+  carried through — the coordinator writes one for every partition it
+  finishes, healthy, empty, M2-only, or failed at capture — and a healthy
+  completed day has one for every partition and is never selected again.
+  The check is per ticker, so one processed ticker never vouches for
+  another on the same day.
+
+**Identity is per partition — touched, then episode, then everything
+else.** The identity a partition runs under decides whether a failure
+there may anchor a new retry window, so it follows the strongest fact
+about *that partition*, never about its neighbours on the day. Evidence
+this invocation durably changed is the strongest: it is a new reason to
+process, and a failure on it legitimately opens a fresh window, even
+over an old episode. An existing episode comes next: a partition whose
+newest `stories` or `themes` outcome is unresolved, and which this
+invocation did not touch, runs under the retry identity — whether it was
+selected as a retry, is rerun because its day was, or is an expired
+episode that came along — so no attempt on it can renew a deadline it
+already owns. Every other partition — never attempted, interrupted
+before themes, or a settled neighbour rerun with its day — runs under
+the evidence-triggered identity, so if its attempt fails, that failure
+is an anchor and the partition is retried on its own account. One day
+can therefore hold a touched partition, a retried one and a recovered
+one, each under its own run id, and no partition's identity is
+inherited from another's.
+
+**The retry window is anchored, not rolling.** An episode is every
+unresolved attempt since the last one that resolved the partition, and
+its window opens at the newest attempt that was *not itself a retry* —
+the failure that started it, or a later failure that followed new
+evidence. A partition with an episode this invocation did not touch
+runs under `<invocation>:intelligence-retry:<ticker>:<day>`; a retry is
+recognised **structurally**, by splitting the run id three times from the
+right and comparing the pipeline-owned component exactly, never by
+searching the string, so an invocation id a caller chose is free to
+contain that text and still be an ordinary evidence-triggered run.
+Retries never move the anchor, so a permanent failure retried every half
+hour stops being retried `RETRY_HORIZON` (three days) after it began,
+whatever the retries recorded. Recovery never claims a partition with an
+unresolved `stories` outcome, and a repeat observation of stored
+evidence never touches one, so neither moves it either: the window is
+anchored to the first unresolved evidence-triggered failure, and only
+a genuine durable change to the partition's evidence can open a new
+one. A success closes the episode. New evidence for the partition is
+not blocked by an expired episode: it arrives through the touched path,
+and if that attempt fails too, a fresh window opens on it.
+Selection is scoped to the running `pipeline_version`; one version's
+`stories` and `themes` outcomes neither hide, schedule, nor recover
+another's.
+
+The same three-day horizon bounds both recovery and retry; a day the
+operator would want caught up for one reason is a day they would want
+caught up for the other. Evidence persisted before intelligence could run
+and never reached within that window is not swept afterwards.
+
+Rerunning a day brings that day's other partitions with it. Healthy
+ones do not rewrite their stories or themes, but each still writes its
+own `stories` and `themes` run rows, under its own identity — an
+identical replay is recorded as `degraded` with no errors, which is the
+ledger's word for "unchanged".
+
+**One clock.** The repository owns it: `Phase0Repository(clock=…)`,
+defaulting to UTC wall time, stamps every run's `started_at` and
+`completed_at`, and `run_live` reads the same clock for the invocation's
+day label and for every cutoff the intelligence component computes. There
+is deliberately no `now=` parameter on `run_live`, `run_replay`, or the
+intelligence builder — a caller-supplied instant would govern the
+comparison but not the timestamps it compares against. A clock that
+returns a naive datetime is refused. Evidence timestamps
+(`raw_items.fetched_at`, `published_at`) are written by the fetchers and
+are not consulted by scheduling; they remain source semantics.
+
+**Status.** The component is `success` when every partition's stories and
+themes landed, `degraded` when any partition failed or degraded on top of
+persisted stories, and `failed` when no story generation was written at
+all. It is not mandatory — a day with nothing to reconcile is an honest
+`success` and must not stop an invocation whose fetches all failed from
+being `failed` — but that cannot make its own failure look green:
+`success` requires every component to succeed, so a failed or degraded
+intelligence run is a `degraded` invocation at best. Semantic dedup being
+unavailable retains M2 stories marked `m2.exact` and ships no themes for
+that partition, exactly as before.
+
 ## Replay
 
 `--replay` calls I3's `reclassify_persisted`. It reads persisted evidence
@@ -125,13 +276,14 @@ the claim is deliberately narrow:
 |---|---|
 | RSS relevance | replayable |
 | Yahoo refetch | not replayed — replay never fetches |
-| Dedup, clustering, summarization (M1–M5) | implemented in `nlp/`, not registered |
+| Stories and themes (M2–M5) | produced by the **live** path; `--replay` does not drive them |
+| Summarization | not registered |
 | Scoped replay (one ticker/day/version) | unavailable — `reclassify_persisted` takes no scope |
 
 Replay currently covers **all** persisted RSS evidence, because that is
-the only scope the public API offers. Downstream stages register in
-`DOWNSTREAM_STAGES` as they land; the tuple is empty on purpose, so the
-CLI's answer about what it can rebuild stays true without being updated.
+the only scope the public API offers. Downstream components register in
+`DOWNSTREAM_STAGES` as builders bound at run time; the CLI reports what is
+registered and, separately, what replay actually drives.
 
 ## Scheduling
 

@@ -34,17 +34,25 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from zoneinfo import ZoneInfo
 
+from phase0 import rss as rss_module
+from phase0 import yahoo as yahoo_module
+from phase0.coordinator import PartitionCoordinator
 from phase0.repository import (
     DEFAULT_DATABASE_PATH,
+    STAGE_DEGRADED,
     Phase0Repository,
+    StageEpisode,
+    StageOutcome,
     redact_secrets,
 )
 from phase0.rss import RSSFetcher
+from phase0.stories import STAGE as STORIES_STAGE
+from phase0.themes import STAGE as THEMES_STAGE
 from phase0.yahoo import YahooFinanceFetcher
 
 
@@ -207,10 +215,88 @@ class Stage:
     mandatory: bool = True
 
 
-# M1--M5 register here as they land.  The tuple is empty on purpose: the
-# CLI reads it to report what can and cannot be replayed, so an aspirational
-# entry would become a false claim rather than a to-do.
-DOWNSTREAM_STAGES: tuple[Stage, ...] = ()
+#: How a downstream stage is registered: a builder, not a built stage.
+#:
+#: A ``Stage`` binds a repository, and a module-level tuple has no
+#: repository to bind at import time, so the registry holds constructors
+#: and ``run_live`` calls them beside ``yahoo_stage`` and ``rss_stage``.
+#: Every builder takes the same keyword arguments so the loop in
+#: ``run_live`` stays one line whatever lands here next.
+DownstreamStageBuilder = Callable[..., "Stage"]
+
+#: The name of the component that produces stories and themes.  A unit of
+#: work, not an algorithm: the durable ``stories`` and ``themes`` run rows
+#: it leaves are the repository's, written by the reconcilers under their
+#: own stage names (decision A4).  This is only what the invocation calls
+#: the component that drove them.
+INTELLIGENCE_STAGE = "intelligence"
+
+#: The run-identity component a *retry* attempt is opened under, as
+#: distinct from an attempt triggered by evidence this invocation ingested.
+#:
+#: The distinction has to be durable, because the retry window is
+#: anchored on it: a failure that arrived with new evidence opens a
+#: window, and a failure that is merely a retry of the same input must
+#: not reopen one.  The ledger already records which run produced each
+#: outcome, so the trigger travels in the run identity rather than in a
+#: new column.  ``execute_stage`` derives ``<invocation>:intelligence`` for
+#: the component; retried days derive ``<invocation>:intelligence-retry``
+#: from it, and every partition run under that base ends in
+#: ``:intelligence-retry:<ticker>:<day>``.
+#:
+#: Recognition is structural, not textual -- see :func:`is_retry_run`.
+#: The caller chooses the invocation id and may put anything in it,
+#: including this very string; the three trailing components are the
+#: pipeline's, so those are the only ones read.
+RETRY_RUN_SUFFIX = "-retry"
+RETRY_COMPONENT = f"{INTELLIGENCE_STAGE}{RETRY_RUN_SUFFIX}"
+
+#: The two durable stages the intelligence component drives.
+INTELLIGENCE_STAGES = (STORIES_STAGE, THEMES_STAGE)
+
+#: The ingestion stages whose runs mean "this partition's evidence, or
+#: which ticker it belongs to, may have changed".  Named by inclusion so
+#: a feed checkpoint or a snapshot -- runs that touch feed state and never
+#: an item -- do not make a day look touched, and so a stage added later
+#: has to be added here on purpose.
+EVIDENCE_STAGES = (
+    yahoo_module.STAGE,
+    rss_module.STAGE_INGEST,
+    rss_module.STAGE_CLASSIFY,
+    rss_module.STAGE_RECLASSIFY,
+)
+
+#: The run-log counters that mean an evidence-stage run *durably changed*
+#: what a partition's story stage will read: a raw item inserted under
+#: the partition, or an item whose association with the partition's
+#: ticker -- or whose eligibility -- is different after the run from
+#: before.  A run of an evidence stage that recorded neither saw only
+#: what was already stored; a provider serving the same article again,
+#: or a classifier re-deciding the same association, is not news.
+DURABLE_CHANGE_COUNTERS = ("raw_items_inserted", "relevance_changed")
+
+#: How long an unresolved intelligence failure keeps being retried, and
+#: how far back an evidence-writing run is looked at for partitions the
+#: pipeline never got to.  One horizon for both: they are the two ways
+#: the same unattended schedule falls behind, and a day the operator
+#: would want caught up for one reason is a day they would want caught
+#: up for the other.
+#: without new evidence arriving for its partition, measured from the
+#: attempt that *opened* the episode -- the first failure after the last
+#: success, or after the last evidence-triggered attempt -- and never
+#: from a retry.  A retry that fails again does not extend its own
+#: window; after this long it stops, and only new evidence, arriving
+#: through the touched-day path, opens another.
+#:
+#: Three days covers the ordinary shape of a transient outage -- a model
+#: cache missing on Friday's last run is retried on Monday's first -- and
+#: bounds two costs: the ``run_log`` scan that finds such episodes, and
+#: how many times a partition with a *permanent* defect is re-attempted
+#: before it is left alone.  At the scheduled cadence that is roughly 150
+#: attempts, each of which reads the partition and writes a failed run
+#: row; unchanged healthy partitions on the same day settle without
+#: rewriting stories or themes but do write their own run rows.
+RETRY_HORIZON = timedelta(days=3)
 
 
 def component_status(
@@ -462,6 +548,390 @@ def rss_replay_stage(
     return Stage("rss_relevance_replay", action, settled=("updated",))
 
 
+# -- Intelligence: stories and themes over what ingestion persisted --------
+#
+# The component calls ``PartitionCoordinator`` and nothing else.  The
+# coordinator owns the ordering that makes story and theme output correct
+# -- capture previous theme identities, then stories, then themes with the
+# captured identities -- and owns the isolation between partitions.  What
+# is decided here is only *which days* to hand it.
+
+
+Partition = tuple[str, str]
+"""``(ticker, trading_day)`` -- the grain every scheduling fact has."""
+
+
+@dataclass(frozen=True)
+class IntelligenceSelection:
+    """Which partitions this invocation reconciles, why, and under what name.
+
+    Every fact here is per partition, because that is the grain the
+    ledger keeps them at; the day is only the unit the coordinator
+    executes.  ``touched`` are the partitions this invocation's own
+    evidence-stage runs durably changed, read back from ``run_log``
+    rather than remembered.  ``retried`` are partitions whose unresolved
+    failure episode is still inside its retry window.  ``recovered`` are
+    partitions, not touched, with recent evidence whose intelligence work
+    this pipeline version never began, or began and never carried as far
+    as themes.  ``unresolved`` are the partitions on the selected days whose
+    newest ``stories`` or ``themes`` outcome is :func:`unresolved` --
+    an episode, whether its window is open or has closed.  ``days`` is
+    every day named by the first three, sorted.
+
+    **Identity -- touched, then episode, then everything else.**  The
+    identity a partition runs under decides whether a failure there can
+    anchor a new retry window, so it follows the strongest fact about
+    *that partition*, never about its neighbours on the day.  Evidence
+    this invocation changed is the strongest: a new reason to process,
+    and a failure on it legitimately opens a fresh window.  An existing
+    episode comes next: a partition that has one and was not touched
+    runs under the retry identity, whether it was selected as a retry,
+    is rerun because its day was, or is an expired episode that came
+    along -- so no attempt on it can renew a deadline it already owns.
+    Every other partition -- never attempted, interrupted before
+    themes, or a settled neighbour -- runs under the evidence-triggered
+    identity, so if its attempt fails, that failure is an anchor and the
+    partition is retried on its own account.
+    """
+
+    touched: frozenset[Partition]
+    retried: frozenset[Partition]
+    recovered: frozenset[Partition]
+    unresolved: frozenset[Partition]
+    days: tuple[str, ...]
+
+    @property
+    def touched_days(self) -> tuple[str, ...]:
+        return _days(self.touched)
+
+    @property
+    def retried_days(self) -> tuple[str, ...]:
+        return _days(self.retried)
+
+    @property
+    def recovered_days(self) -> tuple[str, ...]:
+        return _days(self.recovered)
+
+    def runs_as_retry(self, ticker: str, day: str) -> bool:
+        """Does this partition run under the retry identity?
+
+        It has an episode and this invocation did not change its
+        evidence.  Nothing about any other partition enters into it.
+        """
+
+        partition = (ticker, day)
+        return partition in self.unresolved and partition not in self.touched
+
+
+def _days(partitions: frozenset[Partition]) -> tuple[str, ...]:
+    return tuple(sorted({day for _, day in partitions}))
+
+
+def unresolved(outcome: StageOutcome) -> bool:
+    """Does this outcome leave its partition's intelligence work undone?
+
+    A ``failed`` run does.  A ``degraded`` run does when it carries a
+    ``stage_degraded`` marker -- semantic dedup was unavailable, or themes
+    were refused because the stories were M2-only -- because the stored
+    generation is honest and intermediate and a later run with the model
+    back would replace it.  A ``degraded`` run with **no** marker does
+    not: that is an identical replay whose unchanged rows counted as
+    partial work, and there is nothing to redo.  The marker is the whole
+    distinction, and ``record_degradation`` puts it there so a scheduler
+    never has to infer intent from the word ``degraded``.
+    """
+
+    if outcome.status == "failed":
+        return True
+    if outcome.status == "degraded":
+        return any(kind == STAGE_DEGRADED for kind, _ in outcome.markers)
+    return False
+
+
+def is_retry_run(run_id: str) -> bool:
+    """Was this partition run opened as a retry?
+
+    An intelligence partition run id is ``<base>:<component>:<ticker>:<day>``
+    where ``<base>`` is whatever the caller named the invocation and the
+    last three components were appended by this file and by
+    ``partition_run_id``.  The ticker and the day contain no colon, so
+    splitting three times from the right isolates exactly the component
+    this pipeline chose -- whatever the caller put in front of it.  A
+    caller-supplied invocation id that happens to contain
+    ``:intelligence-retry:`` therefore still runs, and is still read back,
+    as an ordinary evidence-triggered attempt.
+    """
+
+    parts = run_id.rsplit(":", 3)
+    if len(parts) != 4:
+        return False
+    _, component, ticker, day = parts
+    if component != RETRY_COMPONENT or not ticker:
+        return False
+    try:
+        date.fromisoformat(day)
+    except ValueError:
+        return False
+    return True
+
+
+def episode_anchor(episode: StageEpisode) -> str | None:
+    """When this episode's retry window opened, or ``None`` if never.
+
+    The anchor is the newest unresolved attempt that was *not itself a
+    retry* -- the first failure after the last success, or the failure
+    that followed new evidence.  Retries are recognised by the identity
+    they ran under and never move it, so a permanent failure retried
+    every half hour cannot keep its own window open.  An episode made of
+    retries alone has no anchor; it cannot exist through this scheduler,
+    since a retry needs a live window to be scheduled at all, and it is
+    reported as expired rather than guessed at.
+    """
+
+    anchoring = [
+        attempt.completed_at
+        for attempt in episode.attempts
+        if not is_retry_run(attempt.run_id)
+    ]
+    return max(anchoring) if anchoring else None
+
+
+def retryable(episode: StageEpisode, *, since: str) -> bool:
+    """Is this episode still inside its retry window?"""
+
+    if not unresolved(episode.newest):
+        return False
+    anchor = episode_anchor(episode)
+    return anchor is not None and anchor >= since
+
+
+def needs_recovery(latest_stories: StageOutcome | None) -> bool:
+    """Given no ``themes`` run, does the newest ``stories`` outcome leave a
+    partition for recovery rather than for the retry window?
+
+    ``None`` -- no ``stories`` run under this version -- is a partition
+    whose intelligence work never began: recover.  A resolved outcome --
+    ``success``, or a marker-free ``degraded`` replay -- is one the
+    coordinator would have carried on to themes from, so the missing
+    themes run means the process was interrupted between the two:
+    recover.  An :func:`unresolved` outcome -- ``failed``, or ``degraded``
+    with a ``stage_degraded`` marker -- already has an episode, anchored
+    on the attempt that recorded it; recovery must not touch it, or the
+    anchor would move.  Whether that episode is still inside its window
+    is :func:`retryable`'s question, and if it is not, the partition
+    stays where the retry contract leaves it.
+    """
+
+    return latest_stories is None or not unresolved(latest_stories)
+
+
+def select_intelligence_days(
+    repository: Phase0Repository,
+    *,
+    invocation_id: str,
+    pipeline_version: str,
+    now: datetime,
+    horizon: timedelta = RETRY_HORIZON,
+) -> IntelligenceSelection:
+    """Decide which partitions the intelligence component reconciles.
+
+    **Touched partitions** are read from the ledger under this
+    invocation's own prefix: runs of :data:`EVIDENCE_STAGES` that name a
+    ticker and recorded one of :data:`DURABLE_CHANGE_COUNTERS` above
+    zero.  Every component derives its partition run ids from the base
+    the orchestrator gave it, so the prefix is the authoritative record
+    of what was opened, and the counters -- written by the mutations
+    themselves -- are the authoritative record of whether anything
+    changed.  A late-arriving article for last Tuesday inserts under last
+    Tuesday's partition and so selects it; a provider serving an article
+    already stored, or a classifier re-deciding an association that
+    already stood, opens runs that record no change and selects nothing.
+    Touched is therefore never a way for a repeat sighting to reopen an
+    expired failure.
+
+    **Retried partitions** hold an :func:`unresolved` newest ``stories``
+    or ``themes`` outcome whose episode's :func:`episode_anchor` is
+    within :data:`RETRY_HORIZON` of ``now``.  Without this, an unattended
+    pipeline would leave a transient failure failed for as long as no
+    fresh evidence happened to arrive for that partition; with the
+    anchor, a permanent failure stops being retried once its window
+    closes, whatever the retries themselves recorded.
+
+    **Recovered partitions** close the gap the other two leave.  An
+    invocation that persists evidence and then dies before this component
+    runs leaves partitions with evidence and no intelligence rows; one
+    that dies inside it can leave stories settled and themes never
+    opened.  Neither has a failure episode, because nothing failed.  So
+    every day an evidence-writing run completed within the horizon is
+    checked, ticker by ticker, against :func:`needs_recovery`: the
+    partition holds authoritative evidence, this pipeline version has
+    **no ``themes`` run** for it, and its newest ``stories`` outcome --
+    if there is one -- is resolved.  That last clause is what keeps
+    recovery honest.  A partition whose stories *failed* also has no
+    ``themes`` row, because the coordinator does not open themes over a
+    story failure; but that partition has an episode, with an anchor and
+    a deadline, and running it here under the evidence-triggered identity
+    would give it a new anchor every time -- the deadline would never
+    arrive.  Such a partition is the retry window's, inside the window
+    and outside it.  The ``themes`` row is the witness that a partition
+    was carried through: the coordinator writes one for every partition
+    it finishes -- healthy, empty, M2-only, or failed at capture -- and a
+    healthy completed day has one for every partition and is never
+    selected again.
+
+    ``now`` and the ledger's ``completed_at`` values come from the same
+    clock -- the repository's -- so every comparison here means what it
+    says.  Evidence timestamps are not consulted.
+
+    The coordinator works a whole day at a time, so a selected partition
+    brings its day's other partitions with it.  Those settle without
+    rewriting stories or themes, but each writes its own run row -- under
+    its own identity, see :class:`IntelligenceSelection`.
+    """
+
+    reader = repository.read
+    touched = frozenset(
+        reader.changed_partitions(
+            f"{invocation_id}:",
+            stages=EVIDENCE_STAGES,
+            counters=DURABLE_CHANGE_COUNTERS,
+        )
+    )
+    since = (now.astimezone(timezone.utc) - horizon).isoformat()
+    episodes = reader.stage_outcome_episodes(
+        INTELLIGENCE_STAGES, pipeline_version=pipeline_version, completed_since=since
+    )
+    retried = frozenset(
+        (episode.ticker, episode.trading_day)
+        for episode in episodes
+        if retryable(episode, since=since)
+    )
+    recovered: set[Partition] = set()
+    for day in reader.recent_run_days(EVIDENCE_STAGES, completed_since=since):
+        with_evidence = set(reader.evidence_partition_tickers(day))
+        themes_attempted = set(
+            reader.attempted_partitions(
+                THEMES_STAGE, day, pipeline_version=pipeline_version
+            )
+        )
+        latest_stories = reader.latest_partition_outcomes(
+            STORIES_STAGE, day, pipeline_version=pipeline_version
+        )
+        recovered.update(
+            (ticker, day)
+            for ticker in with_evidence - themes_attempted
+            if needs_recovery(latest_stories.get(ticker))
+        )
+    # Evidence this invocation just changed is touched, whatever else is
+    # true of it; recovery is for evidence nobody has processed *before*.
+    recovered -= touched
+    days = _days(touched | retried | frozenset(recovered))
+    unresolved_partitions: set[Partition] = set()
+    for day in days:
+        for stage in INTELLIGENCE_STAGES:
+            newest = reader.latest_partition_outcomes(
+                stage, day, pipeline_version=pipeline_version
+            )
+            unresolved_partitions.update(
+                (ticker, day)
+                for ticker, outcome in newest.items()
+                if unresolved(outcome)
+            )
+    return IntelligenceSelection(
+        touched=touched,
+        retried=retried,
+        recovered=frozenset(recovered),
+        unresolved=frozenset(unresolved_partitions),
+        days=days,
+    )
+
+
+def intelligence_stage(
+    repository: Phase0Repository,
+    *,
+    pipeline_version: str,
+    invocation_id: str,
+    encoder: Any | None = None,
+) -> Stage:
+    """The stories-and-themes component, built when it runs.
+
+    ``encoder`` is the one M1 service both reconcilers share; ``None``
+    means the default local model, resolved lazily by the coordinator on
+    the first partition that needs a vector.  Tests hand in a fake so no
+    model is ever loaded, the same way they hand ``yahoo_stage`` a fake
+    provider.
+
+    Not mandatory, and the reason is arithmetic rather than importance.
+    ``invocation_status`` reports ``failed`` only when every mandatory
+    component settled nothing, and a run with no partitions to reconcile
+    is an honest ``success`` -- which, were this component mandatory,
+    would stop an invocation whose Yahoo *and* RSS fetches both failed
+    from being called ``failed``.  Marking it non-mandatory cannot make a
+    failure here look green: ``success`` requires every component to
+    succeed, so a failed or degraded intelligence run is a ``degraded``
+    invocation at best.
+    """
+
+    def action(base_run_id: str) -> tuple[dict[str, Any], list[Any]]:
+        selection = select_intelligence_days(
+            repository,
+            invocation_id=invocation_id,
+            pipeline_version=pipeline_version,
+            now=repository.now(),
+        )
+        coordinator = PartitionCoordinator(
+            repository, pipeline_version=pipeline_version, encoder=encoder
+        )
+        counts: dict[str, Any] = {
+            "days_touched": len(selection.touched_days),
+            "days_retried": len(selection.retried_days),
+            "days_recovered": len(selection.recovered_days),
+            "days_selected": len(selection.days),
+            "partitions_touched": len(selection.touched),
+            "partitions_retried": len(selection.retried),
+            "partitions_recovered": len(selection.recovered),
+            "partitions": 0,
+        }
+        errors: list[Any] = []
+        retry_base = f"{base_run_id}{RETRY_RUN_SUFFIX}"
+        for day in selection.days:
+            # Each partition runs under its own identity: a partition with
+            # an episode this invocation did not touch runs as a retry, so
+            # its outcome can never anchor a new window; every other one
+            # runs evidence-triggered, so a failure there *is* an anchor.
+            def identity(ticker: str, day: str = day) -> str:
+                return (
+                    retry_base if selection.runs_as_retry(ticker, day) else base_run_id
+                )
+
+            day_counts, day_errors = coordinator.run(
+                day, run_id=base_run_id, identity=identity
+            )
+            for key, value in day_counts.items():
+                if isinstance(value, int):
+                    counts[key] = counts.get(key, 0) + value
+            errors.extend(day_errors)
+        return counts, errors
+
+    return Stage(
+        INTELLIGENCE_STAGE,
+        action,
+        # A partition counts as settled when its stories were written --
+        # healthy or explicitly degraded -- because that generation is
+        # durable whatever the themes then did.  A theme failure on top of
+        # settled stories is a degraded component, not a failed one, and
+        # the error that says so travels in ``errors``.
+        settled=("stories_succeeded", "stories_degraded"),
+        unsettled=("stories_failed", "stories_not_attempted"),
+        mandatory=False,
+    )
+
+
+#: Downstream components, in the order they run after ingestion.  Builders,
+#: bound inside ``run_live``; see :data:`DownstreamStageBuilder`.
+DOWNSTREAM_STAGES: tuple[DownstreamStageBuilder, ...] = (intelligence_stage,)
+
+
 def _finish(
     *,
     invocation_id: str,
@@ -500,21 +970,36 @@ def run_live(
     aliases_path: Path,
     pipeline_version: str = PIPELINE_VERSION,
     invocation_id: str | None = None,
-    now: datetime | None = None,
+    encoder: Any | None = None,
 ) -> InvocationResult:
-    """Fetch every source, then report what each of them settled.
+    """Fetch every source, then reconcile what they persisted, then report.
 
-    Ordering is Yahoo, then RSS, then whatever is registered in
-    ``DOWNSTREAM_STAGES``.  Each component runs to completion independently:
-    it opens its own runs, settles its own partitions, and its evidence is
-    durable the moment it commits, so a later component failing cannot cost
-    an earlier one its day.
+    Ordering is Yahoo, then RSS, then every builder in
+    ``DOWNSTREAM_STAGES`` -- today the intelligence component, which turns
+    the evidence the first two committed into persisted stories and
+    themes.  Each component runs to completion independently: it opens its
+    own runs, settles its own partitions, and its output is durable the
+    moment it commits, so a later component failing cannot cost an earlier
+    one its day.
+
+    ``encoder`` is passed through to the downstream builders; ``None``
+    means the default local embedding model.
+
+    **There is one clock, and it is the repository's.**  The day label,
+    and every comparison a downstream component makes against run
+    timestamps, are read from ``repository.now()`` -- the same source
+    that stamps every run's ``started_at`` and ``completed_at``.  There
+    is deliberately no ``now`` parameter here: a caller-supplied instant
+    would govern the comparison but not the timestamps it compares
+    against, which is two clocks, and two clocks disagree.  A test that
+    needs to move time hands the repository a clock.  Production leaves
+    it unset and gets UTC wall time.
     """
 
     repository.migrate()
     started_at = datetime.now(timezone.utc)
     correlation = new_invocation_id() if invocation_id is None else invocation_id
-    day = invocation_day(now)
+    day = invocation_day(repository.now())
     stages = [
         yahoo_stage(repository, pipeline_version=pipeline_version),
         rss_stage(
@@ -523,7 +1008,15 @@ def run_live(
             aliases_path=aliases_path,
             pipeline_version=pipeline_version,
         ),
-        *DOWNSTREAM_STAGES,
+        *(
+            build(
+                repository,
+                pipeline_version=pipeline_version,
+                invocation_id=correlation,
+                encoder=encoder,
+            )
+            for build in DOWNSTREAM_STAGES
+        ),
     ]
     _log_event(
         "invocation_started",
@@ -552,10 +1045,12 @@ def replay_capabilities() -> dict[str, Any]:
     """What ``--replay`` can and cannot rebuild today.
 
     Reported rather than assumed, because "replay the pipeline" is a claim
-    this file cannot currently honour: RSS relevance is the only derived
-    state any registered component owns.  Dedup, clustering, summarization
-    and the rest are not registered, so their replay is unimplemented, not
-    merely untested.
+    this file cannot fully honour.  RSS relevance is the only derived
+    state ``run_replay`` rebuilds.  Stories and themes are now produced by
+    the *live* path -- the intelligence component reconciles them after
+    every ingestion -- but ``--replay`` does not drive that component, and
+    there is no scoped "rebuild this partition" entry point.  Summarization
+    is not registered anywhere.
     """
 
     return {
@@ -567,6 +1062,7 @@ def replay_capabilities() -> dict[str, Any]:
             "summarization",
         ],
         "downstream_stages_registered": len(DOWNSTREAM_STAGES),
+        "live_only": [INTELLIGENCE_STAGE],
         "scope": "all persisted RSS evidence",
         "scoped_replay_available": False,
     }
@@ -579,7 +1075,6 @@ def run_replay(
     aliases_path: Path,
     pipeline_version: str = PIPELINE_VERSION,
     invocation_id: str | None = None,
-    now: datetime | None = None,
 ) -> InvocationResult:
     """Rebuild derived state from stored evidence, touching no network.
 
@@ -600,7 +1095,7 @@ def run_replay(
     repository.migrate()
     started_at = datetime.now(timezone.utc)
     correlation = new_invocation_id() if invocation_id is None else invocation_id
-    day = invocation_day(now)
+    day = invocation_day(repository.now())
     capabilities = replay_capabilities()
     stages = [
         rss_replay_stage(

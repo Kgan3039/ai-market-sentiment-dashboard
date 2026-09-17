@@ -48,12 +48,12 @@ result.provider_conflicts   # quarantined provider identities
 ```
 
 **This does not close issue #64.** The DoD requires the stage to run inside
-`pipeline.py`. That runner is now on `main` (issue #68), as are I1
-persistence (#57), I2 Yahoo ingestion (#61) and I3 RSS ingestion (#62) — but
-`DOWNSTREAM_STAGES` is still empty, so no dedup stage is registered and
-nothing calls this core. AC-3's precision/recall half needs a real sample and
-a human review, neither of which exists. What is here is the deduplication
-logic the pipeline will call once I5 wires it.
+`pipeline.py`. That runner is on `main` (issue #68), as are I1 persistence
+(#57), I2 Yahoo ingestion (#61) and I3 RSS ingestion (#62), and the live
+pipeline now registers an `intelligence` component that drives this core
+through `phase0.stories.StoryReconciler` after every ingestion. AC-3's
+precision/recall half still needs a real sample and a human review, neither
+of which exists.
 
 ### Precision-first, with one gate
 
@@ -556,10 +556,12 @@ result = merge_semantic_duplicates(
 ```
 
 **This does not close issue #70.** The DoD requires the stage to be
-"integrated in pipeline". `pipeline.py` (#68) is on `main`, but
-`DOWNSTREAM_STAGES` is empty and this stage is not registered in it. The
-AC-3 half of the DoD is met *on the committed labelled set* — which is
-synthetic, so it is a design measurement, not the G4 gate result.
+"integrated in pipeline". `pipeline.py` (#68) now runs it: the live
+`intelligence` component drives this stage through
+`phase0.stories.StoryReconciler`, with M2's fallback recorded as `m2.exact`
+when this stage is unavailable. The AC-3 half of the DoD is met *on the
+committed labelled set* — which is synthetic, so it is a design measurement,
+not the G4 gate result.
 
 ### The finding that shaped the design
 

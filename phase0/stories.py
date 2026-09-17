@@ -129,7 +129,10 @@ class PartitionOutcome:
 
     ticker: str
     trading_day: str
-    #: ``success``, ``degraded``, or ``failed``.
+    #: ``success``, ``degraded``, ``failed`` -- or ``not_attempted``, which
+    #: this module never produces: an orchestrator reports it when it
+    #: decided, before any run was opened, that these stories must not be
+    #: touched.
     status: str
     #: ``m3.semantic``, ``m2.exact``, or ``None`` when nothing was written.
     story_stage: str | None
