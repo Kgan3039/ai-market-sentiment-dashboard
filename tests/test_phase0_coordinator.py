@@ -132,6 +132,33 @@ def test_the_coordinator_runs_both_stages_in_order(tmp_path):
     assert theme_set(repository) is not None
 
 
+def test_each_partition_runs_under_the_identity_it_is_given(tmp_path):
+    """The day is the unit of execution; the run id is per partition."""
+
+    repository = migrated(tmp_path)
+    seed(repository, ticker="NVDA")
+    seed(repository, ticker="AMD")
+
+    counts, errors = coordinator(repository).run(
+        DAY,
+        run_id="inv:intelligence",
+        identity=lambda ticker: (
+            "inv:intelligence-retry" if ticker == "NVDA" else "inv:intelligence"
+        ),
+    )
+
+    assert errors == []
+    assert counts["partitions"] == 2
+    by_ticker = {
+        (row["ticker"], row["stage"]): row["run_id"]
+        for row in repository.read.run_log_rows()
+    }
+    assert by_ticker[("NVDA", "stories")] == f"inv:intelligence-retry:NVDA:{DAY}"
+    assert by_ticker[("NVDA", "themes")] == f"inv:intelligence-retry:NVDA:{DAY}"
+    assert by_ticker[("AMD", "stories")] == f"inv:intelligence:AMD:{DAY}"
+    assert by_ticker[("AMD", "themes")] == f"inv:intelligence:AMD:{DAY}"
+
+
 def test_previous_identities_are_captured_before_stories_delete_them(tmp_path):
     """The whole reason this module exists.
 
@@ -501,15 +528,27 @@ def test_the_theme_runner_is_reusable_across_partitions(tmp_path):
     assert {outcome.ticker for outcome in outcomes} == {"AMD", "NVDA"}
 
 
-def test_no_pipeline_registration_was_added():
-    """Registration is explicitly out of scope for this slice."""
+def test_the_pipeline_registers_through_the_coordinator_only():
+    """The live pipeline drives this module; it does not reimplement it.
+
+    The orchestrator's downstream registry names one builder, and that
+    builder calls ``PartitionCoordinator``.  ``StoryReconciler`` and
+    ``ThemeReconciler`` are never constructed from ``pipeline.py``, because
+    doing so would put the capture-before-story-write ordering back in a
+    second place where it could be gotten wrong.
+    """
+
+    import inspect
 
     import pipeline
 
-    assert pipeline.DOWNSTREAM_STAGES == ()
-    source = __import__("inspect").getsource(pipeline)
-    assert "phase0.themes" not in source
-    assert "phase0.coordinator" not in source
+    assert pipeline.DOWNSTREAM_STAGES == (pipeline.intelligence_stage,)
+    source = inspect.getsource(pipeline)
+    assert "PartitionCoordinator(" in source
+    assert "StoryReconciler(" not in source
+    assert "ThemeReconciler(" not in source
+    assert "reconcile_stories(" not in source
+    assert "reconcile_themes(" not in source
 
 
 def test_a_zero_theme_generation_is_still_captured(tmp_path):

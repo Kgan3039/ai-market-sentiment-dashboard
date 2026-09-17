@@ -12,6 +12,7 @@ Persistence assertions go through the final public surface:
 :class:`~phase0.repository.Phase0Reader` for evidence.
 """
 
+import hashlib
 import inspect
 import json
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import nlp.embeddings
 import pipeline
 from pipeline import (
     ComponentResult,
@@ -140,6 +142,52 @@ def write_aliases(path):
         "tickers:\n  - ticker: AAPL\n    strong_aliases: [iPhone]\n",
         encoding="utf-8",
     )
+
+
+class FakeEncoder:
+    """A deterministic stand-in for M1's ``EmbeddingService``.
+
+    Vectors are derived from a digest of the text, so the same headline
+    always encodes the same way and no similarity is accidental.  Calls
+    are recorded so a test can prove the component never asked for a
+    vector when it had nothing to embed.
+    """
+
+    model_name = "fake-encoder"
+    model_revision = "rev-1"
+    dimension = 8
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def embed_batch(self, texts):
+        self.calls.append(list(texts))
+        return [
+            [byte / 255.0 for byte in hashlib.sha256(text.encode()).digest()[:8]]
+            for text in texts
+        ]
+
+
+@pytest.fixture(autouse=True)
+def no_real_model(monkeypatch):
+    """Nothing in this module may load a sentence-transformers model.
+
+    The intelligence component resolves M1's default service when no
+    encoder is injected, and on a developer machine that model is often
+    already cached -- so a test that forgot to inject would pass by
+    loading it, and fail on a clean runner by downloading it.  Two
+    patches close both doors: the default service becomes the fake, and
+    the real factory refuses to be called at all.
+    """
+
+    fake = FakeEncoder()
+    monkeypatch.setattr(nlp.embeddings, "get_default_service", lambda: fake)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a real embedding model was requested in a test")
+
+    monkeypatch.setattr(nlp.embeddings, "_default_encoder_factory", refuse)
+    return fake
 
 
 @pytest.fixture
@@ -406,7 +454,12 @@ def test_a_clean_live_invocation_succeeds(tmp_path, config, monkeypatch):
 
     assert result.status == "success"
     assert result.exit_code == 0
-    assert [item.status for item in result.components] == ["success", "success"]
+    assert [item.name for item in result.components] == [
+        "yahoo",
+        "rss",
+        "intelligence",
+    ]
+    assert [item.status for item in result.components] == ["success"] * 3
     assert component(result, "yahoo").counts["tickers_succeeded"] == len(TICKERS)
     assert component(result, "rss").counts["feeds_succeeded"] == 2
 
@@ -508,7 +561,10 @@ def test_partial_evidence_is_degraded_and_never_a_clean_success(
 
     assert result.status == "degraded"
     assert result.exit_code == 1
-    assert {item.status for item in result.components} == {"degraded"}
+    assert {item.status for item in result.components if item.mandatory} == {"degraded"}
+    # Whatever ingestion did persist is reconciled cleanly; the invocation
+    # stays degraded because of what ingestion did not.
+    assert component(result, "intelligence").status == "success"
     assert repository.count("raw_items") == len(TICKERS) - 1 + 1
 
 
@@ -524,7 +580,11 @@ def test_every_source_failing_is_a_failed_invocation(tmp_path, config, monkeypat
 
     assert result.status == "failed"
     assert result.exit_code == 2
-    assert {item.status for item in result.components} == {"failed"}
+    assert {item.status for item in result.components if item.mandatory} == {"failed"}
+    intelligence = component(result, "intelligence")
+    assert intelligence.mandatory is False
+    assert intelligence.status == "success"
+    assert intelligence.counts["partitions"] == 0
 
 
 @pytest.mark.parametrize("crashing", ["yahoo", "rss"])
@@ -580,44 +640,67 @@ def test_component_errors_are_aggregated_without_being_flattened(
     rss_errors = component(result, "rss").errors
     assert [error["feed"] for error in rss_errors] == ["alpha"]
     payload = result.as_dict()
-    assert [item["component"] for item in payload["components"]] == ["yahoo", "rss"]
+    assert [item["component"] for item in payload["components"]] == [
+        "yahoo",
+        "rss",
+        "intelligence",
+    ]
 
 
-def test_downstream_stages_are_registered_nowhere_yet(tmp_path, config, monkeypatch):
-    """An empty registry is the honest state, and the CLI reports it."""
+def test_the_intelligence_stage_is_registered_as_a_builder(
+    tmp_path, config, monkeypatch
+):
+    """The registry holds constructors, and exactly one is registered.
 
-    assert DOWNSTREAM_STAGES == ()
+    A ``Stage`` binds a repository, and a module-level tuple has none to
+    bind at import time, so what is registered is how to build the stage
+    rather than the stage itself.
+    """
+
+    assert DOWNSTREAM_STAGES == (pipeline.intelligence_stage,)
+    assert all(callable(build) for build in DOWNSTREAM_STAGES)
+    assert not any(isinstance(build, Stage) for build in DOWNSTREAM_STAGES)
     repository = migrated(tmp_path)
     wire(monkeypatch, ticker_factory=provider(), get=responder())
 
     result = run_live(repository, **config)
 
-    assert [item.name for item in result.components] == ["yahoo", "rss"]
+    assert [item.name for item in result.components] == [
+        "yahoo",
+        "rss",
+        "intelligence",
+    ]
 
 
-def test_a_registered_downstream_stage_is_orchestrated_in_order(
+def test_a_registered_downstream_builder_is_orchestrated_in_order(
     tmp_path, config, monkeypatch
 ):
-    """The extension point works, so M1--M5 need no orchestrator surgery."""
+    """The extension point still works for whatever lands next."""
 
     repository = migrated(tmp_path)
-    seen: list[str] = []
+    seen: list[tuple[str, str]] = []
 
-    def downstream(base_run_id):
-        seen.append(base_run_id)
-        return {"summarized": 2}, []
+    def summarize_stage(repository, *, pipeline_version, invocation_id, **_):
+        def action(base_run_id):
+            seen.append((invocation_id, base_run_id))
+            return {"summarized": 2}, []
+
+        return Stage("summarize", action, settled=("summarized",))
 
     monkeypatch.setattr(
-        pipeline,
-        "DOWNSTREAM_STAGES",
-        (Stage("summarize", downstream, settled=("summarized",)),),
+        pipeline, "DOWNSTREAM_STAGES", (pipeline.intelligence_stage, summarize_stage)
     )
     wire(monkeypatch, ticker_factory=provider(), get=responder())
 
     result = run_live(repository, **config, invocation_id="inv")
 
-    assert [item.name for item in result.components] == ["yahoo", "rss", "summarize"]
-    assert seen == ["inv:summarize"]
+    assert [item.name for item in result.components] == [
+        "yahoo",
+        "rss",
+        "intelligence",
+        "summarize",
+    ]
+    assert seen == [("inv", "inv:summarize")]
     assert result.status == "success"
 
 
@@ -807,6 +890,15 @@ def test_a_component_is_not_constructed_until_its_stage_runs(
         _recording(pipeline.execute_stage, order),
     )
 
+    original = pipeline.PartitionCoordinator
+
+    class RecordingCoordinator(original):
+        def __init__(self, *args, **kwargs):
+            order.append("coordinator built")
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "PartitionCoordinator", RecordingCoordinator)
+
     run_live(repository, **config)
 
     assert order == [
@@ -814,6 +906,8 @@ def test_a_component_is_not_constructed_until_its_stage_runs(
         "yahoo built",
         "rss stage started",
         "rss built",
+        "intelligence stage started",
+        "coordinator built",
     ]
 
 
@@ -1017,7 +1111,11 @@ def test_replay_reports_what_it_cannot_rebuild(tmp_path, config, monkeypatch):
     assert capabilities["supported"] == ["rss_relevance"]
     assert "dedup" in capabilities["unsupported"]
     assert "summarization" in capabilities["unsupported"]
-    assert capabilities["downstream_stages_registered"] == 0
+    # Stories and themes are produced by the live path now, and the report
+    # says so -- without claiming --replay drives them, because it does not.
+    assert capabilities["downstream_stages_registered"] == 1
+    assert capabilities["live_only"] == ["intelligence"]
+    assert "clustering" in capabilities["unsupported"]
     assert capabilities["scoped_replay_available"] is False
 
     repository = seeded(tmp_path, config, monkeypatch)
@@ -1084,8 +1182,12 @@ def test_invocation_logging_is_structured_and_correlated(
     assert completed["mode"] == "live"
     started = next(p for p in events if p["event"] == "invocation_started")
     assert started["schema_version"] == repository.schema_version()
-    assert started["stages"] == ["yahoo", "rss"]
-    assert {item["component"] for item in completed["components"]} == {"yahoo", "rss"}
+    assert started["stages"] == ["yahoo", "rss", "intelligence"]
+    assert {item["component"] for item in completed["components"]} == {
+        "yahoo",
+        "rss",
+        "intelligence",
+    }
     assert all("duration_ms" in item for item in completed["components"])
 
 
