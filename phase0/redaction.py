@@ -36,6 +36,49 @@ SECRET_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+#: LLM usage telemetry whose key happens to contain ``token``.
+#:
+#: ``SECRET_KEY_PATTERN`` matches ``token`` as a substring, which is right
+#: for ``access_token`` and wrong for ``prompt_tokens``: a token *count* is
+#: not a token.  These six names are the counts the providers report, and
+#: they are matched **exactly** (case-insensitively), never as a
+#: substring — ``my_prompt_tokens``, ``prompt_tokens_secret`` and
+#: ``prompt_token`` are not on the list and stay redacted.
+SAFE_TELEMETRY_KEYS = frozenset(
+    {
+        "prompt_tokens",
+        "candidate_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "completion_tokens",
+    }
+)
+
+
+def _is_safe_telemetry_value(key: str, value: Any) -> bool:
+    """Whether ``key``/``value`` is a usage count and nothing else.
+
+    The key alone is not enough.  A credential can be filed under any name
+    an upstream chooses, so the *value* must also be shaped like a count:
+    ``None`` (the providers' "unknown", which is never zero) or a
+    non-negative ``int``.  A string, float, negative number, mapping,
+    sequence or object under an approved key is treated as what it is —
+    something other than a count — and redacted.
+
+    ``bool`` is excluded explicitly: it is a subclass of ``int``, so
+    ``True`` would otherwise pass as the count ``1``.
+    """
+
+    if key.lower() not in SAFE_TELEMETRY_KEYS:
+        return False
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, int) and value >= 0
+
+
 #: ``Authorization: <anything>`` — the entire header value disappears, so
 #: ``Bearer abc``, ``Basic dXNlcjpwYXNz``, and a bare opaque token are all
 #: removed rather than merely losing their scheme word.
@@ -115,16 +158,31 @@ def contains_credential(value: Any) -> bool:
     return redact_text(value) != value
 
 
+def _redact_mapping_value(key: str, value: Any) -> Any:
+    """One mapping entry, redacted by its key and then by its value.
+
+    A key that names a credential drops its value whatever the type —
+    with the single exception carved out by
+    :func:`_is_safe_telemetry_value`, which requires the key to be an
+    approved usage-count name *and* the value to be an actual count.  The
+    values it admits are exactly the ones recursion would return
+    untouched anyway, so surviving here is not a second path into the
+    data: it is the same scalar, kept.
+    """
+
+    if not SECRET_KEY_PATTERN.search(key):
+        return redact_secrets(value)
+    if _is_safe_telemetry_value(key, value):
+        return value
+    return REDACTED
+
+
 def redact_secrets(value: Any) -> Any:
     """Recursively redact credentials in strings, mappings, and sequences."""
 
     if isinstance(value, Mapping):
         return {
-            str(key): (
-                REDACTED
-                if SECRET_KEY_PATTERN.search(str(key))
-                else redact_secrets(item)
-            )
+            str(key): _redact_mapping_value(str(key), item)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple, set, frozenset)):
