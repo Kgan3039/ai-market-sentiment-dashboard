@@ -51,6 +51,14 @@ from phase0.summaries import (
 from phase0.themes import story_description
 
 ROOT = Path(__file__).resolve().parents[1]
+#: The A3 tables (migration 016).  A2 alone writes none of them.
+SUMMARY_TABLES = (
+    "summary_artifacts",
+    "summary_sentences",
+    "summary_sentence_citations",
+    "summary_generations",
+    "summary_generation_attempts",
+)
 DAY = "2026-07-23"
 TICKER = "TSLA"
 VERSION = "v1"
@@ -702,10 +710,16 @@ def test_generation_writes_nothing(tmp_path):
             "stories": repository.read.count("stories"),
             "tables": sorted(repository.read.table_names()),
             "schema_version": repository.schema_version(),
+            "summary_rows": {
+                table: repository.read.count(table) for table in SUMMARY_TABLES
+            },
         }
 
     before = snapshot()
     assert before["summary"] is None and before["status"] == "ready"
+    # A3's tables exist (migration 016) and A2 alone never touches them.
+    assert set(SUMMARY_TABLES) <= set(before["tables"])
+    assert before["summary_rows"] == {table: 0 for table in SUMMARY_TABLES}
 
     client = EchoClient()
     population = day.population()
@@ -717,16 +731,22 @@ def test_generation_writes_nothing(tmp_path):
     assert result.summary is not None
 
     assert snapshot() == before
-    assert not any("summar" in table for table in before["tables"])
     # The persisted theme row still carries no summary; the result is a value.
     assert repository.read.theme(theme_id)["summary"] is None
 
 
-def test_no_summary_migration_exists():
+def test_summary_persistence_is_its_own_migration_and_leaves_themes_alone():
+    """A3 (016) owns the ``summary_*`` tables; no migration before it names
+    them, and 016 adds nothing to ``themes``."""
+
     migrations = sorted((ROOT / "phase0" / "migrations").glob("*.sql"))
     assert migrations, "migrations directory is where it was"
     for path in migrations:
         text = path.read_text(encoding="utf-8").lower()
+        if path.name.startswith("016_"):
+            assert "alter table themes" not in text
+            assert "update themes" not in text
+            continue
         assert "summaries" not in text and "summary_" not in text, path.name
 
 

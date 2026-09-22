@@ -34,6 +34,7 @@ import json
 import hashlib
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -382,6 +383,11 @@ COUNTABLE_TABLES = frozenset(
         "story_members",
         "story_provider_conflicts",
         "story_semantic_merges",
+        "summary_artifacts",
+        "summary_generation_attempts",
+        "summary_generations",
+        "summary_sentence_citations",
+        "summary_sentences",
         "supported_tickers",
         "theme_citations",
         "theme_excluded_stories",
@@ -1188,6 +1194,484 @@ class ThemePopulation:
     member_provenance: tuple[MemberEvidenceProvenance, ...]
 
 
+# ----------------------------------------------------------------------
+# A3: persisted summaries.
+#
+# Rows from the five ``summary_*`` tables (migration 016), read back whole.
+# None of these carries a "current" flag: an artifact is current only when
+# the lifecycle (:mod:`phase0.summary_lifecycle`) rebuilds the frozen A2
+# input from the live theme population and finds this exact key, then
+# re-validates the reconstruction.  What is here is what was stored.
+# ----------------------------------------------------------------------
+
+SUMMARY_ARTIFACT_ACCEPTED = "accepted"
+SUMMARY_ARTIFACT_INVALIDATED = "invalidated"
+SUMMARY_ARTIFACT_STATUSES = frozenset(
+    {SUMMARY_ARTIFACT_ACCEPTED, SUMMARY_ARTIFACT_INVALIDATED}
+)
+
+#: What one provider-calling lifecycle invocation came to.
+SUMMARY_GENERATION_ACCEPTED = "accepted"
+SUMMARY_GENERATION_UNAVAILABLE = "unavailable"
+SUMMARY_GENERATION_DISCARDED_STALE = "discarded_stale"
+SUMMARY_GENERATION_DISCARDED_DUPLICATE = "discarded_duplicate"
+SUMMARY_GENERATION_OUTCOMES = frozenset(
+    {
+        SUMMARY_GENERATION_ACCEPTED,
+        SUMMARY_GENERATION_UNAVAILABLE,
+        SUMMARY_GENERATION_DISCARDED_STALE,
+        SUMMARY_GENERATION_DISCARDED_DUPLICATE,
+    }
+)
+
+#: ``detail`` of a ``discarded_stale`` generation whose theme was still
+#: there and healthy but whose frozen input had moved underneath it.  The
+#: other details are :mod:`phase0.summaries` refusal codes.
+SUMMARY_DISCARD_INPUT_CHANGED = "input_fingerprint_changed"
+
+#: ``invalidated_reason`` prefix for an accepted artifact that a
+#: replacement generation found structurally invalid.
+SUMMARY_INVALIDATED_CORRUPT = "corrupt_on_replacement"
+
+
+@dataclass(frozen=True)
+class PersistedSummaryCitation:
+    """One story a generated sentence cites, at its position in that sentence.
+
+    The citation id is exactly ``story:<story_id>`` under the artifact's
+    ``citation_convention`` and is not stored separately.  ``story_id`` is
+    a logical identifier: the ``stories`` row it named may since have been
+    reconciled away, which is one of the things that makes an artifact
+    historical rather than current.
+    """
+
+    position: int
+    story_id: int
+
+
+@dataclass(frozen=True)
+class PersistedSummarySentence:
+    ordinal: int
+    text: str
+    citations: tuple[PersistedSummaryCitation, ...]
+
+
+@dataclass(frozen=True)
+class PersistedSummaryArtifact:
+    """One accepted (or since-invalidated) summary, as ``summary_artifacts`` has it.
+
+    ``status == 'accepted'`` means an originally accepted generation that
+    has not been explicitly invalidated.  It does **not** mean current:
+    currentness is derived by the lifecycle from the live population and
+    this row's exact ``(theme_id, input_fingerprint, policy_fingerprint)``
+    key plus a fresh run of A2's validator.
+    """
+
+    artifact_id: int
+    ticker: str
+    trading_day: str
+    pipeline_version: str
+    theme_id: int
+    theme_key: str
+    input_fingerprint: str
+    policy_fingerprint: str
+    citation_convention: str
+    prompt_version: str
+    model: str
+    label: str
+    guarantee: str
+    #: SHA-256 over the accepted content as stored; see
+    #: :func:`summary_artifact_digest`.  Recomputed from this record before
+    #: any reuse, and required to match.
+    content_digest: str
+    status: str
+    created_at: str
+    invalidated_at: str | None
+    invalidated_reason: str | None
+    sentences: tuple[PersistedSummarySentence, ...]
+
+    @property
+    def story_ids(self) -> tuple[int, ...]:
+        """Every cited story id, in sentence order then citation order."""
+
+        return tuple(
+            citation.story_id
+            for sentence in self.sentences
+            for citation in sentence.citations
+        )
+
+
+@dataclass(frozen=True)
+class PersistedSummaryAttempt:
+    """One provider call inside one generation, as recorded."""
+
+    attempt: int
+    outcome: str
+    #: ``(code, detail)`` pairs from A2's validator, in reported order.
+    failures: tuple[tuple[str, str], ...]
+    latency_ms: float | None
+    #: ``None`` means the provider reported no figure.  Never zero by default.
+    prompt_tokens: int | None
+    candidate_tokens: int | None
+    total_tokens: int | None
+    #: Redacted provider error text, for provider outcomes.
+    error: str | None
+
+
+@dataclass(frozen=True)
+class PersistedSummaryGeneration:
+    """One lifecycle invocation that called the provider, with its attempts."""
+
+    generation_id: int
+    run_id: str
+    ticker: str
+    trading_day: str
+    pipeline_version: str
+    theme_id: int
+    theme_key: str
+    input_fingerprint: str
+    policy_fingerprint: str
+    model: str
+    max_attempts: int
+    outcome: str
+    reason: str | None
+    detail: str | None
+    artifact_id: int | None
+    completed_at: str
+    attempts: tuple[PersistedSummaryAttempt, ...]
+
+    @property
+    def provider_calls(self) -> int:
+        return len(self.attempts)
+
+    @property
+    def accepted_attempt(self) -> int | None:
+        for attempt in self.attempts:
+            if attempt.outcome == "accepted":
+                return attempt.attempt
+        return None
+
+    @property
+    def total_latency_ms(self) -> float | None:
+        """Sum of the attempts' latencies, or ``None`` when any is unknown."""
+
+        if not self.attempts or any(
+            attempt.latency_ms is None for attempt in self.attempts
+        ):
+            return None
+        return float(sum(attempt.latency_ms or 0.0 for attempt in self.attempts))
+
+
+#: Version tag folded into every artifact digest, so a future change to
+#: what the digest covers cannot collide with rows digested under this one.
+SUMMARY_DIGEST_VERSION = "a3.artifact_digest.v1"
+
+
+def summary_artifact_digest(
+    *,
+    ticker: str,
+    trading_day: str,
+    pipeline_version: str,
+    theme_id: int,
+    theme_key: str,
+    input_fingerprint: str,
+    policy_fingerprint: str,
+    citation_convention: str,
+    prompt_version: str,
+    model: str,
+    label: str,
+    guarantee: str,
+    sentences: Sequence[tuple[int, str, Sequence[tuple[int, int]]]],
+) -> str:
+    """SHA-256 over the whole immutable content of one accepted artifact.
+
+    Canonical JSON (sorted keys, no whitespace, UTF-8) of, exactly:
+
+    * ``version``: :data:`SUMMARY_DIGEST_VERSION`;
+    * the reuse identity: ``ticker``, ``trading_day``, ``pipeline_version``,
+      ``theme_id``, ``theme_key``, ``input_fingerprint``,
+      ``policy_fingerprint``, ``citation_convention``, ``prompt_version``,
+      ``model``;
+    * the generated content: ``label``, ``guarantee``, and ``sentences`` as
+      an ordered list of ``{ordinal, text, citations}`` where ``citations``
+      is an ordered list of ``{position, story_id}``.
+
+    Not covered, on purpose: the row id, ``status``, ``created_at`` and the
+    invalidation columns -- lifecycle bookkeeping, not content.  Ordinals
+    and positions are digested as stored rather than re-derived, so a
+    missing middle sentence, a missing trailing sentence, a missing or
+    reordered citation, a changed text or label, and a forged identity
+    column each change the digest.
+    """
+
+    payload = {
+        "version": SUMMARY_DIGEST_VERSION,
+        "ticker": str(ticker),
+        "trading_day": str(trading_day),
+        "pipeline_version": str(pipeline_version),
+        "theme_id": int(theme_id),
+        "theme_key": str(theme_key),
+        "input_fingerprint": str(input_fingerprint),
+        "policy_fingerprint": str(policy_fingerprint),
+        "citation_convention": str(citation_convention),
+        "prompt_version": str(prompt_version),
+        "model": str(model),
+        "label": str(label),
+        "guarantee": str(guarantee),
+        "sentences": [
+            {
+                "ordinal": int(ordinal),
+                "text": str(text),
+                "citations": [
+                    {"position": int(position), "story_id": int(story_id)}
+                    for position, story_id in citations
+                ],
+            }
+            for ordinal, text, citations in sentences
+        ],
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def summary_artifact_digest_of(artifact: PersistedSummaryArtifact) -> str:
+    """:func:`summary_artifact_digest` over a stored record, as read back."""
+
+    return summary_artifact_digest(
+        ticker=artifact.ticker,
+        trading_day=artifact.trading_day,
+        pipeline_version=artifact.pipeline_version,
+        theme_id=artifact.theme_id,
+        theme_key=artifact.theme_key,
+        input_fingerprint=artifact.input_fingerprint,
+        policy_fingerprint=artifact.policy_fingerprint,
+        citation_convention=artifact.citation_convention,
+        prompt_version=artifact.prompt_version,
+        model=artifact.model,
+        label=artifact.label,
+        guarantee=artifact.guarantee,
+        sentences=[
+            (
+                sentence.ordinal,
+                sentence.text,
+                [(c.position, c.story_id) for c in sentence.citations],
+            )
+            for sentence in artifact.sentences
+        ],
+    )
+
+
+def summary_artifact_candidate(
+    artifact: PersistedSummaryArtifact, citation_id_for: Callable[[int], str]
+) -> dict[str, Any]:
+    """The stored artifact in the shape A2's validator judges.
+
+    ``citation_id_for`` is :func:`ai.guarded_summary.citation_id_for`,
+    passed in so this module does not import the A2 package at load time
+    (the two import each other's package).  Exactly what was stored:
+    a missing sentence or citation comes out as a candidate the validator
+    refuses, which is the whole point of re-validating before reuse.
+    """
+
+    return {
+        "label": artifact.label,
+        "sentences": [
+            {
+                "text": sentence.text,
+                "citation_ids": [
+                    citation_id_for(citation.story_id)
+                    for citation in sentence.citations
+                ],
+            }
+            for sentence in artifact.sentences
+        ],
+    }
+
+
+def _summary_contract() -> tuple[Any, Any, Any]:
+    """The A2 module, the population projection and the lifecycle, on demand.
+
+    ``ai.guarded_summary`` imports ``phase0.redaction``, and this package's
+    ``__init__`` imports this module, so a module-level import in either
+    direction is a cycle; :mod:`phase0.summary_lifecycle` imports this
+    module outright.  The write path needs A2's types and validator,
+    :func:`phase0.summaries.build_generation_input`, and the lifecycle's
+    one definition of a valid stored artifact only when it runs.
+    """
+
+    from ai import guarded_summary
+
+    from . import summaries, summary_lifecycle
+
+    return guarded_summary, summaries, summary_lifecycle
+
+
+def _optional_token_count(value: Any) -> int | None:
+    """A provider token count, or ``None`` for "not reported".
+
+    Never coerced: an unknown count is stored as NULL, and a value that is
+    not a non-negative integer is a defect rather than a zero.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise Phase0ValidationError(
+            f"token count must be a non-negative int: {value!r}"
+        )
+    return value
+
+
+def _summary_artifacts_on(
+    connection: sqlite3.Connection, where: str, parameters: Sequence[Any]
+) -> list[PersistedSummaryArtifact]:
+    """Artifacts matching ``where``, whole, on the caller's connection.
+
+    ``where`` is always a literal from the method calling this.  Sentences
+    come back in ordinal order and citations in position order, which is
+    the order the generation produced them and the order a reader must
+    show them in.
+    """
+
+    rows = _rows(
+        connection,
+        f"SELECT * FROM summary_artifacts WHERE {where} ORDER BY id DESC",
+        parameters,
+    )
+    artifacts: list[PersistedSummaryArtifact] = []
+    for row in rows:
+        artifact_id = int(row["id"])
+        citations: dict[int, list[PersistedSummaryCitation]] = {}
+        for entry in _rows(
+            connection,
+            """
+            SELECT sentence_ordinal, position, story_id
+            FROM summary_sentence_citations
+            WHERE artifact_id = ?
+            ORDER BY sentence_ordinal, position
+            """,
+            (artifact_id,),
+        ):
+            citations.setdefault(int(entry["sentence_ordinal"]), []).append(
+                PersistedSummaryCitation(
+                    position=int(entry["position"]), story_id=int(entry["story_id"])
+                )
+            )
+        sentences = tuple(
+            PersistedSummarySentence(
+                ordinal=int(entry["ordinal"]),
+                text=str(entry["text"]),
+                citations=tuple(citations.get(int(entry["ordinal"]), ())),
+            )
+            for entry in _rows(
+                connection,
+                "SELECT ordinal, text FROM summary_sentences WHERE artifact_id = ? "
+                "ORDER BY ordinal",
+                (artifact_id,),
+            )
+        )
+        artifacts.append(
+            PersistedSummaryArtifact(
+                artifact_id=artifact_id,
+                ticker=str(row["ticker"]),
+                trading_day=str(row["trading_day"]),
+                pipeline_version=str(row["pipeline_version"]),
+                theme_id=int(row["theme_id"]),
+                theme_key=str(row["theme_key"]),
+                input_fingerprint=str(row["input_fingerprint"]),
+                policy_fingerprint=str(row["policy_fingerprint"]),
+                citation_convention=str(row["citation_convention"]),
+                prompt_version=str(row["prompt_version"]),
+                model=str(row["model"]),
+                label=str(row["label"]),
+                guarantee=str(row["guarantee"]),
+                content_digest=str(row["content_digest"]),
+                status=str(row["status"]),
+                created_at=str(row["created_at"]),
+                invalidated_at=row["invalidated_at"],
+                invalidated_reason=row["invalidated_reason"],
+                sentences=sentences,
+            )
+        )
+    return artifacts
+
+
+def _summary_generations_on(
+    connection: sqlite3.Connection, where: str, parameters: Sequence[Any]
+) -> list[PersistedSummaryGeneration]:
+    """Generations matching ``where`` with their attempts, newest first."""
+
+    generations: list[PersistedSummaryGeneration] = []
+    for row in _rows(
+        connection,
+        f"SELECT * FROM summary_generations WHERE {where} ORDER BY id DESC",
+        parameters,
+    ):
+        generation_id = int(row["id"])
+        attempts = tuple(
+            PersistedSummaryAttempt(
+                attempt=int(entry["attempt"]),
+                outcome=str(entry["outcome"]),
+                failures=tuple(
+                    (str(item.get("code")), str(item.get("detail")))
+                    for item in json.loads(entry["failures"] or "[]")
+                    if isinstance(item, dict)
+                ),
+                latency_ms=(
+                    None if entry["latency_ms"] is None else float(entry["latency_ms"])
+                ),
+                prompt_tokens=(
+                    None
+                    if entry["prompt_tokens"] is None
+                    else int(entry["prompt_tokens"])
+                ),
+                candidate_tokens=(
+                    None
+                    if entry["candidate_tokens"] is None
+                    else int(entry["candidate_tokens"])
+                ),
+                total_tokens=(
+                    None
+                    if entry["total_tokens"] is None
+                    else int(entry["total_tokens"])
+                ),
+                error=entry["error"],
+            )
+            for entry in _rows(
+                connection,
+                "SELECT * FROM summary_generation_attempts WHERE generation_id = ? "
+                "ORDER BY attempt",
+                (generation_id,),
+            )
+        )
+        generations.append(
+            PersistedSummaryGeneration(
+                generation_id=generation_id,
+                run_id=str(row["run_id"]),
+                ticker=str(row["ticker"]),
+                trading_day=str(row["trading_day"]),
+                pipeline_version=str(row["pipeline_version"]),
+                theme_id=int(row["theme_id"]),
+                theme_key=str(row["theme_key"]),
+                input_fingerprint=str(row["input_fingerprint"]),
+                policy_fingerprint=str(row["policy_fingerprint"]),
+                model=str(row["model"]),
+                max_attempts=int(row["max_attempts"]),
+                outcome=str(row["outcome"]),
+                reason=row["reason"],
+                detail=row["detail"],
+                artifact_id=(
+                    None if row["artifact_id"] is None else int(row["artifact_id"])
+                ),
+                completed_at=str(row["completed_at"]),
+                attempts=attempts,
+            )
+        )
+    return generations
+
+
 #: Module-private construction key.  It is never exported, never stored on
 #: an instance, and never reachable from the public API, so a caller cannot
 #: build a :class:`StageRunContext` even by copying every visible field.
@@ -1576,7 +2060,9 @@ class Phase0Admin:
     reviewer greps ``.admin.`` to find every one of them.
 
     The theme stage adds one more to that list: ``clear_theme_set``, which
-    removes a partition's theme set through the same logged path.
+    removes a partition's theme set through the same logged path.  The A3
+    summary lifecycle adds ``persist_summary_generation``, which records one
+    guarded generation and its artifact the same way.
     """
 
     def __init__(self, repository: "Phase0Repository") -> None:
@@ -2529,164 +3015,90 @@ class Phase0Reader:
         day = _normalize_day(trading_day)
         version = _require_text(pipeline_version, "pipeline_version")
         with self._snapshot() as connection:
-            set_rows = _rows(
+            return _read_theme_population(connection, symbol, day, version)
+
+    # -- Persisted summaries (A3) ------------------------------------------
+    #
+    # Raw reads, deliberately keyed by explicit fingerprints and deliberately
+    # *not* named "current".  A caller holding an old fingerprint gets the
+    # artifact that fingerprint names, which may be stale, superseded, or
+    # invalidated.  The one read that may call an artifact current is
+    # ``phase0.summary_lifecycle.current_summary_artifact``, which derives
+    # both fingerprints itself.  None of these ever calls a provider.
+
+    def summary_artifact(
+        self, theme_id: int, input_fingerprint: str, policy_fingerprint: str
+    ) -> PersistedSummaryArtifact | None:
+        """The accepted artifact for one exact generation key, or ``None``.
+
+        Only ``status = 'accepted'`` rows answer; an invalidated artifact
+        under the same key is history and is reachable through
+        :meth:`summary_artifacts`.  At most one row can match, by index.
+        """
+
+        with self._snapshot() as connection:
+            matches = _summary_artifacts_on(
                 connection,
-                """
-                SELECT id, method, method_reason, config_fingerprint,
-                       algorithm_version, model_name, model_revision,
-                       embedding_dimension, updated_at, source_metadata
-                FROM theme_sets
-                WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
-                """,
-                (symbol, day, version),
+                "theme_id = ? AND input_fingerprint = ? AND policy_fingerprint = ? "
+                "AND status = ?",
+                (
+                    _require_int(theme_id, "theme_id", minimum=1),
+                    _require_text(input_fingerprint, "input_fingerprint"),
+                    _require_text(policy_fingerprint, "policy_fingerprint"),
+                    SUMMARY_ARTIFACT_ACCEPTED,
+                ),
             )
-            theme_set = None
-            themes: list[ThemeMembership] = []
-            other: list[OtherCoveragePlacement] = []
-            excluded: list[ExcludedPlacement] = []
-            if set_rows:
-                row = set_rows[0]
-                theme_set = PersistedThemeSet(
-                    theme_set_id=int(row["id"]),
-                    method=str(row["method"]),
-                    method_reason=str(row["method_reason"] or ""),
-                    config_fingerprint=str(row["config_fingerprint"] or ""),
-                    algorithm_version=str(row["algorithm_version"] or ""),
-                    model_name=row["model_name"],
-                    model_revision=row["model_revision"],
-                    embedding_dimension=(
-                        None
-                        if row["embedding_dimension"] is None
-                        else int(row["embedding_dimension"])
-                    ),
-                    updated_at=row["updated_at"],
-                    source_metadata=(
-                        None
-                        if row["source_metadata"] is None
-                        else json.loads(row["source_metadata"])
-                    ),
-                )
-                membership: dict[int, list[int]] = {}
-                for link in _rows(
-                    connection,
-                    """
-                    SELECT theme_stories.theme_id AS theme_id,
-                           theme_stories.story_id AS story_id
-                    FROM theme_stories
-                    JOIN themes ON themes.id = theme_stories.theme_id
-                    WHERE themes.ticker = ? AND themes.trading_day = ?
-                      AND themes.pipeline_version = ?
-                    ORDER BY theme_stories.theme_id, theme_stories.story_id
-                    """,
-                    (symbol, day, version),
-                ):
-                    membership.setdefault(int(link["theme_id"]), []).append(
-                        int(link["story_id"])
-                    )
-                themes = [
-                    ThemeMembership(
-                        theme_id=int(theme["id"]),
-                        theme_key=theme["theme_key"],
-                        label=str(theme["label"]),
-                        label_source=theme["label_source"],
-                        salience_rank=int(theme["salience_rank"]),
-                        story_count=(
-                            None
-                            if theme["story_count"] is None
-                            else int(theme["story_count"])
-                        ),
-                        story_ids=tuple(membership.get(int(theme["id"]), ())),
-                    )
-                    for theme in _rows(
-                        connection,
-                        """
-                        SELECT id, theme_key, label, label_source, salience_rank,
-                               story_count
-                        FROM themes
-                        WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
-                        ORDER BY salience_rank, id
-                        """,
-                        (symbol, day, version),
-                    )
-                ]
-                other = [
-                    OtherCoveragePlacement(
-                        story_id=int(entry["story_id"]),
-                        reason=str(entry["reason"]),
-                        position=int(entry["position"]),
-                    )
-                    for entry in _rows(
-                        connection,
-                        """
-                        SELECT story_id, reason, position FROM theme_other_coverage
-                        WHERE theme_set_id = ? ORDER BY position, story_id
-                        """,
-                        (theme_set.theme_set_id,),
-                    )
-                ]
-                excluded = [
-                    ExcludedPlacement(
-                        story_id=int(entry["story_id"]), reason=str(entry["reason"])
-                    )
-                    for entry in _rows(
-                        connection,
-                        """
-                        SELECT story_id, reason FROM theme_excluded_stories
-                        WHERE theme_set_id = ? ORDER BY story_id
-                        """,
-                        (theme_set.theme_set_id,),
-                    )
-                ]
-            signature = Phase0Repository._story_generation_signature(
-                connection, symbol, day, version
-            )
-            stories = _persisted_stories(connection, symbol, day, version, signature)
-            provenance = [
-                MemberEvidenceProvenance(
-                    raw_item_id=int(item["id"]),
-                    source=item["source"],
-                    fetched_at=item["fetched_at"],
-                    ingest_status=item["ingest_status"],
-                    external_id=item["external_id"],
-                    has_payload=bool(item["has_payload"]),
-                    has_feed_snapshot=bool(item["has_feed_snapshot"]),
-                )
-                for item in _rows(
-                    connection,
-                    """
-                    SELECT DISTINCT raw_items.id AS id, raw_items.source AS source,
-                           raw_items.fetched_at AS fetched_at,
-                           raw_items.ingest_status AS ingest_status,
-                           raw_items.external_id AS external_id,
-                           (raw_items.raw_json IS NOT NULL
-                            AND length(raw_items.raw_json) > 0) AS has_payload,
-                           EXISTS (
-                               SELECT 1 FROM raw_item_feeds
-                               WHERE raw_item_feeds.raw_item_id = raw_items.id
-                                 AND raw_item_feeds.snapshot_id IS NOT NULL
-                           ) AS has_feed_snapshot
-                    FROM raw_items
-                    JOIN story_members ON story_members.raw_item_id = raw_items.id
-                    JOIN stories ON stories.id = story_members.story_id
-                    WHERE stories.ticker = ? AND stories.trading_day = ?
-                      AND stories.pipeline_version = ?
-                      AND stories.invalidated_at IS NULL
-                    ORDER BY raw_items.id
-                    """,
-                    (symbol, day, version),
-                )
-            ]
-        return ThemePopulation(
-            ticker=symbol,
-            trading_day=day,
-            pipeline_version=version,
-            theme_set=theme_set,
-            themes=tuple(themes),
-            other_coverage=tuple(other),
-            excluded=tuple(excluded),
-            stories=stories,
-            member_provenance=tuple(provenance),
-        )
+        return matches[0] if matches else None
+
+    def summary_artifacts(
+        self,
+        ticker: str,
+        trading_day: str | date,
+        pipeline_version: str,
+        theme_id: int | None = None,
+    ) -> list[PersistedSummaryArtifact]:
+        """Every artifact ever stored for a partition (or one theme), newest first.
+
+        History, every status included.  Nothing here is current by virtue
+        of being listed.
+        """
+
+        where = "ticker = ? AND trading_day = ? AND pipeline_version = ?"
+        parameters: list[Any] = [
+            normalize_ticker(ticker),
+            _normalize_day(trading_day),
+            _require_text(pipeline_version, "pipeline_version"),
+        ]
+        if theme_id is not None:
+            where += " AND theme_id = ?"
+            parameters.append(_require_int(theme_id, "theme_id", minimum=1))
+        with self._snapshot() as connection:
+            return _summary_artifacts_on(connection, where, parameters)
+
+    def summary_generations(
+        self,
+        ticker: str,
+        trading_day: str | date,
+        pipeline_version: str,
+        theme_id: int | None = None,
+    ) -> list[PersistedSummaryGeneration]:
+        """Every provider-calling generation for a partition (or theme), newest first.
+
+        Each carries its attempts, so provider calls, token usage, latency
+        and the unavailable reasons are all read from here.
+        """
+
+        where = "ticker = ? AND trading_day = ? AND pipeline_version = ?"
+        parameters: list[Any] = [
+            normalize_ticker(ticker),
+            _normalize_day(trading_day),
+            _require_text(pipeline_version, "pipeline_version"),
+        ]
+        if theme_id is not None:
+            where += " AND theme_id = ?"
+            parameters.append(_require_int(theme_id, "theme_id", minimum=1))
+        with self._snapshot() as connection:
+            return _summary_generations_on(connection, where, parameters)
 
     def story(self, story_id: int) -> dict[str, Any] | None:
         return self._one(
@@ -3035,6 +3447,177 @@ class Phase0Reader:
             raise Phase0ValidationError(f"unknown Phase 0 table {table!r}")
         rows = self._query(f"SELECT COUNT(*) AS total FROM {table}")
         return int(rows[0]["total"])
+
+
+def _read_theme_population(
+    connection: sqlite3.Connection, symbol: str, day: str, version: str
+) -> ThemePopulation:
+    """Assemble one partition's :class:`ThemePopulation` on ``connection``.
+
+    The body of :meth:`Phase0Reader.theme_population`, on whatever
+    connection the caller holds: the reader runs it inside its read
+    snapshot, and the summary write path runs it *inside its write
+    transaction*, so the frozen input it re-derives there describes the
+    same committed state the write is about to join.  One assembly, two
+    callers, so the two cannot drift.
+    """
+
+    set_rows = _rows(
+        connection,
+        """
+        SELECT id, method, method_reason, config_fingerprint,
+               algorithm_version, model_name, model_revision,
+               embedding_dimension, updated_at, source_metadata
+        FROM theme_sets
+        WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+        """,
+        (symbol, day, version),
+    )
+    theme_set = None
+    themes: list[ThemeMembership] = []
+    other: list[OtherCoveragePlacement] = []
+    excluded: list[ExcludedPlacement] = []
+    if set_rows:
+        row = set_rows[0]
+        theme_set = PersistedThemeSet(
+            theme_set_id=int(row["id"]),
+            method=str(row["method"]),
+            method_reason=str(row["method_reason"] or ""),
+            config_fingerprint=str(row["config_fingerprint"] or ""),
+            algorithm_version=str(row["algorithm_version"] or ""),
+            model_name=row["model_name"],
+            model_revision=row["model_revision"],
+            embedding_dimension=(
+                None
+                if row["embedding_dimension"] is None
+                else int(row["embedding_dimension"])
+            ),
+            updated_at=row["updated_at"],
+            source_metadata=(
+                None
+                if row["source_metadata"] is None
+                else json.loads(row["source_metadata"])
+            ),
+        )
+        membership: dict[int, list[int]] = {}
+        for link in _rows(
+            connection,
+            """
+            SELECT theme_stories.theme_id AS theme_id,
+                   theme_stories.story_id AS story_id
+            FROM theme_stories
+            JOIN themes ON themes.id = theme_stories.theme_id
+            WHERE themes.ticker = ? AND themes.trading_day = ?
+              AND themes.pipeline_version = ?
+            ORDER BY theme_stories.theme_id, theme_stories.story_id
+            """,
+            (symbol, day, version),
+        ):
+            membership.setdefault(int(link["theme_id"]), []).append(
+                int(link["story_id"])
+            )
+        themes = [
+            ThemeMembership(
+                theme_id=int(theme["id"]),
+                theme_key=theme["theme_key"],
+                label=str(theme["label"]),
+                label_source=theme["label_source"],
+                salience_rank=int(theme["salience_rank"]),
+                story_count=(
+                    None if theme["story_count"] is None else int(theme["story_count"])
+                ),
+                story_ids=tuple(membership.get(int(theme["id"]), ())),
+            )
+            for theme in _rows(
+                connection,
+                """
+                SELECT id, theme_key, label, label_source, salience_rank,
+                       story_count
+                FROM themes
+                WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+                ORDER BY salience_rank, id
+                """,
+                (symbol, day, version),
+            )
+        ]
+        other = [
+            OtherCoveragePlacement(
+                story_id=int(entry["story_id"]),
+                reason=str(entry["reason"]),
+                position=int(entry["position"]),
+            )
+            for entry in _rows(
+                connection,
+                """
+                SELECT story_id, reason, position FROM theme_other_coverage
+                WHERE theme_set_id = ? ORDER BY position, story_id
+                """,
+                (theme_set.theme_set_id,),
+            )
+        ]
+        excluded = [
+            ExcludedPlacement(
+                story_id=int(entry["story_id"]), reason=str(entry["reason"])
+            )
+            for entry in _rows(
+                connection,
+                """
+                SELECT story_id, reason FROM theme_excluded_stories
+                WHERE theme_set_id = ? ORDER BY story_id
+                """,
+                (theme_set.theme_set_id,),
+            )
+        ]
+    signature = Phase0Repository._story_generation_signature(
+        connection, symbol, day, version
+    )
+    stories = _persisted_stories(connection, symbol, day, version, signature)
+    provenance = [
+        MemberEvidenceProvenance(
+            raw_item_id=int(item["id"]),
+            source=item["source"],
+            fetched_at=item["fetched_at"],
+            ingest_status=item["ingest_status"],
+            external_id=item["external_id"],
+            has_payload=bool(item["has_payload"]),
+            has_feed_snapshot=bool(item["has_feed_snapshot"]),
+        )
+        for item in _rows(
+            connection,
+            """
+            SELECT DISTINCT raw_items.id AS id, raw_items.source AS source,
+                   raw_items.fetched_at AS fetched_at,
+                   raw_items.ingest_status AS ingest_status,
+                   raw_items.external_id AS external_id,
+                   (raw_items.raw_json IS NOT NULL
+                    AND length(raw_items.raw_json) > 0) AS has_payload,
+                   EXISTS (
+                       SELECT 1 FROM raw_item_feeds
+                       WHERE raw_item_feeds.raw_item_id = raw_items.id
+                         AND raw_item_feeds.snapshot_id IS NOT NULL
+                   ) AS has_feed_snapshot
+            FROM raw_items
+            JOIN story_members ON story_members.raw_item_id = raw_items.id
+            JOIN stories ON stories.id = story_members.story_id
+            WHERE stories.ticker = ? AND stories.trading_day = ?
+              AND stories.pipeline_version = ?
+              AND stories.invalidated_at IS NULL
+            ORDER BY raw_items.id
+            """,
+            (symbol, day, version),
+        )
+    ]
+    return ThemePopulation(
+        ticker=symbol,
+        trading_day=day,
+        pipeline_version=version,
+        theme_set=theme_set,
+        themes=tuple(themes),
+        other_coverage=tuple(other),
+        excluded=tuple(excluded),
+        stories=stories,
+        member_provenance=tuple(provenance),
+    )
 
 
 class Phase0Repository:
@@ -6246,6 +6829,568 @@ class Phase0Repository:
             return result
 
     # ------------------------------------------------------------------
+    # Persisted summaries (A3)
+    # ------------------------------------------------------------------
+
+    def persist_summary_generation(
+        self,
+        *,
+        run: Any,
+        result: Any,
+        generation_input: Any,
+        policy: Any,
+        terminal: bool = False,
+    ) -> PersistedSummaryGeneration:
+        """Record one A2 generation durably; activate it only if still current.
+
+        ``result`` is the :class:`ai.guarded_summary.SummaryGenerationResult`
+        that :func:`ai.guarded_summary.generate_guarded_summary` returned
+        for ``generation_input`` under ``policy`` -- the same resolved
+        :class:`ai.guarded_summary.GenerationPolicy` the caller looked the
+        cache up with.  Everything lands in one transaction with the run's
+        ``run_log`` row, **after** the provider has returned; no
+        transaction is ever open across the provider call.
+
+        **The result is not trusted.**  A ``SummaryGenerationResult`` is a
+        plain value that anything could have assembled or altered on its
+        way here, so the whole A2 contract is re-proved inside the
+        transaction before a row is written (:meth:`_require_result_contract`):
+        the attempt history is structurally sound and agrees with the
+        status, and an accepted summary is judged again by A2's own
+        validator against the *rebuilt* live input under the policy's
+        rules.  A result that fails is refused with
+        :class:`Phase0ValidationError`, nothing is written, and the run is
+        recorded failed -- it is never reinterpreted as ``unavailable``.
+
+        **Compare-and-set against the live population.**  For an accepted
+        result the frozen input is rebuilt here, on this connection, inside
+        ``BEGIN IMMEDIATE``, through the same projection the caller used
+        (:func:`phase0.summaries.build_generation_input` over
+        :func:`_read_theme_population`).  The artifact is inserted only if
+        the rebuilt ``input_fingerprint`` equals the result's.  A theme that
+        has disappeared, a population that has become unhealthy, or an
+        input that has changed records the generation as
+        ``discarded_stale`` -- attempts and usage included, because the
+        provider was paid -- and inserts no artifact.  Currentness is never
+        approximated from timestamps.
+
+        **One accepted artifact per key.**  If an accepted artifact already
+        holds ``(theme_id, input_fingerprint, policy_fingerprint)`` it is
+        judged by the lifecycle's one definition of a valid stored artifact
+        (:func:`phase0.summary_lifecycle.validate_persisted_artifact`:
+        identity, structure, content digest, then A2's validator) against
+        the rebuilt input: valid, and this generation is recorded as
+        ``discarded_duplicate`` of it; invalid, and it is transitioned
+        ``accepted -> invalidated`` in this same transaction before the
+        replacement takes its key.  The partial unique index enforces the
+        rule against anything this code did not think of.
+
+        **Idempotent per run.**  A second call with the same key under the
+        same run returns the row the first call wrote.  That makes the
+        *write* safe to retry after an uncertain outcome; it does not stop
+        the caller from having made a second provider call to get there.
+        """
+
+        with self._logged_mutation(
+            run, operation="persist_summary_generation", terminal=terminal
+        ) as (connection, context):
+            guarded, summaries, lifecycle = _summary_contract()
+            if not isinstance(result, guarded.SummaryGenerationResult):
+                raise Phase0ValidationError("result must be a SummaryGenerationResult")
+            if not isinstance(generation_input, guarded.SummaryGenerationInput):
+                raise Phase0ValidationError(
+                    "generation_input must be a SummaryGenerationInput"
+                )
+            if not isinstance(policy, guarded.GenerationPolicy):
+                raise Phase0ValidationError("policy must be a GenerationPolicy")
+            self._require_result_contract(guarded, result, generation_input, policy)
+
+            theme = generation_input.theme
+            ticker = normalize_ticker(generation_input.ticker)
+            day = _normalize_day(generation_input.trading_day)
+            version = _require_text(theme.pipeline_version, "pipeline_version")
+            self._assert_run_partition(
+                context,
+                operation="persist_summary_generation",
+                ticker=ticker,
+                trading_day=day,
+                pipeline_version=version,
+            )
+            key = (
+                _require_int(theme.theme_id, "theme_id", minimum=1),
+                result.input_fingerprint,
+                result.policy_fingerprint,
+            )
+
+            replayed = _summary_generations_on(
+                connection,
+                "run_id = ? AND theme_id = ? AND input_fingerprint = ? "
+                "AND policy_fingerprint = ?",
+                (context.run_id, *key),
+            )
+            if replayed:
+                context._merge_counts({"summary_generations_replayed": 1})
+                return replayed[0]
+
+            completed_at = self.now().isoformat()
+            outcome: str | None = None
+            reason: str | None = None
+            detail: str | None = None
+            artifact_id: int | None = None
+            inserted = 0
+            invalidated = 0
+
+            if result.status == guarded.STATUS_UNAVAILABLE:
+                outcome = SUMMARY_GENERATION_UNAVAILABLE
+                reason = require_safe_identifier_scalar(result.reason, "reason")
+            else:
+                try:
+                    rebuilt = summaries.build_generation_input(
+                        _read_theme_population(connection, ticker, day, version),
+                        theme.theme_id,
+                    )
+                except summaries.SummaryInputError as exc:
+                    # The summary is still held to its own frozen input:
+                    # a corrupted accepted result is refused even when it
+                    # would only have been recorded as stale.
+                    self._require_accepted_summary(
+                        guarded, result, generation_input, policy
+                    )
+                    outcome = SUMMARY_GENERATION_DISCARDED_STALE
+                    detail = exc.code
+                else:
+                    if rebuilt.input_fingerprint != result.input_fingerprint:
+                        self._require_accepted_summary(
+                            guarded, result, generation_input, policy
+                        )
+                        outcome = SUMMARY_GENERATION_DISCARDED_STALE
+                        detail = SUMMARY_DISCARD_INPUT_CHANGED
+                    else:
+                        # The label is not part of the input identity and
+                        # may move without the fingerprint; the rest may not.
+                        if (
+                            rebuilt.theme.theme_id,
+                            rebuilt.theme.theme_key,
+                            rebuilt.theme.pipeline_version,
+                        ) != (
+                            result.theme.theme_id,
+                            result.theme.theme_key,
+                            result.theme.pipeline_version,
+                        ):
+                            raise Phase0IntegrityError(
+                                "the rebuilt input names a different theme "
+                                "identity than the result under one fingerprint"
+                            )
+                        self._require_accepted_summary(guarded, result, rebuilt, policy)
+                        holders = _summary_artifacts_on(
+                            connection,
+                            "theme_id = ? AND input_fingerprint = ? "
+                            "AND policy_fingerprint = ? AND status = ?",
+                            (*key, SUMMARY_ARTIFACT_ACCEPTED),
+                        )
+                        if holders:
+                            holder = holders[0]
+                            verdict = lifecycle.validate_persisted_artifact(
+                                holder, rebuilt, policy
+                            )
+                            if verdict.valid:
+                                outcome = SUMMARY_GENERATION_DISCARDED_DUPLICATE
+                                artifact_id = holder.artifact_id
+                            else:
+                                self._invalidate_summary_artifact(
+                                    connection,
+                                    holder.artifact_id,
+                                    reason=SUMMARY_INVALIDATED_CORRUPT
+                                    + ":"
+                                    + ",".join(verdict.codes),
+                                    at=completed_at,
+                                )
+                                invalidated = 1
+                        if outcome is None:
+                            artifact_id = self._insert_summary_artifact(
+                                connection,
+                                guarded,
+                                result=result,
+                                generation_input=rebuilt,
+                                policy=policy,
+                                created_at=completed_at,
+                            )
+                            inserted = 1
+                            outcome = SUMMARY_GENERATION_ACCEPTED
+
+            cursor = connection.execute(
+                """
+                INSERT INTO summary_generations (
+                    run_id, ticker, trading_day, pipeline_version, theme_id,
+                    theme_key, input_fingerprint, policy_fingerprint, model,
+                    max_attempts, outcome, reason, detail, artifact_id,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    context.run_id,
+                    ticker,
+                    day,
+                    version,
+                    key[0],
+                    theme.theme_key,
+                    key[1],
+                    key[2],
+                    require_safe_identifier_scalar(policy.model, "model"),
+                    int(result.max_attempts),
+                    outcome,
+                    reason,
+                    (
+                        None
+                        if detail is None
+                        else require_safe_identifier_scalar(detail, "detail")
+                    ),
+                    artifact_id,
+                    completed_at,
+                ),
+            )
+            generation_id = int(cursor.lastrowid)
+            for attempt in result.attempts:
+                usage = attempt.usage
+                connection.execute(
+                    """
+                    INSERT INTO summary_generation_attempts (
+                        generation_id, attempt, outcome, failures, latency_ms,
+                        prompt_tokens, candidate_tokens, total_tokens, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        generation_id,
+                        _require_int(attempt.attempt, "attempt", minimum=1),
+                        require_safe_identifier_scalar(attempt.outcome, "outcome"),
+                        _dump_json(
+                            [
+                                {
+                                    "code": str(failure.code),
+                                    "detail": sanitize_diagnostic_scalar(
+                                        failure.detail, "failure detail"
+                                    ),
+                                }
+                                for failure in attempt.failures
+                            ]
+                        ),
+                        (
+                            None
+                            if attempt.latency_ms is None
+                            else max(0.0, float(attempt.latency_ms))
+                        ),
+                        _optional_token_count(
+                            None if usage is None else usage.prompt_tokens
+                        ),
+                        _optional_token_count(
+                            None if usage is None else usage.candidate_tokens
+                        ),
+                        _optional_token_count(
+                            None if usage is None else usage.total_tokens
+                        ),
+                        sanitize_diagnostic_scalar(attempt.error, "attempt error"),
+                    ),
+                )
+
+            if outcome in (
+                SUMMARY_GENERATION_ACCEPTED,
+                SUMMARY_GENERATION_DISCARDED_DUPLICATE,
+            ):
+                context._record_outcome(success=1)
+            else:
+                context._record_outcome(partial=1)
+            context._merge_counts(
+                {
+                    "summary_generations": 1,
+                    "summary_provider_calls": len(result.attempts),
+                    f"summary_{outcome}": 1,
+                    "summary_artifacts_inserted": inserted,
+                    "summary_artifacts_invalidated": invalidated,
+                }
+            )
+            return _summary_generations_on(connection, "id = ?", (generation_id,))[0]
+
+    @staticmethod
+    def _require_result_contract(
+        guarded: Any, result: Any, generation_input: Any, policy: Any
+    ) -> None:
+        """Re-prove everything A2 promises about a result, structurally.
+
+        A2 builds a result that satisfies all of this; a value that
+        reaches the persistence boundary is held to it again because
+        nothing about a dataclass stops a caller from replacing a field.
+        Every failure is a :class:`Phase0ValidationError`.
+
+        Identity: the result names ``generation_input`` (fingerprint and
+        theme) and ``policy`` (fingerprint and attempt bound).
+
+        Attempts: at least one and at most ``policy.max_attempts``,
+        numbered ``1..n`` in order, each with a known outcome, failures
+        consistent with the outcome (only a rejection carries codes, and
+        only known ones), and at most one accepted.
+
+        Accepted: exactly one accepted attempt, it is the last, it is
+        ``accepted_attempt``, a summary is present, ``reason`` is ``None``.
+        Unavailable: no accepted attempt, ``accepted_attempt`` is ``None``,
+        no summary, and ``reason`` is the one A2 derives from the final
+        attempt's outcome.  The summary's own validity is proved
+        separately, against the input, by :meth:`_require_accepted_summary`.
+        """
+
+        def refuse(message: str) -> None:
+            raise Phase0ValidationError(f"result violates the A2 contract: {message}")
+
+        if (
+            result.input_fingerprint != generation_input.input_fingerprint
+            or result.theme != generation_input.theme
+        ):
+            raise Phase0ValidationError(
+                "the result was not generated from this generation input"
+            )
+        if result.policy_fingerprint != policy.fingerprint:
+            raise Phase0ValidationError(
+                "the result's policy fingerprint is not the resolved policy's; "
+                "a generation looked up under one policy cannot be persisted "
+                "under another"
+            )
+        if result.max_attempts != policy.max_attempts:
+            refuse("max_attempts does not match the policy")
+        if result.status not in (guarded.STATUS_ACCEPTED, guarded.STATUS_UNAVAILABLE):
+            refuse(f"unknown status {result.status!r}")
+
+        attempts = result.attempts
+        if not isinstance(attempts, tuple) or not attempts:
+            refuse("a provider-calling generation records at least one attempt")
+        if len(attempts) > policy.max_attempts:
+            refuse("more attempts than the policy allows")
+        known_outcomes = {
+            guarded.OUTCOME_ACCEPTED,
+            guarded.OUTCOME_REJECTED,
+            guarded.OUTCOME_PROVIDER_ERROR,
+            guarded.OUTCOME_PROVIDER_TIMEOUT,
+            guarded.OUTCOME_PROVIDER_UNCONFIGURED,
+        }
+        accepted_numbers: list[int] = []
+        for ordinal, attempt in enumerate(attempts, start=1):
+            if not isinstance(attempt, guarded.AttemptRecord):
+                refuse(f"attempt {ordinal} is not an AttemptRecord")
+            if isinstance(attempt.attempt, bool) or attempt.attempt != ordinal:
+                refuse(f"attempt numbers must run 1..{len(attempts)} in order")
+            if attempt.outcome not in known_outcomes:
+                refuse(f"attempt {ordinal} has unknown outcome {attempt.outcome!r}")
+            codes = tuple(failure.code for failure in attempt.failures)
+            if codes != tuple(attempt.validation_codes):
+                refuse(f"attempt {ordinal} failures and validation codes disagree")
+            if attempt.outcome == guarded.OUTCOME_REJECTED:
+                if not codes or any(
+                    code not in guarded.VALIDATION_CODES for code in codes
+                ):
+                    refuse(f"attempt {ordinal} was rejected without known codes")
+            elif codes:
+                refuse(f"attempt {ordinal} carries failures but was not rejected")
+            if attempt.outcome == guarded.OUTCOME_ACCEPTED:
+                accepted_numbers.append(ordinal)
+            if ordinal < len(attempts) and attempt.outcome in (
+                guarded.OUTCOME_ACCEPTED,
+                guarded.OUTCOME_PROVIDER_UNCONFIGURED,
+            ):
+                refuse(f"attempt {ordinal} ended the generation; nothing follows it")
+        if len(accepted_numbers) > 1:
+            refuse("more than one accepted attempt")
+
+        last = attempts[-1]
+        if result.status == guarded.STATUS_ACCEPTED:
+            if accepted_numbers != [len(attempts)]:
+                refuse("an accepted result ends with its one accepted attempt")
+            if result.accepted_attempt != len(attempts):
+                refuse("accepted_attempt does not name the accepted attempt")
+            if result.summary is None:
+                refuse("an accepted result carries a summary")
+            if result.reason is not None:
+                refuse("an accepted result carries no reason")
+        else:
+            if accepted_numbers:
+                refuse("an unavailable result has no accepted attempt")
+            if result.accepted_attempt is not None:
+                refuse("an unavailable result has no accepted_attempt")
+            if result.summary is not None:
+                refuse("an unavailable result carries no summary")
+            if last.outcome == guarded.OUTCOME_PROVIDER_UNCONFIGURED:
+                expected = guarded.REASON_PROVIDER_UNCONFIGURED
+            elif last.outcome in (
+                guarded.OUTCOME_PROVIDER_ERROR,
+                guarded.OUTCOME_PROVIDER_TIMEOUT,
+            ):
+                expected = guarded.REASON_PROVIDER_UNAVAILABLE
+            else:
+                expected = guarded.REASON_VALIDATION_EXHAUSTED
+            if result.reason != expected:
+                refuse(
+                    f"reason {result.reason!r} does not follow from the final "
+                    f"attempt ({last.outcome})"
+                )
+
+    @staticmethod
+    def _require_accepted_summary(
+        guarded: Any, result: Any, generation_input: Any, policy: Any
+    ) -> None:
+        """An accepted summary must still pass A2's validator, exactly.
+
+        Judged against ``generation_input`` under ``policy.rules`` -- the
+        rebuilt live input when the result is current, the result's own
+        frozen input when it is about to be recorded as stale -- and the
+        validator's normalized form must be the summary itself, so a
+        summary that only passes after normalization is refused too.
+        """
+
+        verdict = guarded.validate_candidate(
+            result.summary, generation_input, rules=policy.rules
+        )
+        if not verdict.accepted:
+            raise Phase0ValidationError(
+                "result violates the A2 contract: the accepted summary fails "
+                f"validation ({', '.join(verdict.codes)})"
+            )
+        if verdict.summary != result.summary:
+            raise Phase0ValidationError(
+                "result violates the A2 contract: the accepted summary is not "
+                "in A2's normalized form"
+            )
+
+    @staticmethod
+    def _insert_summary_artifact(
+        connection: sqlite3.Connection,
+        guarded: Any,
+        *,
+        result: Any,
+        generation_input: Any,
+        policy: Any,
+        created_at: str,
+    ) -> int:
+        """Insert one accepted artifact with its sentences and citations.
+
+        Citation ids are parsed back to the persisted story ids they name,
+        and each is checked against the frozen input's ids on the way in:
+        A2 already guaranteed both, and the check costs nothing next to
+        storing a citation that names nothing.  The content digest is
+        computed from exactly the material written.
+        """
+
+        theme = generation_input.theme
+        summary = result.summary
+        ticker = normalize_ticker(generation_input.ticker)
+        day = _normalize_day(generation_input.trading_day)
+        version = _require_text(theme.pipeline_version, "pipeline_version")
+        model = require_safe_identifier_scalar(policy.model, "model")
+        label = _require_text(summary.label, "label")
+        guarantee = _require_text(result.guarantee, "guarantee")
+        prefix = guarded.CITATION_PREFIX
+        sentences: list[tuple[int, str, list[tuple[int, int]]]] = []
+        for ordinal, sentence in enumerate(summary.sentences, start=1):
+            citations: list[tuple[int, int]] = []
+            for position, citation_id in enumerate(sentence.citation_ids):
+                if citation_id not in generation_input.evidence_ids:
+                    raise Phase0IntegrityError(
+                        f"sentence {ordinal} cites an id outside the frozen input"
+                    )
+                try:
+                    story_id = int(str(citation_id)[len(prefix) :])
+                except ValueError as exc:
+                    raise Phase0IntegrityError(
+                        f"sentence {ordinal} carries a malformed citation id"
+                    ) from exc
+                if guarded.citation_id_for(story_id) != citation_id:
+                    raise Phase0IntegrityError(
+                        f"sentence {ordinal} carries a malformed citation id"
+                    )
+                citations.append((position, story_id))
+            sentences.append(
+                (ordinal, _require_text(sentence.text, "sentence"), citations)
+            )
+        digest = summary_artifact_digest(
+            ticker=ticker,
+            trading_day=day,
+            pipeline_version=version,
+            theme_id=theme.theme_id,
+            theme_key=theme.theme_key,
+            input_fingerprint=result.input_fingerprint,
+            policy_fingerprint=result.policy_fingerprint,
+            citation_convention=guarded.CITATION_CONVENTION,
+            prompt_version=guarded.PROMPT_VERSION,
+            model=model,
+            label=label,
+            guarantee=guarantee,
+            sentences=sentences,
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO summary_artifacts (
+                ticker, trading_day, pipeline_version, theme_id, theme_key,
+                input_fingerprint, policy_fingerprint, citation_convention,
+                prompt_version, model, label, guarantee, content_digest,
+                status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ticker,
+                day,
+                version,
+                _require_int(theme.theme_id, "theme_id", minimum=1),
+                theme.theme_key,
+                result.input_fingerprint,
+                result.policy_fingerprint,
+                guarded.CITATION_CONVENTION,
+                guarded.PROMPT_VERSION,
+                model,
+                label,
+                guarantee,
+                digest,
+                SUMMARY_ARTIFACT_ACCEPTED,
+                created_at,
+            ),
+        )
+        artifact_id = int(cursor.lastrowid)
+        for ordinal, text, citations in sentences:
+            connection.execute(
+                "INSERT INTO summary_sentences (artifact_id, ordinal, text) "
+                "VALUES (?, ?, ?)",
+                (artifact_id, ordinal, text),
+            )
+            for position, story_id in citations:
+                connection.execute(
+                    """
+                    INSERT INTO summary_sentence_citations (
+                        artifact_id, sentence_ordinal, position, story_id
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (artifact_id, ordinal, position, story_id),
+                )
+        return artifact_id
+
+    @staticmethod
+    def _invalidate_summary_artifact(
+        connection: sqlite3.Connection, artifact_id: int, *, reason: str, at: str
+    ) -> None:
+        """The one mutation an artifact admits: ``accepted -> invalidated``."""
+
+        cursor = connection.execute(
+            "UPDATE summary_artifacts SET status = ?, invalidated_at = ?, "
+            "invalidated_reason = ? WHERE id = ? AND status = ?",
+            (
+                SUMMARY_ARTIFACT_INVALIDATED,
+                at,
+                require_safe_identifier_scalar(reason, "invalidated_reason"),
+                int(artifact_id),
+                SUMMARY_ARTIFACT_ACCEPTED,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise Phase0IntegrityError(
+                f"summary artifact {artifact_id} was not accepted when its "
+                "invalidation was attempted"
+            )
+
+    # ------------------------------------------------------------------
     # Evaluation labels
     # ------------------------------------------------------------------
 
@@ -6678,11 +7823,21 @@ class Phase0Repository:
         attempt: int = 1,
         replay: bool = False,
         stage_key: Mapping[str, Any] | None = None,
+        mutation_id: str | None = None,
     ) -> int:
         """Write the run-log row on an existing transaction.
 
         Logged pipeline mutations call this *inside* their own write
-        transaction so the row and the data it describes commit together.
+        transaction so the row and the data it describes commit together,
+        and they pass their ``mutation_id`` -- the marker that
+        :meth:`_logged_mutation` minted for that one invocation -- so the
+        row records *which* transaction wrote it.  Every other writer of
+        the row (stage settlement, the failure path, the public
+        :meth:`write_run_log`) passes none, and the upsert then keeps the
+        marker already on the row: ``last_mutation_id`` always reads as
+        the most recent logged mutation whose accounting was atomically
+        written with the row, or NULL when no logged mutation ever wrote
+        it.
         """
 
         resolved_status = status or ("degraded" if errors else "success")
@@ -6724,8 +7879,8 @@ class Phase0Repository:
                 run_id, stage, counts, duration_ms, errors, started_at,
                 completed_at, status, trading_day, pipeline_version,
                 ticker, success_count, partial_count, failure_count,
-                attempt, replay
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                attempt, replay, last_mutation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, stage) DO UPDATE SET
                 counts = excluded.counts,
                 duration_ms = excluded.duration_ms,
@@ -6736,7 +7891,10 @@ class Phase0Repository:
                 partial_count = excluded.partial_count,
                 failure_count = excluded.failure_count,
                 attempt = excluded.attempt,
-                replay = excluded.replay
+                replay = excluded.replay,
+                last_mutation_id = COALESCE(
+                    excluded.last_mutation_id, run_log.last_mutation_id
+                )
             """,
             (
                 _require_text(run_id, "run_id"),
@@ -6755,6 +7913,7 @@ class Phase0Repository:
                 _require_int(failure_count, "failure_count", minimum=0),
                 _require_int(attempt, "attempt", minimum=1),
                 1 if replay else 0,
+                mutation_id,
             ),
         )
         row = connection.execute(
@@ -6948,8 +8107,14 @@ class Phase0Repository:
             yield context
         except BaseException as exc:  # noqa: BLE001 - re-raised below
             failure = exc
-            context._record_outcome(failure=1)
-            context._record_error({"error": f"{type(exc).__name__}: {exc}"})
+            if not context.settled:
+                # A settled run's outcome is written and immutable (the
+                # same rule ``record_degradation`` applies); an exception
+                # escaping after settlement -- a commit that landed and
+                # then reported an error, say -- is the caller's news, not
+                # a second failure the durable row never recorded.
+                context._record_outcome(failure=1)
+                context._record_error({"error": f"{type(exc).__name__}: {exc}"})
             raise
         finally:
             self._unregister_run(context)
@@ -7113,7 +8278,16 @@ class Phase0Repository:
         connection: sqlite3.Connection,
         context: StageRunContext,
         status: str,
+        *,
+        mutation_id: str | None = None,
     ) -> None:
+        """The run's current accounting, as one ``run_log`` row.
+
+        ``mutation_id`` is set only by :meth:`_logged_mutation`, for the
+        row it writes inside the mutation's own transaction; a settlement
+        supplies none and leaves the row's marker alone.
+        """
+
         completed = self.now()
         self._write_run_log(
             connection,
@@ -7134,6 +8308,7 @@ class Phase0Repository:
             attempt=context.attempt,
             replay=context.replay,
             stage_key=context._stage_key,
+            mutation_id=mutation_id,
         )
 
     @staticmethod
@@ -7490,10 +8665,21 @@ class Phase0Repository:
         declares the stage finished.  It, too, changes nothing in memory
         until its own commit returns.
 
-        If anything raises — including ``commit()`` — the data rolls back,
-        the failure settlement runs in its own transaction, the context
+        If anything raises before ``commit()`` the data rolls back, the
+        failure settlement runs in its own transaction, the context
         becomes ``TERMINAL_FAILED`` only once *that* commits, and the
         original exception propagates untouched.
+
+        ``commit()`` raising is different: an I/O error can be reported
+        after the transaction is durable, so the disk is asked.  Each
+        invocation mints its own random marker (``mutation_id``) and
+        writes it into the run-log row inside the transaction, and the
+        durable probe afterwards (:meth:`_commit_landed`) decides by that
+        marker -- *this* transaction is the only one that could ever have
+        written it -- rather than by whether the row's counters look like
+        what was intended.  Two writers holding the same run identity can
+        commit rows whose counters coincide; they cannot commit the same
+        marker.
 
         A run whose outcome is already settled is refused *before* any
         transaction opens.  That ordering matters too: the previous
@@ -7520,19 +8706,50 @@ class Phase0Repository:
         connection: sqlite3.Connection | None = None
         context: StageRunContext | None = None
         committed = False
+        # The counters as they stand before this operation: what earlier
+        # operations of this run *committed*.  The body accumulates onto
+        # them while it prepares the run-log row, and if the operation is
+        # proved rolled back the accumulation is undone below, so the
+        # failure settlement records the committed state and not the rows
+        # that were just rolled back.  Errors are not restored: a
+        # degradation the stage recorded is a fact about the attempt, and
+        # the failure that follows is appended beside it.
+        staged: tuple[int, int, int, dict] | None = None
+        # The run-log row as it was before this operation and as this
+        # transaction rewrote it, both read on the transaction's own
+        # connection.  ``commit()`` raising does not mean the transaction
+        # rolled back -- an I/O error can be reported after it is durable
+        # -- so when it raises, a fresh connection reads the row again and
+        # what is *on disk* decides which of the two this operation left.
+        before: tuple[Any, ...] | None = None
+        intended: tuple[Any, ...] | None = None
+        # This invocation's identity on disk.  Minted here, written by
+        # the final run-log write below, and never reused: it is what the
+        # probe looks for when the commit's outcome is in doubt.
+        mutation_id: str | None = None
         try:
             connection = self._open_connection()
             connection.execute("BEGIN IMMEDIATE")
             context = self._authorize_run(connection, run, operation=operation)
+            mutation_id = self._new_mutation_id()
+            staged = self._counter_snapshot(context)
+            before = self._run_log_outcome(connection, context)
             yield connection, context
             if terminal:
                 status = context._resolved_status()
-                self._write_final_run_log(connection, context, status)
+                self._write_final_run_log(
+                    connection, context, status, mutation_id=mutation_id
+                )
                 if context._stage_key is not None:
                     self._finish_stage_key(connection, context, status)
             else:
                 # Never "success" before the stage says it is finished.
-                self._write_final_run_log(connection, context, "degraded")
+                self._write_final_run_log(
+                    connection, context, "degraded", mutation_id=mutation_id
+                )
+            # Everything this transaction will make durable is written;
+            # from here on a failure is a failure *of the commit*.
+            intended = self._run_log_outcome(connection, context)
             connection.commit()
             committed = True
         except BaseException as exc:  # noqa: BLE001 - re-raised below
@@ -7549,20 +8766,61 @@ class Phase0Repository:
                 and self._is_active_run(run)
                 and not run.settled
             ):
-                run._record_outcome(failure=1)
-                run._record_error(
-                    {"operation": operation, "error": f"{type(exc).__name__}: {exc}"}
+                landed = (
+                    False
+                    if intended is None or mutation_id is None
+                    else self._commit_landed(context, before, intended, mutation_id)
                 )
-                # Settles the run in its own transaction and only then moves
-                # the context — and never at the cost of the exception the
-                # caller is waiting for: the failure below *is* the news.
-                self._settle_run(
-                    run,
-                    "failed",
-                    key_status="failed",
-                    settled_state=RUN_STATE_TERMINAL_FAILED,
-                    suppress_errors=True,
-                )
+                if landed is True:
+                    # Durable.  The counters the body accumulated are the
+                    # durable row's, and the run keeps them.  Nothing here
+                    # is a failure of the mutation; the exception is still
+                    # the caller's to see.
+                    if terminal:
+                        context._transition(RUN_STATE_TERMINAL_SUCCEEDED)
+                elif landed is False:
+                    # Rolled back.  Nothing this operation counted was
+                    # committed, and the run records the failure.
+                    if staged is not None:
+                        self._restore_counters(context, staged)
+                    run._record_outcome(failure=1)
+                    run._record_error(
+                        {
+                            "operation": operation,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    # Settles the run in its own transaction and only then
+                    # moves the context -- and never at the cost of the
+                    # exception the caller is waiting for: the failure
+                    # below *is* the news.
+                    self._settle_run(
+                        run,
+                        "failed",
+                        key_status="failed",
+                        settled_state=RUN_STATE_TERMINAL_FAILED,
+                        suppress_errors=True,
+                    )
+                else:
+                    # Unprovable: the durable row could not be read, or it
+                    # matches neither what was there nor what was written
+                    # -- typically because another writer holding the same
+                    # run identity committed since, and its marker is what
+                    # is on disk now.  Neither success nor rollback is
+                    # assumed and nothing is written over whatever is on
+                    # disk: a failure settlement here could overwrite that
+                    # writer's durable row.  This is the state the
+                    # repository already has for "the outcome is unknown":
+                    # the key is left as it was, so the lease expires and
+                    # ordinary recovery reclaims it.
+                    run._record_error(
+                        {
+                            "operation": operation,
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "durable_outcome": "unknown",
+                        }
+                    )
+                    context._transition(RUN_STATE_SETTLEMENT_FAILED)
             raise
         finally:
             if connection is not None:
@@ -7570,6 +8828,171 @@ class Phase0Repository:
         if terminal and committed and context is not None:
             # Durable first, then said out loud.
             context._transition(RUN_STATE_TERMINAL_SUCCEEDED)
+
+    #: The ``run_log`` columns one logged mutation rewrites: everything on
+    #: the row except its identity, plus ``last_mutation_id`` -- the marker
+    #: of the mutation that wrote it.  Two reads of them that compare
+    #: equal describe the same outcome written by the *same* transaction;
+    #: without the marker they would only say the outcomes coincide.
+    _RUN_LOG_OUTCOME_COLUMNS: tuple[str, ...] = (
+        "counts",
+        "duration_ms",
+        "errors",
+        "completed_at",
+        "status",
+        "success_count",
+        "partial_count",
+        "failure_count",
+        "attempt",
+        "replay",
+        "last_mutation_id",
+    )
+
+    #: Where ``last_mutation_id`` sits in a ``_run_log_outcome`` tuple.
+    _RUN_LOG_MUTATION_ID_INDEX: int = _RUN_LOG_OUTCOME_COLUMNS.index("last_mutation_id")
+
+    @staticmethod
+    def _new_mutation_id() -> str:
+        """A fresh identity for one logged mutation.
+
+        128 random bits from the OS, so two invocations -- in this process
+        or another -- never mint the same one.  Not derived from the run,
+        the stage, the clock, a counter or the data, and not a secret:
+        it proves *which* transaction wrote a row, nothing more.  Tests
+        that need to know a marker ahead of time patch this method; no
+        caller supplies one.
+        """
+
+        return uuid.uuid4().hex
+
+    @classmethod
+    def _run_log_outcome(
+        cls, connection: sqlite3.Connection, context: StageRunContext
+    ) -> tuple[Any, ...] | None:
+        """This run's ``run_log`` outcome columns as ``connection`` sees them.
+
+        On the transaction's own connection before the body, this is the
+        committed state the operation started from, carrying whichever
+        marker (or NULL) the row had; after the final write it is exactly
+        what the commit would make durable, in stored form (JSON text
+        included), so no re-serialization can disagree, and it carries
+        this invocation's marker.  On a fresh connection afterwards it is
+        what actually is durable.  ``None`` when the row does not exist
+        yet.
+        """
+
+        columns = ", ".join(cls._RUN_LOG_OUTCOME_COLUMNS)
+        row = connection.execute(
+            f"SELECT {columns} FROM run_log WHERE run_id = ? AND stage = ?",
+            (context.run_id, context.stage),
+        ).fetchone()
+        return None if row is None else tuple(row)
+
+    def _open_probe_connection(self) -> sqlite3.Connection:
+        """A fresh read-only connection, for looking at what is durable."""
+
+        connection = sqlite3.connect(
+            f"file:{self.database_path}?mode=ro", uri=True, timeout=10
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA query_only = ON")
+        return connection
+
+    def _commit_landed(
+        self,
+        context: StageRunContext,
+        before: tuple[Any, ...] | None,
+        intended: tuple[Any, ...],
+        mutation_id: str,
+    ) -> bool | None:
+        """Whether a commit that raised nevertheless became durable.
+
+        Read on a **fresh, read-only** connection: the failed
+        transaction's own connection proves nothing about the disk, and
+        the question needs no write.  The answer rests on the row's
+        ``last_mutation_id``, which only this invocation could have
+        written (``mutation_id``), never on its counters alone:
+
+        ``True``
+            the durable row carries this invocation's marker and the
+            outcome it wrote.  This transaction became durable.
+        ``False``
+            the durable row is exactly the pre-operation row, its old
+            marker (or NULL) included.  No logged mutation has written the
+            row since ``before`` was read, and every logged mutation
+            writes a marker of its own, so this one rolled back; another
+            writer cannot have rewritten the row back to ``before``.
+        ``None``
+            anything else: a marker that is neither -- another writer
+            holding the same run identity committed since, and whether
+            this transaction landed first can no longer be read off the
+            row -- a row that disappeared, a marker that is somehow not
+            in ``intended``, or a probe that could not run.  The caller
+            answers ``None`` with the repository's existing "outcome
+            unknown" state, never with a guess, and writes nothing over
+            what is on disk.
+
+        A row whose counters coincide with ``intended`` but whose marker
+        is not ``mutation_id`` is therefore *not* a landed commit, however
+        alike the two outcomes look.
+        """
+
+        index = self._RUN_LOG_MUTATION_ID_INDEX
+        if intended[index] != mutation_id:
+            # The final write did not carry this invocation's identity, so
+            # nothing on disk can be attributed to it.  Not reachable
+            # through ``_logged_mutation``; kept so no refactor can turn
+            # the proof back into a counter comparison unnoticed.
+            return None
+        try:
+            probe = self._open_probe_connection()
+        except Exception:  # noqa: BLE001 - the caller's exception wins
+            return None
+        try:
+            durable = self._run_log_outcome(probe, context)
+        except Exception:  # noqa: BLE001 - the caller's exception wins
+            return None
+        finally:
+            with contextlib.suppress(Exception):
+                probe.close()
+        if durable is None:
+            # ``before`` may be None too (a first operation whose row was
+            # never inserted): that is the rollback case, decided below.
+            return False if before is None else None
+        if durable[index] == mutation_id:
+            return True if durable == intended else None
+        if durable == before:
+            return False
+        return None
+
+    @staticmethod
+    def _counter_snapshot(run: StageRunContext) -> tuple[int, int, int, dict]:
+        """The run's committed accounting, copied, before an operation."""
+
+        return (
+            run._success_count,
+            run._partial_count,
+            run._failure_count,
+            dict(run._counts),
+        )
+
+    @staticmethod
+    def _restore_counters(
+        run: StageRunContext, snapshot: tuple[int, int, int, dict]
+    ) -> None:
+        """Undo one rolled-back operation's accumulation.
+
+        See :meth:`_logged_mutation`.
+        """
+
+        success, partial, failure, counts = snapshot
+        setter = object.__setattr__
+        setter(run, "_success_count", success)
+        setter(run, "_partial_count", partial)
+        setter(run, "_failure_count", failure)
+        run._counts.clear()
+        run._counts.update(counts)
 
     def ingest_raw_items(
         self,

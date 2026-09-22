@@ -273,13 +273,203 @@ What it does and does not claim, exactly:
 |---|---|
 | Registered in `pipeline.py` / the coordinator | **no** — nothing schedules it |
 | Writes `themes.summary`, `themes.status`, `themes.citations`, `run_log` | **no** — it holds no repository handle |
-| Persists, caches, or invalidates summaries | **no** — A3 owns persistence, cache, accounting and lifecycle |
+| Persists, caches, or invalidates summaries | **no** — the A3 lifecycle below does, and only when a caller invokes it |
 | Served by the narrative API | **no** — the API is still fixture-backed |
 | "accepted" means | structurally grounded (every sentence cites ids that exist in the frozen input) and clean under `config/banned_phrases.txt` |
 | "accepted" does **not** mean | semantically faithful — sentence support remains the G2 human-review gate (A4b) |
 
 The population health gate refuses stale, M2-only, mixed-stage, or
 inconsistent theme sets with a stable code before any prompt is built.
+
+### Persisted summary lifecycle (A3) exists, and is not wired in
+
+`phase0/summary_lifecycle.py` and migration `016_summary_artifacts.sql`
+make the A2 result durable: `ensure_summary(...)` reuses a stored,
+still-valid artifact with zero provider calls, calls A2 only when nothing
+can be reused, and hands the result to
+`Phase0Repository.persist_summary_generation`, which records it in one
+transaction with the run's `run_log` row. Nothing schedules it: it takes a
+`stage_run` context from the caller (stage name `summaries`), constructs no
+provider client, and is not in `DOWNSTREAM_STAGES`. A3b wires it into the
+scheduled path.
+
+**Where summaries live.** Five tables of their own — `summary_artifacts`
+(the accepted label and identity), `summary_sentences` (ordered),
+`summary_sentence_citations` (ordered `story_id`s per sentence; the
+citation id is exactly `story:<story_id>` and is not stored twice),
+`summary_generations` (one row per lifecycle invocation that called the
+provider) and `summary_generation_attempts` (one per provider call: outcome,
+validation failures, latency, token counts, redacted error). `themes.summary`,
+`themes.status`, `themes.citations` and `theme_citations` stay the theme
+stage's, are rewritten by every theme reconciliation (`summary` as NULL),
+and are never the summary source. `theme_citations` is M5's raw-item
+evidence membership; `summary_sentence_citations` is what a generated
+sentence cited. The two are not interchangeable.
+
+**No foreign key to `themes` or `stories`.** Ordinary reconciliation deletes
+and recreates both — any story change deletes the whole theme set, and an
+obsolete story is hard-deleted — so A3 rows carry `theme_id` and `story_id`
+as immutable *logical* identifiers of the rows they named. Both are
+`AUTOINCREMENT`, so a recreated theme can never collide with an old
+artifact's key. Reconciliation neither writes nor deletes A3 rows; nothing
+in A3 blocks reconciliation. Old artifacts survive as history.
+
+**Current is derived, never stored, and always from the live database.**
+There is no `is_current` flag. `summary_lifecycle.current_summary_artifact`
+and `ensure_summary` read their own fresh `Phase0Reader.theme_population`
+snapshot and build the frozen A2 input from it; neither accepts a
+population from the caller, so a retained snapshot cannot call a historical
+artifact current after its theme moved, was re-keyed, or vanished. An
+artifact is current when, and only when: that live population is healthy
+and holds the theme; the frozen input rebuilt from it has this artifact's
+exact `input_fingerprint`; the policy resolved from the client that would
+generate (`ai.guarded_summary.resolve_generation_policy`) has this
+artifact's exact `policy_fingerprint`; and the stored row passes
+`summary_lifecycle.validate_persisted_artifact` — the one definition of a
+valid stored artifact, shared by the read path and the write path's
+existing-holder check. That validator proves, in order: the stored
+**identity** columns (theme id and key, ticker, day, pipeline version, both
+fingerprints, model, A2's current citation convention and prompt version,
+`status = 'accepted'`) agree with the input and policy — a row found by its
+key is not trusted to be what the key says; the **structure as stored**
+(ordinals exactly `1..N` within A2's bounds, at least one citation per
+sentence, positions exactly `0..M-1`, no story cited twice by one sentence,
+every cited story in the frozen input — nothing is renumbered on the way
+to a verdict); the **content digest** (`summary_artifacts.content_digest`,
+SHA-256 of canonical JSON over the identity columns, label, guarantee and
+every `(ordinal, text)` and `(position, story_id)` as stored — see
+`Phase0Repository.summary_artifact_digest`) recomputed from the stored rows,
+so a trailing sentence quietly gone or a citation reordered is refused even
+though what remains looks well-formed; and only then A2's pure
+`validate_candidate` under the policy's rules. A refused row is never
+returned as current, is treated as a miss, and causes no write on the read
+path. `current_summary_artifact` takes a resolved `GenerationPolicy` (whose
+fingerprint is intrinsic to its fields), not a fingerprint — a caller
+cannot make an old artifact current by handing over an old hash. The raw
+`Phase0Reader.summary_artifact(theme_id, input_fingerprint,
+policy_fingerprint)` answers by explicit key and is deliberately not named
+"current"; `summary_artifacts(...)` and `summary_generations(...)` are
+history.
+
+**Sealed rows.** Beyond the immutability triggers on every `UPDATE`, once a
+`summary_generations` row with outcome `accepted` names an artifact —
+written last, in the same transaction — its sentences and citations can be
+neither added nor deleted, and the artifact row itself cannot be deleted
+(cascades fire the same child triggers; the generation row also holds it
+by `RESTRICT`). That holds after invalidation too: history stays whole.
+Deliberate cleanup goes through the generation rows first. The triggers
+are defense in depth; the digest and read-side validation remain the
+proof.
+
+**One policy, resolved once.** The lifecycle resolves the generation policy
+from the client at the start of an invocation and carries the same object
+through the lookup, the generation (`generate_guarded_summary(...,
+policy=...)`) and the write. The rules the fingerprint was computed over are
+the rules the validator runs; a rules file reloaded in between cannot make
+the lookup and the generation disagree. A result whose policy fingerprint is
+not the resolved policy's is refused at persist.
+
+**The result is not trusted either.** `persist_summary_generation` re-proves
+the whole A2 contract inside its transaction before any row is written:
+the result names the input and the resolved policy (fingerprints,
+`max_attempts`); the attempt history is at least one and at most
+`max_attempts` records, numbered `1..n` in order, with known outcomes,
+failures only on rejections and only with known codes, and at most one
+accepted attempt that — for an accepted result — is the last one and is
+`accepted_attempt`, with a summary and no reason; an unavailable result has
+no accepted attempt, no `accepted_attempt`, no summary, and the reason A2
+derives from its final attempt. An accepted summary is then judged again
+by A2's `validate_candidate` against the rebuilt live input (or, when the
+result is about to be recorded stale, its own frozen input) under the
+policy's rules, and must already be in A2's normalized form. Anything that
+fails raises `Phase0ValidationError`, writes nothing, and settles the run
+failed; it is never reinterpreted as `unavailable`.
+
+**Write-time compare-and-set.** No transaction spans the provider call.
+After A2 returns, the write opens `BEGIN IMMEDIATE`, rebuilds the frozen
+input from the live population through the same projection, and inserts an
+artifact only if the rebuilt `input_fingerprint` equals the result's. A
+theme that disappeared, a population that became unhealthy, or an input
+that changed is recorded as a `discarded_stale` generation — attempts and
+usage included — with no artifact. If an accepted artifact already holds the
+key it is judged by `validate_persisted_artifact` against the rebuilt input:
+valid, and this generation is `discarded_duplicate` referencing it;
+invalid, and it is transitioned `accepted → invalidated` in the same
+transaction before the replacement takes its key. That transition is the
+only update the artifact tables admit (enforced by trigger);
+`status = 'accepted'` means originally accepted and not yet explicitly
+invalidated, and lifecycle currentness additionally requires a successful
+validation.
+
+**Concurrency, exactly.** Two workers generating the same input under the
+same policy may both spend provider calls; the partial unique index on the
+accepted key plus `BEGIN IMMEDIATE` guarantee one accepted artifact, and
+the second completion is recorded as `discarded_duplicate` of the winner.
+A3 prevents duplicate durable artifacts and duplicate accounting identities
+(one generation per `(run_id, theme_id, input_fingerprint,
+policy_fingerprint)`, so a retried write under the same run finds its row).
+A3 does **not** prevent duplicate provider spend — no pre-call lease exists —
+and a retry after an uncertain database outcome can incur another provider
+call unless the caller detects the prior generation. A3b's scheduled-stage
+leasing may improve that.
+
+**Accounting.** `summary_generations.outcome` ∈ `accepted | unavailable |
+discarded_stale | discarded_duplicate`; `reason` carries A2's
+`validation_exhausted | provider_unavailable | provider_unconfigured` for
+unavailable outcomes. Per attempt: outcome, `(code, detail)` validation
+failures, `latency_ms`, `prompt_tokens`/`candidate_tokens`/`total_tokens`
+(NULL when the provider reported nothing — unknown is never zero) and the
+redacted provider error. Provider calls, the accepted attempt and total
+latency are derived from the attempt rows, not stored. No monetary cost is
+persisted: token usage is, and pricing can be applied later.
+
+**Crash semantics.** Artifact, sentences, citations, generation, attempts
+and the run-log row commit together after the provider returns, so no
+partially written artifact can appear. A logged mutation that fails before
+its commit rolls back the data and restores the run's counters to what
+earlier operations of that run had committed before recording its failure,
+so the durable failed run-log row never claims `summary_accepted`,
+`summary_artifacts_inserted` or a `success_count` for rows that were rolled
+back, and a run whose first operation committed and whose second failed
+shows the first exactly once. `commit()` raising is not taken as proof of
+a rollback: the repository re-reads the run-log row on a fresh read-only
+connection and decides by identity, not by resemblance. Every logged
+mutation mints a random 128-bit marker of itself (`uuid4`, never supplied
+by a caller, never reused, not a secret) and writes it to
+`run_log.last_mutation_id` in the same transaction as its data (migration
+016; NULL on rows written before it and on rows no logged mutation wrote;
+stage settlement and operator writes carry none and leave the row's
+marker as it is). `(run_id, stage)` names a row, not the transaction that
+wrote it — a second writer holding the same run identity can commit a row
+whose every outcome column coincides with what this operation intended —
+so the probe asks whether *this* marker became durable: the row carries
+this mutation's marker and the outcome it wrote ⇒ landed (accounting
+kept; the run stays open for a non-terminal operation, or reconciles to
+`terminal_succeeded` for a terminal one; the exception still propagates);
+the row is exactly the pre-operation row, old marker or NULL included ⇒
+rolled back (no other logged mutation can have rewritten it back, since
+each writes a marker of its own), and the failure path above runs;
+anything else — another writer's marker, a vanished row, a probe that
+fails — is unknown, and is left in the repository's existing
+`settlement_failed` "outcome unknown" state with nothing written over the
+durable row, so a competing writer's durable row is never overwritten
+and never claimed. A landed commit whose marker another writer has since
+replaced is therefore unknown, not a rollback. Accepted limitation: a
+process that dies between the provider's answer and the commit leaves that
+spend unaccounted. No pre-call pending row is written to close this.
+
+**Retries after `unavailable`.** Nothing implicit suppresses a call:
+`ensure_summary` without a `RetryPolicy` retries an unavailable key on every
+invocation. A caller may pass `RetryPolicy(cooldown=..., max_generations=...)`
+to suppress calls durably against the recorded generations for the exact
+key; the production cadence is A3b's decision, not a constant here. Readers
+never call the provider; only `ensure_summary` may.
+
+**Citation resolution** for a current artifact: artifact → sentence →
+ordered `story_id` → `story:<id>` → the frozen `EvidenceStory`
+(`CurrentSummary.evidence_for`) → `raw_item_ids` / `urls`. Structural
+traceability only; nothing establishes that the story supports the sentence
+(G2, A4b).
 
 ## Replay
 
@@ -302,7 +492,7 @@ the claim is deliberately narrow:
 | RSS relevance | replayable |
 | Yahoo refetch | not replayed — replay never fetches |
 | Stories and themes (M2–M5) | produced by the **live** path; `--replay` does not drive them |
-| Summarization | implemented (A2, guarded), not registered; nothing persisted |
+| Summarization | implemented (A2 generation, A3 persisted lifecycle), not registered; nothing generated or persisted by the scheduled path |
 | Scoped replay (one ticker/day/version) | unavailable — `reclassify_persisted` takes no scope |
 
 Replay currently covers **all** persisted RSS evidence, because that is
