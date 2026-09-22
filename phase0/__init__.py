@@ -27,6 +27,11 @@ from .scalars import (
     validate_safe_identifier_scalar,
 )
 from .repository import (
+    PersistedSummaryArtifact,
+    PersistedSummaryAttempt,
+    PersistedSummaryCitation,
+    PersistedSummaryGeneration,
+    PersistedSummarySentence,
     Phase0Admin,
     Phase0Reader,
     Phase0Repository,
@@ -39,6 +44,11 @@ from .tickers import SUPPORTED_TICKERS, TICKER_UNIVERSE, normalize_ticker
 __all__ = [
     "ExcludedStoryRecord",
     "OtherCoverageRecord",
+    "PersistedSummaryArtifact",
+    "PersistedSummaryAttempt",
+    "PersistedSummaryCitation",
+    "PersistedSummaryGeneration",
+    "PersistedSummarySentence",
     "Phase0Error",
     "Phase0IntegrityError",
     "Phase0Admin",

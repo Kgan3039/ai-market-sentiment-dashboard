@@ -673,6 +673,115 @@ def compute_policy_fingerprint(
     return _sha256(_canonical_json(payload))
 
 
+def _require_allowed_attempts(max_attempts: Any) -> None:
+    if (
+        isinstance(max_attempts, bool)
+        or not isinstance(max_attempts, int)
+        or max_attempts not in ALLOWED_MAX_ATTEMPTS
+    ):
+        raise ValueError(
+            f"max_attempts must be one of {sorted(ALLOWED_MAX_ATTEMPTS)} (at most "
+            f"one regeneration), not {max_attempts!r}"
+        )
+
+
+@dataclass(frozen=True)
+class GenerationPolicy:
+    """Everything that decides what this module would accept, resolved once.
+
+    The policy is *resolved* from a client and a rule set by
+    :func:`resolve_generation_policy` and then carried, unchanged, through
+    every step that has to agree on it: a cache lookup keyed by
+    ``fingerprint``, the generation itself, and the write that records
+    which policy produced a result.  The rules travel inside it so the
+    validator runs against the rules the fingerprint was computed over --
+    never against a file that may have been reloaded in between.
+
+    Frozen and exact, like :class:`SummaryGenerationInput`:
+    ``__post_init__`` recomputes ``fingerprint`` from the other fields and
+    refuses an instance whose fingerprint disagrees with them, so a
+    hand-assembled policy cannot claim a fingerprint it does not have.
+    """
+
+    model: str
+    max_attempts: int
+    rules: tuple[tuple[str, str, str], ...]
+    temperature: float
+    max_output_tokens: int
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        _require_str(self.model, "model")
+        _require_allowed_attempts(self.max_attempts)
+        if not isinstance(self.rules, tuple) or not all(
+            isinstance(rule, tuple) and len(rule) == 3 for rule in self.rules
+        ):
+            raise GuardedSummaryError(
+                "rules must be a tuple of (category, kind, pattern)"
+            )
+        for rule in self.rules:
+            for value in rule:
+                _require_str(value, "rule")
+        if isinstance(self.temperature, bool) or not isinstance(
+            self.temperature, (int, float)
+        ):
+            raise GuardedSummaryError("temperature must be a number")
+        _require_int(self.max_output_tokens, "max_output_tokens")
+        if self.max_output_tokens <= 0:
+            raise GuardedSummaryError("max_output_tokens must be positive")
+        _require_str(self.fingerprint, "fingerprint")
+        expected = compute_policy_fingerprint(
+            model=self.model,
+            max_attempts=self.max_attempts,
+            rules=self.rules,
+            temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
+        )
+        if self.fingerprint != expected:
+            raise GuardedSummaryError("policy fingerprint does not match the policy")
+
+
+def resolve_generation_policy(
+    client: Any,
+    *,
+    max_attempts: int = MAX_ATTEMPTS,
+    rules: Optional[Rules] = None,
+) -> GenerationPolicy:
+    """The effective policy one generation over ``client`` would run under.
+
+    Exactly what :func:`generate_guarded_summary` resolves for itself when
+    it is given no policy: the client's model and output cap, the attempt
+    bound, and the copy rules -- loaded from their source of truth when
+    ``rules`` is ``None``, and snapshotted here so the same rules reach
+    the validator.  A caller that must agree with a generation about its
+    policy (a cache lookup made *before* the call) resolves once and hands
+    the same object to both.
+    """
+
+    _require_allowed_attempts(max_attempts)
+    active_rules = tuple(
+        tuple(rule) for rule in (load_copy_rules() if rules is None else rules)
+    )
+    model = str(getattr(client, "model", "unspecified"))
+    max_output_tokens = int(
+        getattr(client, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
+    )
+    return GenerationPolicy(
+        model=model,
+        max_attempts=max_attempts,
+        rules=active_rules,
+        temperature=DEFAULT_TEMPERATURE,
+        max_output_tokens=max_output_tokens,
+        fingerprint=compute_policy_fingerprint(
+            model=model,
+            max_attempts=max_attempts,
+            rules=active_rules,
+            temperature=DEFAULT_TEMPERATURE,
+            max_output_tokens=max_output_tokens,
+        ),
+    )
+
+
 # ----------------------------------------------------------------------
 # The typed result
 # ----------------------------------------------------------------------
@@ -735,6 +844,7 @@ def generate_guarded_summary(
     max_attempts: int = MAX_ATTEMPTS,
     rules: Optional[Rules] = None,
     clock: Callable[[], float] = time.perf_counter,
+    policy: Optional[GenerationPolicy] = None,
 ) -> SummaryGenerationResult:
     """Generate, validate, regenerate once with feedback, or give up -- typed.
 
@@ -742,6 +852,14 @@ def generate_guarded_summary(
     response_schema)``; it is called exactly once per attempt and never
     more than ``max_attempts`` times.  The evidence half of the prompt is
     identical on every attempt.
+
+    ``policy`` is an already-resolved :class:`GenerationPolicy`, for a
+    caller that looked something up under a fingerprint before calling
+    and needs this generation to run under exactly that policy.  When it
+    is given, ``rules`` must be left unset and ``max_attempts`` must equal
+    the policy's -- the policy already fixes both -- and the client must
+    still be the one the policy was resolved from.  Without it the policy
+    is resolved here, from the same helper, with the same result.
 
     Handled and recorded: a validation rejection or malformed answer
     (retryable with feedback), a provider request failure or timeout
@@ -756,24 +874,29 @@ def generate_guarded_summary(
         raise GuardedSummaryError(
             "generate_guarded_summary needs a SummaryGenerationInput"
         )
-    if (
-        isinstance(max_attempts, bool)
-        or not isinstance(max_attempts, int)
-        or max_attempts not in ALLOWED_MAX_ATTEMPTS
-    ):
-        raise ValueError(
-            f"max_attempts must be one of {sorted(ALLOWED_MAX_ATTEMPTS)} (at most "
-            f"one regeneration), not {max_attempts!r}"
+    _require_allowed_attempts(max_attempts)
+    if policy is None:
+        policy = resolve_generation_policy(
+            client, max_attempts=max_attempts, rules=rules
         )
-    active_rules = load_copy_rules() if rules is None else tuple(rules)
-    policy = compute_policy_fingerprint(
-        model=str(getattr(client, "model", "unspecified")),
-        max_attempts=max_attempts,
-        rules=active_rules,
-        max_output_tokens=int(
-            getattr(client, "max_output_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
-        ),
-    )
+    else:
+        if not isinstance(policy, GenerationPolicy):
+            raise GuardedSummaryError("policy must be a GenerationPolicy")
+        if rules is not None or max_attempts != policy.max_attempts:
+            raise GuardedSummaryError(
+                "a resolved policy already fixes the rules and max_attempts; "
+                "pass max_attempts=policy.max_attempts and no rules"
+            )
+        observed = resolve_generation_policy(
+            client, max_attempts=policy.max_attempts, rules=policy.rules
+        )
+        if observed.fingerprint != policy.fingerprint:
+            raise GuardedSummaryError(
+                "the client no longer matches the resolved policy; resolve the "
+                "policy again from the client that will generate"
+            )
+    active_rules = policy.rules
+    policy_fingerprint = policy.fingerprint
 
     def finish(
         status: str,
@@ -788,7 +911,7 @@ def generate_guarded_summary(
             reason=reason,
             attempts=tuple(attempts),
             input_fingerprint=generation_input.input_fingerprint,
-            policy_fingerprint=policy,
+            policy_fingerprint=policy_fingerprint,
             theme=generation_input.theme,
             max_attempts=max_attempts,
             accepted_attempt=accepted_attempt,
@@ -898,6 +1021,7 @@ __all__ = [
     "CODE_UNKNOWN_CITATION",
     "EvidenceStory",
     "FEEDBACK_MESSAGES",
+    "GenerationPolicy",
     "GuardedSummaryError",
     "ALLOWED_MAX_ATTEMPTS",
     "MAX_ATTEMPTS",
@@ -925,6 +1049,7 @@ __all__ = [
     "compute_policy_fingerprint",
     "generate_guarded_summary",
     "load_copy_rules",
+    "resolve_generation_policy",
     "rules_digest",
     "validate_candidate",
 ]

@@ -435,6 +435,11 @@ def test_fresh_database_has_every_object_and_records_its_history(tmp_path):
         "story_semantic_merges",
         "run_log_stage_keys",
         "schema_migrations",
+        "summary_artifacts",
+        "summary_sentences",
+        "summary_sentence_citations",
+        "summary_generations",
+        "summary_generation_attempts",
     } <= names
     assert repository.schema_version() == LATEST_VERSION
     applied = [entry["name"] for entry in repository.applied_migrations()]
@@ -5332,6 +5337,9 @@ LOGGED_ENTRYPOINTS = [
     # partition's theme set through the same _logged_mutation the others
     # use, so the key moves with the data and the run log.
     "clear_theme_set",
+    # A3: one guarded generation, its accounting and (when still current)
+    # its artifact, in the one transaction that also writes the run log.
+    "persist_summary_generation",
 ]
 
 
@@ -5461,6 +5469,12 @@ READER_PROBES = {
     # enumeration that finds theme-only partitions as well as story ones.
     "partition_generations": (("2026-08-20",), {}),
     "theme_population": (("NVDA", "2026-08-20", "v1"), {}),
+    # A3: persisted summaries, by exact key and as history.  The one read
+    # allowed to call an artifact "current" lives in
+    # phase0.summary_lifecycle and derives both fingerprints itself.
+    "summary_artifact": ((1, "a" * 64, "b" * 64), {}),
+    "summary_artifacts": (("NVDA", "2026-08-20", "v1"), {}),
+    "summary_generations": (("NVDA", "2026-08-20", "v1"), {}),
 }
 
 
@@ -9385,6 +9399,31 @@ OVERLAP_RULE_VERSION = next(
 PRE_OVERLAP_VERSION = OVERLAP_RULE_VERSION - 1
 
 
+@contextlib.contextmanager
+def marker_column_lent(database: Path):
+    """Let today's writers seed a pre-016 database, then take the loan back.
+
+    Since 016 every logged mutation writes ``run_log.last_mutation_id``
+    (see ``test_016_adds_the_mutation_marker_to_run_log...``), and the
+    hostile cases below seed databases stopped *before* 016 through the
+    ordinary API on purpose: the rows under test have to be what the
+    runner writes, not what a test types.  So the column is lent for the
+    seeding and dropped again before the upgrade under test.  The schema
+    is proved to be exactly what it was before the loan, so nothing about
+    the upgrade being tested is eased by it.
+    """
+
+    pristine = schema_snapshot(Phase0Repository(database))
+    with Phase0Repository(database).admin.connect_writable() as connection:
+        connection.execute("ALTER TABLE run_log ADD COLUMN last_mutation_id TEXT")
+    try:
+        yield
+    finally:
+        with Phase0Repository(database).admin.connect_writable() as connection:
+            connection.execute("ALTER TABLE run_log DROP COLUMN last_mutation_id")
+        assert schema_snapshot(Phase0Repository(database)) == pristine
+
+
 def v13_repository(tmp_path, name="v13.sqlite3"):
     """A database stopped one migration short of the overlap rule."""
 
@@ -9401,14 +9440,15 @@ def test_a_clean_v13_database_upgrades_with_its_data_intact(tmp_path):
     """Hostile case 11."""
 
     repository, database = v13_repository(tmp_path)
-    stories, groups = split_partition(repository, [1, 1])
-    settle_themes(
-        repository,
-        [
-            a_theme("A", [stories[0]], [groups[0][0]], 1),
-            a_theme("B", [stories[1]], [groups[1][0]], 2),
-        ],
-    )
+    with marker_column_lent(database):
+        stories, groups = split_partition(repository, [1, 1])
+        settle_themes(
+            repository,
+            [
+                a_theme("A", [stories[0]], [groups[0][0]], 1),
+                a_theme("B", [stories[1]], [groups[1][0]], 2),
+            ],
+        )
     before = theme_membership(repository)
 
     upgraded = Phase0Repository(database)
@@ -9441,14 +9481,15 @@ def test_a_v13_database_already_carrying_a_duplicate_refuses_to_upgrade(tmp_path
     """
 
     repository, database = v13_repository(tmp_path)
-    stories, groups = split_partition(repository, [1, 1])
-    settle_themes(
-        repository,
-        [
-            a_theme("A", [stories[0]], [groups[0][0]], 1),
-            a_theme("B", [stories[1]], [groups[1][0]], 2),
-        ],
-    )
+    with marker_column_lent(database):
+        stories, groups = split_partition(repository, [1, 1])
+        settle_themes(
+            repository,
+            [
+                a_theme("A", [stories[0]], [groups[0][0]], 1),
+                a_theme("B", [stories[1]], [groups[1][0]], 2),
+            ],
+        )
     with repository.admin.connect_writable() as connection:
         theme_ids = [
             int(row["id"])
@@ -9493,13 +9534,14 @@ def test_a_cross_partition_duplicate_does_not_block_the_upgrade(tmp_path):
     """
 
     repository, database = v13_repository(tmp_path)
-    for ticker in ("NVDA", "AMD"):
-        stories, groups = split_partition(repository, [1], ticker=ticker)
-        settle_themes(
-            repository,
-            [a_theme(f"{ticker}-A", [stories[0]], [groups[0][0]], 1)],
-            ticker=ticker,
-        )
+    with marker_column_lent(database):
+        for ticker in ("NVDA", "AMD"):
+            stories, groups = split_partition(repository, [1], ticker=ticker)
+            settle_themes(
+                repository,
+                [a_theme(f"{ticker}-A", [stories[0]], [groups[0][0]], 1)],
+                ticker=ticker,
+            )
 
     upgraded = Phase0Repository(database)
     upgraded.migrate()
@@ -9806,9 +9848,10 @@ def test_an_existing_database_gains_the_complete_predicate_on_upgrade(tmp_path):
 
     before = Phase0Repository(database)
     assert before.schema_version() == 12
-    victim, survivor = two_stories_in_one_partition(before)
-    identity = str(victim)
-    embed_while_sole_owner(before, "story", identity)
+    with marker_column_lent(database):
+        victim, survivor = two_stories_in_one_partition(before)
+        identity = str(victim)
+        embed_while_sole_owner(before, "story", identity)
     wear_alias(before, "story", survivor, "fingerprint", identity)
 
     upgraded = Phase0Repository(database)
@@ -11191,6 +11234,18 @@ def caught_validation_cases(repository: Phase0Repository) -> dict:
             ),
             "embeddings",
         ),
+        # A result that is not an A2 result at all: refused inside the
+        # transaction, recorded as this run's failure.
+        "persist_summary_generation": (
+            lambda run, terminal: repository.persist_summary_generation(
+                run=run,
+                result=object(),
+                generation_input=object(),
+                policy=object(),
+                terminal=terminal,
+            ),
+            "summary_generations",
+        ),
         # A snapshot stamped on a day this run does not cover.
         "record_feed_snapshot": (
             lambda run, terminal: repository.record_feed_snapshot(
@@ -11911,11 +11966,263 @@ def test_a_durable_success_is_never_overwritten_by_a_late_error(tmp_path):
                 repository.ingest_raw_items([raw_item(1)], run=run, terminal=True)
 
     assert repository.count("raw_items") == 1
-    assert [
-        entry["status"] for entry in repository.run_log_entries(run_id="run-1")
-    ] == ["success"]
+    entry = repository.run_log_entries(run_id="run-1")[0]
+    assert entry["status"] == "success"
     assert repository.stage_key_state(**key)["status"] == "success"
-    assert escaped["run"].state == "terminal_succeeded"
+    run = escaped["run"]
+    assert run.state == "terminal_succeeded"
+    # And the context describes the durable row, not a rollback it never had.
+    assert (
+        (run.success_count, run.partial_count, run.failure_count)
+        == (
+            entry["success_count"],
+            entry["partial_count"],
+            entry["failure_count"],
+        )
+        == (1, 0, 0)
+    )
+    assert (
+        run.counts
+        == entry["counts"]
+        == {
+            "raw_items_seen": 1,
+            "raw_items_inserted": 1,
+        }
+    )
+    assert run.errors == [] and entry["errors"] == []
+
+
+def test_a_durable_nonterminal_commit_keeps_its_accounting_after_a_late_error(
+    tmp_path,
+):
+    """The non-terminal half of the rule above, for any logged mutation.
+
+    A non-terminal operation whose commit landed and then raised leaves
+    the run open with the accounting it committed: no failure settlement
+    is written over the durable row, nothing is counted twice, and the
+    caller still sees the error.
+    """
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            with failing_commits(factory=_CommitsThenRaises):
+                repository.ingest_raw_items([raw_item(1)], run=run)
+        assert repository.count("raw_items") == 1
+        entry = repository.run_log_entries(run_id="run-1")[0]
+        assert entry["status"] == "degraded"  # non-terminal, as written
+        assert (entry["success_count"], entry["failure_count"]) == (1, 0)
+        assert entry["counts"] == {"raw_items_seen": 1, "raw_items_inserted": 1}
+        assert run.state == "active" and not run.settled
+        assert (run.success_count, run.partial_count, run.failure_count) == (1, 0, 0)
+        assert run.counts == entry["counts"]
+        # The run carries on, and the next operation builds on the truth.
+        repository.ingest_raw_items([raw_item(2)], run=run, terminal=True)
+    entry = repository.run_log_entries(run_id="run-1")[0]
+    assert entry["status"] == "success"
+    assert entry["success_count"] == 2 and entry["failure_count"] == 0
+    assert entry["counts"] == {"raw_items_seen": 2, "raw_items_inserted": 2}
+    assert repository.count("raw_items") == 2
+
+
+def test_a_genuine_rollback_after_a_landed_commit_keeps_only_what_landed(
+    tmp_path,
+):
+    """Both kinds of commit failure in one run, in order: landed, then not."""
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        with pytest.raises(sqlite3.OperationalError):
+            with failing_commits(factory=_CommitsThenRaises):
+                repository.ingest_raw_items([raw_item(1)], run=run)
+        with pytest.raises(sqlite3.OperationalError):
+            with failing_commits(factory=_CommitFails):
+                repository.ingest_raw_items([raw_item(2)], run=run)
+        assert run.state == "terminal_failed"
+        assert (run.success_count, run.partial_count, run.failure_count) == (1, 0, 1)
+        assert run.counts == {"raw_items_seen": 1, "raw_items_inserted": 1}
+    assert repository.count("raw_items") == 1
+    entry = repository.run_log_entries(run_id="run-1")[0]
+    assert entry["status"] == "failed"
+    assert (entry["success_count"], entry["failure_count"]) == (1, 1)
+    assert entry["counts"] == {"raw_items_seen": 1, "raw_items_inserted": 1}
+
+
+def test_a_competing_writer_with_the_same_run_identity_is_not_this_commit(
+    tmp_path,
+):
+    """Codex P2, on the shared ``_logged_mutation`` path with no A3 in it.
+
+    ``(run_id, stage)`` names a row, not the transaction that last wrote
+    it.  Writer A's ingest rolls back; before A's durability probe runs,
+    writer B -- a second repository over the same database, holding an
+    authorized run under the same run identity and partition, on the same
+    frozen clock -- commits an ingest of its own whose run-log outcome is
+    column-for-column what A intended.  Only the per-mutation marker
+    differs, and that is what A must decide by: B's commit is not A's.
+    """
+
+    from datetime import datetime, timezone
+
+    frozen = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    a = Phase0Repository(tmp_path / "shared.sqlite3", clock=lambda: frozen)
+    a.migrate()
+    b = Phase0Repository(a.database_path, clock=lambda: frozen)
+    minted: list[str] = []
+    real_mint = Phase0Repository._new_mutation_id
+    answers: list[Any] = []
+    real_landed = Phase0Repository._commit_landed
+    real_probe = Phase0Repository._open_probe_connection
+    escaped: dict[str, Any] = {}
+    # B's run stays open across A's probe, so what A reads is the row as
+    # B's *mutation* left it; B settles after A has decided.
+    closing = contextlib.ExitStack()
+
+    def mint():
+        marker = real_mint()
+        minted.append(marker)
+        return marker
+
+    def landed(self, context, before, intended, mutation_id):
+        answer = real_landed(self, context, before, intended, mutation_id)
+        answers.append((before, intended, mutation_id, answer))
+        return answer
+
+    def probe(self):
+        if self is a and "b" not in escaped:
+            # B's ordinary path, in full: its own run, its own marker, a
+            # real commit -- landing between A's failed commit and A's look
+            # at the disk.
+            run_b = closing.enter_context(
+                b.stage_run(
+                    run_id="run-1",
+                    stage="ingest",
+                    trading_day=DAY,
+                    pipeline_version="v1",
+                    ticker="NVDA",
+                )
+            )
+            escaped["b"] = run_b
+            b.ingest_raw_items([raw_item(1)], run=run_b)
+        return real_probe(self)
+
+    with mock.patch.object(Phase0Repository, "_new_mutation_id", staticmethod(mint)):
+        with mock.patch.object(Phase0Repository, "_commit_landed", landed):
+            with mock.patch.object(Phase0Repository, "_open_probe_connection", probe):
+                with a.stage_run(
+                    run_id="run-1",
+                    stage="ingest",
+                    trading_day=DAY,
+                    pipeline_version="v1",
+                    ticker="NVDA",
+                ) as run_a:
+                    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+                        with failing_commits(factory=_CommitFails):
+                            a.ingest_raw_items([raw_item(1)], run=run_a)
+                    # Two markers, A's first; the durable row carries B's.
+                    ma, mb = minted
+                    assert ma != mb
+                    [(before, intended, asked, answer)] = answers
+                    assert before is None and asked == ma
+                    index = Phase0Repository._RUN_LOG_MUTATION_ID_INDEX
+                    assert intended[index] == ma
+                    [row] = run_log_rows(a)
+                    assert row["last_mutation_id"] == mb
+                    # The collision: every outcome column but the marker
+                    # is what A meant to write.
+                    with a.admin.connect_writable() as connection:
+                        durable = a._run_log_outcome(connection, run_a)
+                    assert durable[:index] == intended[:index]
+                    assert durable[index + 1 :] == intended[index + 1 :]
+                    assert durable != intended
+                    # A neither claims B's commit nor calls itself rolled
+                    # back: unknown, with nothing written.
+                    assert answer is None
+                    assert run_a.state == "settlement_failed"
+                    assert (
+                        run_a.success_count,
+                        run_a.partial_count,
+                        run_a.failure_count,
+                    ) == (1, 0, 0)
+                    assert any(
+                        e.get("durable_outcome") == "unknown" for e in run_a.errors
+                    )
+    # Only B's data exists, and A's block ending wrote nothing over B's row.
+    assert a.count("raw_items") == 1
+    [row] = run_log_rows(a)
+    assert row["status"] == "degraded" and row["last_mutation_id"] == mb
+    assert (row["success_count"], row["failure_count"]) == (1, 0)
+    # B settles its own run on its own terms, and keeps its marker.
+    closing.close()
+    assert escaped["b"].state == "closed_without_terminal"
+    [row] = run_log_rows(a)
+    assert row["status"] == "success" and row["last_mutation_id"] == mb
+
+
+def test_a_logged_mutation_marks_the_row_and_settlement_keeps_the_mark(tmp_path):
+    """The marker on the shared run-log path: one per logged mutation,
+    written with the row, untouched by the stage's own settlement, and
+    absent from rows no logged mutation wrote."""
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.ingest_raw_items([raw_item(1)], run=run)
+        [row] = run_log_rows(repository)
+        first = row["last_mutation_id"]
+        assert isinstance(first, str) and len(first) == 32
+        int(first, 16)
+        repository.ingest_raw_items([raw_item(2)], run=run)
+        [row] = run_log_rows(repository)
+        second = row["last_mutation_id"]
+        assert second != first
+    [row] = run_log_rows(repository)
+    assert row["status"] == "success" and row["last_mutation_id"] == second
+    # A run that made no logged mutation has a row and no marker.
+    with repository.stage_run(
+        run_id="run-2",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ):
+        pass
+    rows = {r["run_id"]: r for r in run_log_rows(repository)}
+    assert rows["run-2"]["last_mutation_id"] is None
+    # And the operator's writer supplies none either: it keeps what is there.
+    repository.admin.log_stage(
+        run_id="run-1",
+        stage="ingest",
+        counts={},
+        duration_ms=0,
+        errors=[],
+        started_at=rows["run-1"]["started_at"],
+        completed_at=rows["run-1"]["completed_at"],
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+        status="failed",
+    )
+    rows = {r["run_id"]: r for r in run_log_rows(repository)}
+    assert rows["run-1"]["status"] == "failed"
+    assert rows["run-1"]["last_mutation_id"] == second
 
 
 def test_the_context_is_marked_successful_only_after_the_commit(tmp_path):
@@ -13562,3 +13869,496 @@ def test_latest_partition_outcomes_report_each_tickers_newest_run(tmp_path):
     assert list(latest("themes", DAY, pipeline_version="v1")) == ["NVDA"]
     assert latest("themes", DAY, pipeline_version="v1")["NVDA"].run_id == "t1"
     assert latest("stories", "2026-01-01", pipeline_version="v1") == {}
+
+
+# ----------------------------------------------------------------------
+# A3: the summary tables (migration 016) hold their own invariants
+# ----------------------------------------------------------------------
+
+_FP = "a" * 64
+_FP2 = "b" * 64
+
+
+def _summary_artifact_row(connection: sqlite3.Connection, **overrides) -> int:
+    values = {
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "theme_id": 7,
+        "theme_key": "k",
+        "input_fingerprint": _FP,
+        "policy_fingerprint": _FP2,
+        "citation_convention": "persisted_story_id.v1",
+        "prompt_version": "a2.guarded.v1",
+        "model": "fake-model",
+        "label": "Label",
+        "guarantee": "structural_only",
+        "content_digest": "0" * 64,
+        "status": "accepted",
+        "created_at": "2026-07-23T10:00:00+00:00",
+    }
+    values.update(overrides)
+    columns = ", ".join(values)
+    placeholders = ", ".join("?" for _ in values)
+    cursor = connection.execute(
+        f"INSERT INTO summary_artifacts ({columns}) VALUES ({placeholders})",
+        tuple(values.values()),
+    )
+    return int(cursor.lastrowid)
+
+
+def _summary_generation_row(connection: sqlite3.Connection, **overrides) -> int:
+    values = {
+        "run_id": "run-1",
+        "ticker": "NVDA",
+        "trading_day": DAY,
+        "pipeline_version": "v1",
+        "theme_id": 7,
+        "theme_key": "k",
+        "input_fingerprint": _FP,
+        "policy_fingerprint": _FP2,
+        "model": "fake-model",
+        "max_attempts": 2,
+        "outcome": "unavailable",
+        "reason": "provider_unavailable",
+        "detail": None,
+        "artifact_id": None,
+        "completed_at": "2026-07-23T10:00:00+00:00",
+    }
+    values.update(overrides)
+    columns = ", ".join(values)
+    placeholders = ", ".join("?" for _ in values)
+    cursor = connection.execute(
+        f"INSERT INTO summary_generations ({columns}) VALUES ({placeholders})",
+        tuple(values.values()),
+    )
+    return int(cursor.lastrowid)
+
+
+def test_one_accepted_summary_artifact_per_generation_key(tmp_path):
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        first = _summary_artifact_row(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_artifact_row(connection)
+        # An invalidated row under the same key is history, not a collision.
+        connection.execute(
+            "UPDATE summary_artifacts SET status = 'invalidated', "
+            "invalidated_at = '2026-07-23T11:00:00+00:00', "
+            "invalidated_reason = 'corrupt_on_replacement' WHERE id = ?",
+            (first,),
+        )
+        second = _summary_artifact_row(connection)
+        assert second != first
+        # A different policy or input is a different key.
+        _summary_artifact_row(connection, policy_fingerprint="c" * 64)
+        _summary_artifact_row(connection, input_fingerprint="d" * 64)
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "label = 'Other'",
+        "theme_id = 8",
+        "input_fingerprint = '%s'" % ("e" * 64),
+        "policy_fingerprint = '%s'" % ("e" * 64),
+        "model = 'other-model'",
+        "created_at = '2026-07-24T10:00:00+00:00'",
+        "theme_key = 'other'",
+        "content_digest = '%s'" % ("1" * 64),
+    ],
+)
+def test_an_accepted_summary_artifact_is_immutable(tmp_path, assignment):
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        artifact_id = _summary_artifact_row(connection)
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                f"UPDATE summary_artifacts SET {assignment} WHERE id = ?",
+                (artifact_id,),
+            )
+
+
+def test_invalidation_is_the_only_transition_and_is_one_way(tmp_path):
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        artifact_id = _summary_artifact_row(connection)
+        # Invalidated needs a timestamp and a reason.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE summary_artifacts SET status = 'invalidated' WHERE id = ?",
+                (artifact_id,),
+            )
+        connection.execute(
+            "UPDATE summary_artifacts SET status = 'invalidated', "
+            "invalidated_at = '2026-07-23T11:00:00+00:00', "
+            "invalidated_reason = 'corrupt_on_replacement' WHERE id = ?",
+            (artifact_id,),
+        )
+        # Never back, and never edited once invalidated.
+        for assignment in (
+            "status = 'accepted', invalidated_at = NULL, invalidated_reason = NULL",
+            "invalidated_reason = 'something else'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(
+                    f"UPDATE summary_artifacts SET {assignment} WHERE id = ?",
+                    (artifact_id,),
+                )
+        # Accepted rows cannot carry invalidation columns.
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_artifact_row(
+                connection,
+                input_fingerprint="f" * 64,
+                invalidated_at="2026-07-23T11:00:00+00:00",
+            )
+
+
+def test_summary_tables_seal_the_ticker_universe(tmp_path):
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="unsupported"):
+            _summary_artifact_row(connection, ticker="GME")
+        with pytest.raises(sqlite3.IntegrityError, match="unsupported"):
+            _summary_generation_row(connection, ticker="GME")
+
+
+def test_summary_sentences_and_citations_are_ordered_immutable_and_cascade(
+    tmp_path,
+):
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        artifact_id = _summary_artifact_row(connection)
+        connection.execute(
+            "INSERT INTO summary_sentences (artifact_id, ordinal, text) "
+            "VALUES (?, 1, 'First.'), (?, 2, 'Second.')",
+            (artifact_id, artifact_id),
+        )
+        connection.execute(
+            "INSERT INTO summary_sentence_citations "
+            "(artifact_id, sentence_ordinal, position, story_id) "
+            "VALUES (?, 1, 0, 11), (?, 1, 1, 12), (?, 2, 0, 12)",
+            (artifact_id, artifact_id, artifact_id),
+        )
+        # A citation must belong to a sentence of its artifact.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO summary_sentence_citations "
+                "(artifact_id, sentence_ordinal, position, story_id) "
+                "VALUES (?, 3, 0, 11)",
+                (artifact_id,),
+            )
+        # The same story cannot be cited twice by one sentence.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO summary_sentence_citations "
+                "(artifact_id, sentence_ordinal, position, story_id) "
+                "VALUES (?, 1, 2, 11)",
+                (artifact_id,),
+            )
+        for statement in (
+            "UPDATE summary_sentences SET text = 'x' WHERE artifact_id = ?",
+            "UPDATE summary_sentence_citations SET story_id = 99 "
+            "WHERE artifact_id = ?",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(statement, (artifact_id,))
+        # Blank sentences and zero ordinals are refused.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO summary_sentences (artifact_id, ordinal, text) "
+                "VALUES (?, 3, '   ')",
+                (artifact_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO summary_sentences (artifact_id, ordinal, text) "
+                "VALUES (?, 0, 'Zero.')",
+                (artifact_id,),
+            )
+        # Sealed: once an accepted generation names the artifact, its
+        # sentence and citation sets are fixed and even the parent cannot
+        # be deleted out from under them...
+        generation_id = _summary_generation_row(
+            connection,
+            run_id="sealer",
+            outcome="accepted",
+            reason=None,
+            artifact_id=artifact_id,
+        )
+        for statement, parameters in (
+            (
+                "INSERT INTO summary_sentences (artifact_id, ordinal, text) "
+                "VALUES (?, 3, 'Third.')",
+                (artifact_id,),
+            ),
+            (
+                "DELETE FROM summary_sentences WHERE artifact_id = ? AND ordinal = 2",
+                (artifact_id,),
+            ),
+            (
+                "INSERT INTO summary_sentence_citations "
+                "(artifact_id, sentence_ordinal, position, story_id) "
+                "VALUES (?, 2, 1, 13)",
+                (artifact_id,),
+            ),
+            (
+                "DELETE FROM summary_sentence_citations WHERE artifact_id = ?",
+                (artifact_id,),
+            ),
+            ("DELETE FROM summary_artifacts WHERE id = ?", (artifact_id,)),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(statement, parameters)
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM summary_sentences WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()[0]
+            == 2
+        )
+        # ...and an invalidated artifact stays sealed: history is kept whole.
+        connection.execute(
+            "UPDATE summary_artifacts SET status = 'invalidated', "
+            "invalidated_at = '2026-07-23T11:00:00+00:00', "
+            "invalidated_reason = 'corrupt_on_replacement' WHERE id = ?",
+            (artifact_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM summary_sentences WHERE artifact_id = ?", (artifact_id,)
+            )
+        # Cleanup is parent-level and deliberate: the generation first, then
+        # the artifact, whose children follow it.
+        connection.execute(
+            "DELETE FROM summary_generations WHERE id = ?", (generation_id,)
+        )
+        connection.execute("DELETE FROM summary_artifacts WHERE id = ?", (artifact_id,))
+        assert (
+            connection.execute("SELECT COUNT(*) FROM summary_sentences").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM summary_sentence_citations"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_summary_generation_outcomes_are_internally_consistent(tmp_path):
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        artifact_id = _summary_artifact_row(connection)
+        # unavailable needs a reason; nothing else may carry one.
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_generation_row(connection, outcome="unavailable", reason=None)
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_generation_row(
+                connection,
+                run_id="run-2",
+                outcome="accepted",
+                reason="provider_unavailable",
+                artifact_id=artifact_id,
+            )
+        # accepted / duplicate need an artifact; unavailable / stale must not.
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_generation_row(
+                connection, run_id="run-3", outcome="accepted", reason=None
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_generation_row(
+                connection,
+                run_id="run-4",
+                outcome="unavailable",
+                artifact_id=artifact_id,
+            )
+        # stale needs a detail.
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_generation_row(
+                connection, run_id="run-5", outcome="discarded_stale", reason=None
+            )
+        accepted = _summary_generation_row(
+            connection,
+            run_id="run-6",
+            outcome="accepted",
+            reason=None,
+            artifact_id=artifact_id,
+        )
+        # Only one generation may claim to have accepted an artifact...
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_generation_row(
+                connection,
+                run_id="run-7",
+                outcome="accepted",
+                reason=None,
+                artifact_id=artifact_id,
+            )
+        # ...but a duplicate may reference it.
+        _summary_generation_row(
+            connection,
+            run_id="run-8",
+            outcome="discarded_duplicate",
+            reason=None,
+            artifact_id=artifact_id,
+        )
+        # One generation per (run, key).
+        with pytest.raises(sqlite3.IntegrityError):
+            _summary_generation_row(
+                connection,
+                run_id="run-8",
+                reason=None,
+                outcome="discarded_stale",
+                detail="x",
+            )
+        # Accounting is immutable, and an artifact a generation names stays.
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE summary_generations SET outcome = 'unavailable', "
+                "reason = 'provider_unavailable', artifact_id = NULL WHERE id = ?",
+                (accepted,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM summary_artifacts WHERE id = ?", (artifact_id,)
+            )
+
+
+def test_summary_attempt_rows_keep_unknown_usage_null_and_are_immutable(tmp_path):
+    repository = migrated(tmp_path)
+    with repository.admin.connect_writable() as connection:
+        generation_id = _summary_generation_row(connection)
+        connection.execute(
+            "INSERT INTO summary_generation_attempts "
+            "(generation_id, attempt, outcome, failures, latency_ms) "
+            "VALUES (?, 1, 'provider_error', '[]', 12.5)",
+            (generation_id,),
+        )
+        row = connection.execute(
+            "SELECT prompt_tokens, candidate_tokens, total_tokens "
+            "FROM summary_generation_attempts WHERE generation_id = ?",
+            (generation_id,),
+        ).fetchone()
+        assert tuple(row) == (None, None, None)
+        for statement in (
+            "INSERT INTO summary_generation_attempts (generation_id, attempt, "
+            "outcome, prompt_tokens) VALUES (?, 2, 'rejected', -1)",
+            "INSERT INTO summary_generation_attempts (generation_id, attempt, "
+            "outcome, latency_ms) VALUES (?, 2, 'rejected', -0.5)",
+            "INSERT INTO summary_generation_attempts (generation_id, attempt, "
+            "outcome, failures) VALUES (?, 2, 'rejected', '{}')",
+            "INSERT INTO summary_generation_attempts (generation_id, attempt, "
+            "outcome) VALUES (?, 0, 'rejected')",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(statement, (generation_id,))
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                "UPDATE summary_generation_attempts SET latency_ms = 0 "
+                "WHERE generation_id = ?",
+                (generation_id,),
+            )
+        # At most one accepted attempt per generation.
+        connection.execute(
+            "INSERT INTO summary_generation_attempts (generation_id, attempt, "
+            "outcome) VALUES (?, 2, 'accepted')",
+            (generation_id,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO summary_generation_attempts (generation_id, attempt, "
+                "outcome) VALUES (?, 3, 'accepted')",
+                (generation_id,),
+            )
+        # Attempts follow their generation.
+        connection.execute(
+            "DELETE FROM summary_generations WHERE id = ?", (generation_id,)
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM summary_generation_attempts"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+# ----------------------------------------------------------------------
+# Migration 016 also marks run_log rows with the mutation that wrote them
+# ----------------------------------------------------------------------
+
+
+def _run_log_columns(repository: Phase0Repository) -> dict[str, dict]:
+    with repository.admin.connect_writable() as connection:
+        return {
+            row["name"]: dict(row)
+            for row in connection.execute("PRAGMA table_info(run_log)")
+        }
+
+
+def test_016_adds_the_mutation_marker_to_run_log_and_leaves_history_null(
+    tmp_path,
+):
+    """Version 16 is one whole: the summary tables and the marker column
+    arrive together, on a fresh database and on an upgrade from 15, and
+    no row written before it is made invalid by it."""
+
+    assert LATEST_VERSION == 16
+    assert not list(MIGRATIONS_PATH.glob("017_*"))
+    # Fresh: the column is there, nullable, no default, not a key.
+    fresh = migrated(tmp_path, "fresh.sqlite3")
+    column = _run_log_columns(fresh)["last_mutation_id"]
+    assert column["type"] == "TEXT"
+    assert column["notnull"] == 0 and column["dflt_value"] is None
+    assert column["pk"] == 0
+
+    # Upgraded: a v15 database with a row the v15 schema wrote.
+    database = tmp_path / "old.sqlite3"
+    old = Phase0Repository(database, migrations_path=partial_migrations(tmp_path, 15))
+    old.migrate()
+    assert old.schema_version() == 15
+    assert "last_mutation_id" not in _run_log_columns(old)
+    with old.admin.connect_writable() as connection:
+        connection.execute(
+            """
+            INSERT INTO run_log (
+                run_id, stage, counts, duration_ms, errors, started_at,
+                completed_at, status, trading_day, pipeline_version, ticker,
+                success_count, partial_count, failure_count, attempt, replay
+            ) VALUES (
+                'historical', 'ingest', '{}', 0, '[]', ?, ?, 'success', ?,
+                'v1', 'NVDA', 1, 0, 0, 1, 0
+            )
+            """,
+            (f"{DAY}T12:00:00+00:00", f"{DAY}T12:00:01+00:00", DAY),
+        )
+    upgraded = Phase0Repository(database)
+    assert upgraded.migrate() == ["016_summary_artifacts.sql"]
+    assert upgraded.schema_version() == 16
+    assert _run_log_columns(upgraded) == _run_log_columns(fresh)
+    assert schema_snapshot(upgraded) == schema_snapshot(fresh)
+    [historical] = upgraded.read.run_log_rows(run_id="historical")
+    assert historical["last_mutation_id"] is None
+    assert historical["status"] == "success" and historical["success_count"] == 1
+
+    # A logged mutation on the upgraded database marks its row; the
+    # historical row is untouched; the marker is 32 hex characters.
+    with upgraded.stage_run(
+        run_id="run-1",
+        stage="ingest",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        upgraded.ingest_raw_items([raw_item(1)], run=run, terminal=True)
+    rows = {row["run_id"]: row for row in upgraded.read.run_log_rows()}
+    assert rows["historical"]["last_mutation_id"] is None
+    marker = rows["run-1"]["last_mutation_id"]
+    assert isinstance(marker, str) and len(marker) == 32
+    int(marker, 16)
+    # And the column's own check: NULL or exactly one marker's width.
+    with upgraded.admin.connect_writable() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE run_log SET last_mutation_id = 'short' "
+                "WHERE run_id = 'historical'"
+            )
