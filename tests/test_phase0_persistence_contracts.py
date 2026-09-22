@@ -5332,6 +5332,11 @@ LOGGED_ENTRYPOINTS = [
     # partition's theme set through the same _logged_mutation the others
     # use, so the key moves with the data and the run log.
     "clear_theme_set",
+    # Summarization usage/latency accounting (issue #73 / A3): writes no
+    # domain rows, only run_log.counts, but still only inside a
+    # _logged_mutation so a key cannot move to success without the
+    # accounting that justified it.
+    "record_summarization_usage",
 ]
 
 
@@ -11233,7 +11238,50 @@ def caught_validation_cases(repository: Phase0Repository) -> dict:
             ),
             "raw_item_match_evidence",
         ),
+        # A negative cache_misses is the rejection. This entrypoint writes
+        # no domain rows on success or failure alike (only run_log.counts,
+        # which the run always gets regardless) - "themes" stands in
+        # because in real use this call always accompanies whatever call
+        # persists the generated summaries in the same run, and a rejected
+        # usage-logging call must not somehow leave themes behind either.
+        "record_summarization_usage": (
+            lambda run, terminal: repository.record_summarization_usage(
+                run=run,
+                calls=[{"prompt_tokens": 10, "candidate_tokens": 5, "total_tokens": 15, "latency_ms": 12.0}],
+                cache_hits=0,
+                cache_misses=-1,
+                terminal=terminal,
+            ),
+            "themes",
+        ),
     }
+
+
+def test_summarization_usage_all_cache_hits_resolves_success_not_degraded(tmp_path):
+    """A 100%-cache-hit run did exactly what it was supposed to - reusing
+    every summary rather than calling the provider - and must not be
+    reported degraded just because nothing needed regenerating."""
+
+    repository = migrated(tmp_path)
+    with repository.stage_run(
+        run_id="run-cache-hits",
+        stage="summaries",
+        trading_day=DAY,
+        pipeline_version="v1",
+        ticker="NVDA",
+    ) as run:
+        repository.record_summarization_usage(
+            run=run,
+            calls=[],
+            cache_hits=3,
+            cache_misses=0,
+            terminal=True,
+        )
+
+    entry = repository.run_log_entries(run_id="run-cache-hits")[0]
+    assert entry["status"] == "success"
+    assert entry["counts"]["cache_hits"] == 3
+    assert entry["counts"]["cache_misses"] == 0
 
 
 @pytest.mark.parametrize("entrypoint", LOGGED_ENTRYPOINTS)

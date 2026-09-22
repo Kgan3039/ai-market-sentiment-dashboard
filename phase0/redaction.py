@@ -36,6 +36,24 @@ SECRET_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+#: Exact key names exempted from ``SECRET_KEY_PATTERN``'s bare ``token``
+#: clause: LLM generation usage counts (issue #73 / A3's telemetry,
+#: matching ``ai.summarization.GenerationUsage``'s field names), not
+#: credentials. Deliberately an *exact-name* allowlist, never a pattern —
+#: widening this to a regex would risk exempting something that actually
+#: is a secret. Checked first, so a key here is never even tested against
+#: the pattern.
+SAFE_TELEMETRY_KEYS = frozenset(
+    {
+        "prompt_tokens",
+        "candidate_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "completion_tokens",
+    }
+)
+
 #: ``Authorization: <anything>`` — the entire header value disappears, so
 #: ``Bearer abc``, ``Basic dXNlcjpwYXNz``, and a bare opaque token are all
 #: removed rather than merely losing their scheme word.
@@ -121,7 +139,9 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
             str(key): (
-                REDACTED
+                redact_secrets(item)
+                if str(key).lower() in SAFE_TELEMETRY_KEYS
+                else REDACTED
                 if SECRET_KEY_PATTERN.search(str(key))
                 else redact_secrets(item)
             )
