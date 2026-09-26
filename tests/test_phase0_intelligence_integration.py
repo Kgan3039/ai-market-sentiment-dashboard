@@ -23,6 +23,7 @@ import pytest
 
 import nlp.embeddings
 import pipeline
+from ai.summarization import GeminiClient
 from nlp.embeddings import EmbeddingModelLoadError
 from phase0.repository import (
     STAGE_DEGRADED,
@@ -125,6 +126,32 @@ def config(tmp_path):
     write_feeds(feeds, ["alpha", "beta"])
     write_aliases(aliases)
     return {"feeds_path": feeds, "aliases_path": aliases}
+
+
+#: Production A3b settings a developer's shell may export.  These tests
+#: never exercise summaries, so every one is cleared and the provider
+#: client's connection factory refuses: an ambient
+#: ``PHASE0_SUMMARIES_ENABLED=1`` cannot change what they test or reach a
+#: network.
+_AMBIENT_SUMMARY_ENV = (
+    "PHASE0_SUMMARIES_ENABLED",
+    "PHASE0_SUMMARIES_MAX_PROVIDER_CALLS",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "GEMINI_MAX_OUTPUT_TOKENS",
+    "GEMINI_TIMEOUT_MS",
+)
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_summary_config(monkeypatch):
+    for name in _AMBIENT_SUMMARY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a real summary provider client was requested")
+
+    monkeypatch.setattr(GeminiClient, "_get_client", refuse)
 
 
 @pytest.fixture(autouse=True)
@@ -258,7 +285,7 @@ def test_a_live_run_produces_persisted_stories_and_themes(
 
 
 def test_the_stage_is_registered_as_a_builder_bound_at_run_time():
-    assert DOWNSTREAM_STAGES == (intelligence_stage,)
+    assert DOWNSTREAM_STAGES[0] is intelligence_stage
     assert not isinstance(intelligence_stage, pipeline.Stage)
 
 

@@ -15,6 +15,7 @@ Persistence assertions go through the final public surface:
 import hashlib
 import inspect
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +24,7 @@ import yaml
 
 import nlp.embeddings
 import pipeline
+from ai.summarization import GeminiClient
 from pipeline import (
     ComponentResult,
     DOWNSTREAM_STAGES,
@@ -40,6 +42,7 @@ from pipeline import (
     run_replay,
     status_report,
 )
+from phase0 import summary_runner
 from phase0.repository import Phase0Reader, Phase0Repository
 from phase0.rss import RSSFetcher
 from phase0.yahoo import TICKERS, YahooFinanceFetcher, YahooProviderGate
@@ -188,6 +191,35 @@ def no_real_model(monkeypatch):
 
     monkeypatch.setattr(nlp.embeddings, "_default_encoder_factory", refuse)
     return fake
+
+
+#: Production A3b settings a developer's shell may export.  Tests that
+#: exercise summaries set exactly what they need after this clears them.
+_AMBIENT_SUMMARY_ENV = (
+    "PHASE0_SUMMARIES_ENABLED",
+    "PHASE0_SUMMARIES_MAX_PROVIDER_CALLS",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "GEMINI_MAX_OUTPUT_TOKENS",
+    "GEMINI_TIMEOUT_MS",
+)
+
+
+@pytest.fixture(autouse=True)
+def summaries_off_by_default(monkeypatch):
+    """The ambient shell must not switch A3b on for tests that assume off.
+
+    The provider client's connection factory also refuses, so no test in
+    this module can reach a network through a real summary client.
+    """
+
+    for name in _AMBIENT_SUMMARY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a real summary provider client was requested")
+
+    monkeypatch.setattr(GeminiClient, "_get_client", refuse)
 
 
 @pytest.fixture
@@ -657,7 +689,10 @@ def test_the_intelligence_stage_is_registered_as_a_builder(
     rather than the stage itself.
     """
 
-    assert DOWNSTREAM_STAGES == (pipeline.intelligence_stage,)
+    assert DOWNSTREAM_STAGES == (
+        pipeline.intelligence_stage,
+        pipeline.summaries_stage,
+    )
     assert all(callable(build) for build in DOWNSTREAM_STAGES)
     assert not any(isinstance(build, Stage) for build in DOWNSTREAM_STAGES)
     repository = migrated(tmp_path)
@@ -1113,8 +1148,8 @@ def test_replay_reports_what_it_cannot_rebuild(tmp_path, config, monkeypatch):
     assert "summarization" in capabilities["unsupported"]
     # Stories and themes are produced by the live path now, and the report
     # says so -- without claiming --replay drives them, because it does not.
-    assert capabilities["downstream_stages_registered"] == 1
-    assert capabilities["live_only"] == ["intelligence"]
+    assert capabilities["downstream_stages_registered"] == 2
+    assert capabilities["live_only"] == ["intelligence", "summaries"]
     assert "clustering" in capabilities["unsupported"]
     assert capabilities["scoped_replay_available"] is False
 
@@ -1510,3 +1545,191 @@ def test_execute_stage_reports_a_base_run_id_per_component():
     assert result.run_id_base == "inv:thing"
     assert result.status == "success"
     assert result.duration_ms >= 0
+
+
+# ---------------------------------------------------------------------------
+# A3b: the feature-gated summaries component
+# ---------------------------------------------------------------------------
+
+SUMMARY_TABLES = (
+    "summary_artifacts",
+    "summary_sentences",
+    "summary_sentence_citations",
+    "summary_generations",
+    "summary_generation_attempts",
+)
+
+
+def summary_rows(repository):
+    return {table: reader(repository).count(table) for table in SUMMARY_TABLES}
+
+
+def intelligence_counts(repository):
+    return {
+        table: reader(repository).count(table)
+        for table in ("raw_items", "stories", "theme_sets", "themes")
+    }
+
+
+def no_client():
+    raise AssertionError("a summary provider client was constructed")
+
+
+def test_flag_off_leaves_the_live_invocation_exactly_as_before(
+    tmp_path, config, monkeypatch
+):
+    monkeypatch.setattr(summary_runner, "production_summary_client", no_client)
+    repository = migrated(tmp_path)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    result = run_live(repository, **config)
+
+    assert [item.name for item in result.components] == [
+        "yahoo",
+        "rss",
+        "intelligence",
+    ]
+    assert result.status == "success"
+    assert summary_rows(repository) == dict.fromkeys(SUMMARY_TABLES, 0)
+    assert not runs(repository, "summaries")
+
+
+def test_enabled_summaries_run_after_intelligence_and_are_optional(
+    tmp_path, config, monkeypatch
+):
+    """Enabled without a key: reported, non-mandatory, and harmless."""
+
+    monkeypatch.setenv(summary_runner.ENABLED_ENV, "true")
+    monkeypatch.delenv(summary_runner.API_KEY_ENV, raising=False)
+    monkeypatch.setattr(summary_runner, "production_summary_client", no_client)
+    repository = migrated(tmp_path)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    result = run_live(repository, **config)
+
+    assert [item.name for item in result.components] == [
+        "yahoo",
+        "rss",
+        "intelligence",
+        "summaries",
+    ]
+    summaries = component(result, "summaries")
+    assert summaries.mandatory is False
+    assert summaries.status == "failed"
+    assert summaries.errors == [
+        {"type": "summaries_unconfigured", "reason": "provider_api_key_missing"}
+    ]
+    assert [item.status for item in result.components[:3]] == ["success"] * 3
+    # One optional failure degrades the invocation; it never fails it.
+    assert result.status == "degraded"
+    assert result.exit_code == EXIT_CODES["degraded"]
+    assert summary_rows(repository) == dict.fromkeys(SUMMARY_TABLES, 0)
+    assert not runs(repository, "summaries")
+
+
+def test_enabled_summaries_sweep_what_intelligence_persisted(
+    tmp_path, config, monkeypatch
+):
+    monkeypatch.setenv(summary_runner.ENABLED_ENV, "1")
+    monkeypatch.setenv(summary_runner.API_KEY_ENV, "test-key")
+    monkeypatch.setattr(
+        summary_runner, "provider_configuration_problem", lambda environ=None: None
+    )
+    order: list[str] = []
+    real = summary_runner.run_scheduled_summaries
+
+    class CitingClient:
+        model = "fake-model"
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system_prompt, user_prompt, response_schema):
+            self.calls += 1
+            ids = re.findall(r"- id: (\S+)", user_prompt)
+            return response_schema.model_validate(
+                {
+                    "label": "Coverage summary",
+                    "sentences": [
+                        {"text": "Coverage leads here.", "citation_ids": ids},
+                        {"text": "Outlets repeat it.", "citation_ids": ids[:1]},
+                    ],
+                }
+            )
+
+    client = CitingClient()
+
+    def recording(repository, **kwargs):
+        order.append("summaries")
+        # By the time summaries run, intelligence has committed its runs.
+        assert runs(repository, "themes")
+        return real(repository, **kwargs, client_factory=lambda: client)
+
+    monkeypatch.setattr(summary_runner, "run_scheduled_summaries", recording)
+    repository = migrated(tmp_path)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    result = run_live(repository, **config, invocation_id="inv")
+
+    assert order == ["summaries"]
+    summaries = component(result, "summaries")
+    assert summaries.run_id_base == "inv:summaries"
+    counts = summaries.counts
+    assert summaries.errors == []
+    assert counts["partitions_considered"] == len(
+        {(ticker, day) for _, ticker, day, _ in runs(repository, "themes")}
+    )
+    assert counts["provider_calls"] == client.calls
+    assert counts["generated"] == reader(repository).count("summary_artifacts")
+    assert counts["partitions_considered"] >= 1
+    assert counts["partitions_settled"] == counts["partitions_considered"]
+    assert counts["themes_considered"] == reader(repository).count("themes")
+    for row in repository.run_log_entries(stage="summaries"):
+        assert row["run_id"].startswith("inv:summaries:")
+
+
+def test_a_raising_summaries_component_cannot_undo_intelligence(
+    tmp_path, config, monkeypatch
+):
+    monkeypatch.setenv(summary_runner.ENABLED_ENV, "true")
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("summary sweep crashed")
+
+    monkeypatch.setattr(summary_runner, "run_scheduled_summaries", explode)
+    repository = migrated(tmp_path)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+
+    result = run_live(repository, **config)
+    persisted = intelligence_counts(repository)
+
+    assert component(result, "summaries").status == "failed"
+    assert component(result, "intelligence").status == "success"
+    assert result.status == "degraded"
+    assert persisted["raw_items"] > 0
+    assert persisted["stories"] > 0
+
+    # The same inputs with summaries off persist exactly the same rows.
+    monkeypatch.delenv(summary_runner.ENABLED_ENV)
+    baseline = migrated(tmp_path, name="baseline.sqlite3")
+    run_live(baseline, **config)
+    assert intelligence_counts(baseline) == persisted
+
+
+def test_replay_never_builds_or_runs_summaries(tmp_path, config, monkeypatch):
+    repository = seeded(tmp_path, config, monkeypatch)
+    monkeypatch.setenv(summary_runner.ENABLED_ENV, "true")
+    monkeypatch.setenv(summary_runner.API_KEY_ENV, "test-key")
+    monkeypatch.setattr(summary_runner, "production_summary_client", no_client)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("replay reached the summary runner")
+
+    monkeypatch.setattr(summary_runner, "run_scheduled_summaries", refuse)
+    monkeypatch.setattr(pipeline, "summaries_stage", refuse)
+
+    result = run_replay(repository, **config)
+
+    assert [item.name for item in result.components] == ["rss_relevance_replay"]
+    assert summary_rows(repository) == dict.fromkeys(SUMMARY_TABLES, 0)
+    assert "summarization" in result.as_dict()["replay"]["unsupported"]

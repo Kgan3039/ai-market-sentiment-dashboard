@@ -50,6 +50,7 @@ from phase0.repository import (
     StageOutcome,
     redact_secrets,
 )
+from phase0 import summary_runner
 from phase0.rss import RSSFetcher
 from phase0.stories import STAGE as STORIES_STAGE
 from phase0.themes import STAGE as THEMES_STAGE
@@ -222,7 +223,7 @@ class Stage:
 #: and ``run_live`` calls them beside ``yahoo_stage`` and ``rss_stage``.
 #: Every builder takes the same keyword arguments so the loop in
 #: ``run_live`` stays one line whatever lands here next.
-DownstreamStageBuilder = Callable[..., "Stage"]
+DownstreamStageBuilder = Callable[..., "Stage | None"]
 
 #: The name of the component that produces stories and themes.  A unit of
 #: work, not an algorithm: the durable ``stories`` and ``themes`` run rows
@@ -927,9 +928,89 @@ def intelligence_stage(
     )
 
 
+# -- Summaries: guarded summaries over the persisted themes (A3b) ---------
+#
+# Feature-gated and off by default.  The component calls
+# ``phase0.summary_runner`` and nothing else; the A2/A3 lifecycle it drives
+# owns caching, currentness and accounting.  It runs after intelligence and
+# independently of it: it sweeps whatever healthy theme populations are
+# persisted, so an intelligence failure this invocation leaves it the
+# populations the last good run stored.
+
+#: The name of the component that makes theme summaries current.  Its
+#: durable run rows are the repository's, under ``summary_runner.STAGE``.
+SUMMARIES_STAGE = "summaries"
+
+
+def summaries_stage(
+    repository: Phase0Repository,
+    *,
+    pipeline_version: str,
+    invocation_id: str,
+    **_: Any,
+) -> Stage | None:
+    """The summaries component, or ``None`` when the feature is off.
+
+    ``None`` is the flag's whole effect: nothing is built, no client is
+    constructed, no summary table is read.  A flag value that is neither
+    on nor off is not guessed at -- the component is built to report
+    ``summaries_misconfigured`` and does nothing else, because this
+    builder runs before ``execute_stage`` and must not raise.
+
+    Not mandatory, and never in :data:`INTELLIGENCE_STAGES`: a summary
+    outcome can make an invocation ``degraded``, but it cannot fail one,
+    cannot unwind an earlier component, and cannot open or extend a story
+    or theme retry episode.
+    """
+
+    try:
+        enabled = summary_runner.summaries_enabled()
+    except summary_runner.SummaryConfigError as exc:
+        message = str(exc)
+
+        def refuse(base_run_id: str) -> tuple[dict[str, Any], list[Any]]:
+            return summary_runner.empty_counts(), [
+                {"type": "summaries_misconfigured", "error": message}
+            ]
+
+        return Stage(
+            SUMMARIES_STAGE,
+            refuse,
+            settled=("partitions_settled",),
+            unsettled=("partitions_failed",),
+            mandatory=False,
+        )
+    if not enabled:
+        return None
+
+    def action(base_run_id: str) -> tuple[dict[str, Any], list[Any]]:
+        return summary_runner.run_scheduled_summaries(
+            repository,
+            pipeline_version=pipeline_version,
+            base_run_id=base_run_id,
+            horizon=RETRY_HORIZON,
+        )
+
+    return Stage(
+        SUMMARIES_STAGE,
+        action,
+        # A partition is settled when its summary work reached a resolved
+        # state -- current, refused by the health gate, or processed --
+        # whatever each theme's outcome was.  An unavailable theme on a
+        # settled partition is a degraded component, reported in errors.
+        settled=("partitions_settled",),
+        unsettled=("partitions_failed",),
+        mandatory=False,
+    )
+
+
 #: Downstream components, in the order they run after ingestion.  Builders,
-#: bound inside ``run_live``; see :data:`DownstreamStageBuilder`.
-DOWNSTREAM_STAGES: tuple[DownstreamStageBuilder, ...] = (intelligence_stage,)
+#: bound inside ``run_live``; see :data:`DownstreamStageBuilder`.  A builder
+#: may return ``None`` for a component switched off by configuration.
+DOWNSTREAM_STAGES: tuple[DownstreamStageBuilder, ...] = (
+    intelligence_stage,
+    summaries_stage,
+)
 
 
 def _finish(
@@ -975,9 +1056,10 @@ def run_live(
     """Fetch every source, then reconcile what they persisted, then report.
 
     Ordering is Yahoo, then RSS, then every builder in
-    ``DOWNSTREAM_STAGES`` -- today the intelligence component, which turns
-    the evidence the first two committed into persisted stories and
-    themes.  Each component runs to completion independently: it opens its
+    ``DOWNSTREAM_STAGES`` -- the intelligence component, which turns the
+    evidence the first two committed into persisted stories and themes,
+    then, when ``PHASE0_SUMMARIES_ENABLED`` is on, the summaries
+    component.  Each component runs to completion independently: it opens its
     own runs, settles its own partitions, and its output is durable the
     moment it commits, so a later component failing cannot cost an earlier
     one its day.
@@ -1008,16 +1090,16 @@ def run_live(
             aliases_path=aliases_path,
             pipeline_version=pipeline_version,
         ),
-        *(
-            build(
-                repository,
-                pipeline_version=pipeline_version,
-                invocation_id=correlation,
-                encoder=encoder,
-            )
-            for build in DOWNSTREAM_STAGES
-        ),
     ]
+    for build in DOWNSTREAM_STAGES:
+        stage = build(
+            repository,
+            pipeline_version=pipeline_version,
+            invocation_id=correlation,
+            encoder=encoder,
+        )
+        if stage is not None:
+            stages.append(stage)
     _log_event(
         "invocation_started",
         invocation_id=correlation,
@@ -1049,8 +1131,9 @@ def replay_capabilities() -> dict[str, Any]:
     state ``run_replay`` rebuilds.  Stories and themes are now produced by
     the *live* path -- the intelligence component reconciles them after
     every ingestion -- but ``--replay`` does not drive that component, and
-    there is no scoped "rebuild this partition" entry point.  Summarization
-    is not registered anywhere.
+    there is no scoped "rebuild this partition" entry point.  Summaries are
+    generated by the live, feature-gated summaries component only: replay
+    has no network and never builds it.
     """
 
     return {
@@ -1062,7 +1145,7 @@ def replay_capabilities() -> dict[str, Any]:
             "summarization",
         ],
         "downstream_stages_registered": len(DOWNSTREAM_STAGES),
-        "live_only": [INTELLIGENCE_STAGE],
+        "live_only": [INTELLIGENCE_STAGE, SUMMARIES_STAGE],
         "scope": "all persisted RSS evidence",
         "scoped_replay_available": False,
     }
