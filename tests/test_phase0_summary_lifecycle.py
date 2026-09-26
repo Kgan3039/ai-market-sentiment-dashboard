@@ -1645,13 +1645,23 @@ def test_lifecycle_imports_no_backend_frontend_agent_or_provider_sdk():
     assert "GeminiClient(" not in source  # never constructs a provider client
 
 
-def test_no_live_pipeline_registration():
+def test_live_registration_goes_through_the_runner_only():
+    """A3b registers summaries through ``phase0.summary_runner`` alone.
+
+    The lifecycle itself is still never imported by the orchestrator, is
+    never driven by the coordinator, and replay still does not summarize.
+    """
+
     import pipeline
 
-    assert pipeline.DOWNSTREAM_STAGES == (pipeline.intelligence_stage,)
+    assert pipeline.DOWNSTREAM_STAGES == (
+        pipeline.intelligence_stage,
+        pipeline.summaries_stage,
+    )
     assert "summarization" in pipeline.replay_capabilities()["unsupported"]
     source = (ROOT / "pipeline.py").read_text("utf-8")
     assert "summary_lifecycle" not in source
+    assert "ensure_summary" not in source
     coordinator = (ROOT / "phase0" / "coordinator.py").read_text("utf-8")
     assert "summary" not in coordinator.lower()
 

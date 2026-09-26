@@ -12,7 +12,34 @@ import re
 
 import pytest
 
+from ai.summarization import GeminiClient
 from pipeline import MARKET_TIMEZONE, invocation_day, single_instance
+
+
+#: Production A3b settings a developer's shell may export.  These tests
+#: never exercise summaries, so every one is cleared and the provider
+#: client's connection factory refuses: an ambient
+#: ``PHASE0_SUMMARIES_ENABLED=1`` cannot change what they test or reach a
+#: network.
+_AMBIENT_SUMMARY_ENV = (
+    "PHASE0_SUMMARIES_ENABLED",
+    "PHASE0_SUMMARIES_MAX_PROVIDER_CALLS",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "GEMINI_MAX_OUTPUT_TOKENS",
+    "GEMINI_TIMEOUT_MS",
+)
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_summary_config(monkeypatch):
+    for name in _AMBIENT_SUMMARY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a real summary provider client was requested")
+
+    monkeypatch.setattr(GeminiClient, "_get_client", refuse)
 
 
 CRON_PATH = Path("deploy/phase0-pipeline.cron")

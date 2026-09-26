@@ -52,6 +52,15 @@ PHASE0_LOCK_FILE=/var/lock/phase0-pipeline.lock
 # alerting that treats every nonzero code as an outage will be noisy;
 # alert on 2, and trend 1.
 
+# SCHEDULED SUMMARIES (A3b) are off unless PHASE0_SUMMARIES_ENABLED=true is
+# in this job's environment. When enabled they also need GEMINI_API_KEY;
+# supply it from the host's secret store (for example an EnvironmentFile
+# the job sources), never in this file or the repository. Optional:
+# PHASE0_SUMMARIES_MAX_PROVIDER_CALLS (default 20 real provider calls per
+# invocation), GEMINI_MODEL, GEMINI_MAX_OUTPUT_TOKENS. Enabled without a key,
+# the summaries component reports summaries_unconfigured, makes no provider
+# call, and the invocation exits 1 (degraded) rather than 2.
+
 # Every 30 minutes from 09:00 through 16:30 ET on weekdays.
 0,30 9-16 * * 1-5 cd $PROJECT_DIR && $PYTHON_BIN pipeline.py --lock-file $PHASE0_LOCK_FILE >> /var/log/ticker-narratives-pipeline.log 2>&1
 

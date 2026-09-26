@@ -15,11 +15,39 @@ from pathlib import Path
 
 import pytest
 
+from ai.summarization import GeminiClient
 from nlp.embeddings import EmbeddingModelLoadError
 from phase0.coordinator import PartitionCoordinator, PartitionResult, summarize
 from phase0.repository import Phase0Repository, StageRunContext
 from phase0.stories import StoryReconciler
 from phase0.themes import ThemeReconciler
+
+
+#: Production A3b settings a developer's shell may export.  These tests
+#: never exercise summaries, so every one is cleared and the provider
+#: client's connection factory refuses: an ambient
+#: ``PHASE0_SUMMARIES_ENABLED=1`` cannot change what they test or reach a
+#: network.
+_AMBIENT_SUMMARY_ENV = (
+    "PHASE0_SUMMARIES_ENABLED",
+    "PHASE0_SUMMARIES_MAX_PROVIDER_CALLS",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "GEMINI_MAX_OUTPUT_TOKENS",
+    "GEMINI_TIMEOUT_MS",
+)
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_summary_config(monkeypatch):
+    for name in _AMBIENT_SUMMARY_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a real summary provider client was requested")
+
+    monkeypatch.setattr(GeminiClient, "_get_client", refuse)
+
 
 DAY = "2026-07-23"
 
@@ -542,7 +570,10 @@ def test_the_pipeline_registers_through_the_coordinator_only():
 
     import pipeline
 
-    assert pipeline.DOWNSTREAM_STAGES == (pipeline.intelligence_stage,)
+    assert pipeline.DOWNSTREAM_STAGES == (
+        pipeline.intelligence_stage,
+        pipeline.summaries_stage,
+    )
     source = inspect.getsource(pipeline)
     assert "PartitionCoordinator(" in source
     assert "StoryReconciler(" not in source
