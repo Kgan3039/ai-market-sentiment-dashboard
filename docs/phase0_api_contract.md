@@ -96,6 +96,25 @@ A2, or a provider, and needs no `GEMINI_API_KEY` and no network.
   theme without a `theme_key`) answer `503` with the fixed detail "Coverage is
   temporarily unavailable." The cause is logged on the server only.
 
+### Frontend acceptance artifact
+
+`frontend/src/test/fixtures/phase0_sqlite_contract.json` holds real
+responses from this source: `tests/test_phase0_frontend_contract.py` seeds a
+temporary database through the Phase 0 write paths, reads it through
+`SqliteNarrativeRepository` and the FastAPI routes, and captures every
+endpoint plus the fixed `503`. `frontend/src/App.contract.test.jsx` renders
+the page from it. Generated sentences come from a fake summary provider
+passed through real A3 persistence; no Gemini, credential or network is
+used. A normal `pytest` run fails when the artifact drifts from the
+backend's output. Regenerate it deliberately, never by hand:
+
+```
+PHASE0_WRITE_FRONTEND_CONTRACT=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_phase0_frontend_contract.py
+```
+
+The artifact is acceptance evidence for the frontend contract only. It does
+not mean a deployment serves SQLite narratives.
+
 The default stays `fixture`. A deployment selects `sqlite` explicitly, once
 the host checks in `docs/phase0_deployment_handoff.md` pass against real
 persisted output.

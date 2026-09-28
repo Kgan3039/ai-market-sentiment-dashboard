@@ -1,0 +1,436 @@
+{
+  "_generated_by": "tests/test_phase0_frontend_contract.py",
+  "_regenerate": "PHASE0_WRITE_FRONTEND_CONTRACT=1 .venv/bin/python -m pytest -p no:cacheprovider -q tests/test_phase0_frontend_contract.py",
+  "_reference_time": "2026-07-23T15:00:00Z",
+  "responses": {
+    "tickers": {
+      "path": "/api/v1/tickers",
+      "status": 200,
+      "body": {
+        "data_as_of": "2026-07-23T14:30:00Z",
+        "tickers": [
+          {
+            "ticker": "TSLA",
+            "company_name": "Tesla",
+            "data_as_of": "2026-07-23T14:30:00Z",
+            "theme_count": 2,
+            "is_stale": false
+          },
+          {
+            "ticker": "NVDA",
+            "company_name": "NVIDIA",
+            "data_as_of": "2026-07-23T14:30:00Z",
+            "theme_count": 0,
+            "is_stale": false
+          },
+          {
+            "ticker": "AMD",
+            "company_name": "Advanced Micro Devices",
+            "data_as_of": "2026-07-23T14:30:00Z",
+            "theme_count": 0,
+            "is_stale": false
+          },
+          {
+            "ticker": "AAPL",
+            "company_name": "Apple",
+            "data_as_of": "2026-07-23T12:00:00Z",
+            "theme_count": 1,
+            "is_stale": true
+          },
+          {
+            "ticker": "META",
+            "company_name": "Meta Platforms",
+            "data_as_of": "2026-07-23T14:30:00Z",
+            "theme_count": 1,
+            "is_stale": false
+          }
+        ]
+      }
+    },
+    "meta_status": {
+      "path": "/api/v1/meta/status",
+      "status": 200,
+      "body": {
+        "data_as_of": "2026-07-23T14:30:00Z",
+        "is_stale": false,
+        "last_runs": [
+          {
+            "stage": "stories",
+            "status": "success",
+            "started_at": "2026-07-23T14:30:00Z",
+            "completed_at": "2026-07-23T14:30:00Z",
+            "duration_ms": 0,
+            "error_count": 0
+          },
+          {
+            "stage": "summaries",
+            "status": "success",
+            "started_at": "2026-07-23T14:30:00Z",
+            "completed_at": "2026-07-23T14:30:00Z",
+            "duration_ms": 0,
+            "error_count": 0
+          },
+          {
+            "stage": "themes",
+            "status": "success",
+            "started_at": "2026-07-23T14:30:00Z",
+            "completed_at": "2026-07-23T14:30:00Z",
+            "duration_ms": 0,
+            "error_count": 0
+          }
+        ]
+      }
+    },
+    "themes_TSLA": {
+      "path": "/api/v1/tickers/TSLA/themes",
+      "status": 200,
+      "body": {
+        "ticker": "TSLA",
+        "date": "2026-07-23",
+        "data_as_of": "2026-07-23T14:30:00Z",
+        "themes": [
+          {
+            "id": "key-TSLA-2026-07-23-0",
+            "label": "Coverage summary",
+            "rank": 1,
+            "sentences": [
+              {
+                "text": "Coverage leads with this story.",
+                "citation_ids": [
+                  "story:5",
+                  "story:4",
+                  "story:3"
+                ]
+              },
+              {
+                "text": "Outlets repeat the report.",
+                "citation_ids": [
+                  "story:3"
+                ]
+              }
+            ],
+            "citations": [
+              {
+                "id": "story:3",
+                "headline": "TSLA 2026-07-23 t0 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/3",
+                "published_at": "2026-07-23T10:00:00Z"
+              },
+              {
+                "id": "story:4",
+                "headline": "TSLA 2026-07-23 t0 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/4",
+                "published_at": "2026-07-23T10:01:00Z"
+              },
+              {
+                "id": "story:5",
+                "headline": "TSLA 2026-07-23 t0 story 2",
+                "outlet": "CNBC",
+                "url": "https://cnbc.example/5",
+                "published_at": "2026-07-23T10:02:00Z"
+              }
+            ],
+            "stories": [
+              {
+                "id": "story:3",
+                "headline": "TSLA 2026-07-23 t0 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/3",
+                "published_at": "2026-07-23T10:00:00Z"
+              },
+              {
+                "id": "story:4",
+                "headline": "TSLA 2026-07-23 t0 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/4",
+                "published_at": "2026-07-23T10:01:00Z"
+              },
+              {
+                "id": "story:5",
+                "headline": "TSLA 2026-07-23 t0 story 2",
+                "outlet": "CNBC",
+                "url": "https://cnbc.example/5",
+                "published_at": "2026-07-23T10:02:00Z"
+              }
+            ],
+            "outlet_count": 3,
+            "story_count": 3,
+            "degraded": false
+          },
+          {
+            "id": "key-TSLA-2026-07-23-1",
+            "label": "Tesla’s Grünheide Gigafactory expansion — and Shanghai 上海 output guidance — draw renewed analyst scrutiny across Europe and Asia this week",
+            "rank": 2,
+            "sentences": [],
+            "citations": [
+              {
+                "id": "story:6",
+                "headline": "TSLA 2026-07-23 t1 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/6",
+                "published_at": "2026-07-23T10:03:00Z"
+              },
+              {
+                "id": "story:7",
+                "headline": "TSLA 2026-07-23 t1 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/7",
+                "published_at": "2026-07-23T10:04:00Z"
+              }
+            ],
+            "stories": [
+              {
+                "id": "story:6",
+                "headline": "TSLA 2026-07-23 t1 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/6",
+                "published_at": "2026-07-23T10:03:00Z"
+              },
+              {
+                "id": "story:7",
+                "headline": "TSLA 2026-07-23 t1 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/7",
+                "published_at": "2026-07-23T10:04:00Z"
+              }
+            ],
+            "outlet_count": 2,
+            "story_count": 2,
+            "degraded": true
+          }
+        ],
+        "other_coverage": {
+          "outlet_count": 3,
+          "story_count": 3,
+          "stories": [
+            {
+              "id": "story:9",
+              "headline": "TSLA 2026-07-23 other 1",
+              "outlet": "Reuters",
+              "url": "https://reuters.example/9",
+              "published_at": "2026-07-23T10:06:00Z"
+            },
+            {
+              "id": "story:8",
+              "headline": "TSLA 2026-07-23 other 0",
+              "outlet": "CNBC",
+              "url": "https://cnbc.example/8",
+              "published_at": "2026-07-23T10:05:00Z"
+            },
+            {
+              "id": "story:10",
+              "headline": "TSLA 2026-07-23 excluded 0",
+              "outlet": "Bloomberg",
+              "url": "https://bloomberg.example/10",
+              "published_at": "2026-07-23T10:07:00Z"
+            }
+          ]
+        }
+      }
+    },
+    "themes_NVDA": {
+      "path": "/api/v1/tickers/NVDA/themes",
+      "status": 200,
+      "body": {
+        "ticker": "NVDA",
+        "date": "2026-07-23",
+        "data_as_of": "2026-07-23T14:30:00Z",
+        "themes": [],
+        "other_coverage": {
+          "outlet_count": 3,
+          "story_count": 3,
+          "stories": [
+            {
+              "id": "story:11",
+              "headline": "NVDA 2026-07-23 t0 story 0",
+              "outlet": "Reuters",
+              "url": "https://reuters.example/11",
+              "published_at": "2026-07-23T10:00:00Z"
+            },
+            {
+              "id": "story:12",
+              "headline": "NVDA 2026-07-23 t0 story 1",
+              "outlet": "Bloomberg",
+              "url": "https://bloomberg.example/12",
+              "published_at": "2026-07-23T10:01:00Z"
+            },
+            {
+              "id": "story:13",
+              "headline": "NVDA 2026-07-23 t0 story 2",
+              "outlet": "CNBC",
+              "url": "https://cnbc.example/13",
+              "published_at": "2026-07-23T10:02:00Z"
+            }
+          ]
+        }
+      }
+    },
+    "themes_AMD": {
+      "path": "/api/v1/tickers/AMD/themes",
+      "status": 200,
+      "body": {
+        "ticker": "AMD",
+        "date": "2026-07-23",
+        "data_as_of": "2026-07-23T14:30:00Z",
+        "themes": [],
+        "other_coverage": {
+          "outlet_count": 0,
+          "story_count": 0,
+          "stories": []
+        }
+      }
+    },
+    "themes_AAPL": {
+      "path": "/api/v1/tickers/AAPL/themes",
+      "status": 200,
+      "body": {
+        "ticker": "AAPL",
+        "date": "2026-07-23",
+        "data_as_of": "2026-07-23T12:00:00Z",
+        "themes": [
+          {
+            "id": "key-AAPL-2026-07-23-0",
+            "label": "Services demand",
+            "rank": 1,
+            "sentences": [],
+            "citations": [
+              {
+                "id": "story:1",
+                "headline": "AAPL 2026-07-23 t0 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/1",
+                "published_at": "2026-07-23T10:00:00Z"
+              },
+              {
+                "id": "story:2",
+                "headline": "AAPL 2026-07-23 t0 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/2",
+                "published_at": "2026-07-23T10:01:00Z"
+              }
+            ],
+            "stories": [
+              {
+                "id": "story:1",
+                "headline": "AAPL 2026-07-23 t0 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/1",
+                "published_at": "2026-07-23T10:00:00Z"
+              },
+              {
+                "id": "story:2",
+                "headline": "AAPL 2026-07-23 t0 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/2",
+                "published_at": "2026-07-23T10:01:00Z"
+              }
+            ],
+            "outlet_count": 2,
+            "story_count": 2,
+            "degraded": true
+          }
+        ],
+        "other_coverage": {
+          "outlet_count": 0,
+          "story_count": 0,
+          "stories": []
+        }
+      }
+    },
+    "themes_META": {
+      "path": "/api/v1/tickers/META/themes",
+      "status": 200,
+      "body": {
+        "ticker": "META",
+        "date": "2026-07-23",
+        "data_as_of": "2026-07-23T14:30:00Z",
+        "themes": [
+          {
+            "id": "key-META-2026-07-23-0",
+            "label": "Coverage summary",
+            "rank": 1,
+            "sentences": [
+              {
+                "text": "Coverage leads with this story.",
+                "citation_ids": [
+                  "story:15",
+                  "story:14"
+                ]
+              },
+              {
+                "text": "Outlets repeat the report.",
+                "citation_ids": [
+                  "story:14"
+                ]
+              }
+            ],
+            "citations": [
+              {
+                "id": "story:14",
+                "headline": "META 2026-07-23 t0 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/14",
+                "published_at": null
+              },
+              {
+                "id": "story:15",
+                "headline": "META 2026-07-23 t0 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/15",
+                "published_at": "2026-07-23T10:01:00Z"
+              }
+            ],
+            "stories": [
+              {
+                "id": "story:14",
+                "headline": "META 2026-07-23 t0 story 0",
+                "outlet": "Reuters",
+                "url": "https://reuters.example/14",
+                "published_at": null
+              },
+              {
+                "id": "story:15",
+                "headline": "META 2026-07-23 t0 story 1",
+                "outlet": "Bloomberg",
+                "url": "https://bloomberg.example/15",
+                "published_at": "2026-07-23T10:01:00Z"
+              }
+            ],
+            "outlet_count": 2,
+            "story_count": 2,
+            "degraded": false
+          }
+        ],
+        "other_coverage": {
+          "outlet_count": 2,
+          "story_count": 2,
+          "stories": [
+            {
+              "id": "story:17",
+              "headline": "META 2026-07-23 other 1",
+              "outlet": "Reuters",
+              "url": "https://reuters.example/17",
+              "published_at": "2026-07-23T10:03:00Z"
+            },
+            {
+              "id": "story:16",
+              "headline": "META 2026-07-23 other 0",
+              "outlet": "CNBC",
+              "url": "https://cnbc.example/16",
+              "published_at": null
+            }
+          ]
+        }
+      }
+    },
+    "unavailable": {
+      "path": "/api/v1/tickers/NVDA/themes",
+      "status": 503,
+      "body": {
+        "detail": "Coverage is temporarily unavailable."
+      }
+    }
+  }
+}
