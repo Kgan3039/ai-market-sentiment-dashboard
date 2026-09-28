@@ -219,7 +219,7 @@ export default function App() {
       {isLoading ? <section className="state-card">Loading current coverage…</section> : null}
       {hasError ? <section className="state-card error">Coverage is temporarily unavailable. Please try again shortly.</section> : null}
 
-      {!isLoading && !hasError && themesPayload?.themes.length === 0 ? (
+      {!isLoading && !hasError && themesPayload?.themes.length === 0 && !themesPayload.other_coverage?.story_count ? (
         <section className="state-card">
           <p>No current coverage for {activeTicker}.</p>
           <p>Check back after the next update.</p>
