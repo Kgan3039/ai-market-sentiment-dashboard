@@ -6,10 +6,13 @@ deployment.
 
 ## Current Blockers
 
-1. The current B1 API deliberately reads committed fixtures. Its live-data
-   adapter must resolve cited sentences to persisted evidence, map run and
-   persistence health into the API degradation state, and exclude incomplete
-   or failed outputs.
+1. The B1 SQLite read source exists but is opt-in
+   (`PHASE0_NARRATIVE_SOURCE=sqlite`; the default is still the fixture). Its
+   behaviour and its deployment requirements -- matching `GEMINI_MODEL` and
+   `GEMINI_MAX_OUTPUT_TOKENS` with the scheduler, `PYTHONPATH` including the
+   project root, and writer-provisioned WAL state (the cron pipeline alone
+   leaves no `-wal`/`-shm` between runs, and a read-only API then answers
+   `503`) -- are in `docs/phase0_api_contract.md`.
 2. The merged pipeline must be demonstrated to persist API-eligible, completed
    narrative/theme output before the ticker page switches to live data. Raw
    items and intermediate story records, including degraded intermediate story
@@ -33,7 +36,8 @@ deployment.
    environment outside the repository checkout.
 2. Set a persistent `PHASE0_DATABASE_PATH`, for example
    `/var/lib/ticker-narratives/phase0.sqlite3`; do not place the database in a
-   temporary build directory.
+   temporary build directory. Give the API the same value and set
+   `PHASE0_NARRATIVE_SOURCE=sqlite` for it.
 3. Supply the LLM credential through the host environment or secret store.
    Never commit it to `.env` or the repository.
 4. Build the frontend with `npm ci && npm run build`, then serve the built

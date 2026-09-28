@@ -103,6 +103,11 @@ from .tickers import SUPPORTED_TICKERS, TICKER_UNIVERSE, normalize_ticker
 _EVIDENCE_DAY = "substr(COALESCE(raw_items.published_at, raw_items.fetched_at), 1, 10)"
 
 DEFAULT_DATABASE_PATH = Path(__file__).resolve().parents[1] / "data" / "phase0.sqlite3"
+#: What a read of an unusable database can raise -- a corrupt or non-SQLite
+#: file, a lock held past the busy timeout, a missing table.  Exported so a
+#: consumer outside the persistence layer can recognise a failed read
+#: without importing the driver itself.
+DATABASE_READ_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
 MIGRATIONS_PATH = Path(__file__).with_name("migrations")
 RUN_STATUSES = {"success", "degraded", "failed"}
 STAGE_KEY_STATUSES = {"success", "degraded", "failed"}
@@ -3405,6 +3410,106 @@ class Phase0Reader:
         return self._query(
             f"SELECT * FROM pipeline_stage_keys{where} "
             "ORDER BY trading_day, ticker, stage",
+            parameters,
+        )
+
+    # -- The narrative read API (B1) ----------------------------------------
+
+    def latest_story_day(self, ticker: str, pipeline_version: str) -> str | None:
+        """The newest day on which ``ticker`` holds a live story, or ``None``.
+
+        Live means what :meth:`theme_population` reads: not invalidated and
+        carrying a cluster fingerprint.  A day holding only a theme set is
+        not coverage, and a day with a summary is not preferred over a
+        newer day without one.
+        """
+
+        rows = self._query(
+            """
+            SELECT MAX(trading_day) AS trading_day FROM stories
+            WHERE ticker = ? AND pipeline_version = ?
+              AND invalidated_at IS NULL AND cluster_fingerprint IS NOT NULL
+            """,
+            (
+                normalize_ticker(ticker),
+                _require_text(pipeline_version, "pipeline_version"),
+            ),
+        )
+        day = rows[0]["trading_day"] if rows else None
+        return None if day is None else str(day)
+
+    def latest_stage_runs(self, pipeline_version: str) -> list[dict[str, Any]]:
+        """The most recently completed ``run_log`` outcome of each stage.
+
+        Recency is completion time, not row id: ``run_log`` is upserted on
+        ``(run_id, stage)``, so a run opened first keeps the lower id however
+        late it settles.  Completion is compared as an instant
+        (``julianday``), then as the stored UTC text, then by the newer row,
+        so equal completions resolve deterministically.  A row whose
+        completion is not a timestamp never wins (the schema already
+        requires one).
+
+        Operational metadata only: the error *count* is computed here so
+        the recorded error text never leaves this method.
+        """
+
+        return self._query(
+            """
+            SELECT stage, status, started_at, completed_at, duration_ms,
+                   error_count
+            FROM (
+                SELECT stage, status, started_at, completed_at, duration_ms,
+                       CASE WHEN json_type(errors) = 'array'
+                            THEN json_array_length(errors) ELSE 0
+                       END AS error_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY stage
+                           ORDER BY julianday(completed_at) DESC,
+                                    completed_at DESC, id DESC
+                       ) AS recency
+                FROM run_log
+                WHERE pipeline_version = ?
+                  AND julianday(completed_at) IS NOT NULL
+            )
+            WHERE recency = 1
+            ORDER BY stage
+            """,
+            (_require_text(pipeline_version, "pipeline_version"),),
+        )
+
+    def latest_run_completion(
+        self,
+        pipeline_version: str,
+        statuses: Sequence[str],
+        *,
+        ticker: str | None = None,
+        trading_day: str | date | None = None,
+    ) -> dict[str, Any] | None:
+        """The most recently completed run with one of ``statuses``, or ``None``.
+
+        Optionally scoped to one ticker and/or trading day.  Returns the
+        run's ``completed_at`` and ``trading_day``.  Newest completion wins,
+        ordered exactly as :meth:`latest_stage_runs` orders it.
+        """
+
+        wanted = tuple(_require_text(status, "status") for status in statuses)
+        if not wanted or not set(wanted) <= RUN_STATUSES:
+            raise Phase0ValidationError(f"statuses must be drawn from {RUN_STATUSES}")
+        clauses = ["pipeline_version = ?", "julianday(completed_at) IS NOT NULL"]
+        parameters: list[Any] = [_require_text(pipeline_version, "pipeline_version")]
+        clauses.append(f"status IN ({','.join('?' for _ in wanted)})")
+        parameters.extend(wanted)
+        if ticker is not None:
+            clauses.append("ticker = ?")
+            parameters.append(normalize_ticker(ticker))
+        if trading_day is not None:
+            clauses.append("trading_day = ?")
+            parameters.append(_normalize_day(trading_day))
+        return self._one(
+            f"SELECT completed_at, trading_day FROM run_log "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY julianday(completed_at) DESC, completed_at DESC, id DESC "
+            "LIMIT 1",
             parameters,
         )
 

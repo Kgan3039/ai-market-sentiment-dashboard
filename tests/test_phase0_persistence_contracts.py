@@ -5454,6 +5454,11 @@ READER_PROBES = {
         ("themes", "2026-08-20"),
         {"pipeline_version": "v1"},
     ),
+    # The B1 narrative read API: latest coverage day, newest run per
+    # stage (error counts, never error text), and freshness anchors.
+    "latest_story_day": (("NVDA", "v1"), {}),
+    "latest_stage_runs": (("v1",), {}),
+    "latest_run_completion": (("v1", ("success", "degraded")), {}),
     "latest_partition_outcomes": (
         ("stories", "2026-08-20"),
         {"pipeline_version": "v1"},
