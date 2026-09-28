@@ -1,12 +1,15 @@
 """Read-model boundary for the Phase 0 narrative API.
 
-Still fixture-backed. I1's SQLite persistence layer
-(:mod:`phase0.repository`) is on ``main``, but nothing yet writes the
-``stories`` and ``themes`` it would read: the downstream stages are
-implemented in :mod:`nlp` and not registered in ``pipeline.py``. The
-adapter from that repository to this read model is deliberately
-deferred until the stored output is stable -- see
-``docs/decisions/I5-decisions.md``.
+Two sources implement :class:`NarrativeReadRepository`, chosen explicitly by
+``PHASE0_NARRATIVE_SOURCE`` (see :func:`build_narrative_repository`):
+
+* ``fixture`` (the default): the committed fixture, for UI work and tests.
+* ``sqlite``: :class:`~app.phase0.sqlite_repository.SqliteNarrativeRepository`,
+  a read-only view of the pipeline's persisted stories, themes and current
+  A3 summaries.  It never generates, never writes, and never falls back to
+  the fixture: a database it cannot read is :class:`NarrativeUnavailableError`.
+
+The source is never switched because a database file happens to exist.
 """
 
 from __future__ import annotations
@@ -73,6 +76,16 @@ def is_stale_during_market_hours(data_as_of: object, now: datetime) -> bool:
     return current_time - timestamp > timedelta(hours=1)
 
 
+class NarrativeUnavailableError(RuntimeError):
+    """Persisted narrative state cannot be served right now.
+
+    Raised for a missing, unreadable, corrupt or wrongly-versioned
+    database, and for persisted rows that break the invariants the public
+    contract relies on.  The routes answer 503 with a fixed message; the
+    cause stays in the server log.
+    """
+
+
 class NarrativeReadRepository(Protocol):
     """Minimal read contract for the Phase 0 persistence layer."""
 
@@ -89,7 +102,7 @@ class NarrativeReadRepository(Protocol):
 
 
 class FixtureNarrativeRepository:
-    """Fixture source until the pipeline SQLite repository merges."""
+    """The committed fixture: the default source for development and tests."""
 
     def __init__(
         self,
@@ -184,12 +197,43 @@ def _load_fixture() -> dict:
         return json.load(fixture_file)
 
 
+NARRATIVE_SOURCES = ("fixture", "sqlite")
+
+
+def build_narrative_repository(
+    source: str,
+    *,
+    database_path: str | Path | None = None,
+    pipeline_version: str = "phase0-v1",
+) -> NarrativeReadRepository:
+    """Build the configured read source; no source is ever inferred."""
+
+    if source == "fixture":
+        return FixtureNarrativeRepository.from_default_fixture()
+    if source == "sqlite":
+        # Imported only in SQLite mode: fixture mode needs nothing outside
+        # the backend package.
+        from phase0.repository import DEFAULT_DATABASE_PATH
+
+        from .sqlite_repository import SqliteNarrativeRepository
+
+        return SqliteNarrativeRepository(
+            database_path=(
+                DEFAULT_DATABASE_PATH if database_path is None else database_path
+            ),
+            pipeline_version=pipeline_version,
+        )
+    raise ValueError(f"unknown narrative source {source!r}; use {NARRATIVE_SOURCES}")
+
+
 @lru_cache(maxsize=1)
 def get_narrative_repository() -> NarrativeReadRepository:
-    """Return the read source.
+    """Return the read source selected by the application settings."""
 
-    Fixture-backed until a SQLite adapter is built on top of
-    :class:`phase0.repository.Phase0Repository`; that waits on the
-    downstream stages actually producing stored output.
-    """
-    return FixtureNarrativeRepository.from_default_fixture()
+    from ..config import settings
+
+    return build_narrative_repository(
+        settings.PHASE0_NARRATIVE_SOURCE,
+        database_path=settings.PHASE0_DATABASE_PATH,
+        pipeline_version=settings.PHASE0_PIPELINE_VERSION,
+    )

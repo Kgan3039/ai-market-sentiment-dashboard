@@ -12,7 +12,9 @@ class Citation(BaseModel):
     headline: str
     outlet: str
     url: str
-    published_at: datetime
+    # Present but null when the publisher gave no publication time: a
+    # missing timestamp is persisted as missing and never invented.
+    published_at: datetime | None
 
 
 class Story(Citation):
@@ -37,7 +39,10 @@ class Theme(BaseModel):
     """A ranked coverage theme with traceable summary content."""
 
     id: str
-    label: str = Field(min_length=1, max_length=120)
+    # No upper bound: a degraded theme carries M5's persisted label, which is
+    # a real canonical headline, and no pipeline stage bounds headline
+    # length.  Generated labels are separately bounded by A2 (<= 8 words).
+    label: str = Field(min_length=1)
     rank: int = Field(ge=1)
     # Matches ai.summarization.ThemeSummary so pipeline output passes through.
     sentences: list[CitedSentence] = Field(default_factory=list)
@@ -120,6 +125,9 @@ class TickerThemesResponse(BaseModel):
         ranks = [theme.rank for theme in self.themes]
         if len(ranks) != len(set(ranks)):
             raise ValueError("Theme ranks must be unique for a ticker day")
+        theme_ids = [theme.id for theme in self.themes]
+        if len(theme_ids) != len(set(theme_ids)):
+            raise ValueError("Theme ids must be unique for a ticker day")
 
         themed_story_ids = [
             story.id for theme in self.themes for story in theme.stories

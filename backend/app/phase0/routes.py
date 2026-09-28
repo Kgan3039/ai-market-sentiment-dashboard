@@ -4,7 +4,11 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from .repository import NarrativeReadRepository, get_narrative_repository
+from .repository import (
+    NarrativeReadRepository,
+    NarrativeUnavailableError,
+    get_narrative_repository,
+)
 from .schemas import (
     MetaStatusResponse,
     TickerListResponse,
@@ -13,9 +17,17 @@ from .schemas import (
 
 router = APIRouter(prefix="/api/v1", tags=["Ticker Narratives"])
 
+#: The only thing a client learns about an unavailable source.  The cause
+#: (paths, SQLite errors, integrity details) stays in the server log.
+UNAVAILABLE_DETAIL = "Coverage is temporarily unavailable."
+
 
 def repository_dependency() -> NarrativeReadRepository:
     return get_narrative_repository()
+
+
+def _unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail=UNAVAILABLE_DETAIL)
 
 
 @router.get("/tickers", response_model=TickerListResponse)
@@ -23,10 +35,13 @@ def list_tickers(
     repository: NarrativeReadRepository = Depends(repository_dependency),
 ) -> TickerListResponse:
     """Return the fixed ticker universe and its current coverage counts."""
-    status = repository.get_status()
-    return TickerListResponse(
-        data_as_of=status.data_as_of, tickers=repository.list_tickers()
-    )
+    try:
+        status = repository.get_status()
+        return TickerListResponse(
+            data_as_of=status.data_as_of, tickers=repository.list_tickers()
+        )
+    except NarrativeUnavailableError:
+        raise _unavailable() from None
 
 
 @router.get("/tickers/{ticker}/themes", response_model=TickerThemesResponse)
@@ -45,6 +60,8 @@ def get_ticker_themes(
             status_code=404,
             detail="Ticker is not part of the Phase 0 universe.",
         ) from exc
+    except NarrativeUnavailableError:
+        raise _unavailable() from None
 
 
 @router.get("/meta/status", response_model=MetaStatusResponse)
@@ -52,4 +69,7 @@ def get_meta_status(
     repository: NarrativeReadRepository = Depends(repository_dependency),
 ) -> MetaStatusResponse:
     """Return the latest pipeline stage status and page freshness timestamp."""
-    return repository.get_status()
+    try:
+        return repository.get_status()
+    except NarrativeUnavailableError:
+        raise _unavailable() from None
