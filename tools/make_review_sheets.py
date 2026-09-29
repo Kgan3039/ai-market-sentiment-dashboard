@@ -1,4 +1,6 @@
-"""``make_review_sheets.py``: sample and score Phase 0 G1 review sheets (A4a, #74).
+"""``make_review_sheets.py``: sample and score Phase 0 review sheets (A4, #74).
+
+G1 theme-assignment sheets (A4a) and G2 sentence-faithfulness sheets (A4b).
 
     # draw 40 placements from what the themes stage persisted for a day
     python -m tools.make_review_sheets sample-assignments \\
@@ -33,6 +35,25 @@ completed sheets to it and never consults the database again.  Scoring
 takes only manifests and sheets; a saved scorecard or round report is
 output, never input.
 
+G2 (A4b) reviews every sentence of every summary a reader may be shown, on
+two days drawn from the operator's candidate days::
+
+    # candidate days in, two eligible days drawn by the seed, census out
+    python -m tools.make_review_sheets sample-sentences \\
+        --database "$PHASE0_DATABASE_PATH" \\
+        --window-start 2026-09-08 --window-end 2026-09-12 \\
+        --seed phase0-g2 --out reviews/g2/g2.csv
+
+    # one census round: the manifest and its one or two completed sheets
+    python -m tools.make_review_sheets score-sentences \\
+        --round reviews/g2/g2.manifest.json reviews/g2/g2.alice.csv \\
+                reviews/g2/g2.bob.csv \\
+        --adjudication reviews/g2/g2.adjudicated.csv \\
+        --report reviews/g2/scorecard.json
+
+G2 sampling resolves the production summary policy exactly as the API does,
+reads SQLite read-only, and never generates, so it needs no GEMINI_API_KEY.
+
 Exit status: 0 PASS, 1 FAIL, 2 usage or input error, 3 INCOMPLETE or
 NOT_ELIGIBLE.  The last two share a code because both mean "no gate
 verdict is available"; the scorecard text says which, and a script that
@@ -48,6 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from nlp.eval import faithfulness
 from nlp.eval.review import (
     DEFAULT_ROUND_SIZE,
     UNRATIFIED_PROTOCOL,
@@ -198,6 +220,123 @@ def _cmd_score(args: argparse.Namespace) -> int:
     return EXIT_BY_RESULT[scorecard.gate_result]
 
 
+def _attestation(args: argparse.Namespace) -> OperatorAttestation | None:
+    if not (args.attestation or args.attested_by):
+        return None
+    if not (args.attestation and args.attested_by):
+        raise ReviewSamplingError("--attestation and --attested-by go together")
+    return OperatorAttestation(
+        attested_by=args.attested_by,
+        statement=args.attestation,
+        attested_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _cmd_sample_sentences(args: argparse.Namespace) -> int:
+    if bool(args.window_start) != bool(args.window_end):
+        raise ReviewSamplingError("--window-start and --window-end go together")
+    window = (args.window_start, args.window_end) if args.window_start else None
+    # Everything the manifest would record verbatim, and every path it would
+    # write, is checked before the database is read or any file is opened.
+    for value, field in (
+        (args.seed, "seed"),
+        (args.round_id, "round_id"),
+        (args.protocol, "protocol"),
+        (Path(args.out).name, "output file name"),
+    ):
+        faithfulness.require_clean_operator_value(value, field)
+    faithfulness.require_known_g2_protocol(args.protocol)
+    out = Path(args.out)
+    faithfulness.check_output_paths(
+        [out, faithfulness.manifest_path_for(out)],
+        inputs=faithfulness.protected_database_paths(args.database),
+    )
+    population = faithfulness.load_sentence_population(
+        args.database,
+        candidate_days=args.candidate_day or (),
+        window=window,
+        pipeline_version=args.pipeline_version,
+    )
+    sample = faithfulness.sample_sentences(
+        population,
+        seed=args.seed,
+        draw_size=args.development_days,
+        round_id=args.round_id,
+    )
+    manifest = faithfulness.build_manifest(
+        sample,
+        protocol_id=args.protocol,
+        csv_name=out.name,
+        operator_attestation=_attestation(args),
+    )
+    csv_path, manifest_path = faithfulness.write_sample(sample, out, manifest=manifest)
+    selection = manifest["selection"]
+    print(
+        f"wrote {len(sample.rows)} sentences from {len(sample.artifacts)} summaries "
+        f"on {', '.join(sample.selected_days)} to {csv_path}"
+    )
+    print(f"manifest: {manifest_path}")
+    print(
+        f"eligible days {len(selection['eligible_days'])} of "
+        f"{len(selection['candidate_days'])} candidates; origin: "
+        f"{manifest['origin']['status']}; protocol: {args.protocol}; "
+        f"snapshot {manifest['snapshot']['sha256'][:12]}"
+    )
+    for excluded in selection["excluded_days"]:
+        print(
+            f"excluded {excluded['trading_day']}: {excluded['reason']}",
+            file=sys.stderr,
+        )
+    counts = manifest["population"]["selected_days"]
+    for key in ("withheld_artifact_count", "population_changed_partition_count"):
+        if counts[key]:
+            print(
+                f"NOTE: {key} = {counts[key]}; the census is incomplete",
+                file=sys.stderr,
+            )
+    if sample.development_override:
+        print(
+            "NOTE: a development draw size was used; the round cannot be gate eligible",
+            file=sys.stderr,
+        )
+    return EXIT_PASS
+
+
+def _cmd_score_sentences(args: argparse.Namespace) -> int:
+    if not 2 <= len(args.round) <= 3:
+        raise ReviewSamplingError(
+            "--round takes a manifest and one or two completed sheets"
+        )
+    if args.report:
+        inputs = [Path(p) for p in args.round]
+        if args.adjudication:
+            inputs.append(Path(args.adjudication))
+        faithfulness.check_output_paths([args.report], inputs=inputs)
+    manifest = faithfulness.read_manifest(args.round[0])
+    result = faithfulness.score_sentence_round(
+        manifest, args.round[1:], adjudicated=args.adjudication
+    )
+    scorecard = faithfulness.score_g2(
+        result,
+        development=faithfulness.G2DevelopmentOverrides(
+            threshold=args.development_threshold
+        ),
+    )
+    payload = scorecard.as_dict()
+    payload["round_report"] = result.as_dict()
+    if args.report:
+        report = Path(args.report)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        faithfulness.create_new_file(
+            report, json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(faithfulness.render_scorecard(scorecard))
+    return EXIT_BY_RESULT[scorecard.gate_result]
+
+
 def _finite_unit_float(text: str) -> float:
     try:
         value = float(text)
@@ -225,7 +364,7 @@ def _positive_int(text: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="make_review_sheets",
-        description="Sample and score Phase 0 G1 review sheets (issue #74 / A4a).",
+        description="Sample and score Phase 0 G1 and G2 review sheets (issue #74).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -300,6 +439,64 @@ def main(argv: Sequence[str] | None = None) -> int:
     score.add_argument("--report", type=Path, help="write the scorecard JSON here")
     score.add_argument("--json", action="store_true")
 
+    sentences = sub.add_parser(
+        "sample-sentences",
+        help="draw two eligible days and take every current summary sentence (gate G2)",
+    )
+    sentences.add_argument(
+        "--database", type=Path, required=True, help="Phase 0 SQLite database"
+    )
+    sentences.add_argument(
+        "--candidate-day", action="append", help="a candidate day, repeatable"
+    )
+    sentences.add_argument("--window-start", help="first candidate day, inclusive")
+    sentences.add_argument("--window-end", help="last candidate day, inclusive")
+    sentences.add_argument(
+        "--pipeline-version", help="required when the candidates span several"
+    )
+    sentences.add_argument(
+        "--seed", required=True, help="the day draw is a pure function of this"
+    )
+    sentences.add_argument("--round-id", default="g2")
+    sentences.add_argument(
+        "--development-days",
+        type=_positive_int,
+        help="development only: draw this many days; forces a NOT_ELIGIBLE evaluation",
+    )
+    sentences.add_argument("--protocol", default=UNRATIFIED_PROTOCOL)
+    sentences.add_argument(
+        "--attested-by", help="who is recording an attestation (audit metadata only)"
+    )
+    sentences.add_argument(
+        "--attestation",
+        help="what the operator checked, in their words (audit metadata only)",
+    )
+    sentences.add_argument("--out", type=Path, required=True)
+
+    score_sentences = sub.add_parser(
+        "score-sentences",
+        help="compute gate G2 from one census manifest and its completed sheets",
+    )
+    score_sentences.add_argument(
+        "--round",
+        nargs="+",
+        required=True,
+        metavar="PATH",
+        help="the manifest followed by its one or two completed sheets",
+    )
+    score_sentences.add_argument(
+        "--adjudication", type=Path, help="the round's adjudication sheet"
+    )
+    score_sentences.add_argument(
+        "--development-threshold",
+        type=_finite_unit_float,
+        help="development only: forces a NOT_ELIGIBLE evaluation",
+    )
+    score_sentences.add_argument(
+        "--report", type=Path, help="write the scorecard JSON here"
+    )
+    score_sentences.add_argument("--json", action="store_true")
+
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -307,6 +504,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "sample-assignments":
             return _cmd_sample(args)
+        if args.command == "sample-sentences":
+            return _cmd_sample_sentences(args)
+        if args.command == "score-sentences":
+            return _cmd_score_sentences(args)
         return _cmd_score(args)
     except ReviewSamplingError as exc:
         print(f"error: {exc}", file=sys.stderr)

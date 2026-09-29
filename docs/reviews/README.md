@@ -15,12 +15,10 @@ and citation tables — and A3b can schedule generation, but only behind
 built so that none of those facts can be papered over by a good-looking
 number, an edited file, or a well-meaning claim.
 
-**Scope today: G1 only (A4a).** G2 sampling (A4b) is not implemented. When it
-is, it must sample the exact persisted artifact a reader would be shown —
-`summary_lifecycle.current_summary_artifact`, recorded by `artifact_id`,
-`theme_id`, `input_fingerprint`, `policy_fingerprint`, sentence ordinal and
-citation position — never a summary generated at review time, which would
-measure the model, not the product.
+**Scope today: G1 (A4a) and G2 (A4b).** G1 is described first; G2 has its
+own section, [G2: sentence faithfulness](#g2-sentence-faithfulness-a4b). Both
+share the reviewer, adjudication and binding rules below, and neither can
+reach a release verdict today.
 
 ## What a G1 row is
 
@@ -308,6 +306,209 @@ eligibility is making a decision that belongs to K4.
 - **K3 (#60)** owns the vocabulary, the adjudication rule, and the
   reviewer-independence rule; the provisional protocol counts nothing as
   adjudicated.
-- **G2 (A4b)** is not implemented. A3 now persists accepted summaries with
-  ordered per-sentence story citations; A4b must sample those exact
-  artifacts by id and fingerprint so what is reviewed is what is served.
+- **G2 (A4b)** samples and scores, but K3 has not said what "supported"
+  means for multiple citations, partial support, unverifiable claims or
+  contradictions, nor whether a reviewer may open the publisher's page.
+  Until a G2 protocol is ratified, G2 is `NOT_ELIGIBLE` whatever the rate.
+
+## G2: sentence faithfulness (A4b)
+
+Section 8's G2 is "summary-sentence faithfulness (supported by cited
+source)", ≥ 95%, over "every sentence from 2 sampled days".
+`nlp/eval/faithfulness.py` builds that review from what was persisted and
+scores it; it generates nothing.
+
+### What is reviewed
+
+The artifacts **eligible to be served at sampling time**: for each candidate
+day and each of the five tickers, one `Phase0Reader.theme_population`
+snapshot, and for each theme the artifact
+`summary_lifecycle.current_summary_artifact` returns under
+`summary_runner.production_generation_policy()` — the same reader and policy
+the narrative API serves with. That is the whole claim. It is **not** every
+artifact served during the day: schema 16 keeps an artifact's sentences and
+cited story ids but not its frozen evidence, and superseded stories are
+deleted, so an artifact replaced during the day cannot be shown to a
+reviewer as the model saw it. No HTTP request is logged either, so nothing
+here proves an artifact was served. Sample a day **before** changing the
+production policy (model, output cap, copy rules): after the change the
+old artifacts are no longer current, the API no longer serves them, and
+G2 no longer samples them. A round already drawn is unaffected — scoring
+never consults the database. Like the API, the sampler must run with the
+scheduler's `GEMINI_MODEL` and `GEMINI_MAX_OUTPUT_TOKENS` (it needs no
+`GEMINI_API_KEY`). The sampler reviews what is current under *its* resolved
+policy: with values that match no persisted artifact nothing is current and
+sampling is refused, but where artifacts persist under more than one policy
+a mismatched setting selects the subset current under the sampler's
+policy, which need not be what the API serves. The manifest records the
+policy it sampled under. A malformed value (for example a non-integer
+`GEMINI_MAX_OUTPUT_TOKENS` or `GEMINI_TIMEOUT_MS`) is a usage error, exit
+`2`, naming the setting and never its value.
+
+Per theme the outcome is recorded: `current_summary` (reviewed),
+`no_current_summary` or `input_refused` (degraded: no sentences, counted),
+or `withheld` (below). Other coverage has no generated sentences and
+contributes no rows. A partition whose population differs between the read
+that lists its themes and the reads that rebuild their artifacts is
+`population_changed_during_sampling`: nothing from it is reviewed, and on a
+selected day it makes the census incomplete.
+
+### Two days, drawn
+
+The operator gives candidate days (`--candidate-day`, repeatable) or an
+inclusive window (`--window-start`/`--window-end`). A candidate day is
+**eligible** only if it holds at least one reviewable current summary; the
+others are listed in `selection.excluded_days` with a reason
+(`no_partitions`, `no_current_summary`, `no_reviewable_current_summary`,
+`population_changed_during_sampling`). Exactly two eligible days are drawn
+with `--seed` (`random.Random(seed).sample` over the sorted eligible days).
+The manifest records the candidate input, every day's accounting, the
+eligible and excluded days, the seed and the selected days; reading it
+re-derives each from the one before and re-runs the draw. Fewer than two
+eligible days is refused. `--development-days N` — with any `N`, **including
+2** — is a development draw: the manifest records
+`selection.draw.development_override: true` as a fact of its own, it is
+folded into every row id (a development and a release review of the same
+sentence have different row ids), and the scorecard is `development` and
+`NOT_ELIGIBLE`. Only an invocation without the flag records `false`, and a
+manifest recording `false` must have drawn exactly two days.
+
+### The review unit and the sheet
+
+One row is **one sentence with its complete ordered citation set**. Every
+sentence of every reviewed artifact on the two days is a row, exactly once.
+
+| columns | role |
+|---|---|
+| `row_id` | `g2-` + SHA-256 over the gate and the identity below |
+| `pipeline_version`, `ticker`, `trading_day`, `theme_key`, `theme_id`, `artifact_id`, `input_fingerprint`, `policy_fingerprint`, `content_digest`, `sentence_ordinal`, `citation_story_ids` | identity (do not edit) |
+| `summary_label`, `sentence_count`, `sentence_text`, `cited_evidence` | context (do not edit) |
+| `manifest_id`, `snapshot_sha256` | binding (do not edit) |
+| `reviewer_id`, `reviewed_at`, `reviewer_verdict`, `reviewer_notes` | reviewer |
+
+`cited_evidence` holds, for each citation in position order, the story's
+outlet, publication time, title, description and first URL. Title and
+description are exactly what the model was shown, so the sheet carries what
+is needed to judge support without opening a URL; whether a reviewer *may*
+open one is K3's call.
+
+The provisional G2 vocabulary is `supported` / `unsupported`, registered in
+`RATIFIED_G2_PROTOCOLS`, separate from G1's registry: a G1 protocol id is
+never a G2 protocol. K3's rules on multiple citations, partial support,
+unverifiable claims and contradictions are not encoded anywhere.
+
+### Binding
+
+The manifest snapshot carries each reviewed artifact whole: identity,
+label, sentences with `(position, story_id)` citations, and the full frozen
+evidence of its input. Reading the manifest recomputes, offline:
+
+- each artifact's `input_fingerprint` from its evidence (A2's
+  `compute_input_fingerprint`) — altered evidence is refused;
+- each artifact's `content_digest` from its label, sentences and
+  citations (A3's `summary_artifact_digest`) — an altered sentence or a
+  changed, added or reordered citation is refused;
+- the policy fingerprint from the recorded policy, and that every artifact
+  was current under it;
+- every row as the exact projection of its artifact — a row added,
+  removed, duplicated or edited is refused;
+- the selection and its draw, the population, snapshot and manifest
+  digests, and the sheet binding, as for G1.
+
+Every total is derived and re-derived bottom-up: each partition's
+`theme_count`, `degraded_theme_count`, `withheld_artifact_count` and
+`reviewed_artifact_ids` from its per-theme outcomes, the day accounting from
+the partitions, and `population.selected_days` from the partitions and the
+census. The per-theme outcomes are the source of truth; a stored total that
+differs from them is refused even if every outer digest was recomputed.
+
+A completed sheet is held to the snapshot column by column, as for G1. For
+both gates, a reviewer or adjudication sheet whose header names any column
+twice, or with a row carrying more cells than its header, is refused before
+any row is read. A G1 manifest is refused by the G2 reader and the reverse,
+and a G2 round cannot be scored by the G1 gate.
+
+### Scorecard
+
+One census round: a manifest, one or two reviewer sheets, and optionally an
+adjudication sheet, with G1's reviewer and adjudication rules. The four
+facts are kept apart:
+
+```
+rate / threshold_met   positive / resolved, compared exactly with 0.95
+review_complete        every sentence resolved; no partition skipped for a
+                       population change and no artifact withheld on the
+                       selected days
+gate_eligible          verified_live origin + verified theme-set build binding
+                       + ratified G2 protocol + two reviewers + an adjudication
+                       state the protocol counts + exactly two days + no overrides
+gate_result            NOT_ELIGIBLE, then INCOMPLETE, then PASS / FAIL
+```
+
+Today every G2 round is `NOT_ELIGIBLE`: origin is `unverified`, theme-set
+build binding is `unverified`, and no G2 protocol is ratified. A measured
+rate of 0.95 or more on such a round is a measurement, never a PASS; the
+scorecard prints it on its own line. `--development-threshold` forces
+`NOT_ELIGIBLE`.
+
+### Security
+
+The sentence under review and the evidence it is judged against are never
+redacted: a redacted sentence is not the served one, and redacted evidence
+would not reproduce the input fingerprint. If the label, a sentence, an
+evidence field or an identifier carries credential-like text
+(`phase0.redaction.contains_credential`), the artifact is **withheld**:
+recorded as `sentence_credential`, `label_credential`,
+`evidence_credential` or `identifier_credential` with the field named and
+the value withheld, and on a selected day the census is incomplete. URLs
+and the M5 theme label are reference context and pass through
+`redact_text`. The manifest records the database's basename, not its path.
+
+Operator values the manifest records verbatim — the seed, the round id, the
+protocol id, the output file name — are checked before the draw and before
+any file is created; a credential-like one is refused, naming the field and
+never the value. A seed is refused rather than redacted: it *is* the draw.
+
+`sample-sentences` never overwrites: the CSV and its manifest must both be
+new paths, distinct from each other and from the database and its `-wal`,
+`-shm` and `-journal` files — named after both the supplied database path
+and its resolved symlink target — compared after resolving relative paths,
+`..` and symlinks. Both are created exclusively, as a pair: a write that
+fails partway (a full disk, a failed close) removes every file this
+invocation created, and never a file that existed before. The
+`score-sentences` report must likewise be new and not any input manifest or
+sheet. Every check runs before the first file is opened for writing.
+
+### Isolation
+
+Sampling uses `Phase0Reader` only (`mode=ro`, `query_only`, write-denying
+authorizer): **read-only database access, with no logical mutation** — no
+row and no byte of the main database file changes. That is not zero
+filesystem activity: reading a WAL database needs its `-wal` and `-shm`
+coordination files, and when they are missing SQLite creates them if the
+directory permits, or the read fails (reported as a usage error, exit `2`)
+if it does not. In the supported B3 topology the WAL keeper provisions and
+owns those files (`docs/phase0_deployment_handoff.md`, "SQLite serving").
+It resolves the production policy without a provider request and needs no
+`GEMINI_API_KEY`; it never calls `ensure_summary` or A2, never runs
+ingestion or intelligence, and makes no network request. Scoring reads
+only the manifest and sheets.
+
+### Commands
+
+```
+# two days drawn from a candidate window; every current sentence on them
+python -m tools.make_review_sheets sample-sentences \
+    --database "$PHASE0_DATABASE_PATH" \
+    --window-start 2026-09-08 --window-end 2026-09-12 \
+    --seed phase0-g2 --out docs/reviews/g2/g2.csv
+
+# the gate, from the artifacts themselves
+python -m tools.make_review_sheets score-sentences \
+    --round docs/reviews/g2/g2.manifest.json docs/reviews/g2/g2.alice.csv docs/reviews/g2/g2.bob.csv \
+    --adjudication docs/reviews/g2/g2.adjudicated.csv \
+    --report docs/reviews/g2/scorecard.json
+```
+
+Exit status as for G1: `0` PASS, `1` FAIL, `2` usage or input error, `3`
+INCOMPLETE or NOT_ELIGIBLE.
