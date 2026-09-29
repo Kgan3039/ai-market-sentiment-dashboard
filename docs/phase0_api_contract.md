@@ -140,13 +140,25 @@ persisted output.
     `-shm` index, with the database file's permissions, and leaves them;
   - if it may not, the read fails ("attempt to write a readonly database")
     and the API answers the fixed `503`.
-- **Supported deployment:** the writer side provisions and keeps the live WAL
-  state -- for example a writer-owned process that holds one connection to
-  the database open, so `-wal` and `-shm` survive the pipeline's own
-  open/write/close cycles. The API user then needs only read access to the
-  database, `-wal` and `-shm` files and no write access to the directory; it
-  creates no file and sees each new commit. Without that, the API fails
-  closed with `503` rather than being given ownership of database files.
+- **Supported deployment (B3):** the writer side provisions and keeps the live
+  WAL state with `phase0/wal_keeper.py`, run by systemd
+  (`deploy/phase0-wal-keeper.service`) as the **writer** identity. It holds
+  one `mode=ro`, `query_only` connection -- it proves at startup that the
+  connection refuses a write, holds no transaction, and never creates,
+  migrates, re-journals or checkpoints the database -- so `-wal` and `-shm`
+  survive the pipeline's own open/write/close cycles. The API user then needs
+  only read access to the database, `-wal` and `-shm` files and no write
+  access to the directory; it creates no file and sees each new commit
+  without a restart. While the keeper is down and a pipeline run has since
+  closed as the last connection, the API fails closed with `503`, and it
+  recovers on the next request after the keeper returns. It is never given
+  ownership of database files instead.
+- **Enablement gate:** `tools/phase0_api_preflight.py`, run as the API user
+  with the API's environment, must exit `0` before `sqlite` is selected. It
+  reports infrastructure (decides the exit code), availability and freshness
+  separately. The permission model, rollout, rollback, restore procedure and
+  the host smoke checklist are in `docs/phase0_deployment_handoff.md`,
+  "SQLite serving (B3)".
 - Never open the live database with `immutable=1`: SQLite would stop
   noticing the writer's commits. `nolock` or exclusive locking on the reader
   would likewise give up correct coordination with the writer.
