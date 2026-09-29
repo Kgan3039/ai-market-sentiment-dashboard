@@ -61,6 +61,12 @@ PHASE0_LOCK_FILE=/var/lock/phase0-pipeline.lock
 # the summaries component reports summaries_unconfigured, makes no provider
 # call, and the invocation exits 1 (degraded) rather than 2.
 
+# SQLITE-BACKED API (B3). This crontab stays the only application-data
+# writer. Serving the API from SQLite additionally needs the read-only WAL
+# keeper (deploy/phase0-wal-keeper.service) running as this same writer user
+# on the same PHASE0_DATABASE_PATH, and tools/phase0_api_preflight.py passing
+# as the API user; see docs/phase0_deployment_handoff.md, "SQLite serving".
+
 # Every 30 minutes from 09:00 through 16:30 ET on weekdays.
 0,30 9-16 * * 1-5 cd $PROJECT_DIR && $PYTHON_BIN pipeline.py --lock-file $PHASE0_LOCK_FILE >> /var/log/ticker-narratives-pipeline.log 2>&1
 

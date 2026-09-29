@@ -1,0 +1,68 @@
+# Phase 0 WAL keeper (B3).  Supported deployment contract:
+# docs/phase0_deployment_handoff.md, "SQLite serving (B3)".
+#
+# WHAT IT IS FOR
+# The cron pipeline (deploy/phase0-pipeline.cron) opens, writes and closes
+# the database, and SQLite deletes phase0.sqlite3-wal and -shm when the last
+# connection closes.  A read-only API cannot read a WAL database without
+# them.  This service holds one mode=ro, query_only connection open as the
+# WRITER identity, so the coordination files exist for as long as the API
+# serves SQLite.  It never writes, migrates, checkpoints or creates the
+# database; it refuses to start (exit 2) if the database is missing, not
+# WAL, or not the expected schema, and exits 3 if the path is replaced
+# underneath it.  Either way systemd retries.
+#
+# INSTALL
+#   1. Replace the three placeholders below -- the writer user, the shared
+#      reader group, and the paths -- with the host's values.  They must be
+#      the SAME writer user that owns the crontab and the SAME database path
+#      the crontab passes as PHASE0_DATABASE_PATH.
+#   2. sudo cp deploy/phase0-wal-keeper.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#   3. Run pipeline.py once first: the keeper never creates the database.
+#   4. sudo systemctl enable --now phase0-wal-keeper
+#      journalctl -u phase0-wal-keeper  -> expect {"event": "keeper_ready", ...}
+#
+# No GEMINI_API_KEY, no EnvironmentFile with secrets: the keeper needs none.
+
+[Unit]
+Description=Phase 0 SQLite WAL keeper (read-only; keeps -wal/-shm provisioned for the API)
+# The database lives on local disk; wait for local mounts.
+After=local-fs.target
+RequiresMountsFor=/var/lib/ticker-narratives
+# Never stop retrying: RestartSec below is the crash-loop brake.  A keeper
+# waiting for the first pipeline run, or for a restored database, keeps
+# refusing (exit 2, logged) until the database is servable, then comes up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# PLACEHOLDERS: the writer identity and the shared reader group.
+User=REPLACE_WITH_WRITER_USER
+Group=REPLACE_WITH_READER_GROUP
+# SQLite gives -wal and -shm the database file's own mode, so the 0640 on
+# phase0.sqlite3 is what the API sees; this umask is defence in depth for
+# anything else this process could cause to exist.
+UMask=0027
+WorkingDirectory=/opt/ticker-narratives
+Environment=PHASE0_DATABASE_PATH=/var/lib/ticker-narratives/phase0.sqlite3
+Environment=PYTHONPATH=/opt/ticker-narratives
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/ticker-narratives/.venv/bin/python -m phase0.wal_keeper --database ${PHASE0_DATABASE_PATH}
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=always
+RestartSec=10
+
+# Hardening.  The keeper reads one directory and writes only SQLite's
+# coordination files there.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ticker-narratives
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target
