@@ -292,6 +292,22 @@ ADJUDICATION_FIELDNAMES = (
 )
 
 
+@dataclass(frozen=True)
+class SheetSpec:
+    """The columns a completed sheet is held to, and whose protocol registry.
+
+    :data:`G1_SHEET` is the default everywhere, so G1 reading and scoring
+    are exactly what they were.  A4b's G2 sheet
+    (:mod:`nlp.eval.faithfulness`) supplies its own columns and its own
+    registry; the verdict, reviewer, adjudication and binding rules are
+    shared, not copied.
+    """
+
+    fieldnames: tuple[str, ...]
+    snapshot_fields: tuple[str, ...]
+    resolve_protocol: Any
+
+
 def row_identity(**fields: str) -> dict[str, str]:
     """The durable identity of one review row, in a fixed key order."""
 
@@ -1623,21 +1639,52 @@ class CompletedSheet:
 def _read_csv(
     location: Path, required: Sequence[str], what: str
 ) -> list[dict[str, str]]:
+    """Rows of a reviewer or adjudication sheet, keyed by an unambiguous header.
+
+    The raw header is checked before any row becomes a dict: a column named
+    twice would let ``DictReader`` keep one value while a reviewer read the
+    other, so any repeated name is refused.  So is a row with more cells
+    than the header, whose extras ``DictReader`` would file under ``None``.
+    """
+
     try:
         with location.open(newline="", encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             columns = tuple(reader.fieldnames or ())
+            repeated = sorted({_clean(c) for c in columns if columns.count(c) > 1})
+            if repeated:
+                raise ReviewSamplingError(
+                    f"{location}: {what} names columns more than once: {repeated}"
+                )
             raw_rows = list(reader)
     except OSError as exc:
         raise ReviewSamplingError(f"{location}: cannot read {what}: {exc}") from exc
     missing = sorted(set(required) - set(columns))
     if missing:
         raise ReviewSamplingError(f"{location}: {what} lacks columns {missing}")
+    for number, raw in enumerate(raw_rows, start=1):
+        if None in raw:
+            raise ReviewSamplingError(
+                f"{location}: {what} data row {number} has more cells than its header"
+            )
     return raw_rows
 
 
+#: G1's sheet: the default for every reader and scorer below.  The protocol
+#: resolver is looked up at call time, as it always was.
+G1_SHEET = SheetSpec(
+    fieldnames=ASSIGNMENT_FIELDNAMES,
+    snapshot_fields=SNAPSHOT_FIELDS,
+    resolve_protocol=lambda protocol_id: resolve_protocol(protocol_id),
+)
+
+
 def read_completed_sheet(
-    path: str | Path, manifest: Mapping[str, Any], protocol: Protocol
+    path: str | Path,
+    manifest: Mapping[str, Any],
+    protocol: Protocol,
+    *,
+    spec: SheetSpec = G1_SHEET,
 ) -> CompletedSheet:
     """Read one reviewer's sheet and hold it to the manifest snapshot.
 
@@ -1652,7 +1699,7 @@ def read_completed_sheet(
     allowed = protocol.vocabulary | {""}
     expected = {row["row_id"]: row for row in manifest["snapshot"]["rows"]}
     binding = manifest["binding"]
-    raw_rows = _read_csv(location, ASSIGNMENT_FIELDNAMES, "sheet")
+    raw_rows = _read_csv(location, spec.fieldnames, "sheet")
 
     rows: dict[str, SheetRow] = {}
     reviewers: set[str] = set()
@@ -1672,7 +1719,7 @@ def read_completed_sheet(
                 f"{location}: row {row_id!r} is not in the manifest; rows cannot be "
                 "added or replaced after sampling"
             )
-        for column in SNAPSHOT_FIELDS:
+        for column in spec.snapshot_fields:
             if (raw.get(column) or "") != expected[row_id][column]:
                 raise ReviewSamplingError(
                     f"{location}: row {row_id} column {column!r} differs from the "
@@ -1873,6 +1920,7 @@ def score_round(
     sheets: Sequence[str | Path],
     *,
     adjudicated: str | Path | None = None,
+    spec: SheetSpec = G1_SHEET,
 ) -> RoundResult:
     """Resolve one round: one or two reviewer sheets, optionally adjudicated.
 
@@ -1889,8 +1937,10 @@ def score_round(
         raise ReviewSamplingError("at least one completed sheet is required")
     if len(sheets) > 2:
         raise ReviewSamplingError("at most two reviewer sheets are scored per round")
-    protocol, ratified = resolve_protocol(manifest["labeling_protocol"].get("id"))
-    completed = [read_completed_sheet(path, manifest, protocol) for path in sheets]
+    protocol, ratified = spec.resolve_protocol(manifest["labeling_protocol"].get("id"))
+    completed = [
+        read_completed_sheet(path, manifest, protocol, spec=spec) for path in sheets
+    ]
     reviewer_ids = tuple(sheet.reviewer_id for sheet in completed)
     if len(completed) == 2 and reviewer_ids[0] and reviewer_ids[0] == reviewer_ids[1]:
         raise ReviewSamplingError(
@@ -2493,6 +2543,7 @@ __all__ = [
     "RELEASE_G1_REQUIRED_UNIQUE_ASSIGNMENTS",
     "REJECTED_IDENTIFIER",
     "RELEASE_G1_THRESHOLD",
+    "G1_SHEET",
     "SNAPSHOT_FIELDS",
     "UNRATIFIED_PROTOCOL",
     "AdjudicationState",
@@ -2507,6 +2558,7 @@ __all__ = [
     "ReviewSamplingError",
     "RoundResult",
     "Scorecard",
+    "SheetSpec",
     "SkippedPartition",
     "build_manifest",
     "classify_generation_binding",

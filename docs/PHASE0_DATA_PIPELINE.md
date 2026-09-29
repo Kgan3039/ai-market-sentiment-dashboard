@@ -120,9 +120,10 @@ and its stories are left untouched. Each partition's work lands as its
 own `stories` and `themes` run-log rows, written by the reconcilers under
 their own stage names. Summaries are generated only by the separate,
 feature-gated `summaries` component described below, which is **off by
-default**. The narrative API is unaffected and still serves fixtures; a
-live run producing themes or summaries does not establish release
-provenance for anything.
+default**. The narrative API serves the committed fixture by default and
+reads this persisted output only when `PHASE0_NARRATIVE_SOURCE=sqlite` is
+selected (see `docs/phase0_api_contract.md`); a live run producing themes
+or summaries does not establish release provenance for anything.
 
 **Which partitions.** Every scheduling fact is kept per ticker/day
 partition — that is the grain the ledger records it at — and the day is
@@ -276,7 +277,7 @@ What it does and does not claim, exactly:
 | Registered in `pipeline.py` / the coordinator | only through the A3b `summaries` component, off by default; never the coordinator |
 | Writes `themes.summary`, `themes.status`, `themes.citations`, `run_log` | **no** — it holds no repository handle |
 | Persists, caches, or invalidates summaries | **no** — the A3 lifecycle below does, and only when a caller invokes it |
-| Served by the narrative API | **no** — the API is still fixture-backed |
+| Served by the narrative API | **not directly** — only an A3 artifact current under the production policy, and only from the opt-in SQLite source (`PHASE0_NARRATIVE_SOURCE=sqlite`); the default source is the fixture |
 | "accepted" means | structurally grounded (every sentence cites ids that exist in the frozen input) and clean under `config/banned_phrases.txt` |
 | "accepted" does **not** mean | semantically faithful — sentence support remains the G2 human-review gate (A4b) |
 
