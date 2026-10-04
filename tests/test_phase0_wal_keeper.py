@@ -339,7 +339,7 @@ def test_keeper_refuses_the_wrong_schema_and_never_migrates(db, cleanup):
     migrations = connection.execute("SELECT count(*) FROM schema_migrations").fetchone()
     connection.close()
     event = _refused(start_keeper(cleanup, db))
-    assert "schema version 15, expected 16" in event["reason"]
+    assert "schema version 15, expected 17" in event["reason"]
     connection = sqlite3.connect(db)
     assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
     assert (
@@ -360,7 +360,7 @@ def test_expected_schema_is_the_migration_contract():
     from phase0.repository import MIGRATIONS_PATH
     from phase0.schema import latest_version, load_migrations
 
-    assert wal_keeper.expected_schema_version() == 16
+    assert wal_keeper.expected_schema_version() == 17
     assert wal_keeper.expected_schema_version() == latest_version(
         load_migrations(MIGRATIONS_PATH)
     )
@@ -375,7 +375,7 @@ def test_keeper_provisions_the_wal_files_and_stays_up(db, cleanup):
     keeper = start_keeper(cleanup, db)
     ready = keeper.wait_event("keeper_ready")
     assert ready["journal_mode"] == "wal"
-    assert ready["schema_version"] == 16
+    assert ready["schema_version"] == 17
     assert ready["query_only"] is True and ready["write_refused"] is True
     assert ready["inode"] == os.stat(db).st_ino
     assert all(path.exists() for path in sidecars(db))
@@ -460,7 +460,7 @@ def test_api_reads_while_the_keeper_holds_and_sees_new_commits(db, cleanup):
     api = start_api(cleanup, db)
 
     first = api.ask("read")
-    assert first == {"ok": True, "schema": 16, "runs": 1}
+    assert first == {"ok": True, "schema": 17, "runs": 1}
     first_status = api.ask("status")
     assert first_status["ok"]
 
@@ -500,7 +500,7 @@ def test_keeper_restart_opens_a_failure_window_the_api_recovers_from(db, cleanup
     restarted = start_keeper(cleanup, db)
     restarted.wait_event("keeper_ready")
     api_view(db)
-    assert api.ask("read") == {"ok": True, "schema": 16, "runs": 2}
+    assert api.ask("read") == {"ok": True, "schema": 17, "runs": 2}
 
 
 @needs_permissions
@@ -513,7 +513,7 @@ def test_a_restarted_api_process_reads_while_the_keeper_stays(db, cleanup):
     assert first.ask("read")["ok"]
     first.close()
     second = start_api(cleanup, db)
-    assert second.ask("read") == {"ok": True, "schema": 16, "runs": 1}
+    assert second.ask("read") == {"ok": True, "schema": 17, "runs": 1}
     assert second.ask("status")["ok"]
     assert keeper.process.poll() is None
 
@@ -532,14 +532,14 @@ def test_writer_and_keeper_crashes_lose_nothing_committed(db, cleanup):
     assert crashed.returncode == -signal.SIGKILL
     api_view(db)
     api = start_api(cleanup, db)
-    assert api.ask("read") == {"ok": True, "schema": 16, "runs": 1}
+    assert api.ask("read") == {"ok": True, "schema": 17, "runs": 1}
 
     assert keeper.kill() == -signal.SIGKILL
     writer_view(db)
     restarted = start_keeper(cleanup, db)
     restarted.wait_event("keeper_ready")
     api_view(db)
-    assert api.ask("read") == {"ok": True, "schema": 16, "runs": 1}
+    assert api.ask("read") == {"ok": True, "schema": 17, "runs": 1}
     assert api.ask("status")["ok"]
 
     writer_view(db)

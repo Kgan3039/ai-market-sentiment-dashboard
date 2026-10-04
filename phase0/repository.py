@@ -83,6 +83,7 @@ from .models import (
     ThemeSetRecord,
 )
 from .redaction import SECRET_KEY_PATTERN, redact_secrets, redact_text
+from . import provenance as _provenance
 from .scalars import (
     require_safe_identifier_scalar,
     sanitize_diagnostic_scalar,
@@ -797,6 +798,71 @@ class ThemeIdentity:
 
 
 @dataclass(frozen=True)
+class RunLogFacts:
+    """The ``run_log`` row a provenance column names, as read beside it (A4c).
+
+    Joined on ``(run_id, stage)`` -- ``run_log``'s own identity -- in the
+    same read as the row that names it.  ``recorded_mutation`` is whether
+    the row carries a ``last_mutation_id``: a run that wrote through a
+    logged repository mutation always does, and a row written by
+    ``Phase0Admin.log_stage`` never does.  Facts only; whether they verify
+    a hop is :mod:`phase0.provenance`'s decision.
+    """
+
+    run_id: str
+    stage: str
+    ticker: str | None
+    trading_day: str
+    pipeline_version: str
+    replay: bool
+    status: str
+    recorded_mutation: bool
+
+    def as_facts(self) -> dict[str, Any]:
+        facts = _provenance.run_facts(
+            {
+                "run_id": self.run_id,
+                "stage": self.stage,
+                "ticker": self.ticker,
+                "trading_day": self.trading_day,
+                "pipeline_version": self.pipeline_version,
+                "replay": self.replay,
+                "status": self.status,
+                "recorded_mutation": self.recorded_mutation,
+            }
+        )
+        assert facts is not None
+        return facts
+
+
+#: The ``run_log`` columns a provenance read joins, aliased by ``prefix``.
+def _run_log_columns(alias: str, prefix: str) -> str:
+    return (
+        f"{alias}.run_id AS {prefix}_run_id, {alias}.stage AS {prefix}_stage, "
+        f"{alias}.ticker AS {prefix}_ticker, "
+        f"{alias}.trading_day AS {prefix}_trading_day, "
+        f"{alias}.pipeline_version AS {prefix}_pipeline_version, "
+        f"{alias}.replay AS {prefix}_replay, {alias}.status AS {prefix}_status, "
+        f"({alias}.last_mutation_id IS NOT NULL) AS {prefix}_recorded_mutation"
+    )
+
+
+def _run_log_facts(row: Any, prefix: str) -> RunLogFacts | None:
+    if row[f"{prefix}_run_id"] is None:
+        return None
+    return RunLogFacts(
+        run_id=str(row[f"{prefix}_run_id"]),
+        stage=str(row[f"{prefix}_stage"]),
+        ticker=row[f"{prefix}_ticker"],
+        trading_day=str(row[f"{prefix}_trading_day"]),
+        pipeline_version=str(row[f"{prefix}_pipeline_version"]),
+        replay=bool(row[f"{prefix}_replay"]),
+        status=str(row[f"{prefix}_status"]),
+        recorded_mutation=bool(row[f"{prefix}_recorded_mutation"]),
+    )
+
+
+@dataclass(frozen=True)
 class PersistedStoryMember:
     """One raw item retained inside a persisted story.
 
@@ -846,6 +912,10 @@ class PersistedStory:
     members: tuple[PersistedStoryMember, ...]
     provider_conflicts: tuple[tuple[str, str], ...]
     semantic_merges: tuple[tuple[str, str, float, str], ...]
+    #: A4c: the logged story run that last wrote this content, and its
+    #: ``run_log`` row.  ``None`` means no logged run is known to have.
+    build_run_id: str | None = None
+    build_run: RunLogFacts | None = None
 
 
 @dataclass(frozen=True)
@@ -908,12 +978,17 @@ def _persisted_stories(
 
     rows = _rows(
         connection,
-        """
-        SELECT * FROM stories
-        WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
-          AND cluster_fingerprint IS NOT NULL
-          AND invalidated_at IS NULL
-        ORDER BY id
+        f"""
+        SELECT stories.*, {_run_log_columns("run_log", "log")}
+        FROM stories
+        LEFT JOIN run_log
+          ON run_log.run_id = stories.build_run_id
+         AND run_log.stage = '{_provenance.STORIES_STAGE}'
+        WHERE stories.ticker = ? AND stories.trading_day = ?
+          AND stories.pipeline_version = ?
+          AND stories.cluster_fingerprint IS NOT NULL
+          AND stories.invalidated_at IS NULL
+        ORDER BY stories.id
         """,
         (symbol, day, version),
     )
@@ -1044,6 +1119,8 @@ def _persisted_stories(
                 members=tuple(members_by_story.get(story_id, ())),
                 provider_conflicts=tuple(conflicts_by_story.get(story_id, ())),
                 semantic_merges=tuple(merges_by_story.get(story_id, ())),
+                build_run_id=row["build_run_id"],
+                build_run=_run_log_facts(row, "log"),
             )
         )
 
@@ -1121,8 +1198,17 @@ class PersistedThemeSet:
     updated_at: str | None
     #: The stored ``source_metadata`` block: what the stage recorded about
     #: the story generation it clustered (stage, counts, model identity).
-    #: It is not a signature of that generation; nothing persisted is.
+    #: It is not a signature of that generation; ``build_story_signature``
+    #: is (A4c).
     source_metadata: Mapping[str, Any] | None = None
+    #: A4c: the logged theme run that last wrote this partition's theme
+    #: output, the story-generation signature it verified before writing,
+    #: that signature's format version, and the run's ``run_log`` row.
+    #: All ``None`` when no logged, signature-checked build is known.
+    build_run_id: str | None = None
+    build_story_signature: str | None = None
+    build_story_signature_version: int | None = None
+    build_run: RunLogFacts | None = None
 
 
 @dataclass(frozen=True)
@@ -1136,6 +1222,11 @@ class ThemeMembership:
     salience_rank: int
     story_count: int | None
     story_ids: tuple[int, ...]
+    #: A4c: the stored M5 content digest, and the ``cluster_fingerprint`` of
+    #: every story ``theme_stories`` links, in ``story_ids`` order -- what
+    #: the digest must recompute from.
+    fingerprint: str | None = None
+    member_keys: tuple[str | None, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1168,6 +1259,16 @@ class MemberEvidenceProvenance:
     external_id: str | None
     has_payload: bool
     has_feed_snapshot: bool
+    #: A4c: the logged ingestion run that inserted the row, and its
+    #: ``run_log`` row.  Unlike the descriptive fields above these *can*
+    #: establish origin, because the admin insert path cannot write them.
+    ingest_run_id: str | None = None
+    ingest_stage: str | None = None
+    ticker: str | None = None
+    #: The day the item belongs to, derived as everywhere else:
+    #: ``published_at``, falling back to ``fetched_at``.
+    effective_day: str | None = None
+    ingest_run: RunLogFacts | None = None
 
 
 @dataclass(frozen=True)
@@ -1365,6 +1466,23 @@ class PersistedSummaryGeneration:
         ):
             return None
         return float(sum(attempt.latency_ms or 0.0 for attempt in self.attempts))
+
+
+@dataclass(frozen=True)
+class SummaryArtifactProvenance:
+    """Which generation produced an artifact, and its run (A4c).
+
+    ``generation`` is the one ``outcome = 'accepted'`` row naming the
+    artifact (a partial unique index allows no second).  A
+    ``discarded_duplicate`` generation also names the artifact but produced
+    nothing, and a cache hit writes no generation at all, so neither can
+    appear here: the producer stays the original accepted generation.
+    ``run`` is that generation's ``run_log`` row for the summaries stage.
+    """
+
+    artifact_id: int
+    generation: PersistedSummaryGeneration | None
+    run: RunLogFacts | None
 
 
 #: Version tag folded into every artifact digest, so a future change to
@@ -1681,6 +1799,104 @@ def _summary_generations_on(
 #: an instance, and never reachable from the public API, so a caller cannot
 #: build a :class:`StageRunContext` even by copying every visible field.
 _CONTEXT_KEY = object()
+
+
+# ----------------------------------------------------------------------
+# A4c: who may write trusted provenance.
+#
+# Migration 017's triggers refuse any write that *sets* an ingest, story,
+# or theme-set binding unless ``phase0_provenance_write_authorized()`` --
+# an application function -- returns 1 on the connection doing the write.
+# Every connection this module opens registers it, bound to a grant that
+# is off; only :func:`_trusted_provenance_write` turns it on, for exactly
+# the statements a logged mutation binds with, and it needs a live
+# :class:`StageRunContext` to do so.  So:
+#
+# * knowing a run id authorizes nothing: ordinary SQL on an admin
+#   connection, or on any repository connection outside that window, is
+#   refused by the trigger;
+# * the grant belongs to one connection object (``_GRANTS``), so a
+#   concurrent connection cannot borrow it, and it is switched off in
+#   ``finally``, so an exception cannot leave it on;
+# * it holds no database state, so there is nothing to roll back or leak;
+#   the writes made under it roll back with their transaction;
+# * a bare ``sqlite3`` connection has no such function, and every write
+#   that could set a binding fails there with "no such function" -- closed.
+#
+# Code that registers its own function under this name, or drops the
+# triggers, is outside the trust boundary, like editing the file.
+# ----------------------------------------------------------------------
+
+PROVENANCE_GRANT_FUNCTION = "phase0_provenance_write_authorized"
+
+
+class _ProvenanceGrant:
+    """One connection's write authorization for provenance columns."""
+
+    __slots__ = ("_active",)
+
+    def __init__(self) -> None:
+        self._active = False
+
+    def __call__(self) -> int:
+        return 1 if self._active else 0
+
+
+#: ``id(connection) -> (connection, grant)`` for every open repository
+#: connection.  The entry holds the connection itself, so its id cannot be
+#: reused while the entry exists, and the lookup checks identity as well.
+#: Entries are removed when the repository closes the connection.
+_GRANTS: dict[int, tuple[sqlite3.Connection, _ProvenanceGrant]] = {}
+_GRANTS_LOCK = threading.Lock()
+
+
+def _register_grant(connection: sqlite3.Connection) -> None:
+    grant = _ProvenanceGrant()
+    connection.create_function(PROVENANCE_GRANT_FUNCTION, 0, grant, deterministic=False)
+    with _GRANTS_LOCK:
+        _GRANTS[id(connection)] = (connection, grant)
+
+
+def _close_connection(connection: sqlite3.Connection) -> None:
+    """Close a repository connection and drop its grant."""
+
+    with _GRANTS_LOCK:
+        entry = _GRANTS.get(id(connection))
+        if entry is not None and entry[0] is connection:
+            del _GRANTS[id(connection)]
+    connection.close()
+
+
+@contextmanager
+def _trusted_provenance_write(
+    connection: sqlite3.Connection, run: Any
+) -> Iterator[None]:
+    """Authorize provenance writes on ``connection`` for one logged binding.
+
+    ``run`` must be a :class:`StageRunContext` -- which nothing outside this
+    module can construct -- and the caller is inside that run's
+    ``_logged_mutation`` transaction.  Not re-entrant, and always off again
+    on the way out, whatever happened.
+    """
+
+    if not isinstance(run, StageRunContext):
+        raise Phase0RunContextError(
+            "trusted provenance is written only under a logged stage run"
+        )
+    with _GRANTS_LOCK:
+        entry = _GRANTS.get(id(connection))
+    if entry is None or entry[0] is not connection:
+        raise Phase0RunContextError(
+            "trusted provenance is written only on a repository connection"
+        )
+    grant = entry[1]
+    if grant._active:
+        raise Phase0RunContextError("a provenance grant is already open")
+    grant._active = True
+    try:
+        yield
+    finally:
+        grant._active = False
 
 
 # ----------------------------------------------------------------------
@@ -3042,18 +3258,9 @@ class Phase0Reader:
         """
 
         with self._snapshot() as connection:
-            matches = _summary_artifacts_on(
-                connection,
-                "theme_id = ? AND input_fingerprint = ? AND policy_fingerprint = ? "
-                "AND status = ?",
-                (
-                    _require_int(theme_id, "theme_id", minimum=1),
-                    _require_text(input_fingerprint, "input_fingerprint"),
-                    _require_text(policy_fingerprint, "policy_fingerprint"),
-                    SUMMARY_ARTIFACT_ACCEPTED,
-                ),
+            return _accepted_summary_artifact_on(
+                connection, theme_id, input_fingerprint, policy_fingerprint
             )
-        return matches[0] if matches else None
 
     def summary_artifacts(
         self,
@@ -3104,6 +3311,47 @@ class Phase0Reader:
             parameters.append(_require_int(theme_id, "theme_id", minimum=1))
         with self._snapshot() as connection:
             return _summary_generations_on(connection, where, parameters)
+
+    def summary_artifact_provenance(
+        self, artifact_id: int
+    ) -> SummaryArtifactProvenance:
+        """The accepted generation that produced ``artifact_id``, and its run.
+
+        One snapshot.  Facts only: :func:`phase0.provenance.verify_summary`
+        decides whether they establish the artifact's production origin.
+        """
+
+        with self._snapshot() as connection:
+            return _summary_artifact_provenance_on(connection, artifact_id)
+
+    @contextmanager
+    def review_snapshot(self) -> Iterator["ReviewSnapshot"]:
+        """One partition review's reads, all from one SQLite snapshot (A4c).
+
+        Opens one read-only connection, begins one read transaction, and
+        *establishes* its snapshot immediately with a read of the schema --
+        SQLite fixes a deferred transaction's snapshot at its first read, so
+        doing that first means no later read of this view can see a commit
+        that landed after it began.  In WAL mode writers keep committing
+        while it is open; this view keeps seeing the state it started with.
+
+        The :class:`ReviewSnapshot` it yields answers only the reads a
+        review verdict needs (population, accepted artifact, producer), all
+        on that connection.  On the way out -- normally or by exception --
+        the view is closed, the read transaction rolled back, and the
+        connection closed.  Read-only throughout: the connection is opened
+        ``mode=ro``, ``query_only``, under the read-only authorizer.
+        """
+
+        with self._snapshot() as connection:
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            view = ReviewSnapshot(_SNAPSHOT_KEY, connection)
+            try:
+                yield view
+            finally:
+                view._close()
+                with contextlib.suppress(sqlite3.Error):
+                    connection.rollback()
 
     def story(self, story_id: int) -> dict[str, Any] | None:
         return self._one(
@@ -3554,6 +3802,116 @@ class Phase0Reader:
         return int(rows[0]["total"])
 
 
+def _accepted_summary_artifact_on(
+    connection: sqlite3.Connection,
+    theme_id: int,
+    input_fingerprint: str,
+    policy_fingerprint: str,
+) -> PersistedSummaryArtifact | None:
+    """The accepted artifact for one exact generation key, on ``connection``."""
+
+    matches = _summary_artifacts_on(
+        connection,
+        "theme_id = ? AND input_fingerprint = ? AND policy_fingerprint = ? "
+        "AND status = ?",
+        (
+            _require_int(theme_id, "theme_id", minimum=1),
+            _require_text(input_fingerprint, "input_fingerprint"),
+            _require_text(policy_fingerprint, "policy_fingerprint"),
+            SUMMARY_ARTIFACT_ACCEPTED,
+        ),
+    )
+    return matches[0] if matches else None
+
+
+def _summary_artifact_provenance_on(
+    connection: sqlite3.Connection, artifact_id: int
+) -> SummaryArtifactProvenance:
+    """An artifact's accepted generation and its run, on ``connection``."""
+
+    identifier = _require_int(artifact_id, "artifact_id", minimum=1)
+    generations = _summary_generations_on(
+        connection,
+        "artifact_id = ? AND outcome = ?",
+        (identifier, SUMMARY_GENERATION_ACCEPTED),
+    )
+    generation = generations[0] if generations else None
+    run = None
+    if generation is not None:
+        rows = _rows(
+            connection,
+            f"""
+            SELECT {_run_log_columns("run_log", "log")}
+            FROM run_log WHERE run_id = ? AND stage = ?
+            """,
+            (generation.run_id, _provenance.SUMMARIES_STAGE),
+        )
+        run = _run_log_facts(rows[0], "log") if rows else None
+    return SummaryArtifactProvenance(
+        artifact_id=identifier, generation=generation, run=run
+    )
+
+
+#: Module-private construction key for :class:`ReviewSnapshot`.
+_SNAPSHOT_KEY = object()
+
+
+class ReviewSnapshot:
+    """The reads one partition review makes, answered from one snapshot (A4c).
+
+    Obtained only from :meth:`Phase0Reader.review_snapshot`, valid only
+    inside that block.  It exposes exactly the reads
+    :func:`phase0.summary_lifecycle.current_summary_artifact` and the A4b
+    sampler use -- the partition's population with every provenance fact,
+    the accepted artifact for a key, and that artifact's producing
+    generation with its run -- so a review verdict can be built entirely
+    from one committed state.  It holds no writable handle and returns no
+    connection.
+    """
+
+    __slots__ = ("_connection", "_open")
+
+    def __init__(self, _key: Any, connection: sqlite3.Connection) -> None:
+        if _key is not _SNAPSHOT_KEY:
+            raise Phase0ValidationError(
+                "a ReviewSnapshot is obtained from Phase0Reader.review_snapshot()"
+            )
+        self._connection = connection
+        self._open = True
+
+    def _close(self) -> None:
+        self._open = False
+        self._connection = None
+
+    def _require_open(self) -> sqlite3.Connection:
+        if not self._open or self._connection is None:
+            raise Phase0ValidationError("this review snapshot has been closed")
+        return self._connection
+
+    def theme_population(
+        self, ticker: str, trading_day: str | date, pipeline_version: str
+    ) -> ThemePopulation:
+        connection = self._require_open()
+        return _read_theme_population(
+            connection,
+            normalize_ticker(ticker),
+            _normalize_day(trading_day),
+            _require_text(pipeline_version, "pipeline_version"),
+        )
+
+    def summary_artifact(
+        self, theme_id: int, input_fingerprint: str, policy_fingerprint: str
+    ) -> PersistedSummaryArtifact | None:
+        return _accepted_summary_artifact_on(
+            self._require_open(), theme_id, input_fingerprint, policy_fingerprint
+        )
+
+    def summary_artifact_provenance(
+        self, artifact_id: int
+    ) -> SummaryArtifactProvenance:
+        return _summary_artifact_provenance_on(self._require_open(), artifact_id)
+
+
 def _read_theme_population(
     connection: sqlite3.Connection, symbol: str, day: str, version: str
 ) -> ThemePopulation:
@@ -3569,12 +3927,19 @@ def _read_theme_population(
 
     set_rows = _rows(
         connection,
-        """
-        SELECT id, method, method_reason, config_fingerprint,
+        f"""
+        SELECT theme_sets.id AS id, method, method_reason, config_fingerprint,
                algorithm_version, model_name, model_revision,
-               embedding_dimension, updated_at, source_metadata
+               embedding_dimension, updated_at, source_metadata,
+               build_run_id, build_story_signature,
+               build_story_signature_version,
+               {_run_log_columns("run_log", "log")}
         FROM theme_sets
-        WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
+        LEFT JOIN run_log
+          ON run_log.run_id = theme_sets.build_run_id
+         AND run_log.stage = '{_provenance.THEMES_STAGE}'
+        WHERE theme_sets.ticker = ? AND theme_sets.trading_day = ?
+          AND theme_sets.pipeline_version = ?
         """,
         (symbol, day, version),
     )
@@ -3603,15 +3968,25 @@ def _read_theme_population(
                 if row["source_metadata"] is None
                 else json.loads(row["source_metadata"])
             ),
+            build_run_id=row["build_run_id"],
+            build_story_signature=row["build_story_signature"],
+            # Passed through exactly as stored, never coerced: a REAL 1.5
+            # read as ``int`` would be version 1, and the verifier accepts
+            # only an exact ``int`` it recognizes.
+            build_story_signature_version=row["build_story_signature_version"],
+            build_run=_run_log_facts(row, "log"),
         )
         membership: dict[int, list[int]] = {}
+        member_keys: dict[int, list[str | None]] = {}
         for link in _rows(
             connection,
             """
             SELECT theme_stories.theme_id AS theme_id,
-                   theme_stories.story_id AS story_id
+                   theme_stories.story_id AS story_id,
+                   stories.cluster_fingerprint AS cluster_fingerprint
             FROM theme_stories
             JOIN themes ON themes.id = theme_stories.theme_id
+            LEFT JOIN stories ON stories.id = theme_stories.story_id
             WHERE themes.ticker = ? AND themes.trading_day = ?
               AND themes.pipeline_version = ?
             ORDER BY theme_stories.theme_id, theme_stories.story_id
@@ -3620,6 +3995,9 @@ def _read_theme_population(
         ):
             membership.setdefault(int(link["theme_id"]), []).append(
                 int(link["story_id"])
+            )
+            member_keys.setdefault(int(link["theme_id"]), []).append(
+                link["cluster_fingerprint"]
             )
         themes = [
             ThemeMembership(
@@ -3632,12 +4010,14 @@ def _read_theme_population(
                     None if theme["story_count"] is None else int(theme["story_count"])
                 ),
                 story_ids=tuple(membership.get(int(theme["id"]), ())),
+                fingerprint=theme["fingerprint"],
+                member_keys=tuple(member_keys.get(int(theme["id"]), ())),
             )
             for theme in _rows(
                 connection,
                 """
                 SELECT id, theme_key, label, label_source, salience_rank,
-                       story_count
+                       story_count, fingerprint
                 FROM themes
                 WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?
                 ORDER BY salience_rank, id
@@ -3686,10 +4066,15 @@ def _read_theme_population(
             external_id=item["external_id"],
             has_payload=bool(item["has_payload"]),
             has_feed_snapshot=bool(item["has_feed_snapshot"]),
+            ingest_run_id=item["ingest_run_id"],
+            ingest_stage=item["ingest_stage"],
+            ticker=item["ticker"],
+            effective_day=item["effective_day"],
+            ingest_run=_run_log_facts(item, "log"),
         )
         for item in _rows(
             connection,
-            """
+            f"""
             SELECT DISTINCT raw_items.id AS id, raw_items.source AS source,
                    raw_items.fetched_at AS fetched_at,
                    raw_items.ingest_status AS ingest_status,
@@ -3700,10 +4085,19 @@ def _read_theme_population(
                        SELECT 1 FROM raw_item_feeds
                        WHERE raw_item_feeds.raw_item_id = raw_items.id
                          AND raw_item_feeds.snapshot_id IS NOT NULL
-                   ) AS has_feed_snapshot
+                   ) AS has_feed_snapshot,
+                   raw_items.ingest_run_id AS ingest_run_id,
+                   raw_items.ingest_stage AS ingest_stage,
+                   raw_items.ticker AS ticker,
+                   substr(COALESCE(raw_items.published_at, raw_items.fetched_at),
+                          1, 10) AS effective_day,
+                   {_run_log_columns("run_log", "log")}
             FROM raw_items
             JOIN story_members ON story_members.raw_item_id = raw_items.id
             JOIN stories ON stories.id = story_members.story_id
+            LEFT JOIN run_log
+              ON run_log.run_id = raw_items.ingest_run_id
+             AND run_log.stage = raw_items.ingest_stage
             WHERE stories.ticker = ? AND stories.trading_day = ?
               AND stories.pipeline_version = ?
               AND stories.invalidated_at IS NULL
@@ -3781,12 +4175,19 @@ class Phase0Repository:
     def _open_connection(self) -> sqlite3.Connection:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.database_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        enforced = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        # A4c: every repository connection carries its own provenance grant,
+        # off (see ``_trusted_provenance_write``).
+        _register_grant(connection)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            enforced = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        except BaseException:
+            _close_connection(connection)
+            raise
         if not enforced:
-            connection.close()
+            _close_connection(connection)
             raise Phase0IntegrityError(
                 "SQLite refused to enable foreign-key enforcement"
             )
@@ -3834,7 +4235,7 @@ class Phase0Repository:
             connection.rollback()
             raise
         finally:
-            connection.close()
+            _close_connection(connection)
 
     def migrate(self) -> list[str]:
         """Apply every unapplied migration atomically; return their names."""
@@ -3849,7 +4250,7 @@ class Phase0Repository:
                 connection, migrations, legacy_upgrade=self._upgrade_legacy_v2
             )
         finally:
-            connection.close()
+            _close_connection(connection)
 
     def schema_version(self) -> int:
         with self._connect() as connection:
@@ -4308,23 +4709,47 @@ class Phase0Repository:
 
     @staticmethod
     def _insert_raw_item(
-        connection: sqlite3.Connection, values: Mapping[str, Any]
+        connection: sqlite3.Connection,
+        values: Mapping[str, Any],
+        run: StageRunContext | None = None,
     ) -> InsertResult:
-        cursor = connection.execute(
-            """
-            INSERT INTO raw_items (
-                source, ticker, title, description, url, canonical_url,
-                external_id, published_at, fetched_at, ingest_status,
-                validation_errors, raw_json
-            ) VALUES (
-                :source, :ticker, :title, :description, :url, :canonical_url,
-                :external_id, :published_at, :fetched_at, :ingest_status,
-                :validation_errors, :raw_json
-            )
-            ON CONFLICT(source, canonical_url) DO NOTHING
-            """,
-            values,
+        # Ingestion provenance (A4c) comes from the authorizing run and from
+        # nothing else: a payload key of the same name is never read.  With
+        # no run -- the admin path -- the columns are not written at all and
+        # stay NULL, which is what "origin not established" looks like.  A
+        # conflict inserts nothing, so the row keeps the provenance of the
+        # run that first wrote it.
+        columns = (
+            "source, ticker, title, description, url, canonical_url, "
+            "external_id, published_at, fetched_at, ingest_status, "
+            "validation_errors, raw_json"
         )
+        placeholders = (
+            ":source, :ticker, :title, :description, :url, :canonical_url, "
+            ":external_id, :published_at, :fetched_at, :ingest_status, "
+            ":validation_errors, :raw_json"
+        )
+        parameters = dict(values)
+        statement = (
+            "INSERT INTO raw_items ({columns}) VALUES ({placeholders}) "
+            "ON CONFLICT(source, canonical_url) DO NOTHING"
+        )
+        if run is None:
+            cursor = connection.execute(
+                statement.format(columns=columns, placeholders=placeholders),
+                parameters,
+            )
+        else:
+            parameters["ingest_run_id"] = run.run_id
+            parameters["ingest_stage"] = run.stage
+            with _trusted_provenance_write(connection, run):
+                cursor = connection.execute(
+                    statement.format(
+                        columns=columns + ", ingest_run_id, ingest_stage",
+                        placeholders=placeholders + ", :ingest_run_id, :ingest_stage",
+                    ),
+                    parameters,
+                )
         if cursor.rowcount:
             item_id = int(cursor.lastrowid)
             inserted = True
@@ -5241,6 +5666,7 @@ class Phase0Repository:
                 stories=stories,
                 delete_obsolete=delete_obsolete,
                 connection=connection,
+                build_run=context,
             )
             context._record_outcome(
                 success=len(report.inserted) + len(report.updated),
@@ -5368,6 +5794,7 @@ class Phase0Repository:
         stories: Sequence[StoryRecord],
         delete_obsolete: bool = True,
         connection: sqlite3.Connection | None = None,
+        build_run: StageRunContext | None = None,
     ) -> ReconciliationReport:
         """Reconcile stories with no run attached; see :attr:`admin`.
 
@@ -5388,6 +5815,21 @@ class Phase0Repository:
 
         An identical replay changes nothing, takes the ``unchanged`` path,
         and leaves the theme set exactly where it was.
+
+        **Provenance (A4c).**  ``build_run`` is supplied only by the
+        logged :meth:`reconcile_stories`: its live run, which is also what
+        authorizes the binding write (:func:`_trusted_provenance_write`).
+        Every story this call inserts or rewrites is bound to it as a last,
+        separate step;
+        migration 017's triggers have already cleared any binding the
+        content write left behind, so an admin call (no run) leaves the
+        rows it wrote unbound.  An unchanged story is left alone -- its
+        binding still names the run that wrote that exact content -- unless
+        it has none, in which case this run, having just compared its own
+        recomputation against the stored row and found them equal, binds
+        it.  That is a provenance write, not a content change: it is not
+        counted, it moves no signature (``build_run_id`` is outside
+        :data:`STORY_RECONCILED_COLUMNS`), and it invalidates nothing.
         """
 
         normalized_ticker = normalize_ticker(ticker)
@@ -5517,6 +5959,20 @@ class Phase0Repository:
                         (utc_now(), utc_now(), story_id),
                     )
                     invalidated.append(story_id)
+
+            if build_run is not None:
+                with _trusted_provenance_write(connection, build_run):
+                    for story_id in (*inserted, *updated):
+                        connection.execute(
+                            "UPDATE stories SET build_run_id = ? WHERE id = ?",
+                            (build_run.run_id, story_id),
+                        )
+                    for story_id in unchanged:
+                        connection.execute(
+                            "UPDATE stories SET build_run_id = ? "
+                            "WHERE id = ? AND build_run_id IS NULL",
+                            (build_run.run_id, story_id),
+                        )
 
             return ReconciliationReport(
                 inserted=tuple(inserted),
@@ -6127,6 +6583,13 @@ class Phase0Repository:
         the generation that won the race stays as it is.  Nothing retries
         automatically; the run is recorded failed and the next one reads
         the stories that are actually there.
+
+        **Provenance (A4c).**  Only a call that carried
+        ``expected_story_signature`` -- and so had it re-verified above --
+        binds the theme set (:meth:`_bind_theme_set`).  Without it nothing
+        is bound: migration 017 clears any binding the content write
+        disturbed, so the set reads as unverified rather than as built over
+        stories nobody checked.
         """
 
         with self._logged_mutation(
@@ -6176,6 +6639,15 @@ class Phase0Repository:
                 excluded=excluded,
                 connection=connection,
             )
+            if expected_story_signature is not None:
+                self._bind_theme_set(
+                    connection,
+                    normalized_ticker,
+                    day,
+                    version,
+                    run=context,
+                    story_signature=expected_story_signature,
+                )
             context._record_outcome(
                 # Rewriting the day's coverage, exclusions, or theme-set
                 # metadata is work this run did, whether or not any theme
@@ -6190,6 +6662,58 @@ class Phase0Repository:
             )
             context._merge_counts(report.counts)
             return report
+
+    @staticmethod
+    def _bind_theme_set(
+        connection: sqlite3.Connection,
+        ticker: str,
+        day: str,
+        version: str,
+        *,
+        run: StageRunContext,
+        story_signature: str,
+    ) -> None:
+        """Bind the partition's theme set to this run and verified signature.
+
+        Called last, inside the logged theme reconciliation, after the
+        signature was re-verified on this transaction.  A binding that
+        survived the reconciliation already names the run that wrote this
+        exact output over this exact signature -- migration 017 clears it
+        on any content write -- so it is left alone: an identical replay
+        changes nothing, not even provenance, and the binding follows the
+        run that last *wrote* the output, not the last one to look at it.
+        A missing, differently-signed, or older-format binding is replaced,
+        because this run has just verified the stored output over this
+        signature.  Not counted: it is provenance, not content.
+        """
+
+        row = connection.execute(
+            "SELECT id, build_run_id, build_story_signature, "
+            "build_story_signature_version FROM theme_sets "
+            "WHERE ticker = ? AND trading_day = ? AND pipeline_version = ?",
+            (ticker, day, version),
+        ).fetchone()
+        if row is None:
+            return
+        if (
+            row["build_run_id"] is not None
+            and row["build_story_signature"] == story_signature
+            and row["build_story_signature_version"]
+            == _provenance.STORY_SIGNATURE_VERSION
+        ):
+            return
+        with _trusted_provenance_write(connection, run):
+            connection.execute(
+                "UPDATE theme_sets SET build_run_id = ?, "
+                "build_story_signature = ?, build_story_signature_version = ? "
+                "WHERE id = ?",
+                (
+                    run.run_id,
+                    story_signature,
+                    _provenance.STORY_SIGNATURE_VERSION,
+                    int(row["id"]),
+                ),
+            )
 
     def clear_theme_set(
         self,
@@ -8338,7 +8862,7 @@ class Phase0Repository:
                 connection.rollback()
             raise
         finally:
-            connection.close()
+            _close_connection(connection)
 
     @staticmethod
     def _already_succeeded(
@@ -8929,7 +9453,7 @@ class Phase0Repository:
             raise
         finally:
             if connection is not None:
-                connection.close()
+                _close_connection(connection)
         if terminal and committed and context is not None:
             # Durable first, then said out loud.
             context._transition(RUN_STATE_TERMINAL_SUCCEEDED)
@@ -9139,7 +9663,10 @@ class Phase0Repository:
         ) as (connection, context):
             prepared = [self._prepare_raw_item(item) for item in items]
             self._assert_raw_item_partition(connection, prepared, context)
-            results = [self._insert_raw_item(connection, values) for values in prepared]
+            results = [
+                self._insert_raw_item(connection, values, context)
+                for values in prepared
+            ]
             if source_state is not None:
                 self._set_source_state(
                     connection,
@@ -10116,6 +10643,9 @@ __all__ = [
     "OtherCoveragePlacement",
     "ExcludedPlacement",
     "MemberEvidenceProvenance",
+    "ReviewSnapshot",
+    "RunLogFacts",
+    "SummaryArtifactProvenance",
     "ThemePopulation",
     "StoryGeneration",
     "StoryGenerationConflict",

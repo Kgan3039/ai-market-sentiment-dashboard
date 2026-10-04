@@ -588,6 +588,92 @@ subject to the retry policy.
 An accepted summary is structurally grounded and copy-policy valid, as A2
 defines it. Nothing here establishes semantic faithfulness (G2, A4b).
 
+## Production provenance (A4c)
+
+Migration 017 links every row a served summary depends on to the logged
+stage run that wrote it, so a reviewer (A4b) can *derive* whether the
+evidence came through the pipeline instead of assuming it. There is no
+provenance table: each link is a nullable column naming a `run_log` row by
+`(run_id, stage)`, and `phase0/provenance.py` is the one definition of
+whether a link verifies.
+
+| Row | Column(s) | Written by | Meaning |
+|---|---|---|---|
+| `raw_items` | `ingest_run_id`, `ingest_stage` | `ingest_raw_items`, at INSERT only, from the run context | the logged ingestion run that inserted the row |
+| `stories` | `build_run_id` | logged `reconcile_stories`, as a separate last step | the story run that last wrote this content |
+| `theme_sets` | `build_run_id`, `build_story_signature`, `build_story_signature_version` | logged `reconcile_themes`, only when it carried `expected_story_signature` | the theme run that last wrote the partition's theme output, and the story-generation signature it re-verified before writing |
+| `summary_artifacts` | *(none added)* | — | the one `accepted` `summary_generations` row naming the artifact, and its `run_id` |
+
+**What "verified" checks, per hop.** The named `run_log` row exists for the
+expected stage, covers the row's partition (ticker, day, and pipeline
+version for derived stages; the item's effective day for ingestion), and
+carries a `last_mutation_id` — a logged repository mutation happened under
+it (a row written by `Phase0Admin.log_stage` has none). Ingestion
+additionally requires `replay = 0` and a stage of `fetch_yahoo` or
+`ingest_rss`. A theme build additionally requires its stored signature, under
+a recognized `STORY_SIGNATURE_VERSION`, to equal the partition's current
+story-generation signature, and every theme's stored `fingerprint` to
+recompute from its persisted membership. A summary's producer is its
+`accepted` generation only: a `discarded_duplicate` row names the artifact
+but produced nothing, and a cache hit writes no generation.
+
+**Health is not provenance.** A run's final `status` is recorded and never
+required: a run can admit evidence and settle `degraded` or `failed`
+because a later operation failed.
+
+**Untrusted writes cannot keep a binding.** Triggers clear a story's or
+theme set's binding on any write to the content it attests (the row, its
+members, conflicts, merges, themes, memberships, citations, coverage,
+exclusions) that does not itself re-bind. The logged paths re-bind as their
+last statement; the admin paths and raw SQL do not, so after them the
+binding is gone rather than stale. Raw-item provenance is write-once — no
+UPDATE may set, change, or clear it — and the evidence it attests (`title`,
+`description`, `url`, `raw_json`, …) is frozen with it. A historical row
+therefore stays unverified permanently: a later re-fetch proves the URL,
+not what the stored row was made from.
+
+**Only the repository can set a binding.** Knowing a valid run id
+authorizes nothing. Every write that sets, copies, or restores a binding —
+an INSERT carrying one, or an UPDATE that changes one to a non-NULL value —
+is refused by a trigger unless the writing connection's
+`phase0_provenance_write_authorized()` returns 1. The repository registers
+that function on each connection it opens, switched off, and switches it on
+(`_trusted_provenance_write`) only around the binding statements of a
+logged mutation, for the live `StageRunContext` doing it. The grant is
+Python state on that one connection object: a concurrent connection cannot
+borrow it, it is switched off in `finally`, and the writes made under it
+roll back with their transaction. A bare `sqlite3` connection has no such
+function, so there every write that could set a binding fails.
+
+**Idempotency is unchanged.** None of the columns is part of any content
+signature or reconciled-column list, so binding moves no signature,
+invalidates nothing, and is not counted as a change. An identical rerun
+writes nothing, and the binding keeps naming the run that wrote the
+content. A logged rerun that finds an unchanged but *unbound* story, or a
+theme set whose binding is missing or stale, binds it — it has just
+recomputed exactly that content.
+
+**The claim, exactly.** The persisted content is linked through
+repository-controlled logged stage writes and existing deterministic
+content digests. It is **not** proof that a network fetch happened, not a
+signature or attestation, and says nothing about host, build, or CI
+identity. Ordinary SQL — including through `Phase0Admin.connect_writable`
+with the triggers intact — can clear a binding but never set one. Outside
+the boundary: dropping the triggers, registering an impostor
+`phase0_provenance_write_authorized`, or otherwise editing the SQLite file
+(after which `run_log` and every binding can be forged).
+
+**Sampling reads one snapshot per partition.** A4b reads each partition
+inside `Phase0Reader.review_snapshot()`: one read-only connection, one
+SQLite read transaction whose snapshot is established before the first
+partition read, held open through the population (theme build, stories, raw
+items, every joined run), each theme's current artifact, and each artifact's
+producing generation and run, then rolled back and closed — on success or
+error. Every fact a partition's review verdict rests on is therefore from
+one committed state; in WAL mode, writers keep committing meanwhile and this
+pass simply does not see them. This is transactional read consistency
+within one database file, not a cross-machine or cryptographic snapshot.
+
 ## Replay
 
 `--replay` calls I3's `reclassify_persisted`. It reads persisted evidence
