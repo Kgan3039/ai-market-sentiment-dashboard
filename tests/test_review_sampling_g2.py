@@ -18,7 +18,7 @@ import os
 import re
 import socket
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -29,6 +29,7 @@ import nlp.eval.faithfulness as g2
 import nlp.eval.review as review
 import phase0.summary_lifecycle as lifecycle
 from nlp.dedup.selection import cluster_fingerprint_for
+from nlp.themes import theme_fingerprint_for
 from phase0.models import (
     OtherCoverageRecord,
     StoryMemberRecord,
@@ -125,23 +126,32 @@ class Client:
         )
 
 
-def _insert_item(repository, ticker, day, outlet, stamp):
+def _insert_item(repository, ticker, day, outlet, stamp, *, logged=False):
+    """One raw item: through the admin path, or (A4c) a logged ingestion run."""
+
     index = next(_ITEMS)
-    [result] = repository.admin.insert_raw_items(
-        [
-            {
-                "source": f"yahoo:{outlet}",
-                "ticker": ticker,
-                "title": f"{outlet} headline {index}",
-                "description": f"{outlet} standfirst {index}.",
-                "url": f"https://{outlet.lower()}.example/{index}",
-                "canonical_url": f"https://{outlet.lower()}.example/{index}",
-                "published_at": stamp,
-                "fetched_at": f"{day}T11:00:00+00:00",
-                "raw_json": {"index": index},
-            }
-        ]
-    )
+    item = {
+        "source": f"yahoo:{outlet}",
+        "ticker": ticker,
+        "title": f"{outlet} headline {index}",
+        "description": f"{outlet} standfirst {index}.",
+        "url": f"https://{outlet.lower()}.example/{index}",
+        "canonical_url": f"https://{outlet.lower()}.example/{index}",
+        "published_at": stamp,
+        "fetched_at": f"{day}T11:00:00+00:00",
+        "raw_json": {"index": index},
+    }
+    if not logged:
+        [result] = repository.admin.insert_raw_items([item])
+        return result.item_id
+    with repository.stage_run(
+        run_id=f"ingest-{next(_RUNS)}",
+        stage="fetch_yahoo",
+        trading_day=day,
+        pipeline_version=VERSION,
+        ticker=ticker,
+    ) as run:
+        [result] = repository.ingest_raw_items([item], run=run, terminal=True)
     return result.item_id
 
 
@@ -175,8 +185,27 @@ def _story(ticker, item_id, title, outlet, stamp):
     )
 
 
-def seed(world, ticker, day, themes=(2, 1), other=1, generation=0):
-    """One partition through the real reconciliation paths; theme ids by rank."""
+def seed(
+    world,
+    ticker,
+    day,
+    themes=(2, 1),
+    other=1,
+    generation=0,
+    *,
+    logged_ingest=False,
+    bound_themes=False,
+):
+    """One partition through the real reconciliation paths; theme ids by rank.
+
+    By default raw items go in through the admin path and themes carry
+    synthetic fingerprints and no verified signature -- a world whose
+    content is real but whose production origin is not established.
+    ``logged_ingest`` admits the raw items through a logged ingestion run,
+    and ``bound_themes`` builds the themes the way M5 does (real content
+    fingerprints, the story signature carried and re-verified), so that
+    together they produce a chain A4c verifies.
+    """
 
     repository = world.repository
     groups = [
@@ -188,7 +217,9 @@ def seed(world, ticker, day, themes=(2, 1), other=1, generation=0):
     for title in [t for group in groups for t in group] + others:
         outlet = OUTLETS[sequence % len(OUTLETS)]
         stamp = f"{day}T10:{sequence:02d}:00+00:00"
-        item = _insert_item(repository, ticker, day, outlet, stamp)
+        item = _insert_item(
+            repository, ticker, day, outlet, stamp, logged=logged_ingest
+        )
         records.append(_story(ticker, item, title, outlet, stamp))
         sequence += 1
     with repository.stage_run(
@@ -219,12 +250,19 @@ def seed(world, ticker, day, themes=(2, 1), other=1, generation=0):
             ]
             for row in rows
         }
+    keys = {row["id"]: row["cluster_fingerprint"] for row in rows}
     theme_records = []
     for n, group in enumerate(groups):
         members = [by_title[t] for t in group]
         theme_records.append(
             ThemeRecord(
-                fingerprint=f"fp-{ticker}-{day}-{generation}-{n}-{members[0]}",
+                fingerprint=(
+                    theme_fingerprint_for(
+                        ticker, date.fromisoformat(day), [keys[m] for m in members]
+                    )
+                    if bound_themes
+                    else f"fp-{ticker}-{day}-{generation}-{n}-{members[0]}"
+                ),
                 theme_key=f"key-{ticker}-{day}-{n}",
                 label=f"Theme {n}",
                 label_source="canonical_story_title",
@@ -236,6 +274,11 @@ def seed(world, ticker, day, themes=(2, 1), other=1, generation=0):
             )
         )
     other_ids = [by_title[t] for t in others]
+    signature = (
+        repository.story_generation(ticker, day, VERSION).signature
+        if bound_themes
+        else None
+    )
     with repository.stage_run(
         run_id=f"seed-{next(_RUNS)}",
         stage="themes",
@@ -266,6 +309,7 @@ def seed(world, ticker, day, themes=(2, 1), other=1, generation=0):
                 for index, story_id in enumerate(other_ids)
             ],
             excluded=[],
+            expected_story_signature=signature,
             terminal=True,
         )
     population = repository.read.theme_population(ticker, day, VERSION)
@@ -722,26 +766,34 @@ def test_an_artifact_current_for_another_input_skips_the_partition(world, monkey
     assert all((a["trading_day"], a["ticker"]) != (D1, "TSLA") for a in pop.artifacts)
 
 
-def test_a_population_that_moves_between_reads_is_skipped(world, monkeypatch, tmp_path):
+def test_a_partition_whose_projection_disagrees_is_skipped(
+    world, monkeypatch, tmp_path
+):
+    """Within one review snapshot the lifecycle's projection and the
+    enumeration read the same rows; if they ever disagree the partition is
+    skipped, and a selected day holding it is an incomplete census."""
+
     standard_world(world)
-    real = Phase0Reader.theme_population
-    reads: dict[tuple, int] = {}
+    from phase0.summaries import build_generation_input
 
-    def moving(self, ticker, day, version):
-        found = real(self, ticker, day, version)
-        key = (ticker, str(day))
-        reads[key] = reads.get(key, 0) + 1
-        if key == ("NVDA", D2) and reads[key] > 1:
-            return dataclasses.replace(found, themes=())
-        return found
-
-    monkeypatch.setattr(Phase0Reader, "theme_population", moving)
-    pop = population(world)
-    nvda = next(
-        p for p in pop.partitions if (p["trading_day"], p["ticker"]) == (D2, "NVDA")
+    tsla = Phase0Reader(world.path).theme_population("TSLA", D2, VERSION)
+    other_input = build_generation_input(
+        tsla, sorted(tsla.themes, key=lambda t: t.salience_rank)[1].theme_id
     )
-    assert nvda["outcome"] == g2.PARTITION_POPULATION_CHANGED
-    # A selected day with a skipped partition is an incomplete census.
+    real = g2.current_summary_artifact
+
+    def drifted(snapshot, ticker, day, *args, **kwargs):
+        found = real(snapshot, ticker, day, *args, **kwargs)
+        if found is None or (ticker, day) != ("TSLA", D2):
+            return found
+        return dataclasses.replace(found, generation_input=other_input)
+
+    monkeypatch.setattr(g2, "current_summary_artifact", drifted)
+    pop = population(world)
+    skipped = next(
+        p for p in pop.partitions if (p["trading_day"], p["ticker"]) == (D2, "TSLA")
+    )
+    assert skipped["outcome"] == g2.PARTITION_POPULATION_CHANGED
     drawn = next(
         d
         for n in range(50)
@@ -755,6 +807,32 @@ def test_a_population_that_moves_between_reads_is_skipped(world, monkeypatch, tm
     card = g2.score_g2(g2.score_sentence_round(g2.read_manifest(manifest_path), [a]))
     assert card.review_complete is False
     assert any("changed while sampling" in i for i in card.incompleteness)
+
+
+def test_a_population_moved_by_a_concurrent_writer_is_judged_on_its_snapshot(
+    world, monkeypatch
+):
+    """A concurrent rebuild commits mid-read: this pass sees the state it
+    opened, wholly, and reviews it; it never mixes in the rebuild."""
+
+    standard_world(world)
+    real = g2.current_summary_artifact
+    fired = []
+
+    def moving(snapshot, ticker, day, *args, **kwargs):
+        if (ticker, day) == ("NVDA", D2) and not fired:
+            fired.append(True)
+            seed(world, "NVDA", D2, themes=(1, 2), generation=1)
+        return real(snapshot, ticker, day, *args, **kwargs)
+
+    monkeypatch.setattr(g2, "current_summary_artifact", moving)
+    pop = population(world)
+    nvda = next(
+        p for p in pop.partitions if (p["trading_day"], p["ticker"]) == (D2, "NVDA")
+    )
+    assert fired
+    assert nvda["outcome"] == g2.PARTITION_ENUMERATED
+    assert nvda["reviewed_artifact_ids"]  # the pre-rebuild artifact, current then
 
 
 # ----------------------------------------------------------------------
@@ -1139,12 +1217,12 @@ def test_the_threshold_is_compared_exactly(positive, resolved, met):
         assert rate == positive / resolved
 
 
-def _twenty_sentence_world(world):
+def _twenty_sentence_world(world, **production):
     """Exactly two eligible days, ten sentences each: five two-sentence summaries."""
 
     for day in (D1, D2):
         for ticker, count in (("TSLA", 3), ("NVDA", 2)):
-            ids = seed(world, ticker, day, themes=(1,) * count, other=0)
+            ids = seed(world, ticker, day, themes=(1,) * count, other=0, **production)
             for theme_id in ids:
                 summarize(world, ticker, day, theme_id)
 
@@ -1167,11 +1245,11 @@ def test_nineteen_of_twenty_meets_the_threshold_and_is_still_not_a_pass(
 
 @pytest.fixture
 def eligible_machinery(monkeypatch):
-    """What a later reviewed change would have to supply, stood in for.
+    """A ratified protocol, stood in for: K3 has not ratified one.
 
-    Nothing produces verified origin or build binding today, and no G2
-    protocol is ratified; these patches show the precedence would work once
-    all three exist, and that each alone still blocks.
+    Verified origin and theme-build binding are *not* stood in for (A4c):
+    ``_twenty`` produces them, or withholds them, through the real write
+    paths, and the scorer derives them from the manifest's facts.
     """
 
     protocol = review.Protocol(
@@ -1181,16 +1259,11 @@ def eligible_machinery(monkeypatch):
         adjudicated_states=frozenset({review.AdjudicationState.UNANIMOUS}),
     )
     monkeypatch.setattr(g2, "RATIFIED_G2_PROTOCOLS", {"k3-g2-test": protocol})
-    monkeypatch.setattr(
-        g2,
-        "classify_generation_binding",
-        lambda population: (review.GENERATION_BINDING_VERIFIED, "sig"),
-    )
     return monkeypatch
 
 
-def _twenty(world, tmp_path, protocol, verdicts):
-    _twenty_sentence_world(world)
+def _twenty(world, tmp_path, protocol, verdicts, *, logged_ingest=True):
+    _twenty_sentence_world(world, logged_ingest=logged_ingest, bound_themes=True)
     drawn = g2.sample_sentences(population(world, days=(D1, D2)), seed="t")
     manifest = g2.build_manifest(
         drawn, csv_name="t.csv", protocol_id=protocol, code=CODE
@@ -1206,20 +1279,23 @@ def _twenty(world, tmp_path, protocol, verdicts):
 def test_unverified_origin_alone_prevents_eligibility(
     world, tmp_path, eligible_machinery
 ):
-    card = g2.score_g2(_twenty(world, tmp_path, "k3-g2-test", lambda i: "supported"))
-    assert card.eligibility_blockers == (
-        f"origin is unverified: {review.UNVERIFIED_DETAIL}",
+    # Raw items through the admin path: every content digest still holds.
+    card = g2.score_g2(
+        _twenty(
+            world, tmp_path, "k3-g2-test", lambda i: "supported", logged_ingest=False
+        )
     )
+    [blocker] = card.eligibility_blockers
+    assert blocker.startswith("origin is unverified: ")
+    assert "has no ingestion provenance" in blocker
     assert card.gate_result is review.GateResult.NOT_ELIGIBLE
 
 
 def test_an_unratified_protocol_alone_prevents_eligibility(
     world, tmp_path, eligible_machinery
 ):
-    eligible_machinery.setattr(
-        g2, "classify_origin", lambda source: (review.OriginStatus.VERIFIED_LIVE, "t")
-    )
     card = g2.score_g2(_twenty(world, tmp_path, "unratified", lambda i: "supported"))
+    assert card.origin_status is review.OriginStatus.VERIFIED_LIVE
     # Unratified: the protocol is refused, and so is its adjudication state,
     # because an unratified protocol counts nothing as adjudicated.
     assert len(card.eligibility_blockers) == 2
@@ -1236,9 +1312,6 @@ def test_an_unratified_protocol_alone_prevents_eligibility(
 def test_the_precedence_reaches_pass_or_fail_only_when_everything_holds(
     world, tmp_path, eligible_machinery, unsupported, result
 ):
-    eligible_machinery.setattr(
-        g2, "classify_origin", lambda source: (review.OriginStatus.VERIFIED_LIVE, "t")
-    )
     card = g2.score_g2(
         _twenty(
             world,

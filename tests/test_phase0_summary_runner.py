@@ -1338,7 +1338,11 @@ def test_replay_capability_is_explicit():
 
 
 def test_no_new_migration(repository):
+    """The summary runner owns no schema: the latest migration is A4c's
+    provenance binding, which adds no summary column."""
+
     migrations = sorted((ROOT / "phase0" / "migrations").glob("*.sql"))
-    assert not list((ROOT / "phase0" / "migrations").glob("017*"))
-    assert migrations[-1].name == "016_summary_artifacts.sql"
-    assert repository.schema_version() == 16
+    assert not list((ROOT / "phase0" / "migrations").glob("018*"))
+    assert migrations[-1].name == "017_review_provenance_binding.sql"
+    assert "summary_" not in migrations[-1].read_text()
+    assert repository.schema_version() == 17

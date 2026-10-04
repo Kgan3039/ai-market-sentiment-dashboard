@@ -3648,6 +3648,10 @@ def test_every_story_column_is_owned_or_deliberately_exempt(tmp_path):
         "canonical_item_id",  # written after members; compared separately
         "invalidated_at",  # compared separately, as liveness
         "updated_at",  # bookkeeping this class sets itself
+        # A4c provenance: *who* wrote the content, never part of it.  Were
+        # it compared, binding a story would read as rewriting it and
+        # invalidate the day's themes.
+        "build_run_id",
     }
 
     assert columns == set(STORY_RECONCILED_COLUMNS) | not_owned
@@ -4236,6 +4240,10 @@ def test_every_theme_set_column_is_owned_or_deliberately_exempt(tmp_path):
         "trading_day",
         "pipeline_version",  # partition identity: what pairs the rows up
         "updated_at",  # bookkeeping about the write, not an output
+        # A4c provenance: which verified build wrote the output, not output.
+        "build_run_id",
+        "build_story_signature",
+        "build_story_signature_version",
     }
 
     assert columns == set(THEME_SET_RECONCILED_COLUMNS) | not_owned
@@ -5480,6 +5488,8 @@ READER_PROBES = {
     "summary_artifact": ((1, "a" * 64, "b" * 64), {}),
     "summary_artifacts": (("NVDA", "2026-08-20", "v1"), {}),
     "summary_generations": (("NVDA", "2026-08-20", "v1"), {}),
+    "summary_artifact_provenance": ((1,), {}),
+    "review_snapshot": ((), {}),
 }
 
 
@@ -5556,6 +5566,9 @@ def test_every_reader_method_returns_plain_data(tmp_path):
     )
 
     for name, (args, kwargs) in READER_PROBES.items():
+        if name == "review_snapshot":
+            _probe_review_snapshot(repository)
+            continue
         result = getattr(repository.read, name)(*args, **kwargs)
         values = result if isinstance(result, list) else [result]
         for value in values:
@@ -5568,6 +5581,35 @@ def test_every_reader_method_returns_plain_data(tmp_path):
                     name,
                     item,
                 )
+
+
+def _probe_review_snapshot(repository):
+    """The one reader method that is a context: its view hands nothing out.
+
+    It yields a view, not data, so the probe enters it: the view must not be
+    a connection, must expose exactly its three reads and none of the escape
+    hatches, must return plain frozen data from them, and must refuse to be
+    used once its block has ended.
+    """
+
+    with repository.read.review_snapshot() as view:
+        assert not isinstance(view, (sqlite3.Connection, sqlite3.Cursor))
+        assert _public_names(type(view)) == {
+            "theme_population",
+            "summary_artifact",
+            "summary_artifact_provenance",
+        }
+        for attribute in ESCAPE_HATCHES:
+            assert not hasattr(view, attribute), attribute
+        population = view.theme_population("NVDA", DAY, "v1")
+        assert dataclasses.is_dataclass(population)
+        for item in _plain_values(population):
+            assert not isinstance(item, (sqlite3.Connection, sqlite3.Cursor))
+        assert view.summary_artifact(1, "a" * 64, "b" * 64) is None
+        produced = view.summary_artifact_provenance(1)
+        assert produced.generation is None and produced.run is None
+    with pytest.raises(Phase0ValidationError, match="closed"):
+        view.theme_population("NVDA", DAY, "v1")
 
 
 @pytest.mark.parametrize("attribute", ESCAPE_HATCHES)
@@ -9420,13 +9462,30 @@ def marker_column_lent(database: Path):
 
     pristine = schema_snapshot(Phase0Repository(database))
     with Phase0Repository(database).admin.connect_writable() as connection:
-        connection.execute("ALTER TABLE run_log ADD COLUMN last_mutation_id TEXT")
+        for table, column, kind in LENT_COLUMNS:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
     try:
         yield
     finally:
         with Phase0Repository(database).admin.connect_writable() as connection:
-            connection.execute("ALTER TABLE run_log DROP COLUMN last_mutation_id")
+            for table, column, _ in reversed(LENT_COLUMNS):
+                connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
         assert schema_snapshot(Phase0Repository(database)) == pristine
+
+
+#: What today's logged writers need on a pre-016 database: 016's mutation
+#: marker, and 017's provenance columns (A4c), which the logged ingestion,
+#: story, and theme paths write.  Lent bare -- no constraints, no triggers
+#: -- and dropped again, exactly like the marker.
+LENT_COLUMNS = (
+    ("run_log", "last_mutation_id", "TEXT"),
+    ("raw_items", "ingest_run_id", "TEXT"),
+    ("raw_items", "ingest_stage", "TEXT"),
+    ("stories", "build_run_id", "TEXT"),
+    ("theme_sets", "build_run_id", "TEXT"),
+    ("theme_sets", "build_story_signature", "TEXT"),
+    ("theme_sets", "build_story_signature_version", "INTEGER"),
+)
 
 
 def v13_repository(tmp_path, name="v13.sqlite3"):
@@ -14307,8 +14366,12 @@ def test_016_adds_the_mutation_marker_to_run_log_and_leaves_history_null(
     arrive together, on a fresh database and on an upgrade from 15, and
     no row written before it is made invalid by it."""
 
-    assert LATEST_VERSION == 16
-    assert not list(MIGRATIONS_PATH.glob("017_*"))
+    assert LATEST_VERSION >= 16
+    # Later migrations add provenance elsewhere (017) and leave run_log's
+    # shape to 016 alone.
+    for later in MIGRATIONS_PATH.glob("0*.sql"):
+        if int(later.name.split("_", 1)[0]) > 16:
+            assert "ALTER TABLE run_log" not in later.read_text()
     # Fresh: the column is there, nullable, no default, not a key.
     fresh = migrated(tmp_path, "fresh.sqlite3")
     column = _run_log_columns(fresh)["last_mutation_id"]
@@ -14337,8 +14400,9 @@ def test_016_adds_the_mutation_marker_to_run_log_and_leaves_history_null(
             (f"{DAY}T12:00:00+00:00", f"{DAY}T12:00:01+00:00", DAY),
         )
     upgraded = Phase0Repository(database)
-    assert upgraded.migrate() == ["016_summary_artifacts.sql"]
-    assert upgraded.schema_version() == 16
+    applied = upgraded.migrate()
+    assert applied[0] == "016_summary_artifacts.sql"
+    assert upgraded.schema_version() == LATEST_VERSION
     assert _run_log_columns(upgraded) == _run_log_columns(fresh)
     assert schema_snapshot(upgraded) == schema_snapshot(fresh)
     [historical] = upgraded.read.run_log_rows(run_id="historical")

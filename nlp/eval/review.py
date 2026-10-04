@@ -19,14 +19,15 @@ healthy output.
 **Origin is a fact about persistence, not a claim anyone makes.**  A row
 that came out of SQLite is not thereby real ingested evidence:
 ``Phase0Admin.insert_raw_items`` writes rows indistinguishable from fetched
-ones, and ``raw_items`` carries no link to the run that fetched it.  So
-every sample carries an :class:`OriginStatus` derived from *how it was
-read*: ``SYNTHETIC`` for the committed fixture, ``UNVERIFIED`` for any
-database.  ``VERIFIED_LIVE`` exists in the vocabulary and has no producer:
-persistence would have to link each raw item structurally to the fetch
-run that wrote it, and a reviewed code change would then classify it.  An
-operator's attestation is recorded on the manifest as audit metadata and
-changes nothing.
+ones.  Since A4c, persistence links each raw item, story, and theme set to
+the logged run that wrote it (:mod:`phase0.provenance`), and the G2
+manifest records those facts so its scorer can derive ``VERIFIED_LIVE``.
+**An A4a manifest records none of them**, so every A4a sample still
+carries the :class:`OriginStatus` derived from *how it was read*:
+``SYNTHETIC`` for the committed fixture, ``UNVERIFIED`` for any database.
+Extending the A4a manifest is its own reviewed change.  An operator's
+attestation is recorded on the manifest as audit metadata and changes
+nothing.
 
 **Authority.**  A gate is scored only from artifacts that can be held to
 something: the sample manifest (whose captured snapshot is
@@ -103,13 +104,12 @@ SOURCE_PERSISTED = "persisted"
 SOURCE_FIXTURE = "fixture"
 
 #: Whether a theme set is known to have been built over the story
-#: generation it now sits on.  Nothing persisted records the generation a
-#: set was built from -- ``reconcile_themes`` checks the signature inside
-#: its transaction and drops it -- so a database set is ``unverified``: the
-#: *current* signature is reported as current and proves nothing about the
-#: build.  A fixture set is clustered in-process, so build and current are
-#: one act.  ``verified`` has no producer until persistence keeps the
-#: build-time signature.
+#: generation it now sits on.  Since A4c persistence keeps the build-time
+#: signature (``theme_sets.build_story_signature``), and the G2 scorer
+#: derives ``verified`` from facts its manifest records.  An A4a manifest
+#: records only the *current* signature, which proves nothing about the
+#: build, so an A4a database set stays ``unverified``.  A fixture set is
+#: clustered in-process, so build and current are one act.
 GENERATION_BINDING_VERIFIED = "verified"
 GENERATION_BINDING_UNVERIFIED = "unverified"
 GENERATION_BINDING_IN_PROCESS = "in_process"
@@ -542,12 +542,13 @@ class Population:
 def classify_generation_binding(population: Any) -> tuple[str, str | None]:
     """Whether a persisted theme set is known to be built over its stories.
 
-    Returns ``(binding, build_signature)``.  Nothing persisted records the
-    story generation a set was built over -- ``reconcile_themes`` verifies
-    the signature inside its transaction and does not keep it -- so this
-    is ``(unverified, None)`` for every database set.  When persistence
-    keeps the build-time signature, this is where it is read and compared
-    with ``population.stories.signature``, in a reviewed change.
+    Returns ``(binding, build_signature)``: ``(unverified, None)`` for
+    every database set, deliberately.  Persistence now keeps the build-time
+    signature (A4c), but the A4a manifest does not record the facts that
+    would let its scorer re-derive a verdict offline, and a status string
+    alone is not evidence.  Reading ``PersistedThemeSet.build_*`` here is
+    the A4a manifest upgrade, a reviewed change of its own; G2's
+    derivation is :func:`nlp.eval.faithfulness.reviewed_bindings`.
     """
 
     return GENERATION_BINDING_UNVERIFIED, None
@@ -1149,9 +1150,9 @@ def load_fixture_population(
 
 
 UNVERIFIED_DETAIL = (
-    "persisted rows whose ingestion origin cannot be established: raw_items "
-    "carries no link to a fetch run, and Phase0Admin.insert_raw_items writes "
-    "rows identical to fetched ones"
+    "persisted rows whose ingestion origin cannot be established from this "
+    "sample: it records no per-row production provenance, and "
+    "Phase0Admin.insert_raw_items writes rows identical to fetched ones"
 )
 SYNTHETIC_DETAIL = "authored for development by the fixture's own declaration"
 
@@ -1160,11 +1161,11 @@ def classify_origin(source: Mapping[str, Any]) -> tuple[OriginStatus, str]:
     """Where the rows came from, from how they were read and nothing else.
 
     A database is ``UNVERIFIED``.  Not because its rows are suspected, but
-    because nothing in persistence can distinguish a fetched row from a
+    because the source mode alone cannot distinguish a fetched row from a
     written one, and a classification that cannot be checked is a claim.
-    ``VERIFIED_LIVE`` is returned by nothing; the day persistence records
-    the fetch run behind each raw item, this function is where that
-    evidence would be read, in a reviewed change.
+    ``VERIFIED_LIVE`` is never returned here: it is derived from recorded
+    per-row provenance facts, which only a G2 ``/2`` manifest carries
+    (:func:`nlp.eval.faithfulness.classify_g2_origin`).
     """
 
     mode = source.get("mode")
@@ -2364,9 +2365,9 @@ def score_gate(
     )
     if bindings != [GENERATION_BINDING_VERIFIED]:
         blockers.append(
-            f"theme-set build provenance is {bindings}: nothing persisted records "
-            "the story generation a theme set was built over, so the current "
-            "generation's signature proves nothing about the build"
+            f"theme-set build provenance is {bindings}: an A4a manifest records "
+            "no theme-build facts, so the current generation's signature proves "
+            "nothing about the build"
         )
     if not ratified:
         blockers.append(

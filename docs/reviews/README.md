@@ -47,10 +47,12 @@ output:
 
 ### The build binding is unknown, and said so
 
-Nothing persisted records which story generation a theme set was built over:
-`reconcile_themes` verifies the signature inside its transaction and does not
-keep it, and `theme_sets.source_metadata` holds counts and model identity,
-not a signature. So each theme set's provenance carries three fields:
+Since A4c persistence keeps the build-time signature
+(`theme_sets.build_story_signature`, see
+[the pipeline doc](../PHASE0_DATA_PIPELINE.md#production-provenance-a4c)),
+but the G1 manifest does not record the facts that would let its scorer
+re-derive a verdict offline, and a status string is not evidence. So each
+G1 theme set's provenance still carries three fields:
 
 | field | value for a database set |
 |---|---|
@@ -63,8 +65,9 @@ build: stories mutated in place with the same ids, stages and memberships
 change the current signature and nothing else, and the set is still not
 claimed to have been built over them. A generation-unverified set may be
 sampled for development review, but `unverified` is a release blocker on its
-own, independent of origin and protocol. `verified` has no producer until
-persistence keeps the build-time signature. A fixture set is clustered
+own, independent of origin and protocol. G1 produces `verified` only once
+its manifest is upgraded to carry the A4c facts, as G2's `/2` does. A
+fixture set is clustered
 in-process, so its binding is `in_process` (build and current are one act).
 
 ### Provenance identifiers are refused, not rewritten
@@ -180,21 +183,21 @@ protocol counts none. An empty adjudication file changes nothing.
 
 A row that came out of SQLite is **not** thereby real ingested evidence.
 `Phase0Admin.insert_raw_items` writes rows indistinguishable from fetched
-ones, every test does so, and `raw_items` carries no link to the run that
-fetched it. So origin is derived from *how the sample was read* and from
-nothing anyone says:
+ones. Since A4c `raw_items` records the logged ingestion run that inserted
+it, but a G1 manifest records no per-row provenance, so G1 origin is still
+derived from *how the sample was read* and from nothing anyone says (G2's
+`/2` manifest does carry the facts; see below):
 
 | `origin.status` | source | `trust_contract` | can be gate eligible |
 |---|---|---|---|
 | `synthetic` | `--fixture` | `synthetic_development` | no |
 | `unverified` | any `--database` | **none** — no dataset kind is truthful | no |
-| `verified_live` | *nothing produces this today* | `sampled_production` | yes, with everything else |
+| `verified_live` | *no G1 sample produces this today* | `sampled_production` | yes, with everything else |
 
-`verified_live` needs persistence to link each raw item structurally to the
-fetch run that wrote it, and then a reviewed change to
-`nlp.eval.review.classify_origin`. Until then every database sample is
-`unverified`, and the scorecard's banner says exactly that rather than
-calling the data synthetic.
+Persistence now links each raw item to its ingestion run (A4c); G1 reaching
+`verified_live` needs its manifest to record those facts, in a reviewed
+change. Until then every G1 database sample is `unverified`, and the
+scorecard's banner says exactly that rather than calling the data synthetic.
 
 `--attested-by` / `--attestation` record an operator's statement on the
 manifest under `operator_attestation`, with `effect: none`. It is audit
@@ -300,9 +303,10 @@ eligibility is making a decision that belongs to K4.
   `intelligence` component that writes `stories`/`themes` on every live
   run, so scheduled runs will produce what this tool samples — but no soak
   window has run under it, and nothing sampled so far came from one.
-- **Origin cannot be verified from persistence.** `verified_live` needs a
-  structural fetch-run link on raw items. Until it exists, every database
-  sample is `unverified` and no G1 release verdict is reachable.
+- **G1 origin is not yet derived from persistence.** A4c added the
+  structural links and G2 records them; the G1 manifest does not, so every
+  G1 database sample is `unverified` and no G1 release verdict is reachable
+  until it does.
 - **K3 (#60)** owns the vocabulary, the adjudication rule, and the
   reviewer-independence rule; the provisional protocol counts nothing as
   adjudicated.
@@ -348,10 +352,13 @@ policy it sampled under. A malformed value (for example a non-integer
 Per theme the outcome is recorded: `current_summary` (reviewed),
 `no_current_summary` or `input_refused` (degraded: no sentences, counted),
 or `withheld` (below). Other coverage has no generated sentences and
-contributes no rows. A partition whose population differs between the read
-that lists its themes and the reads that rebuild their artifacts is
-`population_changed_during_sampling`: nothing from it is reviewed, and on a
-selected day it makes the census incomplete.
+contributes no rows. Every partition is read inside one SQLite snapshot,
+so its population cannot move under the read. The outcome
+`population_changed_during_sampling` is kept (it appears in `/1` manifests)
+for the one disagreement still possible: an artifact's re-derived input not
+matching the partition's enumeration of the same snapshot. Nothing from such
+a partition is reviewed, and on a selected day it makes the census
+incomplete.
 
 ### Two days, drawn
 
@@ -445,11 +452,53 @@ gate_eligible          verified_live origin + verified theme-set build binding
 gate_result            NOT_ELIGIBLE, then INCOMPLETE, then PASS / FAIL
 ```
 
-Today every G2 round is `NOT_ELIGIBLE`: origin is `unverified`, theme-set
-build binding is `unverified`, and no G2 protocol is ratified. A measured
+Today every G2 round is `NOT_ELIGIBLE` because no G2 protocol is ratified
+(K3). Origin and theme-set build binding are derived, not assumed — see
+*Production provenance* below. A measured
 rate of 0.95 or more on such a round is a measurement, never a PASS; the
 scorecard prints it on its own line. `--development-threshold` forces
 `NOT_ELIGIBLE`.
+
+### Production provenance (A4c)
+
+A `/2` manifest (`a4b-g2-review-sample/2`) records, beside each reviewed
+artifact, the persisted facts of every hop its origin depends on:
+
+- `provenance.summary` — its `accepted` generation and that generation's
+  `summaries` run;
+- `provenance.stories` — each evidence story, in evidence order, with its
+  `build_run_id` and story run;
+- `provenance.raw_items` — each member raw item with the ingestion run and
+  stage that inserted it;
+
+and, per read partition, `theme_build`: the theme set's `build_run_id`,
+`build_story_signature` and its version, the partition's *current*
+story-generation signature read in the same snapshot, the build run, and
+each theme's stored fingerprint, story ids and member `cluster_fingerprint`s.
+
+`origin` is `verified_live` only when every reviewed artifact's whole chain
+verifies (`phase0.provenance`), and a partition's `generation_binding` is
+`verified` only when its theme build does. Both are **derived** from the
+facts on every read: a recorded `origin` or `generation_binding` that does
+not follow from the facts is refused, and so are facts that contradict the
+artifact beside them (story facts that are not its evidence, raw-item facts
+that are not its members, a theme membership that is not its evidence,
+facts from another partition) — even with every outer digest recomputed.
+A fact that is consistent but does not verify (a run of the wrong stage, a
+replay ingestion) leaves the round unverified rather than refused.
+
+The facts are coherent: each partition is read inside one SQLite read
+transaction (`Phase0Reader.review_snapshot()`), so its population,
+provenance, artifact currentness and producer all describe one committed
+state. A commit landing during the read is not seen by that pass; a later
+pass sees it.
+
+A `/1` manifest stays readable and scorable, but it records no facts, so
+its origin and binding are `unverified` whatever it says, and it can never
+be gate eligible. The facts are relational provenance through logged
+repository writes, not signatures: ordinary SQL cannot set a binding, but a
+writer who drops the triggers, or who rewrites a manifest wholly
+consistently, is outside what they prove.
 
 ### Security
 

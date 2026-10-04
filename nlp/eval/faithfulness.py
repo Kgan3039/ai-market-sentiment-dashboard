@@ -7,14 +7,15 @@ and reads them back.  It generates nothing and calls no model: what is
 reviewed is what was persisted.
 
 **The population is what a reader may be shown at sampling time.**  For each
-candidate day, each of the five tickers is read as one
-:meth:`~phase0.repository.Phase0Reader.theme_population` snapshot, and each
-theme's summary is looked up with
+candidate day, each of the five tickers is read inside one
+:meth:`~phase0.repository.Phase0Reader.review_snapshot` -- one SQLite read
+transaction -- and each theme's summary is looked up there with
 :func:`phase0.summary_lifecycle.current_summary_artifact` under the
-production policy -- the same reader and the same policy the narrative API
-serves with.  Only an artifact current *for that snapshot* is reviewed; a
-partition whose population moves while it is read is skipped as
-``population_changed_during_sampling``, never assembled from two moments.
+production policy, the same function and policy the narrative API serves
+with.  Every fact a partition's verdict rests on (population, provenance,
+currentness, producer) therefore describes one committed state; a commit
+that lands while the snapshot is open is not seen by this pass.  This is
+transactional read consistency within one database file, nothing more.
 The claim is "artifacts eligible to be served at sampling time", not "every
 artifact served during the day": schema 16 does not keep the frozen evidence
 of superseded artifacts, and no HTTP request is logged.
@@ -39,6 +40,20 @@ captured whole, so reading a manifest recomputes the artifact's
 Evidence that does not reproduce the fingerprint, a sentence or citation
 that does not reproduce the digest, or a row that is not the exact
 projection of its artifact is refused.
+
+**Production origin is re-derived, never believed (A4c).**  A ``/2``
+manifest carries, beside each reviewed artifact, the persisted provenance
+facts of every hop it depends on -- the accepted generation and its
+summaries run, each evidence story and its story run, each member raw item
+and the ingestion run that inserted it -- and, per partition, the theme
+set's build binding with the current story-generation signature and every
+theme's stored fingerprint and membership.  :mod:`phase0.provenance`
+decides from those facts, at sampling time and again offline at scoring
+time, whether origin is ``verified_live`` and whether the theme build is
+``verified``; a recorded status string is only ever compared against that
+derivation.  A ``/1`` manifest stays readable and carries no such facts,
+so both stay unverified and it can never be gate eligible.  A matching
+``input_fingerprint`` is content identity, not production origin.
 
 **Four facts, kept apart**, exactly as for G1: ``threshold_met`` is
 arithmetic, ``review_complete`` is whether the census was finished,
@@ -75,6 +90,7 @@ from ai.guarded_summary import (
 from ai.summarization import ProviderConfigurationError
 from nlp.eval.review import (
     BINDING_FIELDS,
+    GENERATION_BINDING_UNVERIFIED,
     GENERATION_BINDING_VERIFIED,
     REJECTED_IDENTIFIER,
     REVIEWER_FIELDS,
@@ -97,13 +113,13 @@ from nlp.eval.review import (
     _sha256_file,
     _sha256_text,
     canonical_json,
-    classify_generation_binding,
     classify_origin,
     code_identity,
     derive_gate_result,
     score_round,
     sha256_of,
 )
+from phase0 import provenance
 from phase0.redaction import contains_credential
 from phase0.repository import (
     DATABASE_READ_ERRORS,
@@ -119,8 +135,18 @@ from phase0.summary_lifecycle import current_summary_artifact
 from phase0.tickers import TICKER_UNIVERSE
 
 #: Bumped when the manifest's shape changes.  Distinct from A4a's, so a G1
-#: manifest is never read as a G2 one, nor the reverse.
-MANIFEST_SCHEMA = "a4b-g2-review-sample/1"
+#: manifest is never read as a G2 one, nor the reverse.  ``/2`` (A4c) adds
+#: the production-provenance facts; ``/1`` manifests remain readable and
+#: score, but carry no proof, so their origin and theme-build binding are
+#: unverified whatever they say.
+MANIFEST_SCHEMA = "a4b-g2-review-sample/2"
+MANIFEST_SCHEMA_V1 = "a4b-g2-review-sample/1"
+READABLE_MANIFEST_SCHEMAS = frozenset({MANIFEST_SCHEMA_V1, MANIFEST_SCHEMA})
+
+V1_ORIGIN_DETAIL = (
+    "a /1 manifest records no production provenance; origin cannot be "
+    "established from it"
+)
 SHEET_KIND = "sentence_faithfulness"
 GATE = "G2"
 
@@ -146,6 +172,9 @@ CLAIM = (
 
 PARTITION_ENUMERATED = "enumerated"
 PARTITION_POPULATION_REFUSED = "population_refused"
+#: Kept for vocabulary compatibility (``/1`` manifests carry it).  Since
+#: each partition is read in one snapshot, it now means only that a current
+#: artifact's re-derived input disagreed with the partition's enumeration.
 PARTITION_POPULATION_CHANGED = "population_changed_during_sampling"
 
 THEME_CURRENT = "current_summary"
@@ -462,31 +491,178 @@ def _policy_record(policy: GenerationPolicy) -> dict[str, Any]:
     }
 
 
-def _population_state(population: Any) -> str:
-    """Everything the partition's layout depends on, digested for comparison."""
+# -- Production provenance (A4c) -----------------------------------------------
+
+
+def _run_facts(run: Any) -> dict[str, Any] | None:
+    return None if run is None else run.as_facts()
+
+
+def _carries_credential(value: Any) -> bool:
+    if isinstance(value, str):
+        return contains_credential(value)
+    if isinstance(value, Mapping):
+        return any(_carries_credential(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_carries_credential(v) for v in value)
+    return False
+
+
+def _theme_build_facts(population: Any) -> dict[str, Any] | None:
+    """The theme set's build binding and what verifying it needs, as plain data.
+
+    ``current_story_signature`` was read in the same snapshot as the
+    binding, so comparing the two offline is comparing one moment.
+    """
 
     theme_set = population.theme_set
-    return sha256_of(
-        {
-            "theme_set": (
-                None
-                if theme_set is None
-                else [
-                    theme_set.theme_set_id,
-                    theme_set.updated_at,
-                    theme_set.config_fingerprint,
-                ]
-            ),
-            "signature": population.stories.signature,
-            "stories": sorted(s.story_id for s in population.stories.stories),
-            "themes": [
-                [t.theme_id, t.theme_key, t.salience_rank, list(t.story_ids)]
-                for t in population.themes
-            ],
-            "other": [[o.story_id, o.position] for o in population.other_coverage],
-            "excluded": [e.story_id for e in population.excluded],
-        }
-    )
+    if theme_set is None:
+        return None
+    return {
+        "theme_set_id": theme_set.theme_set_id,
+        "ticker": population.ticker,
+        "trading_day": population.trading_day,
+        "pipeline_version": population.pipeline_version,
+        "build_run_id": theme_set.build_run_id,
+        "build_story_signature": theme_set.build_story_signature,
+        "build_story_signature_version": theme_set.build_story_signature_version,
+        "current_story_signature": population.stories.signature,
+        "run": _run_facts(theme_set.build_run),
+        "themes": [
+            {
+                "theme_id": theme.theme_id,
+                "fingerprint": theme.fingerprint,
+                "story_ids": list(theme.story_ids),
+                "member_keys": list(theme.member_keys),
+            }
+            for theme in sorted(
+                population.themes, key=lambda t: (t.salience_rank, t.theme_id)
+            )
+        ],
+    }
+
+
+def _partition_theme_build(population: Any) -> dict[str, Any] | None:
+    """Theme-build facts safe to record; ``None`` (unverified) if they are not."""
+
+    facts = _theme_build_facts(population)
+    return None if _carries_credential(facts) else facts
+
+
+def binding_of(theme_build: Mapping[str, Any] | None) -> str:
+    """The generation binding a partition's recorded facts establish."""
+
+    if provenance.verify_theme_build(theme_build) is None:
+        return GENERATION_BINDING_VERIFIED
+    return GENERATION_BINDING_UNVERIFIED
+
+
+def _story_facts(story: Any) -> dict[str, Any]:
+    return {
+        "story_id": story.story_id,
+        "cluster_fingerprint": story.cluster_fingerprint,
+        "ticker": story.ticker,
+        "trading_day": story.trading_day,
+        "pipeline_version": story.pipeline_version,
+        "build_run_id": story.build_run_id,
+        "run": _run_facts(story.build_run),
+    }
+
+
+def _raw_item_facts(raw_item_id: int, member: Any) -> dict[str, Any]:
+    return {
+        "raw_item_id": raw_item_id,
+        "ticker": None if member is None else member.ticker,
+        "effective_day": None if member is None else member.effective_day,
+        "ingest_run_id": None if member is None else member.ingest_run_id,
+        "ingest_stage": None if member is None else member.ingest_stage,
+        "run": None if member is None else _run_facts(member.ingest_run),
+    }
+
+
+def _summary_facts(summary: Any) -> dict[str, Any]:
+    """The producing generation of one artifact, and its joined run."""
+
+    generation = summary.generation
+    return {
+        "generation": (
+            None
+            if generation is None
+            else {
+                "generation_id": generation.generation_id,
+                "run_id": generation.run_id,
+                "artifact_id": generation.artifact_id,
+                "outcome": generation.outcome,
+                "ticker": generation.ticker,
+                "trading_day": generation.trading_day,
+                "pipeline_version": generation.pipeline_version,
+                "theme_id": generation.theme_id,
+                "input_fingerprint": generation.input_fingerprint,
+                "policy_fingerprint": generation.policy_fingerprint,
+            }
+        ),
+        "run": _run_facts(summary.run),
+    }
+
+
+def _artifact_provenance(population: Any, current: Any, summary: Any) -> dict[str, Any]:
+    """Every production-provenance fact one artifact's origin depends on.
+
+    Story and raw-item facts come from ``population``, and ``summary`` was
+    read in the same review snapshot.
+    """
+
+    stories = {story.story_id: story for story in population.stories.stories}
+    members = {member.raw_item_id: member for member in population.member_provenance}
+    evidence = current.generation_input.evidence
+    return {
+        "summary": _summary_facts(summary),
+        "stories": [
+            _story_facts(stories[item.persisted_story_id]) for item in evidence
+        ],
+        "raw_items": [
+            _raw_item_facts(raw_item_id, members.get(raw_item_id))
+            for raw_item_id in sorted(
+                {i for item in evidence for i in item.raw_item_ids}
+            )
+        ],
+    }
+
+
+def artifact_origin_problems(
+    artifact: Mapping[str, Any], theme_build: Mapping[str, Any] | None
+) -> list[str]:
+    """Every hop of one artifact's production chain that does not verify.
+
+    Summary generation and its run; each evidence story and its run; each
+    member raw item and its ingestion run; and the theme membership the
+    evidence was drawn from, as the partition's recorded theme build holds
+    it.  Empty means the whole chain verifies.  Whether the theme build
+    itself is bound to the current stories is the separate generation
+    binding, which is its own blocker.
+    """
+
+    facts = artifact.get("provenance")
+    if not isinstance(facts, Mapping):
+        return [f"artifact {artifact.get('artifact_id')} records no provenance"]
+    problems: list[str] = []
+    summary = provenance.verify_summary(facts.get("summary"), artifact)
+    if summary is not None:
+        problems.append(summary)
+    for story in facts.get("stories") or []:
+        problem = provenance.verify_story(story)
+        if problem is not None:
+            problems.append(problem)
+    for item in facts.get("raw_items") or []:
+        problem = provenance.verify_raw_item(item)
+        if problem is not None:
+            problems.append(problem)
+    if theme_build is None:
+        problems.append(
+            f"artifact {artifact.get('artifact_id')}: its partition records no "
+            "theme build, so its theme membership is unproven"
+        )
+    return problems
 
 
 def _withheld_field(current: Any) -> tuple[str, str] | None:
@@ -566,6 +742,90 @@ def _artifact_record(current: Any, salience_rank: int) -> dict[str, Any]:
     }
 
 
+#: Marks a partition record in the ``/1`` shape, which carries no facts.
+_V1 = object()
+
+
+VERIFIED_ORIGIN_DETAIL = (
+    "every reviewed artifact's chain verifies against persisted state: its "
+    "accepted generation and summaries run, each evidence story and its story "
+    "run, each member raw item and the non-replay ingestion run that inserted "
+    "it, and its theme membership. Relational provenance through logged "
+    "repository writes -- not a signature, and not proof a fetch reached the "
+    "network"
+)
+
+
+def classify_g2_origin(manifest: Mapping[str, Any]) -> tuple[OriginStatus, str]:
+    """Origin of a G2 round, derived from the facts it records and nothing else.
+
+    ``verified_live`` only for a ``/2`` manifest whose every reviewed
+    artifact's whole chain verifies (:func:`artifact_origin_problems`).  A
+    ``/1`` manifest has no facts and is unverified; so is a round that
+    reviewed nothing.  A recorded ``origin`` block is never read here.
+    """
+
+    origin, detail = classify_origin(manifest["source"])
+    if origin is not OriginStatus.UNVERIFIED:
+        return origin, detail
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        return OriginStatus.UNVERIFIED, V1_ORIGIN_DETAIL
+    artifacts = manifest["snapshot"]["artifacts"]
+    if not artifacts:
+        return (
+            OriginStatus.UNVERIFIED,
+            "no artifact was reviewed, so there is no production chain to verify",
+        )
+    builds = {
+        (p["trading_day"], p["ticker"]): p.get("theme_build")
+        for p in manifest["population"]["partitions"]
+    }
+    problems: list[str] = []
+    for artifact in artifacts:
+        problems.extend(
+            artifact_origin_problems(
+                artifact, builds.get((artifact["trading_day"], artifact["ticker"]))
+            )
+        )
+    if problems:
+        return (
+            OriginStatus.UNVERIFIED,
+            f"{len(problems)} production-provenance hop(s) do not verify; first: "
+            f"{problems[0]}",
+        )
+    return OriginStatus.VERIFIED_LIVE, VERIFIED_ORIGIN_DETAIL
+
+
+def reviewed_bindings(manifest: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """The generation bindings of the partitions actually reviewed, and why not.
+
+    Only a ``/2`` partition can be verified, and its binding is re-derived
+    from its facts; a ``/1`` partition's stored string is not evidence.
+    """
+
+    selected = set(manifest["selection"]["selected_days"])
+    bindings: set[str] = set()
+    reasons: list[str] = []
+    for partition in manifest["population"]["partitions"]:
+        if partition["trading_day"] not in selected:
+            continue
+        if not partition["reviewed_artifact_ids"]:
+            continue
+        if manifest.get("schema") != MANIFEST_SCHEMA:
+            bindings.add(GENERATION_BINDING_UNVERIFIED)
+            reasons.append("a /1 manifest records no theme-build provenance")
+            continue
+        problem = provenance.verify_theme_build(partition.get("theme_build"))
+        if problem is None:
+            bindings.add(GENERATION_BINDING_VERIFIED)
+        else:
+            bindings.add(GENERATION_BINDING_UNVERIFIED)
+            reasons.append(
+                f"{partition['ticker']} {partition['trading_day']}: {problem}"
+            )
+    return sorted(bindings), reasons
+
+
 def _partition_record(
     ticker: str,
     day: str,
@@ -576,9 +836,10 @@ def _partition_record(
     detail: str = "",
     generation_binding: str | None = None,
     themes: Sequence[Mapping[str, Any]] = (),
+    theme_build: Any = _V1,
 ) -> dict[str, Any]:
     reviewed = [t["artifact_id"] for t in themes if t["outcome"] == THEME_CURRENT]
-    return {
+    record = {
         "ticker": ticker,
         "trading_day": day,
         "pipeline_version": version,
@@ -596,6 +857,16 @@ def _partition_record(
         "reviewed_artifact_ids": reviewed,
         "themes": [dict(t) for t in themes],
     }
+    if theme_build is not _V1:
+        # /2: the facts, and a binding that is always *derived* from them --
+        # never taken from the caller, so a record cannot claim one.
+        record["theme_build"] = theme_build
+        record["generation_binding"] = (
+            binding_of(theme_build)
+            if outcome in (PARTITION_ENUMERATED, PARTITION_POPULATION_CHANGED)
+            else None
+        )
+    return record
 
 
 def _read_partition(
@@ -605,10 +876,29 @@ def _read_partition(
     version: str,
     policy: GenerationPolicy,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """One partition, from one snapshot, with a race guard; nothing written."""
+    """One partition, wholly from one SQLite snapshot; nothing written.
 
-    first = reader.theme_population(ticker, day, version)
-    refused = assess_population(first)
+    Every read the verdict rests on -- the population with its theme build,
+    stories, and member raw items and all their joined runs; each theme's
+    current artifact; and each artifact's producing generation and run --
+    goes through one :meth:`~phase0.repository.Phase0Reader.review_snapshot`.
+    A commit that lands while it is open is simply not seen by this pass, so
+    no recorded fact can come from a different moment than any other.
+    """
+
+    with reader.review_snapshot() as snapshot:
+        return _read_partition_in(snapshot, ticker, day, version, policy)
+
+
+def _read_partition_in(
+    snapshot: Any,
+    ticker: str,
+    day: str,
+    version: str,
+    policy: GenerationPolicy,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    population = snapshot.theme_population(ticker, day, version)
+    refused = assess_population(population)
     if refused is not None:
         code, detail = refused
         return (
@@ -619,14 +909,16 @@ def _read_partition(
                 PARTITION_POPULATION_REFUSED,
                 reason=code,
                 detail=detail,
+                theme_build=None,
             ),
             [],
         )
-    binding, _ = classify_generation_binding(first)
+    theme_build = _partition_theme_build(population)
     themes: list[dict[str, Any]] = []
     artifacts: list[dict[str, Any]] = []
-    changed = False
-    for membership in sorted(first.themes, key=lambda t: (t.salience_rank, t.theme_id)):
+    for membership in sorted(
+        population.themes, key=lambda t: (t.salience_rank, t.theme_id)
+    ):
         entry: dict[str, Any] = {
             "theme_id": membership.theme_id,
             "theme_key": _clean(membership.theme_key or ""),
@@ -637,21 +929,42 @@ def _read_partition(
             "artifact_id": None,
         }
         try:
-            layout = build_generation_input(first, membership.theme_id)
+            layout = build_generation_input(population, membership.theme_id)
         except SummaryInputError as exc:
             entry.update(outcome=THEME_INPUT_REFUSED, reason=exc.code)
             themes.append(entry)
             continue
         current = current_summary_artifact(
-            reader, ticker, day, version, membership.theme_id, policy
+            snapshot, ticker, day, version, membership.theme_id, policy
         )
         if current is None:
             entry.update(outcome=THEME_NO_CURRENT)
         elif current.generation_input.input_fingerprint != layout.input_fingerprint:
-            changed = True
-            break
+            # Within one snapshot the lifecycle's projection and this
+            # enumeration read the same rows, so they must agree; if they
+            # ever do not, nothing from the partition is reviewed.
+            return (
+                _partition_record(
+                    ticker,
+                    day,
+                    version,
+                    PARTITION_POPULATION_CHANGED,
+                    reason=PARTITION_POPULATION_CHANGED,
+                    detail="the current artifact's input does not match the "
+                    "partition's enumeration; nothing from it is reviewed",
+                    theme_build=theme_build,
+                ),
+                [],
+            )
         else:
             withheld = _withheld_field(current)
+            facts = _artifact_provenance(
+                population,
+                current,
+                snapshot.summary_artifact_provenance(current.artifact.artifact_id),
+            )
+            if withheld is None and _carries_credential(facts):
+                withheld = (WITHHELD_IDENTIFIER, "provenance")
             if withheld is not None:
                 entry.update(
                     outcome=THEME_WITHHELD, reason=withheld[0], field=withheld[1]
@@ -660,34 +973,18 @@ def _read_partition(
                 entry.update(
                     outcome=THEME_CURRENT, artifact_id=current.artifact.artifact_id
                 )
-                artifacts.append(_artifact_record(current, membership.salience_rank))
+                record = _artifact_record(current, membership.salience_rank)
+                record["provenance"] = facts
+                artifacts.append(record)
         themes.append(entry)
-    if not changed:
-        last = reader.theme_population(ticker, day, version)
-        changed = _population_state(last) != _population_state(first)
-    if changed:
-        return (
-            _partition_record(
-                ticker,
-                day,
-                version,
-                PARTITION_POPULATION_CHANGED,
-                reason=PARTITION_POPULATION_CHANGED,
-                detail="the partition changed between the reads that enumerate "
-                "its themes and the reads that reconstruct their artifacts; "
-                "nothing from it is reviewed",
-                generation_binding=binding,
-            ),
-            [],
-        )
     return (
         _partition_record(
             ticker,
             day,
             version,
             PARTITION_ENUMERATED,
-            generation_binding=binding,
             themes=themes,
+            theme_build=theme_build,
         ),
         artifacts,
     )
@@ -810,6 +1107,7 @@ def load_sentence_population(
                             reason=rejected_at[(ticker, day)],
                             detail="discovered pipeline_version is not a usable "
                             "identifier (value withheld)",
+                            theme_build=None,
                         )
                     )
                     continue
@@ -823,6 +1121,7 @@ def load_sentence_population(
                             reason=SKIP_NO_STORY_OUTPUT,
                             detail="no stories and no theme set persisted for this "
                             "partition",
+                            theme_build=None,
                         )
                     )
                     continue
@@ -1081,7 +1380,6 @@ def build_manifest(
     population = sample.population
     protocol = require_known_g2_protocol(protocol_id)
     csv_name = require_clean_operator_value(csv_name, "output file name")
-    origin, detail = classify_origin(population.source)
     when = generated_at or datetime.now(timezone.utc)
     partitions = [dict(p) for p in population.partitions]
     artifacts = [dict(a) for a in sample.artifacts]
@@ -1093,7 +1391,7 @@ def build_manifest(
         "generated_at": when.isoformat(),
         "code": dict(code if code is not None else code_identity()),
         "source": dict(population.source),
-        "origin": {"status": origin.value, "detail": detail},
+        "origin": None,
         "operator_attestation": (
             None if operator_attestation is None else operator_attestation.as_dict()
         ),
@@ -1143,6 +1441,10 @@ def build_manifest(
             ),
         },
     }
+    # Recorded for a reader's convenience; every reader re-derives it from
+    # the facts above and refuses a recorded value that disagrees.
+    origin, detail = classify_g2_origin(manifest)
+    manifest["origin"] = {"status": origin.value, "detail": detail}
     binding = {
         "manifest_id": manifest_identity(manifest),
         "snapshot_sha256": manifest["snapshot"]["sha256"],
@@ -1545,6 +1847,9 @@ def _verify_partitions(payload: Mapping[str, Any], location: Path) -> None:
                 )
             for theme in themes:
                 _verify_theme_outcome(theme, where, location)
+            v2 = payload["schema"] == MANIFEST_SCHEMA
+            if v2:
+                _verify_theme_build_shape(partition, where, location)
             expected = _partition_record(
                 partition["ticker"],
                 partition["trading_day"],
@@ -1553,6 +1858,7 @@ def _verify_partitions(payload: Mapping[str, Any], location: Path) -> None:
                 reason=partition["reason"],
                 generation_binding=partition["generation_binding"],
                 themes=themes,
+                theme_build=partition["theme_build"] if v2 else _V1,
             )
             expected["detail"] = partition["detail"]
         except (KeyError, TypeError) as exc:
@@ -1560,9 +1866,141 @@ def _verify_partitions(payload: Mapping[str, Any], location: Path) -> None:
         if partition != expected:
             raise _refuse(
                 location,
-                f"{where}: its totals do not follow from its theme outcomes; the "
-                "accounting was altered",
+                f"{where}: its totals or its theme-build binding do not follow "
+                "from its recorded outcomes and facts; the accounting was altered",
             )
+
+
+_THEME_BUILD_KEYS = frozenset(
+    {
+        "theme_set_id",
+        "ticker",
+        "trading_day",
+        "pipeline_version",
+        "build_run_id",
+        "build_story_signature",
+        "build_story_signature_version",
+        "current_story_signature",
+        "run",
+        "themes",
+    }
+)
+_THEME_ENTRY_KEYS = frozenset({"theme_id", "fingerprint", "story_ids", "member_keys"})
+_PROVENANCE_KEYS = frozenset({"summary", "stories", "raw_items"})
+
+
+def _verify_theme_build_shape(
+    partition: Mapping[str, Any], where: str, location: Path
+) -> None:
+    """A ``/2`` partition's theme-build facts are well formed and its own."""
+
+    if "theme_build" not in partition:
+        raise _refuse(location, f"{where}: a /2 partition records no theme_build")
+    facts = partition["theme_build"]
+    if facts is None:
+        return
+    if partition["outcome"] not in (
+        PARTITION_ENUMERATED,
+        PARTITION_POPULATION_CHANGED,
+    ):
+        raise _refuse(location, f"{where}: only a read partition has theme-build facts")
+    if not isinstance(facts, dict) or set(facts) != _THEME_BUILD_KEYS:
+        raise _refuse(location, f"{where}: its theme-build facts are malformed")
+    if (facts["ticker"], facts["trading_day"], facts["pipeline_version"]) != (
+        partition["ticker"],
+        partition["trading_day"],
+        partition["pipeline_version"],
+    ):
+        raise _refuse(
+            location, f"{where}: its theme-build facts are another partition's"
+        )
+    themes = facts["themes"]
+    if not isinstance(themes, list) or any(
+        not isinstance(t, dict) or set(t) != _THEME_ENTRY_KEYS for t in themes
+    ):
+        raise _refuse(location, f"{where}: its theme-build themes are malformed")
+    recorded = sorted(t["theme_id"] for t in themes)
+    outcomes = sorted(t["theme_id"] for t in partition["themes"])
+    if partition["outcome"] == PARTITION_ENUMERATED and recorded != outcomes:
+        raise _refuse(
+            location, f"{where}: its theme-build facts and theme outcomes disagree"
+        )
+
+
+def _verify_artifact_provenance(
+    artifact: Mapping[str, Any],
+    theme_build: Mapping[str, Any] | None,
+    location: Path,
+) -> None:
+    """Refuse provenance facts that contradict the artifact they sit beside.
+
+    What can be decided offline is decided here: the facts must name
+    exactly the artifact's evidence stories, in order, in its partition;
+    exactly its evidence raw items; and the theme membership the partition's
+    recorded theme build holds for its theme must be those same stories.
+    Whether each hop's run verifies is :func:`artifact_origin_problems`'s
+    question, and a hop that does not is unverified rather than refused.
+    """
+
+    where = f"artifact {artifact.get('artifact_id')}"
+    facts = artifact.get("provenance")
+    if not isinstance(facts, dict) or set(facts) != _PROVENANCE_KEYS:
+        raise _refuse(location, f"{where}: its provenance facts are malformed")
+    try:
+        evidence = artifact["evidence"]
+        stories = facts["stories"]
+        if [s["story_id"] for s in stories] != [
+            e["persisted_story_id"] for e in evidence
+        ]:
+            raise _refuse(location, f"{where}: its story facts are not its evidence")
+        partition = (
+            artifact["ticker"],
+            artifact["trading_day"],
+            artifact["pipeline_version"],
+        )
+        for story in stories:
+            if (story["ticker"], story["trading_day"], story["pipeline_version"]) != (
+                partition
+            ):
+                raise _refuse(
+                    location, f"{where}: a story fact lies outside its partition"
+                )
+        raw_ids = sorted({i for e in evidence for i in e["raw_item_ids"]})
+        if [r["raw_item_id"] for r in facts["raw_items"]] != raw_ids:
+            raise _refuse(
+                location, f"{where}: its raw-item facts are not its evidence's members"
+            )
+        # Story reconciliation admits only members that fall on the
+        # partition's day, so any other recorded day is a contradiction.
+        if any(
+            r["effective_day"] not in (None, artifact["trading_day"])
+            for r in facts["raw_items"]
+        ):
+            raise _refuse(
+                location, f"{where}: a raw-item fact lies outside its partition's day"
+            )
+        if theme_build is not None:
+            entry = next(
+                (
+                    t
+                    for t in theme_build["themes"]
+                    if t["theme_id"] == artifact["theme_id"]
+                ),
+                None,
+            )
+            if (
+                entry is None
+                or entry["story_ids"] != [s["story_id"] for s in stories]
+                or entry["member_keys"] != [s["cluster_fingerprint"] for s in stories]
+            ):
+                raise _refuse(
+                    location,
+                    f"{where}: its evidence is not its theme's recorded membership",
+                )
+    except (KeyError, TypeError) as exc:
+        raise _refuse(
+            location, f"{where}: its provenance facts are malformed: {exc}"
+        ) from exc
 
 
 def read_manifest(path: str | Path) -> dict[str, Any]:
@@ -1573,7 +2011,10 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
         payload = json.loads(location.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise _refuse(location, f"cannot read manifest: {exc}") from exc
-    if not isinstance(payload, dict) or payload.get("schema") != MANIFEST_SCHEMA:
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") not in READABLE_MANIFEST_SCHEMAS
+    ):
         found = payload.get("schema") if isinstance(payload, dict) else None
         raise _refuse(location, f"not a {MANIFEST_SCHEMA} manifest (schema={found!r})")
     if payload.get("gate") != GATE or payload.get("sheet_kind") != SHEET_KIND:
@@ -1647,6 +2088,18 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
                 "partition",
             )
         _verify_artifact(artifact, payload["policy"], location)
+        if payload["schema"] == MANIFEST_SCHEMA:
+            _verify_artifact_provenance(artifact, partition["theme_build"], location)
+        elif "provenance" in artifact:
+            raise _refuse(location, "a /1 manifest cannot carry provenance facts")
+    if payload["schema"] == MANIFEST_SCHEMA:
+        status, detail = classify_g2_origin(payload)
+        if payload["origin"] != {"status": status.value, "detail": detail}:
+            raise _refuse(
+                location,
+                "the recorded origin does not follow from the recorded provenance "
+                "facts; it was altered",
+            )
     if payload["population"].get("digest") != population_digest(partitions, artifacts):
         raise _refuse(location, "population digest does not match; it was altered")
 
@@ -1709,7 +2162,10 @@ def score_sentence_round(
 ) -> RoundResult:
     """Resolve one G2 round with A4a's reviewer and adjudication rules."""
 
-    if "_sha256" not in manifest or manifest.get("schema") != MANIFEST_SCHEMA:
+    if (
+        "_sha256" not in manifest
+        or manifest.get("schema") not in READABLE_MANIFEST_SCHEMAS
+    ):
         raise ReviewSamplingError(
             "a G2 round must be scored from a manifest read by "
             "nlp.eval.faithfulness.read_manifest"
@@ -1856,7 +2312,8 @@ def score_g2(
 ) -> G2Scorecard:
     """The G2 scorecard from exactly one census round.
 
-    Origin from the manifest's source mode, ratification from
+    Origin and theme-build binding re-derived from the manifest's recorded
+    provenance facts (A4c), ratification from
     :data:`RATIFIED_G2_PROTOCOLS`, the threshold and day count from the
     constants, reviewer and adjudication facts from the parsed sheets.
     """
@@ -1874,7 +2331,7 @@ def score_g2(
     development_draw = manifest["selection"]["draw"]["development_override"]
     mode = "development" if development.active or development_draw else "release"
 
-    origin, origin_detail = classify_origin(manifest["source"])
+    origin, origin_detail = classify_g2_origin(manifest)
     protocol, ratified = resolve_g2_protocol(manifest["labeling_protocol"].get("id"))
     outcomes = list(result.outcomes)
     resolved = [o for o in outcomes if o.resolved is not None]
@@ -1905,17 +2362,12 @@ def score_g2(
     blockers: list[str] = []
     if origin is not OriginStatus.VERIFIED_LIVE:
         blockers.append(f"origin is {origin.value}: {origin_detail}")
-    bindings = sorted(
-        {
-            str(p.get("generation_binding"))
-            for p in manifest["population"]["partitions"]
-            if p["trading_day"] in set(selected) and p["reviewed_artifact_ids"]
-        }
-    )
+    bindings, binding_reasons = reviewed_bindings(manifest)
     if bindings != [GENERATION_BINDING_VERIFIED]:
+        why = binding_reasons[0] if binding_reasons else "no partition was reviewed"
         blockers.append(
-            f"theme-set build provenance is {bindings}: nothing persisted records the "
-            "story generation a theme set was built over"
+            f"theme-set build provenance is {bindings}: a reviewed theme set is not "
+            f"bound to the story generation it sits on (first: {why})"
         )
     if not ratified:
         blockers.append(
@@ -2045,8 +2497,13 @@ __all__ = [
     "SentencePopulation",
     "SentenceRow",
     "SentenceSample",
+    "MANIFEST_SCHEMA_V1",
+    "READABLE_MANIFEST_SCHEMAS",
+    "artifact_origin_problems",
+    "binding_of",
     "build_manifest",
     "check_output_paths",
+    "classify_g2_origin",
     "create_new_file",
     "day_accounting",
     "draw_days",
@@ -2061,6 +2518,7 @@ __all__ = [
     "require_clean_operator_value",
     "require_known_g2_protocol",
     "resolve_g2_protocol",
+    "reviewed_bindings",
     "row_id_for",
     "rows_for_artifact",
     "sample_sentences",
