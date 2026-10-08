@@ -52,6 +52,7 @@ import io
 import json
 import math
 import random
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -164,16 +165,103 @@ class Protocol:
     purpose.  Whether a unanimous two-reviewer round counts as adjudicated,
     or only one with disagreements resolved by a third party, is K3's
     call; until K3 makes it nothing is adjudicated in the gate's sense.
+
+    The remaining fields are a ratified protocol's review rules.  Each
+    defaults to off, so G1 and the provisional protocols read and score
+    exactly as they always have:
+
+    - ``strict_review``: reviewer ids are unique case-insensitively; an
+      adjudicator is a third identity; adjudication rows exist only for
+      rows the two reviewers marked differently, and each final verdict
+      carries notes; non-empty timestamps are ISO-8601.
+    - ``reason_codes``: when non-empty, every negative verdict -- a
+      reviewer's or an adjudicator's -- opens its notes with one of them.
+    - ``exempt_framings``: exact sentence-initial templates read as framing
+      (see :func:`split_exempt_framing`); a reviewer aid, not a scorer.
+    - ``document`` / ``document_sha256``: the guidelines this id names,
+      pinned byte for byte.
     """
 
     id: str
     positive_verdict: str
     negative_verdict: str
     adjudicated_states: frozenset[AdjudicationState]
+    strict_review: bool = False
+    reason_codes: tuple[str, ...] = ()
+    exempt_framings: tuple[str, ...] = ()
+    document: str = ""
+    document_sha256: str = ""
 
     @property
     def vocabulary(self) -> frozenset[str]:
         return frozenset({self.positive_verdict, self.negative_verdict})
+
+    def fingerprint(self) -> str:
+        """SHA-256 over every rule this protocol carries, guidelines digest included.
+
+        Two protocols with one id and different semantics cannot share a
+        fingerprint; a scorecard records it so a reader can tell which
+        semantics a round was scored under.
+        """
+
+        definition = dataclasses.asdict(self)
+        definition["adjudicated_states"] = sorted(
+            state.value for state in self.adjudicated_states
+        )
+        return sha256_of(definition)
+
+
+#: ``CODE`` or ``CODE: explanation`` -- one upper-case code, then free text.
+_REASON_CODE_RE = re.compile(r"\A([A-Z]+)(?::(.*))?\Z", re.DOTALL)
+#: A calendar date, optionally with a time and a UTC offset.  The offset is
+#: held to ISO-8601's own ranges here -- hours 00-23, minutes 00-59 --
+#: because ``datetime.fromisoformat`` would normalise ``+01:99`` rather
+#: than refuse it.  Date and clock fields are checked by the parse.
+_ISO_8601_RE = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}"
+    r"(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?"
+    r"(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?)?\Z"
+)
+
+
+def reason_code_of(notes: str, protocol: Protocol) -> str | None:
+    """The reason code ``notes`` opens with, if it is one of the protocol's."""
+
+    match = _REASON_CODE_RE.match(notes.strip())
+    if match is None or match.group(1) not in protocol.reason_codes:
+        return None
+    return match.group(1)
+
+
+def split_exempt_framing(text: str, protocol: Protocol) -> tuple[str, str]:
+    """``(framing, remainder)`` when ``text`` opens with an exempt template.
+
+    The match is exact and sentence-initial: case, hyphenation, tense and
+    spacing are as listed.  Each template ends in exactly one space, and
+    the remainder starts immediately after it: a remainder that is empty
+    or opens with any whitespace (a second space, a tab, a line break) is
+    not the template.  The framing words are not judged as a
+    coverage-volume claim; the remainder is judged under every ordinary
+    rule.  Anything else returns ``("", text)`` -- no exemption.
+    """
+
+    for framing in protocol.exempt_framings:
+        remainder = text[len(framing) :]
+        if text.startswith(framing) and remainder and not remainder[0].isspace():
+            return framing, remainder
+    return "", text
+
+
+def is_iso_8601(value: str) -> bool:
+    """A date, or a date and time with an optional offset, that exists."""
+
+    if not _ISO_8601_RE.match(value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 UNRATIFIED_PROTOCOL = "unratified"
@@ -1671,6 +1759,36 @@ def _read_csv(
     return raw_rows
 
 
+def _check_review_rules(
+    location: Path,
+    row_id: str,
+    protocol: Protocol,
+    *,
+    verdict: str,
+    timestamp: tuple[str, str],
+    notes: tuple[str, str],
+) -> None:
+    """A ratified protocol's per-row rules; nothing for one that sets none."""
+
+    column, value = timestamp
+    if protocol.strict_review and value and not is_iso_8601(value):
+        raise ReviewSamplingError(
+            f"{location}: row {row_id} {column} is not an ISO-8601 date or "
+            "date-time (YYYY-MM-DD, optionally THH:MM[:SS] and Z or +HH:MM)"
+        )
+    column, value = notes
+    if (
+        protocol.reason_codes
+        and verdict == protocol.negative_verdict
+        and reason_code_of(value, protocol) is None
+    ):
+        raise ReviewSamplingError(
+            f"{location}: row {row_id} is {verdict!r} but {column} does not open "
+            f"with a reason code; protocol {protocol.id!r} requires 'CODE' or "
+            f"'CODE: explanation' with CODE one of {list(protocol.reason_codes)}"
+        )
+
+
 #: G1's sheet: the default for every reader and scorer below.  The protocol
 #: resolver is looked up at call time, as it always was.
 G1_SHEET = SheetSpec(
@@ -1740,12 +1858,22 @@ def read_completed_sheet(
             )
         if reviewer:
             reviewers.add(reviewer)
+        reviewed_at = (raw.get("reviewed_at") or "").strip()
+        notes = (raw.get("reviewer_notes") or "").strip()
+        _check_review_rules(
+            location,
+            row_id,
+            protocol,
+            verdict=verdict,
+            timestamp=("reviewed_at", reviewed_at),
+            notes=("reviewer_notes", notes),
+        )
         rows[row_id] = SheetRow(
             row_id=row_id,
             verdict=verdict,
             reviewer_id=reviewer,
-            reviewed_at=(raw.get("reviewed_at") or "").strip(),
-            notes=(raw.get("reviewer_notes") or "").strip(),
+            reviewed_at=reviewed_at,
+            notes=notes,
         )
     absent = sorted(set(expected) - set(rows))
     if absent:
@@ -1810,12 +1938,28 @@ def read_adjudication_sheet(
                 f"{location}: row {row_id} carries a final verdict but no "
                 "adjudicator_id"
             )
+        adjudicated_at = (raw.get("adjudicated_at") or "").strip()
+        notes = (raw.get("adjudication_notes") or "").strip()
+        _check_review_rules(
+            location,
+            row_id,
+            protocol,
+            verdict=verdict,
+            timestamp=("adjudicated_at", adjudicated_at),
+            notes=("adjudication_notes", notes),
+        )
+        if protocol.strict_review and verdict and not notes:
+            raise ReviewSamplingError(
+                f"{location}: row {row_id} carries a final verdict but no "
+                f"adjudication_notes; protocol {protocol.id!r} requires the "
+                "adjudicator to say why"
+            )
         rows[row_id] = AdjudicationRow(
             row_id=row_id,
             final_verdict=verdict,
             adjudicator_id=adjudicator,
-            adjudicated_at=(raw.get("adjudicated_at") or "").strip(),
-            notes=(raw.get("adjudication_notes") or "").strip(),
+            adjudicated_at=adjudicated_at,
+            notes=notes,
         )
     return AdjudicationSheet(
         path=str(location), sha256=_sha256_file(location), rows=rows
@@ -1916,6 +2060,37 @@ class RoundResult:
         }
 
 
+def _check_independent_adjudication(
+    adjudication: AdjudicationSheet,
+    completed: Sequence[CompletedSheet],
+    protocol: Protocol,
+) -> None:
+    """Under a strict protocol, adjudication is a third party settling disputes.
+
+    Every adjudication row must be a row both reviewers marked and marked
+    differently -- an agreed row, or one a reviewer left blank, is not the
+    adjudicator's to decide -- and no adjudicator may be either reviewer,
+    compared case-insensitively.
+    """
+
+    reviewers = {sheet.reviewer_id.casefold() for sheet in completed}
+    reviewers.discard("")
+    for row_id, row in adjudication.rows.items():
+        verdicts = [sheet.rows[row_id].verdict for sheet in completed]
+        if not all(verdicts) or verdicts[0] == verdicts[1]:
+            raise ReviewSamplingError(
+                f"{adjudication.path}: row {row_id} is not a disagreement between "
+                f"two marked verdicts; protocol {protocol.id!r} adjudicates "
+                "disagreements only"
+            )
+        if row.adjudicator_id and row.adjudicator_id.casefold() in reviewers:
+            raise ReviewSamplingError(
+                f"{adjudication.path}: row {row_id} is adjudicated by "
+                f"{row.adjudicator_id!r}, one of the reviewers; protocol "
+                f"{protocol.id!r} requires a third identity"
+            )
+
+
 def score_round(
     manifest: Mapping[str, Any],
     sheets: Sequence[str | Path],
@@ -1948,6 +2123,17 @@ def score_round(
             f"both sheets are signed by {reviewer_ids[0]!r}; two sheets from one "
             "reviewer are not two reviewers"
         )
+    if (
+        protocol.strict_review
+        and len(completed) == 2
+        and reviewer_ids[0]
+        and reviewer_ids[0].casefold() == reviewer_ids[1].casefold()
+    ):
+        raise ReviewSamplingError(
+            f"the sheets are signed by {reviewer_ids[0]!r} and {reviewer_ids[1]!r}; "
+            f"protocol {protocol.id!r} compares reviewer ids case-insensitively, "
+            "and these are one reviewer"
+        )
     adjudication = (
         None
         if adjudicated is None
@@ -1957,6 +2143,8 @@ def score_round(
         raise ReviewSamplingError(
             "an adjudication sheet needs two reviewer sheets to adjudicate between"
         )
+    if adjudication is not None and protocol.strict_review:
+        _check_independent_adjudication(adjudication, completed, protocol)
 
     outcomes: list[RowOutcome] = []
     disagreements = 0

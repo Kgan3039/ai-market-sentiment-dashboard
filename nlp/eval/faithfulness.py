@@ -29,9 +29,10 @@ manifest, and reading the manifest re-runs the draw.
 **The review unit is one sentence with its complete ordered citation set.**
 Every sentence of every reviewed artifact on the two days is one row, once.
 What "supported" means when citations disagree, when support is partial, or
-when a claim cannot be checked is K3's protocol, not this module's: the
-vocabulary here is the provisional, unratified ``supported`` /
-``unsupported``, and nothing scored under it can be gate eligible.
+when a claim cannot be checked is K3's protocol, not this module's.  The
+ratified protocol is :data:`K3_G2_V1` (``k3-g2-v1``, K3a), whose semantics
+are ``docs/reviews/K3_G2_PROTOCOL.md``; a round drawn under the provisional
+``unratified`` protocol can never be gate eligible.
 
 **The manifest proves itself offline.**  Each artifact's frozen evidence is
 captured whole, so reading a manifest recomputes the artifact's
@@ -200,21 +201,64 @@ DAY_POPULATION_CHANGED = PARTITION_POPULATION_CHANGED
 
 # -- The G2 protocol registry --------------------------------------------------
 
-#: G2's provisional protocol.  Binary, sentence-level, and unratified: K3
-#: owns what "supported" means for multiple citations, partial support,
-#: unverifiable claims and contradictions, and whether a reviewer may open
-#: the publisher's page.  Nothing is adjudicated in the gate's sense until
-#: K3 says what counts.
+#: G2's provisional protocol.  Binary, sentence-level, and unratified: it
+#: says nothing about multiple citations, partial support, unverifiable
+#: claims or contradictions, and counts nothing as adjudicated.  A round
+#: drawn under it stays ``NOT_ELIGIBLE`` forever; :data:`K3_G2_V1` is the
+#: ratified protocol, and a round must be *drawn* under it.
 PROVISIONAL_G2_PROTOCOL = Protocol(
     id=UNRATIFIED_PROTOCOL,
     positive_verdict="supported",
     negative_verdict="unsupported",
     adjudicated_states=frozenset(),
 )
+#: K3a: the ratified G2 protocol.  Its semantics are the guidelines in
+#: ``docs/reviews/K3_G2_PROTOCOL.md``, pinned here byte for byte; a material
+#: change to them -- or to anything below -- is a new id (``k3-g2-v2``),
+#: never an edit of this one, so a round keeps the semantics it was drawn
+#: and scored under.
+K3_G2_V1_ID = "k3-g2-v1"
+K3_G2_V1_DOCUMENT = "docs/reviews/K3_G2_PROTOCOL.md"
+K3_G2_V1_DOCUMENT_SHA256 = (
+    "f933df998c15d259a9d891a065a910b872fde90e12becc9bb1de53528cc15b42"
+)
+#: Why an ``unsupported`` verdict was given: one code opens the notes.
+K3_G2_V1_REASON_CODES = (
+    "ADDITION",
+    "CONTRADICTION",
+    "NUMBER",
+    "ENTITY",
+    "TEMPORAL",
+    "CAUSAL",
+    "CERTAINTY",
+    "SYNTHESIS",
+    "MISCITATION",
+    "UNVERIFIABLE",
+)
+#: The coverage framings ``ai.summarization.SYSTEM_PROMPT`` (rule 9) asks
+#: the model to use, exactly as a sentence opens with them.  Only these
+#: words are framing; what follows is judged under every ordinary rule.
+K3_G2_V1_EXEMPT_FRAMINGS = (
+    "Coverage today is dominated by ",
+    "The most-covered storyline is ",
+)
+K3_G2_V1 = Protocol(
+    id=K3_G2_V1_ID,
+    positive_verdict="supported",
+    negative_verdict="unsupported",
+    adjudicated_states=frozenset(
+        {AdjudicationState.UNANIMOUS, AdjudicationState.RESOLVED}
+    ),
+    strict_review=True,
+    reason_codes=K3_G2_V1_REASON_CODES,
+    exempt_framings=K3_G2_V1_EXEMPT_FRAMINGS,
+    document=K3_G2_V1_DOCUMENT,
+    document_sha256=K3_G2_V1_DOCUMENT_SHA256,
+)
 #: Ratification for G2 lives here and only here, separate from G1's
 #: registry: a protocol ratified for theme assignment says nothing about
-#: sentence faithfulness.
-RATIFIED_G2_PROTOCOLS: Mapping[str, Protocol] = {}
+#: sentence faithfulness.  Entries are never edited or removed.
+RATIFIED_G2_PROTOCOLS: Mapping[str, Protocol] = {K3_G2_V1.id: K3_G2_V1}
 
 
 def resolve_g2_protocol(protocol_id: Any) -> tuple[Protocol, bool]:
@@ -2223,6 +2267,7 @@ class G2Scorecard:
     origin_detail: str
     protocol_id: str
     protocol_ratified: bool
+    protocol_fingerprint: str
     reviewer_count: int
     adjudication_state: AdjudicationState
     selected_days: tuple[str, ...]
@@ -2254,7 +2299,11 @@ class G2Scorecard:
                 "status": self.origin_status.value,
                 "detail": self.origin_detail,
             },
-            "protocol": {"id": self.protocol_id, "ratified": self.protocol_ratified},
+            "protocol": {
+                "id": self.protocol_id,
+                "ratified": self.protocol_ratified,
+                "fingerprint": self.protocol_fingerprint,
+            },
             "reviewer_count": self.reviewer_count,
             "adjudication_state": self.adjudication_state.value,
             "selected_days": list(self.selected_days),
@@ -2358,7 +2407,16 @@ def score_g2(
         incompleteness.append("the census holds no sentences")
     review_complete = not incompleteness
 
-    adjudicated = ratified and result.adjudication_state in protocol.adjudicated_states
+    # An open disagreement under a protocol that counts a resolved round is
+    # adjudication not yet finished, not a round that cannot count: its rows
+    # are unresolved, so the review is INCOMPLETE and can never PASS.
+    pending = (
+        result.adjudication_state is AdjudicationState.OPEN
+        and AdjudicationState.RESOLVED in protocol.adjudicated_states
+    )
+    adjudicated = ratified and (
+        result.adjudication_state in protocol.adjudicated_states or pending
+    )
     blockers: list[str] = []
     if origin is not OriginStatus.VERIFIED_LIVE:
         blockers.append(f"origin is {origin.value}: {origin_detail}")
@@ -2409,6 +2467,7 @@ def score_g2(
         origin_detail=origin_detail,
         protocol_id=protocol.id,
         protocol_ratified=ratified,
+        protocol_fingerprint=protocol.fingerprint(),
         reviewer_count=result.reviewer_count,
         adjudication_state=result.adjudication_state,
         selected_days=selected,
@@ -2450,7 +2509,8 @@ def render_scorecard(scorecard: G2Scorecard) -> str:
         f"threshold_met      {'n/a' if met is None else str(met).lower()}",
         f"origin             {scorecard.origin_status.value}",
         f"protocol           {scorecard.protocol_id} "
-        f"({'ratified' if scorecard.protocol_ratified else 'unratified'})",
+        f"({'ratified' if scorecard.protocol_ratified else 'unratified'}; "
+        f"fingerprint {scorecard.protocol_fingerprint[:12]})",
         f"days               {', '.join(scorecard.selected_days)} "
         f"(required {scorecard.required_days})",
         f"sentences          {scorecard.sentence_count}; "
