@@ -1657,7 +1657,7 @@ def test_writer_provisioned_wal_state_serves_a_read_only_api(persisted_world, ap
     path = persisted_world.path
     keeper = sqlite3.connect(path)  # writer-side, not the API
     try:
-        keeper.execute("SELECT 1").fetchall()
+        keeper.execute("PRAGMA user_version").fetchall()
         assert _sidecars(path) <= _entries(path)
         client = api(read_api(persisted_world))
         os.chmod(path.parent, 0o555)
