@@ -1,0 +1,163 @@
+# CI-1: test and lint every pull request to main and every push to main.
+# Assumptions and how to reproduce each job locally: docs/ci.md.
+#
+# This workflow tests only. It deploys nothing, holds no secrets, and
+# needs no credentials: summaries use fake providers, the embedding model
+# is never downloaded (HF_HUB_OFFLINE), and Yahoo/RSS/Gemini are faked.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: read the repository, nothing else. No job widens this.
+permissions:
+  contents: read
+
+# A concurrency group holds one running and one pending run; a newer pending
+# run replaces the older one. Pull requests share a group per PR number, so a
+# new push cancels the obsolete run. Each push to main gets a group of its
+# own (the unique run id), so no main run is ever queued behind, replaced
+# by, or cancelled for another.
+concurrency:
+  group: >-
+    ci-${{ github.workflow }}-${{ github.event_name == 'pull_request'
+    && format('pr-{0}', github.event.pull_request.number)
+    || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "22"
+  # CPU-only PyTorch, installed before the requirements so pip never pulls
+  # the multi-GB CUDA build. The project does not pin torch (it arrives via
+  # sentence-transformers); this matches the version in the development
+  # environment CI was introduced against. See docs/ci.md.
+  TORCH_VERSION: "2.13.0"
+  TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  python-tests:
+    name: Python tests (3.11)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Fail rather than reach for the network if a test ever loads the
+      # real embedding model.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            data/requirements.txt
+            requirements-dev.txt
+            .github/workflows/ci.yml
+
+      - name: Install CPU-only PyTorch
+        run: python -m pip install "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+
+      - name: Install pinned project dependencies
+        run: >-
+          python -m pip install
+          -r backend/requirements.txt
+          -r data/requirements.txt
+          -r requirements-dev.txt
+
+      - name: Verify the environment
+        run: |
+          python -m pip check
+          python - <<'EOF'
+          import sqlite3, sys
+          import torch
+          from phase0.schema import MINIMUM_SQLITE_VERSION
+          print("python", sys.version.split()[0])
+          print("sqlite", sqlite3.sqlite_version)
+          print("torch", torch.__version__)
+          assert sys.version_info[:2] == (3, 11), sys.version
+          assert torch.version.cuda is None, "CUDA build of torch installed"
+          assert sqlite3.sqlite_version_info >= MINIMUM_SQLITE_VERSION, (
+              f"SQLite {sqlite3.sqlite_version} is below the schema floor "
+              f"{MINIMUM_SQLITE_VERSION}"
+          )
+          EOF
+
+      - name: Run tests
+        # backend/test_*.py files are listed one by one, never globbed: each
+        # was checked to run offline with fakes (docs/ci.md, "Test scope").
+        # backend/test_api.py needs a live server and is not run.
+        run: >-
+          python -m pytest -q
+          tests
+          backend/tests
+          backend/test_data_service_cache.py
+          backend/test_prediction_integration.py
+          backend/test_prediction_persistence.py
+          backend/test_prediction_startup_prewarm.py
+          backend/test_sentiment_quality.py
+
+  python-lint:
+    name: Python lint (Black + Flake8, maintained scope)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history so a pull request can be diffed against its base.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the pinned Black and Flake8
+        # The versions come from backend/requirements.txt, the one place
+        # they are pinned, rather than being repeated here.
+        run: |
+          grep -E '^(black|flake8)==' backend/requirements.txt > "$RUNNER_TEMP/lint-requirements.txt"
+          test "$(wc -l < "$RUNNER_TEMP/lint-requirements.txt")" -eq 2
+          python -m pip install -r "$RUNNER_TEMP/lint-requirements.txt"
+
+      - name: Lint (pull request; changed baseline files lose their exemption)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: python tools/ci_python_lint.py --changed-since "$BASE_REF"
+
+      - name: Lint (push)
+        if: github.event_name != 'pull_request'
+        run: python tools/ci_python_lint.py
+
+  frontend:
+    name: Frontend (Node 22)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
