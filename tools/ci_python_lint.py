@@ -89,8 +89,12 @@ BLACK_BASELINE_AT_INTRODUCTION = _LEGACY_BLACK | _PHASE0_DEBT
 FLAKE8_BASELINE_AT_INTRODUCTION = _LEGACY_FLAKE8 | _PHASE0_DEBT
 
 #: The live exemptions.  Remove entries as files are cleaned; never add.
-BLACK_BASELINE: frozenset[str] = BLACK_BASELINE_AT_INTRODUCTION
-FLAKE8_BASELINE: frozenset[str] = FLAKE8_BASELINE_AT_INTRODUCTION
+BLACK_BASELINE: frozenset[str] = BLACK_BASELINE_AT_INTRODUCTION - {
+    "backend/app/services/data_service.py",
+}
+FLAKE8_BASELINE: frozenset[str] = FLAKE8_BASELINE_AT_INTRODUCTION - {
+    "backend/app/services/data_service.py",
+}
 
 
 class LintEnvironmentError(RuntimeError):
