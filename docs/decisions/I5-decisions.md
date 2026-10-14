@@ -381,6 +381,99 @@ This clears the bar G sets. It does not by itself authorize the change: the
 I2 correction that writes `external_id` on the valid path is still separately
 reviewed, and the observation is one window, not a guarantee.
 
+### Amendment — Search `uuid` (YF-1A.1, approved for YF-1B, October 2026)
+
+**What changed upstream.** By October 2026 Yahoo retired the endpoint
+behind `yf.Ticker(t).news` (`POST finance.yahoo.com/xhr/ncp` now answers
+404). yfinance reports that as an empty list, which is why every AWS-0 run
+fetched nothing. Headlines now come from Yahoo Search
+(`phase0/yahoo_search.py`). Search records carry no `id`; they carry the
+article identifier as top-level `uuid`.
+
+**Decision.** `uuid` is approved as a provider-issued identifier under G.
+- `id` is still preferred when present; otherwise `uuid` is read.
+- A record carrying both, with different values, carries **no** identifier.
+  Neither is trusted over the other. The conflict is recorded on the
+  ticker's source-state checkpoint (`metadata.id_conflicts`) and counted
+  (`id_conflicts`); the record itself stays valid evidence.
+- Nothing else stands in. `content.id`, `content.provider.sourceId`, and
+  synthesized values remain excluded, exactly as above.
+
+**Evidence.** `docs/observations/i5-provider-observation-2026-10-14.json`,
+plus its companion `yf-1a1-search-identity-2026-10-14.md`. Five attempts
+over a real span of 5.41 h against the five approved tickers, recomputable
+with `--recompute`:
+
+- **Presence** — 233 of 233 valid items carried `uuid`; `id` and
+  `content.id` were absent from all of them.
+- **Stability** — 102 distinct articles, 59 observed more than once, none
+  carrying two values; 12 held one `uuid` across observations at least two
+  hours apart (longest 5.41h). That clears the bar per article, on thinner
+  evidence than August's 37, because Search results turn over faster.
+- **Semantics** — article-scoped. 14 articles appeared under more than one
+  ticker and 50 at more than one position, each keeping one value.
+- **Collisions** — 102 identifiers for 102 canonical URLs.
+
+**Why `uuid` is the same identifier, not a new one.** It equals Yahoo's
+per-ticker RSS `<guid>` for every article seen in both (34/34 and 33/33),
+and equals the UUID embedded in `finance.yahoo.com/m/<uuid>/` links (7/7).
+One August article still reachable through Search carries the same value
+today as its retired-endpoint `id` did on 2026-08-23
+(`158484a0-bfd5-3828-b965-441ae440747e`). That is one match and no
+contradiction, but only one comparison was possible.
+
+**Previously stored rows.** None existed when this was decided. There was
+no local Phase 0 database; the AWS-0 database was destroyed holding no
+Yahoo rows; and the evaluation fixtures use synthetic identifiers. Should
+older rows surface, their `id` values share the `uuid` namespace, so
+`provider_key` lines up. Their canonical URLs mostly do not (see G1).
+
+**Revisit** if a Search record ever carries both fields with different
+values (`id_conflicts` above zero). Also revisit if a later observation
+shows a `uuid` that is unstable or colliding: that blocks the field, as G
+says.
+
+---
+
+## G1 — Yahoo Search canonical URLs are Yahoo-hosted (YF-1B)
+
+**Decision.** For this milestone, accept the URL Search sends as the
+Yahoo row's `url` and `canonical_url`. Search's `link` is always a
+`finance.yahoo.com` URL, including for articles syndicated from other
+publishers. No redirect or publisher-URL resolution is added.
+
+**What it changes.** The retired endpoint supplied the publisher's own URL
+through `content.canonicalUrl`: 139 of 200 items on 2026-08-23 pointed off
+Yahoo (fool.com, 247wallst.com, …). From YF-1B on, every Yahoo row is
+Yahoo-hosted.
+
+**Deduplication implications.**
+- **Within Yahoo, unchanged.** Across 5.41 h no article changed `link`, so
+  `(source, canonical_url)` still collapses re-fetches, and the same
+  article fetched under two tickers, into one row (decision E). The `uuid`
+  gives M2 its authoritative provider tier on Yahoo evidence again.
+- **Across sources, weaker.** A Yahoo row and an RSS row for the same
+  syndicated story no longer share a URL, so M2's URL tier cannot join
+  them. Provider keys never could, because the scheme qualifier keeps
+  `yahoo:` and `rss:` ids apart. Only the title and content tiers and
+  semantic dedup remain, and they are deliberately more conservative.
+  Expect more cross-source duplicates where the configured feeds overlap
+  Yahoo's syndication partners.
+- **Across the cutover.** A row stored from the retired endpoint (publisher
+  URL) and a Search row for the same article (Yahoo URL) would share a
+  provider key with different URLs. Where both fall in one ticker-day, M2
+  quarantines that as a provider conflict (`url`): both are kept, each as
+  its own story, and nothing is merged wrongly. No such rows exist (see
+  the G amendment).
+- **Live-updated articles.** Two articles kept their URL and `uuid` while
+  `providerPublishTime` moved by 1.5–2.6 h and one was retitled. The insert
+  conflict keeps the first version, so dedup never compares the two, but a
+  stored row can show a superseded title or time. The retired endpoint
+  behaved the same way.
+
+**Revisit** when cross-source duplicates show up in review, or when a
+publisher-URL source becomes available without redirect-chasing.
+
 ---
 
 ## H — M3 degradation must never look like a healthy day
@@ -651,5 +744,6 @@ stage-agnostic.
   `pipeline.py`, including run identity and replay scope.
 - `nlp/README.md` — M1–M5 design notes and their honest limitations.
 - `docs/observations/` — what the providers actually sent, on a stated day.
-  Decisions B, G, and A2 rest on those observations; the artifacts are
-  evidence rather than tests, and are expected to age.
+  Decisions B, G (with its YF-1A.1 amendment), G1, and A2 rest on those
+  observations; the artifacts are evidence rather than tests, and are
+  expected to age.
