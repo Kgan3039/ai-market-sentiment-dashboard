@@ -501,10 +501,16 @@ class DataService:
 
     @staticmethod
     def _fetch_yfinance_headlines(ticker: str, limit: int) -> List[HeadlineItem]:
-        import yfinance as yf
+        # Yahoo Search, as Phase 0 ingestion asks it (YF-1B): ``Ticker.news``
+        # hits a retired endpoint, and ``yf.Search`` would hand this
+        # long-running process its first answer from yfinance's own cache.
+        from phase0.yahoo_search import SearchTicker, attribution_error
 
-        stock = yf.Ticker(ticker)
-        raw_news = stock.news or []
+        raw_news = [
+            item
+            for item in SearchTicker(ticker).news
+            if attribution_error(ticker, item) is None
+        ]
         headlines = []
         for index, item in enumerate(raw_news[:limit]):
             normalized = DataService._normalize_yfinance_news_item(ticker, item, index)
@@ -544,7 +550,9 @@ class DataService:
             or "Yahoo Finance"
         )
 
-        headline_id = str(item.get("id") or content.get("id") or f"{ticker}-{index}")
+        headline_id = str(
+            item.get("id") or item.get("uuid") or content.get("id") or f"{ticker}-{index}"
+        )
         summary = item.get("summary") or content.get("summary")
 
         return HeadlineItem(

@@ -38,6 +38,12 @@ outstanding provider work, not merely how long the caller waits.  yfinance
 offers no way to cancel a request in flight, so the timeout cannot end the
 call; :class:`YahooProviderGate` bounds it instead, and every request goes
 through one.  See that class for the reasoning.
+
+**Where headlines come from.**  Yahoo Search, through
+:mod:`phase0.yahoo_search` (YF-1B).  ``Ticker.news`` still has the shape
+the ``ticker_factory`` seam exposes, but its endpoint is retired and it
+reports that as an empty list; the module docstring there says why Search
+is asked directly rather than through ``yf.Search``.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ from .redaction import redact_secrets
 from .repository import InsertResult, Phase0Repository, utc_now
 from .tickers import TICKER_UNIVERSE, normalize_ticker
 from .urls import canonicalize_url
+from .yahoo_search import SearchTicker, attribution_error
 
 
 #: The approved universe in the order the spec lists it.  Deliberately not
@@ -98,10 +105,11 @@ class YahooProviderGate:
     """Bound the provider work outstanding at any moment.
 
     A timeout on the caller's side does not stop the request it gave up on.
-    yfinance exposes no cancellation and no per-call timeout — ``Ticker.news``
-    takes no such argument and the library hard-codes ``timeout=30`` into its
-    own session calls — so an abandoned request keeps running until the
-    network answers it.  Timing out therefore cannot mean "the request
+    yfinance exposes no cancellation.  The Search request is handed the
+    fetcher's timeout, but that bounds one HTTP exchange, not yfinance's
+    cookie/crumb retries around it, and an injected ``ticker_factory`` may
+    honour no timeout at all — so an abandoned request keeps running until
+    the network answers it.  Timing out therefore cannot mean "the request
     stopped"; it can only mean "we stopped waiting".  What is left to
     guarantee is that the work we stopped waiting on cannot pile up, and
     that is this class's whole job:
@@ -343,16 +351,40 @@ def _nested_url(value: Any) -> str | None:
     return str(value).strip() if value else None
 
 
-def _provider_item_id(payload: Mapping[str, Any]) -> str | None:
-    """The provider's own top-level ``id``, or no identifier at all.
+def _provider_field(payload: Mapping[str, Any], field: str) -> str | None:
+    return str(payload.get(field) or "").strip() or None
 
-    Decision G: this field and nothing else.  There is no fallback -- not
-    ``content.id``, not ``uuid``, not a digest of the payload -- because
+
+def provider_id_conflict(payload: Any) -> str | None:
+    """Describe a payload whose ``id`` and ``uuid`` name different articles.
+
+    Neither field is trusted over the other when they disagree, so such a
+    record carries no identifier; this is the message that says why.
+    """
+
+    if not isinstance(payload, Mapping):
+        return None
+    item_id = _provider_field(payload, "id")
+    item_uuid = _provider_field(payload, "uuid")
+    if item_id and item_uuid and item_id != item_uuid:
+        return f"Yahoo news item id {item_id!r} and uuid {item_uuid!r} disagree"
+    return None
+
+
+def _provider_item_id(payload: Mapping[str, Any]) -> str | None:
+    """The provider's own top-level ``id``, else its ``uuid``, else nothing.
+
+    Decision G: provider-issued identifiers only.  The retired news
+    endpoint issued ``id``; Search issues the same article identifier as
+    ``uuid`` (YF-1A.1 amendment).  ``id`` is preferred when present, and a
+    record carrying both with different values carries neither -- see
+    :func:`provider_id_conflict`.  There is still no fallback beyond those
+    two -- not ``content.id``, not a digest of the payload -- because
     ``provider_key`` is M2's one authoritative, non-time-bounded merge
     signal, and a value the provider never issued would arrive there
-    looking exactly like one it did.  A blank id is no identifier, so the
-    same ``or None`` the repository applies is applied here, and both the
-    settled and the quarantined path read this one expression: evidence
+    looking exactly like one it did.  A blank value is no identifier, so
+    the same ``or None`` the repository applies is applied here, and both
+    the settled and the quarantined path read this one expression: evidence
     that could not be parsed says the same thing about its identity as
     evidence that could.
 
@@ -361,7 +393,9 @@ def _provider_item_id(payload: Mapping[str, Any]) -> str | None:
     qualifying it here would namespace it twice.
     """
 
-    return str(payload.get("id") or "").strip() or None
+    if provider_id_conflict(payload):
+        return None
+    return _provider_field(payload, "id") or _provider_field(payload, "uuid")
 
 
 def normalize_yahoo_item(
@@ -381,6 +415,9 @@ def normalize_yahoo_item(
     symbol = normalize_ticker(ticker)
     if not isinstance(item, Mapping):
         raise TypeError("Yahoo news item must be an object")
+    unattributed = attribution_error(symbol, item)
+    if unattributed:
+        raise ValueError(unattributed)
 
     content_value = item.get("content")
     content = content_value if isinstance(content_value, Mapping) else {}
@@ -509,8 +546,12 @@ class YahooFinanceFetcher:
                 "PHASE0_YFINANCE_CACHE",
                 str(self.repository.database_path.parent / ".yfinance-cache"),
             )
+            # yfinance keeps its cookie cache here too, and Search needs it.
             yf.set_tz_cache_location(cache_path)
-            factory = yf.Ticker
+
+            def factory(symbol: str) -> SearchTicker:
+                return SearchTicker(symbol, timeout=self.request_timeout_seconds)
+
         else:
             factory = self._ticker_factory
         return list(factory(ticker).news or [])
@@ -557,13 +598,26 @@ class YahooFinanceFetcher:
 
     def _normalize_batch(
         self, ticker: str, items: Sequence[Any], fetched_at: str
-    ) -> tuple[list[dict[str, Any]], list[bool], list[dict[str, Any]]]:
-        """Normalize a response, keeping unusable records as invalid evidence."""
+    ) -> tuple[
+        list[dict[str, Any]], list[bool], list[dict[str, Any]], list[dict[str, Any]]
+    ]:
+        """Normalize a response, keeping unusable records as invalid evidence.
+
+        Identifier conflicts are returned on their own: the record is still
+        usable evidence, it simply carries no ``external_id``, so it is
+        recorded on the checkpoint rather than counted as an error.
+        """
 
         normalized: list[dict[str, Any]] = []
         valid_flags: list[bool] = []
         item_errors: list[dict[str, Any]] = []
+        id_conflicts: list[dict[str, Any]] = []
         for index, payload in enumerate(items):
+            conflict = provider_id_conflict(payload)
+            if conflict:
+                id_conflicts.append(
+                    {"ticker": ticker, "item_index": index, "conflict": conflict}
+                )
             try:
                 normalized.append(
                     normalize_yahoo_item(ticker, payload, fetched_at=fetched_at)
@@ -581,7 +635,7 @@ class YahooFinanceFetcher:
                     _invalid_evidence(ticker, payload, exc, fetched_at=fetched_at)
                 )
                 valid_flags.append(False)
-        return normalized, valid_flags, item_errors
+        return normalized, valid_flags, item_errors, id_conflicts
 
     @staticmethod
     def _provider_status(items: Sequence[Any], valid_count: int, invalid: int) -> str:
@@ -749,11 +803,19 @@ class YahooFinanceFetcher:
 
         counts["retries"] += attempts - 1
         counts["fetched"] += len(items)
-        normalized, valid_flags, item_errors = self._normalize_batch(
+        normalized, valid_flags, item_errors, id_conflicts = self._normalize_batch(
             ticker, items, checked_at
         )
         counts["invalid"] += len(item_errors)
+        counts["id_conflicts"] += len(id_conflicts)
         errors.extend(item_errors)
+        for conflict in id_conflicts:
+            LOGGER.warning(
+                "Yahoo Finance item carries conflicting identifiers for ticker=%s "
+                "item_index=%s",
+                ticker,
+                conflict["item_index"],
+            )
         valid_count = valid_flags.count(True)
         status = self._provider_status(items, valid_count, len(item_errors))
         if status == "empty":
@@ -779,6 +841,7 @@ class YahooFinanceFetcher:
                 "attempts": attempts,
                 "request_timeout_seconds": self.request_timeout_seconds,
                 "errors": item_errors,
+                "id_conflicts": id_conflicts,
                 "trading_days": sorted(by_day),
             },
         )
@@ -877,6 +940,7 @@ class YahooFinanceFetcher:
             "inserted": 0,
             "duplicates": 0,
             "invalid": 0,
+            "id_conflicts": 0,
             "invalid_evidence_inserted": 0,
             "invalid_evidence_duplicates": 0,
             "retries": 0,
@@ -909,6 +973,24 @@ class YahooFinanceFetcher:
             self._fetch_ticker(
                 symbol, base_run_id=base_run_id, counts=counts, errors=errors
             )
+        if processed > 1 and counts["tickers_empty"] == processed:
+            # One quiet ticker is a quiet ticker.  Every ticker settling empty
+            # in one run is what a silently broken endpoint looked like in
+            # AWS-0, so it is named as its own condition.
+            errors.append(
+                {
+                    "diagnostic": "all_tickers_empty",
+                    "tickers": processed,
+                    "error": (
+                        "every requested Yahoo ticker returned an empty provider "
+                        "response; possible provider outage rather than a quiet "
+                        "news period"
+                    ),
+                }
+            )
+            LOGGER.error(
+                "Yahoo Finance returned no headlines for any of %s tickers", processed
+            )
         return counts, redact_secrets(errors)
 
 
@@ -924,4 +1006,5 @@ __all__ = [
     "effective_day",
     "normalize_yahoo_item",
     "partition_run_id",
+    "provider_id_conflict",
 ]
