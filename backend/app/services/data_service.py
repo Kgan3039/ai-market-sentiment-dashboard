@@ -568,10 +568,12 @@ class DataService:
         # long-running process its first answer from yfinance's own cache.
         from phase0.yahoo_search import SearchTicker, attribution_error
 
+        # A record that is not an object is skipped on its own; it must not
+        # take the valid headlines in the same answer down with it.
         raw_news = [
             item
             for item in SearchTicker(ticker).news
-            if attribution_error(ticker, item) is None
+            if isinstance(item, dict) and attribution_error(ticker, item) is None
         ]
         headlines = []
         for index, item in enumerate(raw_news[:limit]):
@@ -585,10 +587,14 @@ class DataService:
     def _normalize_yfinance_news_item(
         ticker: str, item: Dict[str, Any], index: int
     ) -> Optional[HeadlineItem]:
+        from phase0.yahoo import provider_item_id
+
+        if not isinstance(item, dict):
+            return None
         content = item.get("content") if isinstance(item.get("content"), dict) else {}
 
         title = item.get("title") or content.get("title")
-        if not title:
+        if not title or not isinstance(title, str):
             return None
 
         provider = (
@@ -616,12 +622,12 @@ class DataService:
             or "Yahoo Finance"
         )
 
-        headline_id = str(
-            item.get("id")
-            or item.get("uuid")
-            or content.get("id")
-            or f"{ticker}-{index}"
-        )
+        # Provider identity is Decision G's, exactly as ingestion stores it:
+        # ``id``, else ``uuid``, stripped, and none when the two disagree.
+        # The ticker/position key only gives the UI a list key for a record
+        # without one; it is never treated as the provider's identifier.
+        provider_id = provider_item_id(item)
+        headline_id = provider_id or f"{ticker}-{index}"
         summary = item.get("summary") or content.get("summary")
 
         return HeadlineItem(

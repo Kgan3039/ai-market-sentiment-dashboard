@@ -14,7 +14,12 @@ from yfinance.exceptions import YFRateLimitError
 
 from phase0.repository import Phase0Repository
 from phase0 import yahoo_search
-from phase0.yahoo import YahooFinanceFetcher, YahooProviderGate, normalize_yahoo_item
+from phase0.yahoo import (
+    YahooFinanceFetcher,
+    YahooProviderGate,
+    normalize_yahoo_item,
+    provider_item_id,
+)
 from phase0.yahoo_search import (
     SEARCH_URL,
     SearchTicker,
@@ -249,6 +254,33 @@ def test_a_search_record_normalizes_like_any_other_yahoo_record():
         == datetime.fromtimestamp(published, timezone.utc).isoformat()
     )
     assert normalized["raw_json"]["relatedTickers"] == ["AAPL", "NVDA", "SPCX"]
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [
+        {"id": "same", "uuid": "same"},
+        {"id": " padded "},
+        {"id": "   ", "uuid": "the-uuid"},
+        {"id": "article-a", "uuid": "article-b"},
+        {"uuid": None, "content": {"id": "content-only"}},
+    ],
+    ids=["matching", "whitespace", "blank-id", "conflict", "content-id-only"],
+)
+def test_the_public_provider_id_is_the_stored_external_id(ids):
+    """The dashboard reads identity through this; it must equal ingestion's."""
+
+    item = search_item("NVDA", **ids)
+    normalized = normalize_yahoo_item(
+        "NVDA", item, fetched_at="2026-10-15T00:00:00+00:00"
+    )
+
+    assert provider_item_id(item) == normalized["external_id"]
+
+
+@pytest.mark.parametrize("payload", [None, "uuid", ["id"], 7])
+def test_a_payload_that_is_not_an_object_has_no_provider_id(payload):
+    assert provider_item_id(payload) is None
 
 
 def test_an_unattributed_search_record_is_rejected_by_normalization():

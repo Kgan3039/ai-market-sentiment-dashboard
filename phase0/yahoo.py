@@ -398,6 +398,20 @@ def _provider_item_id(payload: Mapping[str, Any]) -> str | None:
     return _provider_field(payload, "id") or _provider_field(payload, "uuid")
 
 
+def provider_item_id(payload: Any) -> str | None:
+    """Decision G's provider identifier for *payload*, for readers outside ingestion.
+
+    The exact rule ingestion stores as ``external_id`` (see
+    :func:`_provider_item_id`), so the dashboard and the pipeline cannot
+    disagree about which article a record is.  Anything that is not a
+    mapping has no identifier.
+    """
+
+    if not isinstance(payload, Mapping):
+        return None
+    return _provider_item_id(payload)
+
+
 def normalize_yahoo_item(
     ticker: str,
     item: Mapping[str, Any],
@@ -1007,4 +1021,5 @@ __all__ = [
     "normalize_yahoo_item",
     "partition_run_id",
     "provider_id_conflict",
+    "provider_item_id",
 ]
