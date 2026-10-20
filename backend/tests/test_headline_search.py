@@ -269,3 +269,143 @@ def test_a_failing_provider_is_still_reported_as_a_failure(monkeypatch):
     status = DataService.get_headlines_status("NVDA")
     assert status["status"] == "unavailable"
     assert status["message"] == "Headline provider failed: YahooSearchError."
+
+
+def valid_item(uuid):
+    return search_item(uuid, f"Story {uuid}", ["NVDA"])
+
+
+def bad_title_item(uuid="bad-title"):
+    return search_item(uuid, {"text": "nested"}, ["NVDA"])
+
+
+def headline_ids(monkeypatch, batch, limit):
+    fake = FakeYfData([batch])
+    monkeypatch.setattr("yfinance.data.YfData", lambda: fake)
+    monkeypatch.setattr(DataService, "_pipeline_headlines", lambda *_args: [])
+    return [item.id for item in DataService.get_headlines("NVDA", limit=limit)]
+
+
+@pytest.mark.parametrize(
+    "batch",
+    [[bad_title_item(), valid_item("v1")], [valid_item("v1"), bad_title_item()]],
+    ids=["invalid-first", "valid-first"],
+)
+def test_a_skipped_record_does_not_spend_the_limit(monkeypatch, batch):
+    assert headline_ids(monkeypatch, batch, limit=1) == ["v1"]
+
+
+def test_several_skipped_records_before_valid_ones(monkeypatch):
+    batch = [
+        bad_title_item("bad-1"),
+        None,
+        {**valid_item("bad-link"), "link": {"url": "x"}},
+        bad_title_item("bad-2"),
+        valid_item("v1"),
+        valid_item("v2"),
+        valid_item("v3"),
+    ]
+
+    assert headline_ids(monkeypatch, batch, limit=2) == ["v1", "v2"]
+
+
+def test_a_limit_above_the_valid_count_returns_every_valid_record(monkeypatch):
+    batch = [valid_item("v1"), bad_title_item(), valid_item("v2")]
+
+    assert headline_ids(monkeypatch, batch, limit=10) == ["v1", "v2"]
+
+
+def test_valid_records_keep_provider_order_under_a_limit(monkeypatch):
+    batch = [valid_item(f"v{n}") for n in range(1, 6)]
+
+    assert headline_ids(monkeypatch, batch, limit=3) == ["v1", "v2", "v3"]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_a_limit_below_one_returns_no_headlines(monkeypatch, limit):
+    """Nothing requested, nothing returned -- never a slice from the end."""
+
+    batch = [valid_item("v1"), valid_item("v2")]
+
+    assert headline_ids(monkeypatch, batch, limit=limit) == []
+
+
+def test_ui_keys_stay_unique_when_records_are_skipped(monkeypatch):
+    batch = [bad_title_item(), identity_item(title="A"), identity_item(title="B")]
+
+    assert headline_ids(monkeypatch, batch, limit=2) == ["NVDA-1", "NVDA-2"]
+
+
+MALFORMED_FIELDS = {
+    "link-object": {"link": {"url": "https://finance.yahoo.com/x"}},
+    "link-number": {"link": 12345},
+    "publisher-object": {"publisher": {"name": "Motley Fool"}},
+    "publisher-number": {"publisher": 7},
+    "summary-list": {"summary": ["not", "text"]},
+    "summary-number": {"summary": 3.5},
+}
+
+
+@pytest.mark.parametrize("malformed", MALFORMED_FIELDS.values(), ids=MALFORMED_FIELDS)
+@pytest.mark.parametrize(
+    "malformed_first", [True, False], ids=["bad-first", "bad-last"]
+)
+def test_a_malformed_field_skips_only_its_article(
+    monkeypatch, malformed, malformed_first
+):
+    bad = {**valid_item("bad"), **malformed}
+    good = valid_item("good")
+    batch = [bad, good] if malformed_first else [good, bad]
+
+    assert headline_ids(monkeypatch, batch, limit=6) == ["good"]
+    status = DataService.get_headlines_status("NVDA")
+    assert status["status"] == "live"
+    assert status["count"] == 1
+
+
+def test_malformed_fields_are_rejected_not_coerced(monkeypatch):
+    """A number in a text field is not turned into text."""
+
+    batch = [{**valid_item("bad"), "publisher": 7, "summary": 3.5}]
+
+    assert headline_ids(monkeypatch, batch, limit=6) == []
+
+
+def test_a_batch_of_only_malformed_fields_is_an_empty_result(monkeypatch):
+    batch = [
+        {**valid_item(name), **fields} for name, fields in MALFORMED_FIELDS.items()
+    ]
+
+    assert headline_ids(monkeypatch, batch, limit=6) == []
+    status = DataService.get_headlines_status("NVDA")
+    assert status["status"] == "unavailable"
+    assert status["message"] == "Headline provider returned no articles."
+
+
+@pytest.mark.parametrize("published", [10**30, float("nan"), float("inf")])
+def test_an_unrepresentable_publish_time_reads_as_missing(monkeypatch, published):
+    batch = [{**valid_item("v1"), "providerPublishTime": published}]
+    fake = FakeYfData([batch])
+    monkeypatch.setattr("yfinance.data.YfData", lambda: fake)
+
+    headlines = DataService.get_headlines("NVDA")
+
+    assert [item.id for item in headlines] == ["v1"]
+    assert headlines[0].published_at is None
+    assert headlines[0].time is None
+
+
+def test_a_programming_error_in_normalization_is_not_swallowed(monkeypatch):
+    """Only schema validation is per-article; other errors stay provider failures."""
+
+    def broken(*_args):
+        raise TypeError("bug in normalization")
+
+    fake = FakeYfData([[valid_item("v1")]])
+    monkeypatch.setattr("yfinance.data.YfData", lambda: fake)
+    monkeypatch.setattr(DataService, "_normalize_yfinance_news_item", broken)
+    monkeypatch.setattr(DataService, "_pipeline_headlines", lambda *_args: [])
+
+    assert DataService.get_headlines("NVDA") == []
+    status = DataService.get_headlines_status("NVDA")
+    assert status["message"] == "Headline provider failed: TypeError."

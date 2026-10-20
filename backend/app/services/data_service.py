@@ -15,6 +15,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 from datetime import datetime
+from pydantic import ValidationError
 from app.models.schemas import (
     Fundamentals,
     HeadlineItem,
@@ -575,9 +576,22 @@ class DataService:
             for item in SearchTicker(ticker).news
             if isinstance(item, dict) and attribution_error(ticker, item) is None
         ]
-        headlines = []
-        for index, item in enumerate(raw_news[:limit]):
-            normalized = DataService._normalize_yfinance_news_item(ticker, item, index)
+        # ``limit`` counts headlines delivered, not records looked at: a
+        # skipped record must not spend a slot a later valid one could fill.
+        headlines: List[HeadlineItem] = []
+        for index, item in enumerate(raw_news):
+            if len(headlines) >= limit:
+                break
+            try:
+                normalized = DataService._normalize_yfinance_news_item(
+                    ticker, item, index
+                )
+            except ValidationError:
+                # A field HeadlineItem rejects (a non-text link, publisher or
+                # summary) is that article's defect alone.  Only schema
+                # validation is caught: the request already succeeded, and
+                # any other error is a bug that should still surface.
+                continue
             if normalized is not None:
                 headlines.append(normalized)
 
@@ -651,7 +665,12 @@ class DataService:
         if value is None:
             return None
         if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(value)
+            # An epoch the platform cannot represent is as unreadable as a
+            # string that is not ISO 8601, and is treated the same way.
+            try:
+                return datetime.fromtimestamp(value)
+            except (OverflowError, OSError, ValueError):
+                return None
         if isinstance(value, str):
             try:
                 return datetime.fromisoformat(value.replace("Z", "+00:00"))
