@@ -322,12 +322,87 @@ def test_valid_records_keep_provider_order_under_a_limit(monkeypatch):
 
 
 @pytest.mark.parametrize("limit", [0, -1])
-def test_a_limit_below_one_returns_no_headlines(monkeypatch, limit):
+def test_the_fetch_loop_returns_nothing_for_a_limit_below_one(monkeypatch, limit):
     """Nothing requested, nothing returned -- never a slice from the end."""
 
-    batch = [valid_item("v1"), valid_item("v2")]
+    fake = FakeYfData([[valid_item("v1"), valid_item("v2")]])
+    monkeypatch.setattr("yfinance.data.YfData", lambda: fake)
 
-    assert headline_ids(monkeypatch, batch, limit=limit) == []
+    assert DataService._fetch_yfinance_headlines("NVDA", limit) == []
+
+
+def committed_nvda_fallback_count(limit):
+    """Demo headlines the committed dataset really holds for NVDA, unmocked."""
+
+    return len(DataService._pipeline_headlines("NVDA", limit))
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_a_limit_below_one_returns_nothing_before_any_lookup(monkeypatch, limit):
+    """Not the cache, not Search, not the committed dataset fallback."""
+
+    assert committed_nvda_fallback_count(6) > 0
+    calls = []
+
+    def spy(name):
+        def record(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"{name} was consulted for limit={limit}")
+
+        return record
+
+    monkeypatch.setattr("yfinance.data.YfData", spy("YfData"))
+    monkeypatch.setattr(DataService, "_cache_lookup", spy("_cache_lookup"))
+    monkeypatch.setattr(
+        DataService, "_fetch_yfinance_headlines", spy("_fetch_yfinance_headlines")
+    )
+    monkeypatch.setattr(DataService, "_pipeline_headlines", spy("_pipeline_headlines"))
+
+    assert DataService.get_headlines("NVDA", limit=limit) == []
+    assert calls == []
+    assert DataService.get_headlines_status("NVDA", limit=limit) == {
+        "available": False,
+        "status": "unavailable",
+        "source": "Yahoo Finance via yfinance",
+        "message": f"No headlines were requested (limit {limit}).",
+        "count": 0,
+    }
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_a_limit_below_one_ignores_the_real_dataset_fallback(monkeypatch, limit):
+    """Empty Search answer, real committed NVDA dataset: still nothing."""
+
+    assert committed_nvda_fallback_count(6) > 0
+    fake = FakeYfData([[]])
+    monkeypatch.setattr("yfinance.data.YfData", lambda: fake)
+
+    assert DataService.get_headlines("NVDA", limit=limit) == []
+    assert fake.calls == 0
+
+
+@pytest.mark.parametrize("limit", [1, 2, 6])
+def test_positive_limits_still_use_the_real_dataset_fallback(monkeypatch, limit):
+    expected = committed_nvda_fallback_count(limit)
+    assert expected == limit
+    fake = FakeYfData([[]])
+    monkeypatch.setattr("yfinance.data.YfData", lambda: fake)
+
+    headlines = DataService.get_headlines("NVDA", limit=limit)
+
+    assert len(headlines) == expected
+    assert fake.calls == 1
+    status = DataService.get_headlines_status("NVDA", limit=limit)
+    assert status["status"] == "cached"
+    assert status["source"] == "Committed demo dataset"
+    assert status["count"] == expected
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_positive_limits_still_cap_live_headlines(monkeypatch, limit):
+    batch = [valid_item("v1"), valid_item("v2"), valid_item("v3")]
+
+    assert headline_ids(monkeypatch, batch, limit=limit) == ["v1", "v2"][:limit]
 
 
 def test_ui_keys_stay_unique_when_records_are_skipped(monkeypatch):

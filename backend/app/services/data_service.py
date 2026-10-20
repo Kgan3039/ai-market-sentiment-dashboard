@@ -462,6 +462,19 @@ class DataService:
         ticker = ticker.upper()
         cache_key = DataService._cache_key("headlines", ticker, limit)
 
+        # Nothing requested: answer before the cache, the provider, or the
+        # demo-dataset fallback, any of which would otherwise supply an item.
+        if limit <= 0:
+            DataService._set_provider_status(
+                cache_key,
+                available=False,
+                status="unavailable",
+                source="Yahoo Finance via yfinance",
+                message=f"No headlines were requested (limit {limit}).",
+                count=0,
+            )
+            return []
+
         cache_hit, cached_headlines, _ = DataService._cache_lookup(cache_key)
         if cache_hit:
             previous_status = DataService._PROVIDER_STATUS.get(cache_key, {})
