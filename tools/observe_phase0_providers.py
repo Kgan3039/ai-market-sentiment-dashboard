@@ -1049,17 +1049,18 @@ def _yahoo_article_urls(yahoo: Mapping[str, Any]) -> set[str]:
 
 
 def default_yahoo_news(ticker: str) -> list[Any]:
-    """Ask yfinance for one ticker's news, the way ingestion does.
+    """Ask Yahoo Search for one ticker's news, the way ingestion does.
 
-    ``YahooFinanceFetcher._news`` additionally points yfinance's timezone
-    cache at the database's directory.  There is no database here, so the
-    library's default location is used instead; it changes where a cache
-    file lands and nothing about the payload under observation.
+    ``YahooFinanceFetcher._news`` additionally points yfinance's cache at
+    the database's directory.  There is no database here, so the library's
+    default location is used instead; it changes where a cache file lands
+    and nothing about the payload under observation.  Every attempt is a
+    fresh request, so repeated attempts really are separate observations.
     """
 
-    import yfinance as yf
+    from phase0.yahoo_search import SearchTicker
 
-    return list(yf.Ticker(ticker).news or [])
+    return list(SearchTicker(ticker).news or [])
 
 
 def default_feed_get(url: str, *, timeout: float) -> Any:

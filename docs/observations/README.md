@@ -30,6 +30,15 @@ classifications share a rank, because neither of them can key a raw item,
 so candidates that ranked alike were not thereby found to be the same
 thing.
 
+## Which Yahoo endpoint a pair observed
+
+The 2026-08-23 pair observed `yf.Ticker(t).news`, an endpoint Yahoo has
+since retired. The 2026-10-14 pair observed Yahoo Search, and
+`yf-1a1-search-identity-2026-10-14.md` records how it was collected and the
+cross-checks behind decision G's `uuid` amendment. Since YF-1B the tool's
+default Yahoo fetch is Search (`phase0/yahoo_search.py`), with a fresh
+request every attempt.
+
 ## Re-running
 
 ```

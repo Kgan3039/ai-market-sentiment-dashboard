@@ -15,7 +15,14 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from app.models.schemas import Fundamentals, HeadlineItem, MarketData, MarketHistoryPoint, SocialPostItem
+from pydantic import ValidationError
+from app.models.schemas import (
+    Fundamentals,
+    HeadlineItem,
+    MarketData,
+    MarketHistoryPoint,
+    SocialPostItem,
+)
 
 
 class DataService:
@@ -28,7 +35,9 @@ class DataService:
     @staticmethod
     def _pipeline_file_path() -> str:
         return os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "stock_data.json")
+            os.path.join(
+                os.path.dirname(__file__), "..", "..", "..", "data", "stock_data.json"
+            )
         )
 
     @staticmethod
@@ -154,10 +163,21 @@ class DataService:
     def _post_content_type(post: Dict[str, Any], source: str) -> str:
         explicit_type = str(post.get("content_type") or "").strip().lower()
         if explicit_type in {"social_post", "publisher_headline", "news_headline"}:
-            return "publisher_headline" if explicit_type == "news_headline" else explicit_type
+            return (
+                "publisher_headline"
+                if explicit_type == "news_headline"
+                else explicit_type
+            )
 
         source_text = str(source or "").strip().lower()
-        social_sources = ("reddit", "twitter", "x.com", "stocktwits", "discord", "telegram")
+        social_sources = (
+            "reddit",
+            "twitter",
+            "x.com",
+            "stocktwits",
+            "discord",
+            "telegram",
+        )
         if any(source_name in source_text for source_name in social_sources):
             return "social_post"
 
@@ -186,7 +206,10 @@ class DataService:
 
                 headlines.append(
                     HeadlineItem(
-                        id=str(post.get("id") or f"{ticker}-dataset-{record_index}-{post_index}"),
+                        id=str(
+                            post.get("id")
+                            or f"{ticker}-dataset-{record_index}-{post_index}"
+                        ),
                         ticker=ticker,
                         headline=text,
                         title=text,
@@ -215,9 +238,13 @@ class DataService:
             return None
 
     @staticmethod
-    def _market_data_from_snapshot(ticker: str, market_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    def _market_data_from_snapshot(
+        ticker: str, market_snapshot: Dict[str, Any]
+    ) -> Dict[str, Any]:
         price = float(market_snapshot.get("price", 0.0) or 0.0)
-        status = market_snapshot.get("status") or ("cached" if price > 0 else "unavailable")
+        status = market_snapshot.get("status") or (
+            "cached" if price > 0 else "unavailable"
+        )
         source = market_snapshot.get("source") or (
             "Pipeline market snapshot" if price > 0 else "unavailable"
         )
@@ -227,16 +254,24 @@ class DataService:
             "price": price,
             "day_high": float(market_snapshot.get("day_high", price) or price),
             "volume": int(market_snapshot.get("volume", 0) or 0),
-            "price_delta_24h": DataService._optional_float(market_snapshot.get("price_delta_24h")),
-            "percent_change_24h": DataService._optional_float(market_snapshot.get("percent_change_24h")),
-            "volume_delta": DataService._optional_float(market_snapshot.get("volume_delta")),
+            "price_delta_24h": DataService._optional_float(
+                market_snapshot.get("price_delta_24h")
+            ),
+            "percent_change_24h": DataService._optional_float(
+                market_snapshot.get("percent_change_24h")
+            ),
+            "volume_delta": DataService._optional_float(
+                market_snapshot.get("volume_delta")
+            ),
             "source": source,
             "status": status,
             "timestamp": datetime.now(),
         }
 
     @staticmethod
-    def _market_data_from_history(ticker: str, hist: Any, source: str) -> Optional[Dict[str, Any]]:
+    def _market_data_from_history(
+        ticker: str, hist: Any, source: str
+    ) -> Optional[Dict[str, Any]]:
         if hist is None or hist.empty:
             return None
 
@@ -247,10 +282,14 @@ class DataService:
         price_delta = price - previous_close
         percent_change = (price_delta / previous_close * 100) if previous_close else 0.0
 
-        previous_volume = hist["Volume"].iloc[-6:-1] if len(hist) > 1 else hist["Volume"].iloc[-1:]
+        previous_volume = (
+            hist["Volume"].iloc[-6:-1] if len(hist) > 1 else hist["Volume"].iloc[-1:]
+        )
         average_volume = float(previous_volume.mean() or 0.0)
         volume = int(latest.get("Volume", 0) or 0)
-        volume_delta = ((volume - average_volume) / average_volume) if average_volume else 0.0
+        volume_delta = (
+            ((volume - average_volume) / average_volume) if average_volume else 0.0
+        )
 
         return {
             "symbol": ticker,
@@ -276,7 +315,8 @@ class DataService:
         Returns:
             MarketData: Current market data
 
-        The service attempts to use data from the pipeline JSON then falls back to yfinance.
+        The service attempts to use data from the pipeline JSON then falls back to
+        yfinance.
         """
         if not ticker or len(ticker.strip()) == 0:
             raise ValueError("Invalid ticker symbol")
@@ -285,17 +325,21 @@ class DataService:
         market_data = None
         ticker_records = DataService._get_ticker_records(ticker)
         if ticker_records:
-            latest = sorted(ticker_records, key=lambda r: r.get("date", ""), reverse=True)[0]
+            latest = sorted(
+                ticker_records, key=lambda r: r.get("date", ""), reverse=True
+            )[0]
             market_snapshot = latest.get("market_data", {}) or {}
-            market_data = DataService._market_data_from_snapshot(ticker, market_snapshot)
+            market_data = DataService._market_data_from_snapshot(
+                ticker, market_snapshot
+            )
 
         # Fallback to yfinance if pipeline data is unavailable or incomplete
-        if market_data is None or market_data['price'] <= 0:
+        if market_data is None or market_data["price"] <= 0:
             try:
                 import yfinance as yf
 
                 stock = yf.Ticker(ticker)
-                hist = stock.history(period='1mo')
+                hist = stock.history(period="1mo")
                 market_data = DataService._market_data_from_history(
                     ticker,
                     hist,
@@ -306,16 +350,16 @@ class DataService:
 
         if market_data is None:
             market_data = {
-                'symbol': ticker,
-                'price': 0.0,
-                'day_high': 0.0,
-                'volume': 0,
-                'price_delta_24h': 0.0,
-                'percent_change_24h': 0.0,
-                'volume_delta': 0.0,
-                'source': 'unavailable',
-                'status': 'unavailable',
-                'timestamp': datetime.now(),
+                "symbol": ticker,
+                "price": 0.0,
+                "day_high": 0.0,
+                "volume": 0,
+                "price_delta_24h": 0.0,
+                "percent_change_24h": 0.0,
+                "volume_delta": 0.0,
+                "source": "unavailable",
+                "status": "unavailable",
+                "timestamp": datetime.now(),
             }
 
         return MarketData(**market_data)
@@ -331,10 +375,15 @@ class DataService:
         Returns:
             Dict[str, MarketData]: Market data for each ticker
         """
-        return {ticker.upper(): DataService.get_market_data(ticker.upper()) for ticker in tickers}
+        return {
+            ticker.upper(): DataService.get_market_data(ticker.upper())
+            for ticker in tickers
+        }
 
     @staticmethod
-    def get_market_history(ticker: str, period: str = "1mo") -> List[MarketHistoryPoint]:
+    def get_market_history(
+        ticker: str, period: str = "1mo"
+    ) -> List[MarketHistoryPoint]:
         """Return recent historical close prices for compact dashboard charts."""
         if not ticker or len(ticker.strip()) == 0:
             raise ValueError("Invalid ticker symbol")
@@ -349,14 +398,18 @@ class DataService:
         try:
             history = DataService._fetch_yfinance_market_history(ticker, period)
         except Exception:
-            stale_hit, stale_history, _ = DataService._cache_lookup(cache_key, allow_expired=True)
+            stale_hit, stale_history, _ = DataService._cache_lookup(
+                cache_key, allow_expired=True
+            )
             return stale_history if stale_hit else []
 
         DataService._cache_set(cache_key, history)
         return history
 
     @staticmethod
-    def _fetch_yfinance_market_history(ticker: str, period: str) -> List[MarketHistoryPoint]:
+    def _fetch_yfinance_market_history(
+        ticker: str, period: str
+    ) -> List[MarketHistoryPoint]:
         import yfinance as yf
 
         stock = yf.Ticker(ticker)
@@ -377,7 +430,9 @@ class DataService:
 
             volume = row.get("Volume")
             try:
-                volume_value = int(volume) if volume is not None and volume == volume else None
+                volume_value = (
+                    int(volume) if volume is not None and volume == volume else None
+                )
             except (TypeError, ValueError):
                 volume_value = None
 
@@ -407,10 +462,25 @@ class DataService:
         ticker = ticker.upper()
         cache_key = DataService._cache_key("headlines", ticker, limit)
 
+        # Nothing requested: answer before the cache, the provider, or the
+        # demo-dataset fallback, any of which would otherwise supply an item.
+        if limit <= 0:
+            DataService._set_provider_status(
+                cache_key,
+                available=False,
+                status="unavailable",
+                source="Yahoo Finance via yfinance",
+                message=f"No headlines were requested (limit {limit}).",
+                count=0,
+            )
+            return []
+
         cache_hit, cached_headlines, _ = DataService._cache_lookup(cache_key)
         if cache_hit:
             previous_status = DataService._PROVIDER_STATUS.get(cache_key, {})
-            cached_source = previous_status.get("source", "Yahoo Finance via yfinance (cache)")
+            cached_source = previous_status.get(
+                "source", "Yahoo Finance via yfinance (cache)"
+            )
             DataService._set_provider_status(
                 cache_key,
                 available=len(cached_headlines) > 0,
@@ -428,7 +498,9 @@ class DataService:
         try:
             headlines = DataService._fetch_yfinance_headlines(ticker, limit)
         except Exception as exc:
-            stale_hit, stale_headlines, _ = DataService._cache_lookup(cache_key, allow_expired=True)
+            stale_hit, stale_headlines, _ = DataService._cache_lookup(
+                cache_key, allow_expired=True
+            )
             if stale_hit:
                 DataService._set_provider_status(
                     cache_key,
@@ -436,7 +508,8 @@ class DataService:
                     status="fallback",
                     source="Yahoo Finance via yfinance (stale cache)",
                     message=(
-                        f"Headline provider failed; using {len(stale_headlines)} cached items."
+                        "Headline provider failed; using "
+                        f"{len(stale_headlines)} cached items."
                         if stale_headlines
                         else "Headline provider failed and cached response was empty."
                     ),
@@ -453,7 +526,8 @@ class DataService:
                     status="cached",
                     source="Committed demo dataset",
                     message=(
-                        f"Headline provider failed; using {len(pipeline_headlines)} committed demo headlines."
+                        "Headline provider failed; using "
+                        f"{len(pipeline_headlines)} committed demo headlines."
                     ),
                     count=len(pipeline_headlines),
                 )
@@ -479,7 +553,9 @@ class DataService:
                     available=True,
                     status="cached",
                     source="Committed demo dataset",
-                    message=f"Using {len(pipeline_headlines)} committed demo headlines.",
+                    message=(
+                        f"Using {len(pipeline_headlines)} committed demo headlines."
+                    ),
                     count=len(pipeline_headlines),
                 )
                 return pipeline_headlines
@@ -501,13 +577,34 @@ class DataService:
 
     @staticmethod
     def _fetch_yfinance_headlines(ticker: str, limit: int) -> List[HeadlineItem]:
-        import yfinance as yf
+        # Yahoo Search, as Phase 0 ingestion asks it (YF-1B): ``Ticker.news``
+        # hits a retired endpoint, and ``yf.Search`` would hand this
+        # long-running process its first answer from yfinance's own cache.
+        from phase0.yahoo_search import SearchTicker, attribution_error
 
-        stock = yf.Ticker(ticker)
-        raw_news = stock.news or []
-        headlines = []
-        for index, item in enumerate(raw_news[:limit]):
-            normalized = DataService._normalize_yfinance_news_item(ticker, item, index)
+        # A record that is not an object is skipped on its own; it must not
+        # take the valid headlines in the same answer down with it.
+        raw_news = [
+            item
+            for item in SearchTicker(ticker).news
+            if isinstance(item, dict) and attribution_error(ticker, item) is None
+        ]
+        # ``limit`` counts headlines delivered, not records looked at: a
+        # skipped record must not spend a slot a later valid one could fill.
+        headlines: List[HeadlineItem] = []
+        for index, item in enumerate(raw_news):
+            if len(headlines) >= limit:
+                break
+            try:
+                normalized = DataService._normalize_yfinance_news_item(
+                    ticker, item, index
+                )
+            except ValidationError:
+                # A field HeadlineItem rejects (a non-text link, publisher or
+                # summary) is that article's defect alone.  Only schema
+                # validation is caught: the request already succeeded, and
+                # any other error is a bug that should still surface.
+                continue
             if normalized is not None:
                 headlines.append(normalized)
 
@@ -517,13 +614,19 @@ class DataService:
     def _normalize_yfinance_news_item(
         ticker: str, item: Dict[str, Any], index: int
     ) -> Optional[HeadlineItem]:
+        from phase0.yahoo import provider_item_id
+
+        if not isinstance(item, dict):
+            return None
         content = item.get("content") if isinstance(item.get("content"), dict) else {}
 
         title = item.get("title") or content.get("title")
-        if not title:
+        if not title or not isinstance(title, str):
             return None
 
-        provider = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+        provider = (
+            content.get("provider") if isinstance(content.get("provider"), dict) else {}
+        )
         canonical_url = content.get("canonicalUrl")
         click_url = content.get("clickThroughUrl")
 
@@ -534,7 +637,9 @@ class DataService:
             url = click_url.get("url")
 
         published_at = DataService._parse_publish_time(
-            item.get("providerPublishTime") or content.get("pubDate") or content.get("displayTime")
+            item.get("providerPublishTime")
+            or content.get("pubDate")
+            or content.get("displayTime")
         )
 
         source = (
@@ -544,7 +649,12 @@ class DataService:
             or "Yahoo Finance"
         )
 
-        headline_id = str(item.get("id") or content.get("id") or f"{ticker}-{index}")
+        # Provider identity is Decision G's, exactly as ingestion stores it:
+        # ``id``, else ``uuid``, stripped, and none when the two disagree.
+        # The ticker/position key only gives the UI a list key for a record
+        # without one; it is never treated as the provider's identifier.
+        provider_id = provider_item_id(item)
+        headline_id = provider_id or f"{ticker}-{index}"
         summary = item.get("summary") or content.get("summary")
 
         return HeadlineItem(
@@ -568,7 +678,12 @@ class DataService:
         if value is None:
             return None
         if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(value)
+            # An epoch the platform cannot represent is as unreadable as a
+            # string that is not ISO 8601, and is treated the same way.
+            try:
+                return datetime.fromtimestamp(value)
+            except (OverflowError, OSError, ValueError):
+                return None
         if isinstance(value, str):
             try:
                 return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -619,9 +734,11 @@ class DataService:
                     status="fallback",
                     source="Yahoo Finance via yfinance (stale cache)",
                     message=(
-                        "Fundamentals provider failed; using cached company fundamentals."
+                        "Fundamentals provider failed; "
+                        "using cached company fundamentals."
                         if stale_fundamentals is not None
-                        else "Fundamentals provider failed and cached response was empty."
+                        else "Fundamentals provider failed and cached response "
+                        "was empty."
                     ),
                 )
                 return stale_fundamentals
@@ -665,20 +782,38 @@ class DataService:
             company_name=info.get("longName") or info.get("shortName"),
             sector=info.get("sector"),
             industry=info.get("industry"),
-            market_cap=DataService._first_number(info, fast_info, "marketCap", "market_cap"),
-            trailing_pe=DataService._first_number(info, fast_info, "trailingPE", "trailing_pe"),
-            forward_pe=DataService._first_number(info, fast_info, "forwardPE", "forward_pe"),
-            price_to_book=DataService._first_number(info, fast_info, "priceToBook", "price_to_book"),
-            dividend_yield=DataService._first_number(info, fast_info, "dividendYield", "dividend_yield"),
+            market_cap=DataService._first_number(
+                info, fast_info, "marketCap", "market_cap"
+            ),
+            trailing_pe=DataService._first_number(
+                info, fast_info, "trailingPE", "trailing_pe"
+            ),
+            forward_pe=DataService._first_number(
+                info, fast_info, "forwardPE", "forward_pe"
+            ),
+            price_to_book=DataService._first_number(
+                info, fast_info, "priceToBook", "price_to_book"
+            ),
+            dividend_yield=DataService._first_number(
+                info, fast_info, "dividendYield", "dividend_yield"
+            ),
             beta=DataService._first_number(info, fast_info, "beta"),
             eps=DataService._first_number(info, fast_info, "trailingEps", "eps"),
-            revenue=DataService._first_number(info, fast_info, "totalRevenue", "revenue"),
-            net_income=DataService._first_number(info, fast_info, "netIncomeToCommon", "net_income"),
+            revenue=DataService._first_number(
+                info, fast_info, "totalRevenue", "revenue"
+            ),
+            net_income=DataService._first_number(
+                info, fast_info, "netIncomeToCommon", "net_income"
+            ),
             operating_cash_flow=DataService._first_number(
                 info, fast_info, "operatingCashflow", "operating_cash_flow"
             ),
-            debt_to_equity=DataService._first_number(info, fast_info, "debtToEquity", "debt_to_equity"),
-            currency=info.get("financialCurrency") or info.get("currency") or fast_info.get("currency"),
+            debt_to_equity=DataService._first_number(
+                info, fast_info, "debtToEquity", "debt_to_equity"
+            ),
+            currency=info.get("financialCurrency")
+            or info.get("currency")
+            or fast_info.get("currency"),
         )
 
         useful_values = fundamentals.model_dump(exclude={"source"}, exclude_none=True)
@@ -753,7 +888,9 @@ class DataService:
         if not posts:
             posts = []
             for headline in DataService.get_headlines(ticker, limit=8):
-                if not DataService._is_valid_pipeline_post(headline.headline, headline.source):
+                if not DataService._is_valid_pipeline_post(
+                    headline.headline, headline.source
+                ):
                     continue
                 posts.append(
                     {
@@ -773,12 +910,14 @@ class DataService:
             "ticker": ticker,
             "post_count": len(posts),
             "posts": posts,
-            "avg_post_score": sum([p.get("post_score", 0) for p in posts]) / max(1, len(posts)),
+            "avg_post_score": sum([p.get("post_score", 0) for p in posts])
+            / max(1, len(posts)),
         }
 
     @staticmethod
     def get_social_posts(ticker: str) -> List[SocialPostItem]:
-        """Return real pipeline social/news posts without fabricating fallback content."""
+        """Return real pipeline social/news posts without fabricating fallback
+        content."""
         if not ticker or len(ticker.strip()) == 0:
             raise ValueError("Invalid ticker symbol")
 
@@ -789,13 +928,18 @@ class DataService:
             record_posts = nested_posts if isinstance(nested_posts, list) else [record]
             for post_index, post in enumerate(record_posts):
                 text = str(post.get("text", "")).strip()
-                source = str(post.get("source", "Unknown source")).strip() or "Unknown source"
+                source = (
+                    str(post.get("source", "Unknown source")).strip()
+                    or "Unknown source"
+                )
                 if not DataService._is_valid_pipeline_post(text, source):
                     continue
 
                 posts.append(
                     SocialPostItem(
-                        id=str(post.get("id") or f"{ticker}-{record_index}-{post_index}"),
+                        id=str(
+                            post.get("id") or f"{ticker}-{record_index}-{post_index}"
+                        ),
                         ticker=ticker,
                         text=text,
                         source=source,

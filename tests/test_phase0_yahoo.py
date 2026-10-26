@@ -381,19 +381,18 @@ def test_a_missing_provider_id_does_not_cost_an_otherwise_valid_item(tmp_path):
     "item",
     [
         {"content": {"id": "content-1"}},
-        {"uuid": "uuid-1"},
         {"content": {"provider": {"sourceId": "source-1"}}},
-        {"content": {"id": "content-1"}, "uuid": "uuid-1"},
     ],
-    ids=["content.id", "uuid", "content.provider.sourceId", "both"],
+    ids=["content.id", "content.provider.sourceId"],
 )
 def test_no_other_identifier_stands_in_for_the_provider_id(item):
-    """Decision G: only the field the observation qualified, or nothing.
+    """Decision G: only the fields the observations qualified, or nothing.
 
-    ``content.id`` and ``uuid`` were observed alongside ``id`` and were not
-    the field the verdict rests on; ``sourceId`` identifies the publisher,
-    not the article. Reading any of them would put an unqualified value
-    where M2 treats it as authoritative.
+    ``id`` (I5 PR 2) and ``uuid`` (YF-1A.1) are qualified. ``content.id``
+    was observed alongside ``id`` and was not the field the verdict rests
+    on; ``sourceId`` identifies the publisher, not the article. Reading
+    either would put an unqualified value where M2 treats it as
+    authoritative.
     """
 
     payload = legacy_item("NVDA")
@@ -410,12 +409,49 @@ def test_the_top_level_id_wins_over_every_other_identifier():
     """Yahoo sends ``id`` and ``content.id`` alike, so they are pulled apart.
 
     Which field was read is not observable while the provider agrees with
-    itself, and the day it stops agreeing is the day it matters.
+    itself, and the day it stops agreeing is the day it matters.  ``uuid``
+    agrees here; disagreement is its own test below.
     """
 
-    item = legacy_item("NVDA", id="prov-9001", uuid="uuid-1")
+    item = legacy_item("NVDA", id="prov-9001", uuid="prov-9001")
     item["content"] = {"id": "content-1", "provider": {"sourceId": "source-1"}}
 
+    assert normalize_yahoo_item("NVDA", item)["external_id"] == "prov-9001"
+
+
+def test_a_search_uuid_is_the_provider_id_when_no_id_is_sent():
+    """YF-1A.1: Search issues the article identifier as ``uuid``."""
+
+    item = legacy_item("NVDA", uuid=" 5bfa9b58-9569-36e3-9d2d-d15047137138 ")
+
+    assert (
+        normalize_yahoo_item("NVDA", item)["external_id"]
+        == "5bfa9b58-9569-36e3-9d2d-d15047137138"
+    )
+
+
+@pytest.mark.parametrize(
+    "updates", [{"id": None}, {"id": ""}, {"id": "  "}], ids=["null", "empty", "spaces"]
+)
+def test_a_blank_id_defers_to_the_uuid(updates):
+    item = legacy_item("NVDA", uuid="uuid-1", **updates)
+
+    assert normalize_yahoo_item("NVDA", item)["external_id"] == "uuid-1"
+
+
+def test_an_id_and_uuid_that_disagree_carry_no_identifier():
+    """Neither is trusted over the other, so the record gets neither."""
+
+    item = legacy_item("NVDA", id="prov-9001", uuid="uuid-1")
+
+    assert normalize_yahoo_item("NVDA", item)["external_id"] is None
+    assert "disagree" in yahoo_module.provider_id_conflict(item)
+
+
+def test_an_id_and_uuid_that_agree_are_no_conflict():
+    item = legacy_item("NVDA", id="prov-9001", uuid=" prov-9001 ")
+
+    assert yahoo_module.provider_id_conflict(item) is None
     assert normalize_yahoo_item("NVDA", item)["external_id"] == "prov-9001"
 
 
@@ -779,26 +815,48 @@ def test_invalid_evidence_keeps_the_provider_id_when_the_payload_carries_one(
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "expected"),
     [
-        {"uuid": "not-the-id", "link": "https://publisher.example/x"},
-        {"id": "  ", "uuid": "not-the-id", "link": "https://publisher.example/x"},
-        {
-            "content": {"id": "nested"},
-            "uuid": "not-the-id",
-            "link": "https://publisher.example/x",
-        },
+        ({"uuid": "issued-uuid", "link": "https://publisher.example/x"}, "issued-uuid"),
+        (
+            {"id": "  ", "uuid": "issued-uuid", "link": "https://publisher.example/x"},
+            "issued-uuid",
+        ),
+        (
+            {
+                "content": {"id": "nested"},
+                "uuid": "issued-uuid",
+                "link": "https://publisher.example/x",
+            },
+            "issued-uuid",
+        ),
+        ({"content": {"id": "nested"}, "link": "https://publisher.example/x"}, None),
+        (
+            {
+                "id": "prov-9001",
+                "uuid": "issued-uuid",
+                "link": "https://publisher.example/x",
+            },
+            None,
+        ),
     ],
-    ids=["uuid-only", "blank-id-beside-uuid", "nested-id-beside-uuid"],
+    ids=[
+        "uuid-only",
+        "blank-id-beside-uuid",
+        "nested-id-beside-uuid",
+        "nested-id-only",
+        "conflicting-id-and-uuid",
+    ],
 )
-def test_invalid_evidence_never_falls_back_to_another_identifier(tmp_path, payload):
-    """A uuid is not the article id, and quarantine does not make it one."""
+def test_invalid_evidence_follows_the_settled_identifier_rule(
+    tmp_path, payload, expected
+):
+    """Quarantine neither invents an identifier nor drops a qualified one."""
 
     _, stored = stored_item(tmp_path, payload)
 
     assert stored["ingest_status"] == "invalid"
-    assert stored["external_id"] is None
-    assert "not-the-id" in stored["raw_json"]
+    assert stored["external_id"] == expected
 
 
 def test_invalid_evidence_without_a_provider_id_keeps_its_digest_identity(tmp_path):
