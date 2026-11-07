@@ -3632,6 +3632,62 @@ class Phase0Reader:
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         return self._query(f"SELECT * FROM run_log{where} ORDER BY id", parameters)
 
+    def operational_run_rows(
+        self, *, start: str | datetime, end: str | datetime, pipeline_version: str
+    ) -> list[dict[str, Any]]:
+        """Bounded, read-only run facts for an operational reporting window.
+
+        The run's start determines its scheduling opportunity.  A completed
+        run may have a different trading day because evidence can arrive late.
+        Error payloads are intentionally omitted from this reporting surface.
+        """
+
+        return self._query(
+            """
+            SELECT run_id, stage, ticker, trading_day, pipeline_version,
+                   status, counts, started_at, completed_at, replay
+            FROM run_log
+            WHERE julianday(started_at) >= julianday(?)
+              AND julianday(started_at) < julianday(?)
+              AND pipeline_version = ?
+            ORDER BY julianday(started_at), id
+            """,
+            (
+                _normalize_datetime(start, "start"),
+                _normalize_datetime(end, "end"),
+                _require_text(pipeline_version, "pipeline_version"),
+            ),
+        )
+
+    def operational_raw_items(
+        self, *, start: str | datetime, end: str | datetime
+    ) -> list[dict[str, Any]]:
+        """Evidence timestamps and provenance, excluding raw publisher text."""
+
+        return self._query(
+            """
+            SELECT raw_items.id, raw_items.source, raw_items.ticker,
+                   raw_items.published_at, raw_items.fetched_at,
+                   raw_items.ingest_status, raw_items.ingest_run_id,
+                   GROUP_CONCAT(DISTINCT raw_item_feeds.feed_source) AS feed_sources
+            FROM raw_items
+            LEFT JOIN raw_item_feeds ON raw_item_feeds.raw_item_id = raw_items.id
+            WHERE julianday(raw_items.fetched_at) >= julianday(?)
+              AND julianday(raw_items.fetched_at) < julianday(?)
+            GROUP BY raw_items.id
+            ORDER BY raw_items.id
+            """,
+            (_normalize_datetime(start, "start"), _normalize_datetime(end, "end")),
+        )
+
+    def operational_sources(self) -> list[str]:
+        """Sources known to the database, including feeds quiet in the window."""
+
+        return [
+            str(row["source"])
+            for row in self._query("SELECT source FROM source_state ORDER BY source")
+        ]
+
     def stage_key_rows(
         self,
         *,

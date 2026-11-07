@@ -619,6 +619,74 @@ def test_every_source_failing_is_a_failed_invocation(tmp_path, config, monkeypat
     assert intelligence.counts["partitions"] == 0
 
 
+def test_restart_after_interruption_preserves_evidence_and_recovers(
+    tmp_path, config, monkeypatch
+):
+    """A process stopping after Yahoo leaves durable evidence for the next run."""
+
+    database = tmp_path / "phase0.sqlite3"
+    repository = migrated(tmp_path)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+    original_execute = pipeline.execute_stage
+    calls = 0
+
+    def interrupt_after_yahoo(stage, *, invocation_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("simulated process stop before RSS")
+        return original_execute(stage, invocation_id=invocation_id)
+
+    monkeypatch.setattr(pipeline, "execute_stage", interrupt_after_yahoo)
+    with pytest.raises(KeyboardInterrupt, match="simulated process stop"):
+        run_live(repository, **config)
+    first_yahoo = repository.run_log_entries(stage="fetch_yahoo")
+    assert len(first_yahoo) == len(TICKERS)
+    assert repository.run_log_entries(stage="checkpoint_rss") == []
+
+    monkeypatch.setattr(pipeline, "execute_stage", original_execute)
+    restarted = Phase0Repository(database)
+    result = run_live(restarted, **config)
+    assert result.status == "success"
+    assert all(
+        row in restarted.run_log_entries(stage="fetch_yahoo") for row in first_yahoo
+    )
+    assert len(restarted.run_log_entries(stage="checkpoint_rss")) == 2
+
+    raw_before = reader(restarted).raw_items()
+    replayed = run_replay(Phase0Repository(database), **config)
+    assert replayed.status == "success"
+    assert reader(restarted).raw_items() == raw_before
+
+
+def test_source_outage_recovers_on_next_unattended_run(tmp_path, config, monkeypatch):
+    repository = migrated(tmp_path)
+    wire(
+        monkeypatch,
+        ticker_factory=provider(failing={"NVDA"}),
+        get=responder(failing={"alpha"}),
+    )
+    first = run_live(repository, **config)
+    assert first.status == "degraded"
+    assert repository.source_state("yahoo:NVDA")["status"] == "failed"
+    assert repository.source_state("rss:alpha")["status"] == "failed"
+    first_runs = repository.run_log_entries()
+
+    # A new process reads the persisted checkpoint and performs an ordinary
+    # scheduled retry. No manual repair or database cleanup is involved.
+    restarted = Phase0Repository(repository.database_path)
+    monkeypatch.setattr(pipeline, "YahooFinanceFetcher", YahooFinanceFetcher)
+    monkeypatch.setattr(pipeline, "RSSFetcher", RSSFetcher)
+    wire(monkeypatch, ticker_factory=provider(), get=responder())
+    second = run_live(restarted, **config)
+    assert second.status == "success", [
+        (part.name, part.status, part.errors) for part in second.components
+    ]
+    assert restarted.source_state("yahoo:NVDA")["status"] == "success"
+    assert restarted.source_state("rss:alpha")["status"] == "success"
+    assert all(row in restarted.run_log_entries() for row in first_runs)
+
+
 @pytest.mark.parametrize("crashing", ["yahoo", "rss"])
 def test_a_component_raising_does_not_stop_or_unwind_the_other(
     tmp_path, config, monkeypatch, crashing
