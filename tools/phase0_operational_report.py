@@ -30,7 +30,9 @@ EASTERN = ZoneInfo("America/New_York")
 INVOCATION_ID = re.compile(
     r"^(phase0-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-" r"[0-9a-f]{4}-[0-9a-f]{12})(?=:)"
 )
-ACCEPTABLE = {"success"}
+# A successful source check may legitimately find no headlines. The pipeline
+# treats source_state "empty" as a completed fetch, not a provider outage.
+ACCEPTABLE = {"success", "empty"}
 OUTCOME_SEVERITY = {
     "success": 0,
     "empty": 1,
@@ -78,6 +80,10 @@ def _invocation_id(run_id: str) -> str:
 
 def _source_result(row: dict) -> tuple[str, str] | None:
     counts = json.loads(row["counts"])
+    # Yahoo can write item partitions before it writes the source checkpoint.
+    # An ingest-only row does not prove that the provider check completed.
+    if "source_state_status" not in counts:
+        return None
     if row["stage"] == "fetch_yahoo" and row["ticker"]:
         source = f'yahoo:{row["ticker"]}'
     elif row["stage"] == "checkpoint_rss":
@@ -89,11 +95,7 @@ def _source_result(row: dict) -> tuple[str, str] | None:
         return None
     status = counts.get("source_state_status")
     if status not in {"success", "partial", "empty", "failed", "unknown"}:
-        status = (
-            row["status"]
-            if row["status"] in {"success", "degraded", "failed"}
-            else "unknown"
-        )
+        status = "unknown"
     return source, status
 
 
@@ -305,6 +307,9 @@ def build_report(
         "gates": {
             "G5": {
                 "status": "unmeasured",
+                "numerator": None,
+                "denominator": len(slots),
+                "unknowns": len(slots),
                 "candidate_successes": clean_candidates,
                 "scheduled_opportunities": len(slots),
                 "reason": (
@@ -315,6 +320,9 @@ def build_report(
             },
             "G6": {
                 "status": "unmeasured",
+                "numerator": None,
+                "denominator": None,
+                "unknowns": None,
                 "reason": (
                     "publish-to-fetch is available above, but historical "
                     "publish-to-visible timestamps are not stored."
@@ -322,6 +330,9 @@ def build_report(
             },
             "G7": {
                 "status": "unmeasured",
+                "numerator": None,
+                "denominator": None,
+                "unknowns": None,
                 "reason": (
                     "The ledger does not retain a historical count of themes "
                     "shipped with and without a current accepted summary."

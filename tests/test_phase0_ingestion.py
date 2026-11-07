@@ -541,6 +541,30 @@ tickers:
     assert repository.count("raw_items") == 1
     assert repository.count("feed_snapshots") == 2
 
+    # The malformed response is retained, and an ordinary later fetch from
+    # a fresh repository can restore the failed feed checkpoint.
+    first_runs = repository.run_log_entries()
+    restarted = Phase0Repository(repository.database_path)
+
+    def repaired_get(url, **kwargs):
+        return Response(
+            b"<rss><channel><item><title>NVIDIA recovery</title>"
+            b"<link>https://example.com/recovery</link></item></channel></rss>"
+        )
+
+    recovered_counts, recovered_errors = RSSFetcher(
+        restarted,
+        feeds_path=feeds,
+        aliases_path=aliases,
+        get=repaired_get,
+    ).fetch()
+
+    assert recovered_errors == []
+    assert recovered_counts["feeds_succeeded"] == 2
+    assert restarted.source_state("rss:broken")["status"] == "success"
+    assert restarted.count("feed_snapshots") == 4
+    assert all(row in restarted.run_log_entries() for row in first_runs)
+
 
 def test_duplicate_rss_item_can_be_assigned_after_initial_unmatched_insert(tmp_path):
     repository = Phase0Repository(tmp_path / "phase0.sqlite3")

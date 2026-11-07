@@ -31,9 +31,12 @@ daylight saving transitions. Confirm the host actually honors
 Each scheduled slot reports whether any live partition run was durable, its
 Yahoo outcome for each of the five tickers, each RSS checkpoint known to the
 database, and failed or degraded stages. `empty` is a completed but quiet
-source check, not a clean invocation; `failed` is a provider or processing
-failure. `partial` and `degraded` remain separate. Replay rows are excluded
-from scheduled-slot accounting. The source registry comes from persisted
+source check; it can be a clean candidate when every other known source and
+stage is healthy. `failed` is a provider or processing failure. `partial`
+and `degraded` remain separate. Replay rows are excluded
+from scheduled-slot accounting. A Yahoo item-partition row without its
+source checkpoint remains `missing`; it cannot prove the provider check
+completed. The source registry comes from persisted
 source state and run rows; a feed that has never left either is unknowable
 from SQLite alone.
 Compare that list with the approved feed configuration before scoring.
@@ -53,11 +56,15 @@ That latency is a diagnostic proxy. It is not publish-to-visible G6.
 | G7: ≤15% themes shipped without summary | Current theme and summary state can be inspected elsewhere | A historical record of themes actually served, with and without a current accepted summary, over the preregistered soak window. A present-day snapshot is not the shipped denominator. |
 
 Do not turn `clean_candidates` into a G5 pass rate. It is a diagnostic count
-of slots where all *known* sources report success and no stage row is
+of slots where all *known* sources report success or a quiet `empty` check and no stage row is
 degraded or failed. Missing invocations, component failures that
 left no row, retired or never-recorded feeds, and process completion require
 the log correlation above. If logs or visibility history are missing, record
-the gate as **unmeasured**, with the missing evidence named.
+the gate as **unmeasured**, with the missing evidence named. Gate objects
+carry `numerator`, `denominator`, and `unknowns` explicitly. G5 knows the
+scheduled denominator but marks every result unknown without invocation
+correlation. G6 and G7 leave counts null because the historical served
+population itself is not recorded; null does not mean zero.
 
 ## Controlled local recovery evidence
 

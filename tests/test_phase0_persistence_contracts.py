@@ -5419,6 +5419,23 @@ READER_PROBES = {
     "theme": ((1,), {}),
     "source_state_rows": ((), {}),
     "run_log_rows": ((), {}),
+    # N1 operational reporting reads stay within the plain-data boundary.
+    "operational_run_rows": (
+        (),
+        {
+            "start": "2026-08-01T00:00:00+00:00",
+            "end": "2026-08-02T00:00:00+00:00",
+            "pipeline_version": "phase0-v1",
+        },
+    ),
+    "operational_raw_items": (
+        (),
+        {
+            "start": "2026-08-01T00:00:00+00:00",
+            "end": "2026-08-02T00:00:00+00:00",
+        },
+    ),
+    "operational_sources": ((), {}),
     "stage_key_rows": ((), {}),
     "table_names": ((), {}),
     "schema_objects": ((), {}),

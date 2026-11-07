@@ -154,12 +154,12 @@ def test_report_separates_quiet_coverage_failures_missing_slots_and_replay(tmp_p
     )
     assert repo.read.run_log_rows() == before
     assert report["scheduled_opportunities"] == 4
-    assert report["clean_candidates"] == 1
+    assert report["clean_candidates"] == 2
     assert report["opportunities_with_no_durable_run"] == 1
     assert report["excluded_replay_rows"] == 2
     assert report["opportunities"][1]["invocations_with_durable_rows"] == 2
     assert [item["status"] for item in report["opportunities"]] == [
-        "incomplete_or_degraded",
+        "clean_candidate",
         "incomplete_or_degraded",
         "no_durable_run",
         "clean_candidate",
@@ -182,6 +182,9 @@ def test_report_separates_quiet_coverage_failures_missing_slots_and_replay(tmp_p
         == "2026-08-18T14:30:02+00:00"
     )
     assert all(gate["status"] == "unmeasured" for gate in report["gates"].values())
+    assert report["gates"]["G5"]["denominator"] == 4
+    assert report["gates"]["G5"]["unknowns"] == 4
+    assert all(gate["numerator"] is None for gate in report["gates"].values())
 
 
 def test_raw_freshness_is_a_fetch_proxy_and_missing_dates_remain_visible(tmp_path):
@@ -213,3 +216,36 @@ def test_raw_freshness_is_a_fetch_proxy_and_missing_dates_remain_visible(tmp_pat
     assert evidence["missing_ingest_run_id"] == 2
     assert evidence["publish_to_fetch_p95_minutes"] == 10
     assert report["gates"]["G6"]["status"] == "unmeasured"
+
+
+def test_ingest_only_yahoo_partition_does_not_claim_a_completed_check(tmp_path):
+    repo = Phase0Repository(tmp_path / "phase0.sqlite3")
+    repo.migrate()
+    invocation = f"phase0-{UUID(int=6)}"
+    for ticker in TICKERS:
+        log(
+            repo,
+            invocation,
+            "fetch_yahoo",
+            f"yahoo:{ticker}:{DAY}",
+            "2026-08-18T13:00:02+00:00",
+            ticker=ticker,
+            source_status=None if ticker == "NVDA" else "success",
+        )
+    log(
+        repo,
+        invocation,
+        "checkpoint_rss",
+        f"rss:alpha:checkpoint:{DAY}",
+        "2026-08-18T13:00:03+00:00",
+        source_status="success",
+    )
+
+    report = build_report(repo.read, start=START, end=END, pipeline_version="phase0-v1")
+
+    assert report["opportunities"][0]["sources"]["yahoo:NVDA"] == "missing"
+    assert report["opportunities"][0]["status"] == "incomplete_or_degraded"
+    assert report["source_checkpoints_from_window_runs"]["yahoo:NVDA"] == {
+        "last_recorded_at": None,
+        "last_successful_at": None,
+    }
