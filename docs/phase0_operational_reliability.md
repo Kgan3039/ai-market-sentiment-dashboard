@@ -71,16 +71,15 @@ population itself is not recorded; null does not mean zero.
 The offline test suite exercises these conditions with fake providers and a
 temporary SQLite database:
 
-| Failure or recovery | Test |
-| --- | --- |
-| Yahoo request timeout, checkpoint outcome, and a later successful fetch | `tests/test_phase0_yahoo.py::test_a_request_timeout_is_reported_and_checkpointed`, `test_the_next_fetch_recovers_once_the_hung_request_finally_returns` |
-| Malformed Yahoo item persists as invalid evidence while later items continue | `tests/test_phase0_yahoo.py::test_a_malformed_item_does_not_abort_later_items_and_is_durable` |
-| Malformed RSS feed does not stop another feed | `tests/test_phase0_ingestion.py::test_malformed_feed_does_not_prevent_later_feed_success` |
-| One ticker and one feed fail without erasing other source evidence | `tests/test_phase0_pipeline.py::test_partial_evidence_is_degraded_and_never_a_clean_success` |
-| A later unattended run restores failed Yahoo and RSS checkpoints without erasing failure history | `tests/test_phase0_pipeline.py::test_source_outage_recovers_on_next_unattended_run` |
-| Process stops between Yahoo and RSS; a new repository instance recovers and offline replay keeps raw evidence | `tests/test_phase0_pipeline.py::test_restart_after_interruption_preserves_evidence_and_recovers` |
-| Replay never calls a provider | `tests/test_phase0_pipeline.py::test_replay_touches_no_network_at_all` |
-| Report distinguishes quiet checks, failures, replay, and missing slots | `tests/test_phase0_operational_report.py` |
+| Condition | Expected | Observed in offline tests |
+| --- | --- | --- |
+| Yahoo request times out | The ticker records a failed checkpoint; a later healthy request restores it. | Timeout and recovery assertions pass in `tests/test_phase0_yahoo.py::test_a_request_timeout_is_reported_and_checkpointed` and `test_the_next_fetch_recovers_once_the_hung_request_finally_returns`. |
+| Yahoo returns a malformed item | The bad item stays as invalid evidence and later items continue. | Both assertions pass in `tests/test_phase0_yahoo.py::test_a_malformed_item_does_not_abort_later_items_and_is_durable`. |
+| One RSS feed returns malformed XML | The other feed succeeds; a later healthy fetch restores the failed feed without deleting earlier runs or snapshots. | Both feeds, restored checkpoint, and retained history are asserted in `tests/test_phase0_ingestion.py::test_malformed_feed_does_not_prevent_later_feed_success`. |
+| One ticker and one feed fail | The invocation is degraded while healthy sources retain their evidence; a later ordinary run restores failed checkpoints. | Degradation and recovery assertions pass in `tests/test_phase0_pipeline.py::test_partial_evidence_is_degraded_and_never_a_clean_success` and `test_source_outage_recovers_on_next_unattended_run`. |
+| Process stops between Yahoo and RSS | Yahoo's committed rows survive; a new process completes; offline replay preserves raw evidence. | All three assertions pass in `tests/test_phase0_pipeline.py::test_restart_after_interruption_preserves_evidence_and_recovers`. |
+| Replay runs | It makes no provider calls and does not count as a scheduled live opportunity. | `tests/test_phase0_pipeline.py::test_replay_touches_no_network_at_all` and `tests/test_phase0_operational_report.py` assert both properties. |
+| Quiet source and incomplete checkpoint | A zero-headline check remains distinct from failure; an ingest-only row cannot claim a completed Yahoo check. | `tests/test_phase0_operational_report.py` asserts both classifications. |
 
 The process-stop test interrupts the orchestrator at a controlled boundary.
 It does not test power loss inside a SQLite transaction or a host reboot.
