@@ -34,7 +34,6 @@ PINNED_BLACK_BASELINE = frozenset(
         "backend/app/services/data_service.py",
         "backend/app/services/prediction_service.py",
         "backend/app/services/sentiment_service.py",
-        "backend/main.py",
         "backend/test_api.py",
         "backend/test_data_service_cache.py",
         "backend/test_prediction_integration.py",
@@ -49,9 +48,7 @@ PINNED_BLACK_BASELINE = frozenset(
         "tools/validate_phase0_copy_rules.py",
     }
 )
-PINNED_FLAKE8_BASELINE = (PINNED_BLACK_BASELINE - {"backend/app/routes/market.py"}) | {
-    "backend/test_prediction_startup_prewarm.py"
-}
+PINNED_FLAKE8_BASELINE = PINNED_BLACK_BASELINE - {"backend/app/routes/market.py"}
 
 
 def probe_failing(failing: set[str]):

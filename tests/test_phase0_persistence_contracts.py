@@ -7090,7 +7090,9 @@ def test_sqlite_is_only_used_inside_the_persistence_layer():
     for path in REPO_ROOT.rglob("*.py"):
         relative = path.relative_to(REPO_ROOT)
         parts = relative.parts
-        if parts[0] in {".venv", "frontend", "node_modules", "tests"}:
+        if parts[0] in {"frontend", "tests"}:
+            continue
+        if any(part in {".venv", "venv", "node_modules"} for part in parts):
             continue
         if parts[0] == "phase0":
             continue

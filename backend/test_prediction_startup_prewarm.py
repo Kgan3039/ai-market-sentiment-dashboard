@@ -7,9 +7,9 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from app.services import prediction_service
-from app.services.prediction_service import PredictionService
-import main as backend_main
+from app.services import prediction_service  # noqa: E402
+from app.services.prediction_service import PredictionService  # noqa: E402
+import main as backend_main  # noqa: E402
 
 
 def test_prediction_prewarm_uses_bootstrap_artifacts(monkeypatch) -> None:
@@ -53,7 +53,7 @@ def test_startup_event_handles_signal_prewarm_failure(monkeypatch, caplog) -> No
         raise RuntimeError("artifact file is unreadable")
 
     monkeypatch.setattr(
-        backend_main.PredictionService,
+        PredictionService,
         "prewarm_model_artifacts",
         staticmethod(fail_prewarm),
     )

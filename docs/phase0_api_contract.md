@@ -43,6 +43,19 @@ record per pipeline stage. A record contains `stage`, `status`, `started_at`,
 unparseable values are invalid pipeline output and are never inferred from
 ticker coverage timestamps.
 
+## Private-pilot serving profile
+
+**Decision (B1, 2026-11-11): option (a), isolate the Phase 0 API.** The private
+pilot must run with `API_SERVING_PROFILE=phase0`. That profile exposes exactly
+the operational `GET /test` route and the three narrative routes above. It
+does not import or mount the legacy sentiment, prediction, market or dashboard
+routers, and it does not register prediction-artifact prewarming.
+
+`API_SERVING_PROFILE=full` remains the backward-compatible default for local
+legacy work; it is not the approved private-pilot configuration. Route and
+fresh-process startup assertions live in
+`backend/tests/test_phase0_serving_profile.py`.
+
 ## Fixture Source
 
 The committed source is
@@ -119,6 +132,20 @@ The default stays `fixture`. A deployment selects `sqlite` explicitly, once
 the host checks in `docs/phase0_deployment_handoff.md` pass against real
 persisted output.
 
+### Performance benchmark
+
+`tools/phase0_api_benchmark.py` measures all three route types. Local mode
+serves a selected SQLite database through the isolated FastAPI application;
+`--seed-representative` can create deterministic synthetic data through the
+real Phase 0 persistence, story/theme reconciliation and summary-artifact
+paths without network or provider calls. HTTP mode measures the same request
+mix against the private host.
+
+The committed local result is
+`docs/benchmarks/phase0_api_local_2026-11-11.md`. It covers 600 measured
+requests against 4,500 stories and passes the 300 ms p95 target for every
+endpoint group. This is local evidence, not the required private-host result.
+
 ### Deployment requirements
 
 - The API process must see the same `GEMINI_MODEL` and
@@ -159,6 +186,8 @@ persisted output.
   separately. The permission model, rollout, rollback, restore procedure and
   the host smoke checklist are in `docs/phase0_deployment_handoff.md`,
   "SQLite serving (B3)".
+- The API service environment must set `API_SERVING_PROFILE=phase0`; the
+  private pilot must not use the backward-compatible `full` profile.
 - Never open the live database with `immutable=1`: SQLite would stop
   noticing the writer's commits. `nolock` or exclusive locking on the reader
   would likewise give up correct coordination with the writer.
