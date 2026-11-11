@@ -6,13 +6,13 @@ deployment.
 
 ## Current Blockers
 
-1. The B1 SQLite read source exists but is opt-in
-   (`PHASE0_NARRATIVE_SOURCE=sqlite`; the default is still the fixture). Its
-   behaviour and API-side requirements -- matching `GEMINI_MODEL` and
+1. B1's isolated serving profile and local SQLite benchmark are implemented,
+   but neither has been measured on a target host. The private API must set
+   `API_SERVING_PROFILE=phase0` and `PHASE0_NARRATIVE_SOURCE=sqlite`. Its
+   API-side requirements -- matching `GEMINI_MODEL` and
    `GEMINI_MAX_OUTPUT_TOKENS` with the scheduler, and `PYTHONPATH` including
    the project root -- are in `docs/phase0_api_contract.md`. B3 adds the
-   writer-side WAL keeper and the preflight gate the switch requires; see
-   "SQLite serving (B3)" below. Neither has been run on a target host yet.
+   writer-side WAL keeper and preflight gate; see "SQLite serving (B3)" below.
 2. The merged pipeline must be demonstrated to persist API-eligible, completed
    narrative/theme output before the ticker page switches to live data. Raw
    items and intermediate story records, including degraded intermediate story
@@ -37,7 +37,8 @@ deployment.
 2. Set a persistent `PHASE0_DATABASE_PATH`, for example
    `/var/lib/ticker-narratives/phase0.sqlite3`; do not place the database in a
    temporary build directory. Give the API the same value, but switch it to
-   `PHASE0_NARRATIVE_SOURCE=sqlite` only through the B3 rollout below.
+   `PHASE0_NARRATIVE_SOURCE=sqlite` only through the B3 rollout below. Set
+   `API_SERVING_PROFILE=phase0` for the API service from its first start.
 3. Supply the LLM credential through the host environment or secret store.
    Never commit it to `.env` or the repository.
 4. Build the frontend with `npm ci && npm run build`, then serve the built
@@ -192,20 +193,27 @@ sudo install -d -o <writer> -g <readers> -m 2750 /var/lib/ticker-narratives
 10. Read `availability` and `freshness` separately: a completed run exists,
     tickers show the expected themes and current summaries, `data_as_of` is
     recent, and the policy fingerprint is the one the scheduler uses.
-11. Set for the API: `PHASE0_NARRATIVE_SOURCE=sqlite`,
+11. Set for the API: `API_SERVING_PROFILE=phase0`,
+    `PHASE0_NARRATIVE_SOURCE=sqlite`,
     `PHASE0_DATABASE_PATH=<the same explicit path>`,
     `PHASE0_PIPELINE_VERSION=<the scheduler's value>`, plus matching
     `GEMINI_MODEL` / `GEMINI_MAX_OUTPUT_TOKENS`.
 12. Do **not** give the API `GEMINI_API_KEY`.
 13. Restart the API.
 14. Smoke `/api/v1/meta/status`, `/api/v1/tickers` and
-    `/api/v1/tickers/{ticker}/themes`.
+    `/api/v1/tickers/{ticker}/themes`; confirm `/openapi.json` contains only
+    those routes plus `/test` and no legacy product routes.
 15. Confirm the API's reads created no new entry in the database directory
     (`ls -la` before and after).
 16. Let cron run again.
 17. Confirm `/api/v1/meta/status` `data_as_of` advanced without an API
     restart.
 18. Verify the frontend through nginx.
+19. Run the host benchmark and attach its JSON output to B1:
+    `python tools/phase0_api_benchmark.py --base-url <private-url>
+    --requests 200 --warmup 10`. If nginx basic auth is enabled, also pass
+    `--basic-auth-user <user>` with the password in
+    `PHASE0_BENCHMARK_PASSWORD`.
 
 ### Rollback
 
@@ -273,6 +281,12 @@ Record the output of each step on the B4 issue.
 - [ ] The API's environment has no `GEMINI_API_KEY`
       (`sudo cat /proc/<api pid>/environ | tr '\0' '\n' | grep -c GEMINI_API_KEY`
       is `0`).
+- [ ] The API's environment has `API_SERVING_PROFILE=phase0`; OpenAPI exposes
+      `/test` and the three narrative routes, with no sentiment, prediction,
+      market or dashboard routes.
+- [ ] `tools/phase0_api_benchmark.py --base-url <private-url> --requests 200
+      --warmup 10` reports p95 below 300 ms for tickers, themes and status;
+      record the live database row counts and host details beside the report.
 - [ ] Reboot: the keeper, the API, cron and nginx come back; the preflight
       passes; the API serves `200`.
 - [ ] Fixture rollback: switch back, restart the API, the page serves the
@@ -285,3 +299,4 @@ Record the output of each step on the B4 issue.
 - The actual filesystem.
 - Keeper and API behaviour across a real reboot.
 - The production switch to `PHASE0_NARRATIVE_SOURCE=sqlite` itself.
+- The private-host API benchmark and p95 result.

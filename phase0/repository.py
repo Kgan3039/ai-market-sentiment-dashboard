@@ -109,6 +109,14 @@ DEFAULT_DATABASE_PATH = Path(__file__).resolve().parents[1] / "data" / "phase0.s
 #: consumer outside the persistence layer can recognise a failed read
 #: without importing the driver itself.
 DATABASE_READ_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
+
+
+def sqlite_runtime_version() -> str:
+    """Return the SQLite runtime version without exposing a driver object."""
+
+    return sqlite3.sqlite_version
+
+
 MIGRATIONS_PATH = Path(__file__).with_name("migrations")
 RUN_STATUSES = {"success", "degraded", "failed"}
 STAGE_KEY_STATUSES = {"success", "degraded", "failed"}

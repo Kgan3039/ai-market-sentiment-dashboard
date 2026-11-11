@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
+    # "phase0" is the private-pilot serving surface: health plus the three
+    # narrative read endpoints. "full" preserves the legacy application for
+    # local compatibility while the pilot is validated.
+    API_SERVING_PROFILE: Literal["full", "phase0"] = "full"
+
     # External services (placeholders - update when services are live)
     NLP_SERVICE_URL: Optional[str] = None
     PREDICTION_SERVICE_URL: Optional[str] = None

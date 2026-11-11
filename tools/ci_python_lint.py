@@ -46,8 +46,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 #: Pre-Phase-0 sentiment/prediction application code and its ad-hoc tests.
 #: Not maintained for Phase 0; spec section 2 retires prediction and numeric
-#: sentiment.  ``backend/main.py`` is here because it predates Phase 0 and
-#: still mounts the legacy routers.
+#: sentiment. The Phase 0 app entry point is maintained separately and is not
+#: exempt.
 _LEGACY_BLACK = frozenset(
     {
         "backend/app/models/schemas.py",
@@ -58,7 +58,6 @@ _LEGACY_BLACK = frozenset(
         "backend/app/services/data_service.py",
         "backend/app/services/prediction_service.py",
         "backend/app/services/sentiment_service.py",
-        "backend/main.py",
         "backend/test_api.py",
         "backend/test_data_service_cache.py",
         "backend/test_prediction_integration.py",
@@ -68,9 +67,7 @@ _LEGACY_BLACK = frozenset(
         "prediction/prediction.py",
     }
 )
-_LEGACY_FLAKE8 = (_LEGACY_BLACK - {"backend/app/routes/market.py"}) | {
-    "backend/test_prediction_startup_prewarm.py"
-}
+_LEGACY_FLAKE8 = _LEGACY_BLACK - {"backend/app/routes/market.py"}
 
 #: Maintained Phase 0 files that already failed when CI was introduced.
 #: Known debt, to be cleaned in a dedicated formatting change; touching one
